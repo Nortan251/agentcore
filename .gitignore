@@ -1,0 +1,68 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Packaging / build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local environment / secrets  (never commit credential material)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+.netrc
+.git-credentials
+secrets.toml
+agent.local.toml
+agent.secret.toml
+
+# Generated runtime state (agent workspaces, runs, memory, conversations)
+.agent_workspace/
+agent_workspace/
+runs/
+.agentcore/
+**/memory/*.json
+**/conversations/*.json
+
+# Temporary scratch material
+scratch_*/
+tmp/
+*.tmp
+*.bak
+*.orig
+*.log
+
+# Editor / OS noise
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local pip/tooling cache living in this workspace root
+.cache/

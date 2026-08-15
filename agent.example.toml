@@ -1,0 +1,108 @@
+# Example configuration. Copy to agent.toml and adjust.
+# Secrets are NEVER stored here — only the NAME of an environment variable.
+
+environment = "development"       # development | test | staging | production
+agent_name  = "agentcore"
+workspace_dir = "./.agent_workspace"
+
+[model]
+# provider: "none" (disabled) | "echo" (offline, no credential) |
+#           "openai_compatible" / "openai" / "groq" / "together" /
+#           "openrouter" / "ollama" / "vllm" / "azure_openai" / "local"
+# All non-echo providers speak the OpenAI /chat/completions format and differ
+# only by base_url + name. Run `agentcore doctor` to list what is available.
+provider = "none"
+name = "none"                     # e.g. "gpt-4o-mini", "llama-3.1-8b-instant"
+api_key_env = "AGENT_MODEL_API_KEY"   # variable NAME, never the key itself
+# base_url = "https://api.openai.com/v1"   # optional; defaulted for known providers
+temperature = 0.2
+max_output_tokens = 4096
+timeout_seconds = 60.0
+max_retries = 3                   # total attempts; retries transient failures only
+
+[tools]
+enabled = []                      # empty = allow all registered tools
+disabled = []
+default_timeout_seconds = 30.0
+max_retries = 1
+
+[tools.settings]
+# per-tool settings passed to ToolContext.config
+# [tools.settings.some_tool]
+# key = "value"
+
+[permissions]
+level = "observe"                 # observe | propose | confirm | autonomous
+blocked_capabilities = []         # always denied, on top of the built-in blocklist
+
+[permissions.capability_overrides]
+# Lower a specific capability's unattended threshold, e.g.:
+# "fs.write" = "confirm"
+
+[logging]
+level = "INFO"
+format = "json"                   # json | text
+# file_path = "./logs/agent.log"
+
+[features]                        # each remaining flag belongs to a future task
+memory = false
+# planning: enable the LLM planner (requires a configured [model] provider).
+# When false, or when no model is configured, the passthrough planner is used.
+planning = false
+# verification: judge whether completed steps achieved their expected result.
+# Deterministic checks always run; a configured [model] additionally enables
+# model-assisted judgement for steps the planner flagged.
+verification = false
+# recovery: retry / replan / escalate after failures and adverse verdicts.
+recovery = false
+computer_control = false
+browser = false
+
+[memory]                          # durable facts that outlive a single run
+# Memory is written ONLY when something explicitly stores a record. Nothing is
+# captured automatically: no transcripts, no model responses, no tool
+# arguments. Requires features.memory = true (above).
+# directory = "./.agent_workspace/memory"   # default: <workspace_dir>/memory
+max_records = 1000                # hard ceiling; writes past it fail loudly
+max_search_results = 20           # default cap on results from one search
+max_content_chars = 4000          # memory holds facts, not transcripts
+# Planner retrieval bounds. Deliberately tighter than max_search_results:
+# remembered text is untrusted input to a model, so it gets a small budget.
+max_planning_memories = 5         # notes injected into one planning prompt
+max_planning_memory_chars = 400   # characters of each note's content
+# Conversational capture. Subordinate to features.memory: with the feature off
+# there is no store, so nothing can be captured regardless of this setting.
+# Capture is selective — explicit "remember that ..." requests and clearly
+# durable statements only. Transcripts, model output, tool arguments and
+# anything credential-shaped are never stored.
+capture_enabled = true
+max_capture_candidates = 5        # candidates considered per conversation turn
+max_capture_chars = 500           # longest candidate accepted
+capture_inferred = false          # never store the agent's own guesses
+
+[conversation]                    # dialogue runtime bounds
+# Conversation history is NOT durable memory: sessions hold the recent
+# dialogue, and only what the capture policy judges durable is remembered.
+# directory = "./.agent_workspace/conversations"
+max_context_messages = 20         # recent turns sent to the model
+max_context_chars = 8000          # independent character budget for those turns
+max_message_chars = 8000          # longest single message accepted
+max_session_messages = 200        # turns retained in a stored session
+max_memories = 5                  # durable memories retrieved per turn
+max_memory_chars = 400            # characters of each memory shown to the model
+# Conversational tool use. Off by default: talking is safe, acting is a
+# deliberate choice. Tools run through the SAME executor and permission policy
+# as autonomous runs — the model can request, never authorise.
+tools_enabled = false
+max_tool_rounds = 3               # bound on tool -> model -> tool per turn
+max_tool_result_chars = 2000      # tool output is truncated with a marker
+
+[recovery]
+max_attempts = 3                  # total attempts per subtask, including the first
+base_delay_seconds = 0.5
+backoff_factor = 2.0
+max_delay_seconds = 30.0
+retry_verification_failures = true
+retry_unverified = false          # unknown outcomes replan rather than repeat
+max_replans = 1
+escalate_on_exhaustion = true
