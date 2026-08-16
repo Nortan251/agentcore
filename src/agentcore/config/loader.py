@@ -309,6 +309,10 @@ def _build_filesystem(data: Mapping[str, Any]) -> FilesystemConfig:
         deny_sensitive_paths=_coerce(
             bool, data.get("deny_sensitive_paths", d.deny_sensitive_paths),
             "filesystem.deny_sensitive_paths"),
+        allow_multiple_hard_links=_coerce(
+            bool, data.get("allow_multiple_hard_links",
+                           d.allow_multiple_hard_links),
+            "filesystem.allow_multiple_hard_links"),
     )
 
 

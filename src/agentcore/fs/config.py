@@ -57,7 +57,24 @@ class FilesystemConfig:
     allow_internal_symlinks: bool = False
     #: Whether the sensitive-path denylist is enforced. Kept configurable for
     #: testing and deliberate operator override; on by default.
+    #:
+    #: When symlinks are permitted the policy is applied to the link's
+    #: *effective target* as well as to the requested name, so an
+    #: innocuously-named link to ``.env`` is still refused.
     deny_sensitive_paths: bool = True
+    #: Whether a regular file with more than one hard link may be read.
+    #:
+    #: ``False`` (default) refuses them. Containment is a property of
+    #: *pathnames*, and a hardlink gives one inode several names — a link
+    #: inside the workspace can point at an inode whose other name is outside
+    #: it, which was reproduced by the audit. The kernel offers no way to
+    #: enumerate an inode's other names, so the link count is the only signal
+    #: available and the conservative reading is the safe one.
+    #:
+    #: The cost is real but small: ordinary files have ``st_nlink == 1``, and
+    #: legitimately hardlinked content (some build caches, deduplicated
+    #: vendored trees) becomes unreadable. Operators who need it can opt in.
+    allow_multiple_hard_links: bool = False
 
     @property
     def effective_chunk_bytes(self) -> int:

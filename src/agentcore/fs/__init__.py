@@ -19,6 +19,8 @@ _EXPORTS = {
     "FilesystemConfig": ("agentcore.fs.config", "FilesystemConfig"),
     "WorkspaceGuard": ("agentcore.fs.guard", "WorkspaceGuard"),
     "SafePath": ("agentcore.fs.guard", "SafePath"),
+    "OpenFile": ("agentcore.fs.opened", "OpenFile"),
+    "open_verified": ("agentcore.fs.opened", "open_verified"),
     "FileFacts": ("agentcore.fs.paths", "FileFacts"),
     "PathKind": ("agentcore.fs.paths", "PathKind"),
     "PathRejectedError": ("agentcore.fs.paths", "PathRejectedError"),

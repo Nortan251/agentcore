@@ -165,9 +165,9 @@ def test_nonexistent_but_contained_path_is_allowed_by_containment(guard):
     """Containment is about location, not existence."""
     safe = guard.resolve_relative("src/brand_new.py")
     assert safe.relative == "src/brand_new.py"
-    # Existence is a separate, explicit check.
+    # Existence is decided at open time, from the descriptor.
     with pytest.raises(PathRejectedError) as exc:
-        guard.require_readable_file(safe)
+        guard.open_file("src/brand_new.py")
     assert exc.value.reason is RejectionReason.NOT_FOUND
 
 
@@ -495,9 +495,9 @@ def test_fifo_is_rejected(workspace):
     os.mkfifo(fifo)
     assert classify(fifo) is PathKind.FIFO
     guard = WorkspaceGuard(workspace)
-    safe = guard.resolve_relative("pipe")
+    # O_NONBLOCK means this rejects rather than hanging on a writer-less FIFO.
     with pytest.raises(PathRejectedError) as exc:
-        guard.require_readable_file(safe)
+        guard.open_file("pipe")
     assert exc.value.reason is RejectionReason.NOT_A_REGULAR_FILE
 
 
@@ -517,18 +517,16 @@ def test_socket_is_rejected(workspace):
         srv.bind(str(sock_path))
         assert classify(sock_path) is PathKind.SOCKET
         guard = WorkspaceGuard(workspace)
-        safe = guard.resolve_relative("sock")
         with pytest.raises(PathRejectedError) as exc:
-            guard.require_readable_file(safe)
+            guard.open_file("sock")
         assert exc.value.reason is RejectionReason.NOT_A_REGULAR_FILE
     finally:
         srv.close()
 
 
 def test_directory_rejected_as_a_file(guard):
-    safe = guard.resolve_relative("src")
     with pytest.raises(PathRejectedError) as exc:
-        guard.require_readable_file(safe)
+        guard.open_file("src")
     assert exc.value.reason is RejectionReason.NOT_A_REGULAR_FILE
 
 
@@ -553,7 +551,7 @@ def test_unreadable_file_rejected(workspace):
     try:
         guard = WorkspaceGuard(workspace)
         with pytest.raises(PathRejectedError) as exc:
-            guard.require_readable_file(guard.resolve_relative("locked.txt"))
+            guard.open_file("locked.txt")
         assert exc.value.reason is RejectionReason.UNREADABLE
     finally:
         locked.chmod(0o644)
@@ -669,11 +667,10 @@ def test_custom_policy_is_used_by_the_guard(workspace):
 # ===========================================================================
 
 def test_read_small_file(guard):
-    safe = guard.resolve_relative("notes.txt")
-    facts = guard.require_readable_file(safe)
-    data, truncated = guard.read_bytes(safe, facts)
+    data, facts, truncated = guard.read_path("notes.txt")
     assert data == b"plain notes\n"
     assert truncated is False
+    assert facts.size == len(data)
 
 
 def test_oversized_file_rejected_before_reading(workspace):
@@ -682,9 +679,8 @@ def test_oversized_file_rejected_before_reading(workspace):
     guard = WorkspaceGuard(workspace,
                            config=FilesystemConfig(max_file_bytes=1000,
                                                    read_chunk_bytes=100))
-    safe = guard.resolve_relative("big.bin")
     with pytest.raises(PathRejectedError) as exc:
-        guard.require_readable_file(safe)
+        guard.open_file("big.bin")
     assert exc.value.reason is RejectionReason.TOO_LARGE
     assert exc.value.details["limit"] == 1000
 
@@ -700,12 +696,12 @@ def test_byte_ceiling_is_enforced_during_reading(workspace):
     guard = WorkspaceGuard(workspace,
                            config=FilesystemConfig(max_file_bytes=1000,
                                                    read_chunk_bytes=64))
-    safe = guard.resolve_relative("grows.bin")
-    facts = guard.require_readable_file(safe)
-    # Grow it far beyond the ceiling *after* validation.
+    handle = guard.open_file("grows.bin")
+    # Grow it far beyond the ceiling *after* it was opened and verified.
     with open(path, "ab") as fh:
         fh.write(b"b" * 100_000)
-    data, _ = guard.read_bytes(safe, facts)
+    with handle:
+        data, _ = guard.read_from(handle)
     assert len(data) == 1000
 
 
@@ -715,9 +711,8 @@ def test_iter_bounded_never_holds_more_than_one_chunk(workspace):
     guard = WorkspaceGuard(workspace,
                            config=FilesystemConfig(max_file_bytes=10_000,
                                                    read_chunk_bytes=1024))
-    safe = guard.resolve_relative("chunked.bin")
-    facts = guard.require_readable_file(safe)
-    sizes = [len(c) for c in guard.iter_bounded(safe, facts)]
+    with guard.open_file("chunked.bin") as handle:
+        sizes = [len(c) for c in guard.iter_from(handle)]
     assert max(sizes) <= 1024
     assert sum(sizes) == 10_000
 
@@ -728,9 +723,7 @@ def test_truncation_is_reported_explicitly(workspace):
     guard = WorkspaceGuard(workspace,
                            config=FilesystemConfig(max_file_bytes=4096,
                                                    read_chunk_bytes=512))
-    safe = guard.resolve_relative("trunc.bin")
-    facts = guard.require_readable_file(safe)
-    data, truncated = guard.read_bytes(safe, facts)
+    data, _, truncated = guard.read_path("trunc.bin")
     # Exactly at the ceiling and complete -> not truncated.
     assert len(data) == 4096 and truncated is False
 
@@ -738,9 +731,8 @@ def test_truncation_is_reported_explicitly(workspace):
 def test_empty_file_reads_cleanly(workspace):
     (workspace / "empty.txt").write_bytes(b"")
     guard = WorkspaceGuard(workspace)
-    safe = guard.resolve_relative("empty.txt")
-    facts = guard.require_readable_file(safe)
-    assert guard.read_bytes(safe, facts) == (b"", False)
+    data, _, truncated = guard.read_path("empty.txt")
+    assert (data, truncated) == (b"", False)
 
 
 # ===========================================================================
@@ -748,37 +740,89 @@ def test_empty_file_reads_cleanly(workspace):
 # ===========================================================================
 
 @POSIX_ONLY
-def test_swapped_file_is_detected(workspace, outside):
-    """Replacing the validated file before opening is detected, not read."""
+def test_replacement_is_read_but_only_as_a_verified_object(workspace):
+    """States the ACTUAL guarantee, which is narrower than 'swap detected'.
+
+    The previous design compared (st_dev, st_ino) captured before opening.
+    That was unsound: inode numbers get reused. What is guaranteed now is that
+    every security property comes from the descriptor, so the replacement is
+    read only if it is itself a regular, single-linked, in-bounds file.
+    """
     victim = workspace / "target.txt"
     victim.write_text("legitimate", encoding="utf-8")
     guard = WorkspaceGuard(workspace)
     safe = guard.resolve_relative("target.txt")
-    facts = guard.require_readable_file(safe)
 
-    # Swap in a different file at the same path.
     victim.unlink()
-    (workspace / "target.txt").write_text("attacker content", encoding="utf-8")
+    victim.write_text("attacker content", encoding="utf-8")
 
+    with guard.open_safe(safe) as handle:
+        data, _ = guard.read_from(handle)
+        # Honest: the new content IS returned. The point is that the facts
+        # describe what was really opened, so no stale value is trusted.
+        assert data == b"attacker content"
+        assert handle.facts.size == len(data)
+        assert handle.facts.kind is PathKind.REGULAR
+
+
+@POSIX_ONLY
+def test_replacement_by_oversized_file_is_still_bounded(workspace):
+    """The size limit follows the descriptor, so a stale size cannot bypass it."""
+    victim = workspace / "target.txt"
+    victim.write_text("tiny", encoding="utf-8")
+    guard = WorkspaceGuard(workspace,
+                           config=FilesystemConfig(max_file_bytes=1000,
+                                                   read_chunk_bytes=128))
+    safe = guard.resolve_relative("target.txt")
+    victim.unlink()
+    victim.write_bytes(b"X" * 50_000)
     with pytest.raises(PathRejectedError) as exc:
-        guard.read_bytes(safe, facts)
-    assert exc.value.reason is RejectionReason.CHANGED_UNDERFOOT
+        guard.open_safe(safe)
+    assert exc.value.reason is RejectionReason.TOO_LARGE
+
+
+@POSIX_ONLY
+def test_replacement_by_special_file_is_refused(workspace):
+    """A FIFO swapped in after validation is caught by fstat on the fd."""
+    victim = workspace / "target.txt"
+    victim.write_text("legitimate", encoding="utf-8")
+    guard = WorkspaceGuard(workspace)
+    safe = guard.resolve_relative("target.txt")
+    victim.unlink()
+    os.mkfifo(victim)
+    with pytest.raises(PathRejectedError) as exc:
+        guard.open_safe(safe)
+    assert exc.value.reason is RejectionReason.NOT_A_REGULAR_FILE
+
+
+@POSIX_ONLY
+def test_replacement_by_hardlink_to_outside_is_refused(workspace, outside):
+    """The most dangerous swap: an alias for a file outside the workspace."""
+    victim = workspace / "target.txt"
+    victim.write_text("legitimate", encoding="utf-8")
+    guard = WorkspaceGuard(workspace)
+    safe = guard.resolve_relative("target.txt")
+    victim.unlink()
+    os.link(outside / "secret.txt", victim)
+    with pytest.raises(PathRejectedError) as exc:
+        guard.open_safe(safe)
+    assert exc.value.reason is RejectionReason.MULTIPLE_HARD_LINKS
 
 
 @POSIX_ONLY
 def test_file_replaced_by_symlink_is_not_followed(workspace, outside):
+    """O_NOFOLLOW refuses a final-component symlink at the syscall level."""
     victim = workspace / "target.txt"
     victim.write_text("legitimate", encoding="utf-8")
     guard = WorkspaceGuard(workspace)
     safe = guard.resolve_relative("target.txt")
-    facts = guard.require_readable_file(safe)
 
     victim.unlink()
     victim.symlink_to(outside / "secret.txt")
 
     with pytest.raises(PathRejectedError) as exc:
-        guard.read_bytes(safe, facts)
-    assert exc.value.reason is RejectionReason.CHANGED_UNDERFOOT
+        guard.open_safe(safe)
+    assert exc.value.reason is RejectionReason.SYMLINK
     assert "TOP SECRET" not in str(exc.value)
 
 
@@ -838,12 +882,12 @@ def test_guard_source_never_calls_write_apis():
     assert offenders == [], offenders
 
 
-def test_open_regular_opens_read_only(guard, workspace):
-    safe = guard.resolve_relative("notes.txt")
-    facts = guard.require_readable_file(safe)
-    with guard.open_regular(safe, facts) as handle:
-        assert handle.readable()
-        assert not handle.writable()
+def test_opened_descriptor_is_read_only(guard, workspace):
+    """Writing to the descriptor must fail: it was opened O_RDONLY."""
+    import os as _os
+    with guard.open_file("notes.txt") as handle:
+        with pytest.raises(OSError):
+            _os.write(handle.fd, b"nope")
 
 
 # ===========================================================================
@@ -884,9 +928,8 @@ def test_clamped_chunk_still_reads_correctly(tmp_path):
     guard = WorkspaceGuard(tmp_path,
                            config=FilesystemConfig(max_file_bytes=100,
                                                    read_chunk_bytes=99_999))
-    safe = guard.resolve_relative("f.bin")
     with pytest.raises(PathRejectedError) as exc:
-        guard.require_readable_file(safe)
+        guard.open_file("f.bin")
     assert exc.value.reason is RejectionReason.TOO_LARGE
 
 
@@ -912,8 +955,8 @@ def test_rejection_details_use_relative_paths_only(guard, workspace, outside):
 
 
 def test_file_facts_to_dict_has_no_absolute_path(guard):
-    safe = guard.resolve_relative("src/app.py")
-    payload = guard.require_readable_file(safe).to_dict()
+    with guard.open_file("src/app.py") as handle:
+        payload = handle.facts.to_dict()
     assert payload["path"] == "src/app.py"
     assert not any(str(v).startswith("/") for v in payload.values())
 

@@ -1,38 +1,58 @@
 """``WorkspaceGuard`` — the single entry point future filesystem tools use.
 
-A future ``read_file`` or ``list_directory`` should need exactly this::
+A future ``read_file`` should need exactly this::
 
-    safe = guard.resolve_relative(args["path"])       # containment + policy
-    facts = guard.require_readable_file(safe)         # kind + size checks
-    data, truncated = guard.read_bytes(safe)          # bounded during reading
+    with guard.open_file(args["path"]) as handle:     # steps 1-6 below
+        data, truncated = guard.read_from(handle)     # step 7
+        facts = handle.facts                          # from fstat(fd)
 
-and must not re-implement canonicalisation, containment, sensitive-file checks
-or special-file checks.
+or, for the simple case, ``data, facts, truncated = guard.read_path(path)``.
+
+Tools must not re-implement canonicalisation, containment, sensitive-file
+checks, special-file checks or bounds.
+
+The authoritative security ordering
+-----------------------------------
+Every filesystem access goes through these steps, in this order, in exactly
+one place (:meth:`WorkspaceGuard.open_file`). A tool must not re-implement or
+reorder any of them::
+
+    1. validate relative form      cheap, lexical, no filesystem access
+    2. resolve / canonicalise      symlinks collapsed
+    3. containment                 component-aware, against the resolved target
+    4. sensitive-path policy       on the requested name AND effective target
+    5. safe open                   O_RDONLY | O_NOFOLLOW | O_NONBLOCK
+    6. descriptor verification     type, link count and size from fstat(fd)
+    7. bounded read                ceiling applied while reading
+
+Steps 1–4 concern *pathnames*; steps 5–7 concern the *object actually opened*.
+That split is the point. Anything decided in 1–4 can be invalidated by a
+concurrent rename, so nothing from those steps is used as the final authority
+on what is read — see :mod:`agentcore.fs.opened`.
 
 TOCTOU — what this guarantees and what it does not
 --------------------------------------------------
-Validation and use are two operations, so a sufficiently privileged local
-attacker who can rename or relink paths *between* them can in principle make
-the opened object differ from the validated one. ``pathlib.resolve()`` does not
-prevent this and this module never claims it does.
+Type, size and link count are read from ``fstat`` on the **open descriptor**,
+so they cannot be stale: they describe the object being read. An earlier design
+compared ``(st_dev, st_ino)`` captured before opening; that was removed because
+inode numbers are reused. On ext4 in this project's own sandbox, deleting a
+validated file and recreating another at the same path **reused the inode on
+the first attempt**, so the comparison silently accepted the replacement. The
+same test on tmpfs never reuses an inode and would have reported success — a
+good illustration of why the check was unsound.
 
-What :meth:`WorkspaceGuard.open_regular` actually does:
+TOCTOU is therefore **reduced, not eliminated**. What is still not guaranteed:
 
-* opens with ``O_NOFOLLOW`` (where the platform provides it), so the final
-  component cannot be a symlink at the moment of opening;
-* ``fstat``s the **open descriptor** and compares device/inode against the
-  values observed during validation, so a swap between validate and open is
-  *detected* and raises :class:`~agentcore.fs.paths.PathRejectedError` with
-  reason ``CHANGED_UNDERFOOT``;
-* re-checks the kind from that same descriptor, so the thing being read is a
-  regular file according to the descriptor itself, not an earlier lookup.
+* *Which object the pathname resolved to* at the instant of the open. A
+  concurrent attacker who can replace a **parent directory** between resolution
+  and open can still redirect it. A complete defence requires ``openat``
+  traversal from a directory descriptor, component by component, which is
+  POSIX-specific; it is deliberately not built here.
+* Consequently, a file legitimately replaced between steps 3 and 5 is read as
+  whatever now exists at that path — but only ever a regular, single-linked,
+  size-bounded file that the descriptor itself vouches for.
 
-What remains unguaranteed: a **parent directory** component could be swapped
-between the walk and the open (a full defence needs ``openat``-relative
-traversal from a directory descriptor, which is POSIX-specific and out of scope
-here), and the check assumes the attacker cannot recreate a file with an
-identical device/inode pair. Both are documented in tests rather than papered
-over.
+These limits are asserted by tests so they cannot be quietly overstated later.
 """
 
 from __future__ import annotations
@@ -43,10 +63,9 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterator
 
 from agentcore.fs.config import FilesystemConfig
+from agentcore.fs.opened import OpenFile, descriptor_path, open_verified
 from agentcore.fs.paths import (
     FileFacts,
-    O_NOFOLLOW,
-    NON_READABLE_KINDS,
     PathKind,
     PathRejectedError,
     RejectionReason,
@@ -129,13 +148,9 @@ class WorkspaceGuard:
     def resolve_relative(self, requested: Any) -> SafePath:
         """Validate a requested path and return a contained absolute path.
 
-        Order matters and is deliberate:
-
-        1. lexical form (cheap, no filesystem access, cross-platform);
-        2. sensitive-path policy (before *any* filesystem access, so a denied
-           credential file is not even stat'd);
-        3. symlink policy (walked component by component, never followed);
-        4. resolved containment (the actual guarantee).
+        Steps 1–4 of the ordering in the module docstring. This settles
+        *pathname* questions only; it deliberately makes no claim about the
+        object that will eventually be opened.
         """
         relative = check_relative_form(
             requested,
@@ -143,6 +158,8 @@ class WorkspaceGuard:
             max_depth=self._config.max_path_depth,
         )
 
+        # 4a. Sensitive policy on the requested name, before any filesystem
+        #     access, so a denied credential file is not even stat'd.
         if self._config.deny_sensitive_paths:
             reason = self._sensitive.reason(relative)
             if reason is not None:
@@ -158,49 +175,85 @@ class WorkspaceGuard:
                     "path crosses a symbolic link, which is not permitted",
                     path=link)
 
+        # 2 + 3. Canonicalise, then containment against the resolved target.
         resolved = contain(self._root, relative)
+
+        # 4b. Sensitive policy on the EFFECTIVE TARGET.
+        #
+        #     Only reachable when symlinks are permitted, and it is exactly the
+        #     case a name-only check misses: ``notes.txt -> hidden/.env``
+        #     resolves inside the workspace and passes containment, but the
+        #     bytes it would yield are a credential file. Policy must follow
+        #     the content, not the label.
+        if self._config.deny_sensitive_paths:
+            effective = resolved.relative_to(self._root).as_posix()
+            if effective != relative.as_posix():
+                reason = self._sensitive.reason(effective)
+                if reason is not None:
+                    raise PathRejectedError(
+                        RejectionReason.SENSITIVE_TARGET,
+                        f"refused: path resolves to a sensitive file ({reason})",
+                        path=relative.as_posix(), target=effective)
+
         return SafePath(absolute=resolved, relative=relative.as_posix())
 
-    # -- kind / readability ------------------------------------------------
-    def require_readable_file(self, safe: SafePath) -> FileFacts:
-        """Assert ``safe`` is an existing, regular, readable, in-bounds file.
+    # -- opening (steps 5-6) -----------------------------------------------
+    def open_file(self, requested: Any) -> OpenFile:
+        """The authoritative entry point: request → open, verified descriptor.
 
-        Returns :class:`FileFacts` carrying the device/inode identity that
-        :meth:`open_regular` later verifies.
+        Runs the whole ordering from the module docstring and hands back an
+        :class:`~agentcore.fs.opened.OpenFile` whose ``facts`` come from
+        ``fstat`` on the descriptor. A future ``read_file`` should call this
+        and nothing else.
+
+        The result is a context manager and **must** be closed::
+
+            with guard.open_file("src/app.py") as handle:
+                data, truncated = guard.read_from(handle)
+        """
+        safe = self.resolve_relative(requested)
+        return self.open_safe(safe)
+
+    def open_safe(self, safe: SafePath) -> OpenFile:
+        """Steps 5–6 for an already-validated :class:`SafePath`."""
+        handle = open_verified(
+            safe.absolute,
+            relative=safe.relative,
+            max_bytes=self._config.max_file_bytes,
+            allow_multiple_links=self._config.allow_multiple_hard_links,
+        )
+        # Defence in depth: on Linux, confirm the descriptor really resolves
+        # inside the workspace. This catches a parent-directory swap that
+        # happened before the open, which pathname containment cannot see.
+        # Absent /proc this returns None and containment rests on steps 2-3.
+        try:
+            actual = descriptor_path(handle.fd)
+            if actual is not None and not actual.is_relative_to(self._root):
+                raise PathRejectedError(
+                    RejectionReason.ESCAPES_WORKSPACE,
+                    "opened file lies outside the workspace",
+                    path=safe.relative)
+        except BaseException:
+            handle.close()
+            raise
+        return handle
+
+    def stat_path(self, safe: SafePath) -> FileFacts:
+        """Advisory pathname inspection, for listing rather than reading.
+
+        Explicitly *not* a security gate for reads: the answer may be stale by
+        the time it is used. Reading must go through :meth:`open_file`, which
+        judges the descriptor.
         """
         kind = classify(safe.absolute)
         if kind is PathKind.MISSING:
             raise PathRejectedError(RejectionReason.NOT_FOUND,
                                     "no such file in the workspace",
                                     path=safe.relative)
-        if kind is PathKind.SYMLINK:
-            raise PathRejectedError(
-                RejectionReason.SYMLINK,
-                "path is a symbolic link, which is not permitted",
-                path=safe.relative)
-        if kind is PathKind.DIRECTORY:
-            raise PathRejectedError(RejectionReason.NOT_A_REGULAR_FILE,
-                                    "path is a directory, not a file",
-                                    path=safe.relative)
-        if kind in NON_READABLE_KINDS:
-            raise PathRejectedError(
-                RejectionReason.NOT_A_REGULAR_FILE,
-                f"path is a {kind}, which cannot be read safely",
-                path=safe.relative)
-
         st = safe.absolute.lstat()
-        if st.st_size > self._config.max_file_bytes:
-            raise PathRejectedError(
-                RejectionReason.TOO_LARGE,
-                "file exceeds the maximum readable size",
-                path=safe.relative, size=st.st_size,
-                limit=self._config.max_file_bytes)
-        if not os.access(safe.absolute, os.R_OK):
-            raise PathRejectedError(RejectionReason.UNREADABLE,
-                                    "file is not readable",
-                                    path=safe.relative)
         return FileFacts(relative=safe.relative, kind=kind, size=st.st_size,
-                         device=st.st_dev, inode=st.st_ino)
+                         device=st.st_dev, inode=st.st_ino,
+                         links=st.st_nlink)
 
     def require_directory(self, safe: SafePath) -> FileFacts:
         """Assert ``safe`` is an existing directory inside the workspace."""
@@ -220,79 +273,41 @@ class WorkspaceGuard:
                                     path=safe.relative)
         st = safe.absolute.lstat()
         return FileFacts(relative=safe.relative, kind=kind, size=0,
-                         device=st.st_dev, inode=st.st_ino)
+                         device=st.st_dev, inode=st.st_ino,
+                         links=st.st_nlink)
 
     def root_path(self) -> SafePath:
         """The workspace root itself as a :class:`SafePath`."""
         return SafePath(absolute=self._root, relative=".")
 
-    # -- bounded reading ---------------------------------------------------
-    def open_regular(self, safe: SafePath, facts: FileFacts):
-        """Open a validated regular file, verifying it did not change.
+    # -- bounded reading (step 7) ------------------------------------------
+    def iter_from(self, handle: OpenFile) -> Iterator[bytes]:
+        """Yield bounded chunks from an already-opened, verified descriptor."""
+        return handle.read_bounded(
+            max_bytes=self._config.max_file_bytes,
+            chunk_bytes=self._config.effective_chunk_bytes,
+        )
 
-        Returns a binary file object. See the module docstring for the exact
-        TOCTOU guarantee.
+    def read_from(self, handle: OpenFile) -> tuple[bytes, bool]:
+        """Read an open descriptor, bounded. Returns ``(data, truncated)``.
+
+        ``truncated`` says the ceiling stopped the read before the file ended,
+        so a caller reports a prefix explicitly rather than silently.
         """
-        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | O_NOFOLLOW
-        try:
-            fd = os.open(safe.absolute, flags)
-        except OSError as exc:
-            # ELOOP here means the final component became a symlink.
-            raise PathRejectedError(RejectionReason.CHANGED_UNDERFOOT,
-                                    "file could not be opened safely",
-                                    path=safe.relative,
-                                    errno=exc.errno) from exc
-        try:
-            st = os.fstat(fd)
-            import stat as stat_module
-            if not stat_module.S_ISREG(st.st_mode):
-                raise PathRejectedError(
-                    RejectionReason.NOT_A_REGULAR_FILE,
-                    "opened object is not a regular file",
-                    path=safe.relative)
-            if (st.st_dev, st.st_ino) != (facts.device, facts.inode):
-                raise PathRejectedError(
-                    RejectionReason.CHANGED_UNDERFOOT,
-                    "file changed between validation and opening",
-                    path=safe.relative)
-        except BaseException:
-            os.close(fd)
-            raise
-        return os.fdopen(fd, "rb")
+        data = b"".join(self.iter_from(handle))
+        ceiling = self._config.max_file_bytes
+        # Size comes from the descriptor, so this comparison is not stale.
+        return data, len(data) >= ceiling and handle.facts.size > ceiling
 
-    def iter_bounded(self, safe: SafePath,
-                     facts: FileFacts) -> Iterator[bytes]:
-        """Yield chunks, stopping at the configured byte ceiling.
+    def read_path(self, requested: Any) -> tuple[bytes, FileFacts, bool]:
+        """Convenience: validate, open, read and close in one call.
 
-        The ceiling is enforced **while** reading: at no point is more than
-        ``max_file_bytes`` (plus one chunk) held, and a file that grew after
-        validation still cannot exceed the cap.
+        Returns ``(data, facts, truncated)``. The descriptor is always closed,
+        including on failure.
         """
-        remaining = self._config.max_file_bytes
-        chunk_size = self._config.effective_chunk_bytes
-        with self.open_regular(safe, facts) as handle:
-            while remaining > 0:
-                chunk = handle.read(min(chunk_size, remaining))
-                if not chunk:
-                    return
-                remaining -= len(chunk)
-                yield chunk
-
-    def read_bytes(self, safe: SafePath,
-                   facts: FileFacts) -> tuple[bytes, bool]:
-        """Read a validated file, bounded. Returns ``(data, truncated)``.
-
-        ``truncated`` is ``True`` when the ceiling stopped the read before the
-        file ended, so a caller can say so explicitly rather than silently
-        returning a prefix.
-        """
-        parts = list(self.iter_bounded(safe, facts))
-        data = b"".join(parts)
-        truncated = len(data) >= self._config.max_file_bytes
-        if truncated:
-            # Distinguish "exactly at the cap and complete" from "cut short".
-            truncated = facts.size > self._config.max_file_bytes
-        return data, truncated
+        with self.open_file(requested) as handle:
+            data, truncated = self.read_from(handle)
+            return data, handle.facts, truncated
 
     # -- observability -----------------------------------------------------
     def describe(self) -> dict[str, Any]:
@@ -308,4 +323,6 @@ class WorkspaceGuard:
             "max_directory_entries": self._config.max_directory_entries,
             "symlinks_allowed": self._config.allow_internal_symlinks,
             "sensitive_paths_denied": self._config.deny_sensitive_paths,
+            "multiple_hard_links_allowed":
+                self._config.allow_multiple_hard_links,
         }

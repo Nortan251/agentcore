@@ -59,6 +59,13 @@ class RejectionReason(str, Enum):
     UNREADABLE = "unreadable"
     TOO_LARGE = "too_large"
     CHANGED_UNDERFOOT = "changed_underfoot"
+    #: A regular file with more than one hard link. Containment is a property
+    #: of pathnames, and a hardlink gives one inode several names — possibly
+    #: including one outside the workspace.
+    MULTIPLE_HARD_LINKS = "multiple_hard_links"
+    #: The sensitive-path policy matched the link's *effective target* rather
+    #: than the requested name.
+    SENSITIVE_TARGET = "sensitive_target"
 
     def __str__(self) -> str:
         return self.value
@@ -273,11 +280,25 @@ NON_READABLE_KINDS = frozenset({
 })
 
 
+def kind_from_mode(mode: int) -> PathKind:
+    """Classify a ``st_mode`` value.
+
+    Split out from :func:`classify` so the same logic serves both a pathname
+    ``lstat`` and an ``fstat`` on an open descriptor — the descriptor path must
+    not re-implement type detection.
+    """
+    return _kind_from_mode(mode)
+
+
 def classify(path: Path) -> PathKind:
     """Classify a path without following symlinks.
 
     Uses ``lstat`` so a symlink reports as :attr:`PathKind.SYMLINK` rather than
     silently reporting whatever it points at.
+
+    This is a *pathname* check and is therefore advisory: by the time the
+    result is used the name may refer to something else. Security decisions
+    about a file being read must come from :mod:`agentcore.fs.opened` instead.
     """
     try:
         st = path.lstat()
@@ -285,7 +306,10 @@ def classify(path: Path) -> PathKind:
         return PathKind.MISSING
     except OSError:
         return PathKind.OTHER
-    mode = st.st_mode
+    return _kind_from_mode(st.st_mode)
+
+
+def _kind_from_mode(mode: int) -> PathKind:
     if stat_module.S_ISLNK(mode):
         return PathKind.SYMLINK
     if stat_module.S_ISREG(mode):
@@ -307,9 +331,12 @@ def classify(path: Path) -> PathKind:
 class FileFacts:
     """Identity of a file as observed at validation time.
 
-    ``device``/``inode`` let a later open verify — via ``fstat`` on the open
-    descriptor — that it got the same object that was validated. This is the
-    project's TOCTOU mitigation; see :mod:`agentcore.fs.guard`.
+    These values are read from ``fstat`` on the **open descriptor**, so they
+    describe the object actually being read rather than whatever a pathname
+    referred to earlier. ``device``/``inode`` are retained for diagnostics and
+    logging; they are deliberately *not* used as a TOCTOU defence, because
+    inode numbers are reused (reproduced on ext4 — see
+    :mod:`agentcore.fs.opened`).
     """
 
     relative: str
@@ -317,11 +344,14 @@ class FileFacts:
     size: int
     device: int
     inode: int
+    #: ``st_nlink`` of the opened object. >1 on a regular file means the inode
+    #: has other names, which may lie outside the workspace.
+    links: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         # Deliberately no absolute path: safe to log.
         return {"path": self.relative, "kind": str(self.kind),
-                "size": self.size}
+                "size": self.size, "links": self.links}
 
 
 #: ``O_NOFOLLOW`` refuses to open a final-component symlink at the syscall

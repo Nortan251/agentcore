@@ -929,11 +929,33 @@ on. **It contains no tools.** `read_file` and `list_directory` do not exist
 yet; this layer is the prerequisite that makes them safe to add.
 
 ```python
-guard = agent.workspace                     # a WorkspaceGuard
-safe  = guard.resolve_relative("src/app.py")   # containment + policy
-facts = guard.require_readable_file(safe)      # kind, size, readability
-data, truncated = guard.read_bytes(safe, facts)  # bounded during reading
+guard = agent.workspace                          # a WorkspaceGuard
+with guard.open_file("src/app.py") as handle:    # validate -> open -> verify
+    data, truncated = guard.read_from(handle)    # bounded while reading
+    facts = handle.facts                         # from fstat(fd), never stale
+
+# or, for the simple case:
+data, facts, truncated = guard.read_path("src/app.py")
 ```
+
+**Security ordering.** Every access runs these steps, in this order, in one
+place (`WorkspaceGuard.open_file`). A tool must not reorder or reimplement any
+of them:
+
+| # | Step | Operates on |
+|---|------|-------------|
+| 1 | validate relative form | pathname (lexical, no I/O) |
+| 2 | resolve / canonicalise | pathname |
+| 3 | containment | pathname |
+| 4 | sensitive-path policy — requested name **and** effective target | pathname |
+| 5 | safe open — `O_RDONLY｜O_NOFOLLOW｜O_NONBLOCK` | descriptor |
+| 6 | descriptor verification — type, link count, size from `fstat(fd)` | descriptor |
+| 7 | bounded read | descriptor |
+
+Steps 1–4 answer questions about *names*; steps 5–7 answer them about the
+*object actually opened*. That split is the whole point: a name can be
+redirected between steps, so nothing from 1–4 is the final authority on what
+gets read.
 
 **Canonical workspace identity.** `AgentConfig.workspace_dir` may be relative
 or `~`-prefixed. `config.canonical_workspace()` resolves it once — absolute
@@ -967,24 +989,68 @@ mention credentials (`token_handling.py`, `id_rsa.pub`) stay readable. The list
 is explicit, centralised and expandable via `SensitivePathPolicy.extend()`; it
 is **not** claimed to be complete.
 
-**Special files.** `classify()` uses `lstat`, distinguishing regular files from
-directories, symlinks, FIFOs, sockets and devices, so a reader can refuse a
-FIFO (which could block forever) before opening it.
+**Special files.** Type comes from `fstat` on the open descriptor, so a FIFO,
+socket or device swapped in after validation is still refused. Files are opened
+`O_NONBLOCK`, so a FIFO with no writer is rejected rather than hanging the
+agent forever.
+
+**Hardlink policy (v1): a regular file with `st_nlink > 1` is refused.**
+Containment is a property of *pathnames*, and a hardlink gives one inode
+several names — a link inside the workspace can point at an inode whose other
+name lies outside it. The audit reproduced exactly that. The kernel offers no
+way to enumerate an inode's other names, so the link count is the only
+available signal and the conservative reading is the safe one. The cost is
+explicit: ordinary files have `st_nlink == 1` and are unaffected, but
+legitimately hardlinked content (some build caches, deduplicated vendored
+trees) becomes unreadable. Operators who need it set
+`allow_multiple_hard_links = true`, which genuinely does re-expose the escape —
+a test asserts that, so nobody enables it believing otherwise. Directories
+normally have `st_nlink >= 2` and are not subject to this rule.
 
 **Bounds** live in `[filesystem]` config, not in a tool: `max_file_bytes` is
-enforced *while* reading, chunk by chunk, so a file that grows after validation
-still cannot exceed the cap.
+checked against the descriptor and enforced *while* reading, chunk by chunk, so
+neither a stale size nor a file that grows mid-read can exceed the cap.
 
-**TOCTOU.** `resolve()` does not make validate→use atomic and this layer never
-claims it does. `open_regular()` opens with `O_NOFOLLOW` and compares
-device/inode on the **open descriptor** against validation time, so a swapped
-file raises `CHANGED_UNDERFOOT` instead of being read. A *parent directory*
-swapped mid-walk is still not defended against — that needs `openat`-relative
-traversal — and a test asserts this admission stays in the docs.
+### TOCTOU: reduced, not eliminated
 
-**Read-only by construction:** the guard exposes no write, delete or rename
-operation, and an AST test fails if the `fs` package ever references a mutating
-filesystem API. `ToolSpec.read_only` remains declarative metadata.
+**Guaranteed.** Traversal containment; sibling-prefix protection
+(`/workspace-other` is not inside `/workspace`); symlink escape refusal;
+sensitive-path denial on both the requested name and the effective target;
+special-file rejection; hardlink refusal; byte and entry bounds. Type, size and
+link count are read from the **open descriptor**, so no stale pathname lookup
+can be substituted for them.
+
+**Reduced risk, not perfect.** An earlier design compared `(st_dev, st_ino)`
+captured before opening and claimed a swap would be detected. That was unsound:
+inode numbers are reused. On ext4 in this project's own sandbox, deleting a
+validated file and recreating another at the same path **reused the inode on
+the first attempt**; the same test on tmpfs never reuses one and would have
+reported success. The comparison was removed rather than patched.
+
+What remains: a file replaced between resolution (step 3) and open (step 5) is
+read as whatever now exists at that path — though only ever as a regular,
+single-linked, size-bounded file that the descriptor itself vouches for.
+Replacing a **parent directory** mid-traversal can still redirect the open; a
+complete defence needs `openat`-relative traversal from a directory descriptor,
+component by component, which is deliberately not built here. Behaviour is also
+filesystem-dependent (inode allocation, hardlink and symlink support all vary).
+Tests assert these admissions remain in the docs, so they cannot be quietly
+upgraded into false claims.
+
+**Windows is not verified.** Junction and reparse-point handling has never been
+executed; the test exists but is skipped off Windows and needs a Windows CI
+job before any claim is made.
+
+**Read-only by construction:** every open uses `O_RDONLY`, the guard exposes no
+write, delete or rename operation, and an AST test fails if the `fs` package
+ever references a mutating filesystem API. `ToolSpec.read_only` remains
+declarative metadata.
+
+**Descriptor safety.** `OpenFile` is a context manager and closes on every
+path, including rejections raised after the `open` succeeded. Tests read and
+reject hundreds of times while asserting the process descriptor count does not
+grow, confirm `close()` is idempotent, and assert no descriptor is retained in
+long-lived state or serialised into run state.
 
 **Workspace/run consistency.** `AgentState.workspace` pins a run to the
 canonical workspace it started in. Resuming from a different workspace raises

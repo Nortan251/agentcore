@@ -117,8 +117,16 @@ max_path_depth = 64               # bounds pathological nesting
 allow_internal_symlinks = false
 # Deny credential-bearing paths (.env, id_rsa, *.pem, .ssh/, .aws/, ...)
 # before any bytes are read. This is independent of [permissions]: fs.read is
-# allowed at OBSERVE, so it cannot protect these files.
+# allowed at OBSERVE, so it cannot protect these files. When symlinks are
+# permitted the policy also applies to a link's EFFECTIVE TARGET, so an
+# innocently-named link to hidden/.env is still refused.
 deny_sensitive_paths = true
+# Refuse regular files with more than one hard link. A hardlink gives one
+# inode several names, and a link inside the workspace can alias a file
+# OUTSIDE it -- pathname containment cannot see this. Ordinary files have
+# exactly one link and are unaffected; deduplicated build caches are not.
+# Setting this true genuinely re-exposes that escape.
+allow_multiple_hard_links = false
 
 [recovery]
 max_attempts = 3                  # total attempts per subtask, including the first
