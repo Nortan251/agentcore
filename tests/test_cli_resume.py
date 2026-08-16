@@ -39,6 +39,18 @@ from agentcore.tools.base import ParamType, Tool, ToolParameter, ToolResult, too
 SECRET = "sk-resume-must-not-leak"
 
 
+@pytest.fixture(autouse=True)
+def _cli_workspace(tmp_path, monkeypatch):
+    """Point the CLI at the same workspace the runs were seeded in.
+
+    Runs here are created with ``workspace_dir=tmp_path`` and are now pinned to
+    that canonical workspace, so a resume invoked with the *default* workspace
+    is correctly refused. A real operator resumes from the project directory;
+    this fixture is the test-harness equivalent of doing so.
+    """
+    monkeypatch.setenv("AGENTCORE_WORKSPACE_DIR", str(tmp_path))
+
+
 # -- fixtures ---------------------------------------------------------------
 
 class ActTool(Tool):

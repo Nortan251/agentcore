@@ -691,6 +691,10 @@ Not implemented, by design: mouse/keyboard control, screen capture, native
 Windows automation, browser automation, autonomous email, payments, credential
 extraction, destructive filesystem operations, system administration.
 
+No filesystem **tool** exists yet either. `agentcore.fs` provides the safety
+primitives (containment, symlink policy, sensitive-path denial, bounds); the
+`read_file` / `list_directory` tools that consume them are a later task.
+
 Memory ships as a **foundation**: durable records, deterministic retrieval and
 the storage boundary. Embeddings, vector search, semantic similarity,
 summarisation and any automatic extraction of memories from conversation are
@@ -917,6 +921,82 @@ planning request.
 
 A replan is a **new proposed approach, not an authority escalation**: it cannot
 bypass permissions, skip verification, or turn a failure into a success.
+
+## Filesystem safety foundation
+
+`agentcore.fs` holds the security primitives a filesystem tool must be built
+on. **It contains no tools.** `read_file` and `list_directory` do not exist
+yet; this layer is the prerequisite that makes them safe to add.
+
+```python
+guard = agent.workspace                     # a WorkspaceGuard
+safe  = guard.resolve_relative("src/app.py")   # containment + policy
+facts = guard.require_readable_file(safe)      # kind, size, readability
+data, truncated = guard.read_bytes(safe, facts)  # bounded during reading
+```
+
+**Canonical workspace identity.** `AgentConfig.workspace_dir` may be relative
+or `~`-prefixed. `config.canonical_workspace()` resolves it once — absolute
+and symlink-free — and `Agent` builds exactly one `WorkspaceGuard` from it.
+Tools receive that guard through `ToolContext.workspace`; nothing downstream
+re-derives the root.
+
+**Containment** is decided against the *resolved* target using
+`Path.is_relative_to`, which is path-component aware. A string prefix test
+would wrongly treat `/workspace-other` as inside `/workspace`, so this layer
+never uses one. Absolute paths, Windows drive paths (`C:\...`), UNC paths
+(`\\server\share`), backslashes and any `..` component are rejected on every
+platform, so a request means the same thing everywhere.
+
+**Symlink policy.** The default rejects *any* symlinked component — even one
+pointing inside the workspace — detected by walking components with
+`is_symlink()`, which never follows. That catches the subtle case of a
+symlinked *parent* directory. `allow_internal_symlinks = true` relaxes this to
+"contained targets only"; escape stays refused either way. Windows
+junctions/reparse points are **not verified** — the test exists but is skipped
+off Windows and needs a Windows CI job.
+
+**Sensitive-file policy** (`fs/sensitive.py`) denies `.env*`, `id_rsa`,
+`*.pem`, `*.key`, `.netrc`, `.git-credentials`, `.ssh/`, `.aws/` and similar
+*before any bytes are read*. It is deliberately separate from
+`PermissionPolicy`, which gates capabilities and does not inspect arguments —
+`FS_READ` is allowed at OBSERVE, so protection cannot come from there. Matching
+is on filename and path components only: a model never decides, and file
+*contents* are never inspected to classify a file. Ordinary files that merely
+mention credentials (`token_handling.py`, `id_rsa.pub`) stay readable. The list
+is explicit, centralised and expandable via `SensitivePathPolicy.extend()`; it
+is **not** claimed to be complete.
+
+**Special files.** `classify()` uses `lstat`, distinguishing regular files from
+directories, symlinks, FIFOs, sockets and devices, so a reader can refuse a
+FIFO (which could block forever) before opening it.
+
+**Bounds** live in `[filesystem]` config, not in a tool: `max_file_bytes` is
+enforced *while* reading, chunk by chunk, so a file that grows after validation
+still cannot exceed the cap.
+
+**TOCTOU.** `resolve()` does not make validate→use atomic and this layer never
+claims it does. `open_regular()` opens with `O_NOFOLLOW` and compares
+device/inode on the **open descriptor** against validation time, so a swapped
+file raises `CHANGED_UNDERFOOT` instead of being read. A *parent directory*
+swapped mid-walk is still not defended against — that needs `openat`-relative
+traversal — and a test asserts this admission stays in the docs.
+
+**Read-only by construction:** the guard exposes no write, delete or rename
+operation, and an AST test fails if the `fs` package ever references a mutating
+filesystem API. `ToolSpec.read_only` remains declarative metadata.
+
+**Workspace/run consistency.** `AgentState.workspace` pins a run to the
+canonical workspace it started in. Resuming from a different workspace raises
+`WorkspaceMismatchError` before any tool runs, so an autonomous task cannot
+silently continue against another project directory. Legacy runs stored without
+the field load normally and adopt the current workspace.
+
+**Run-state output bounds.** `state.record_tool_call()` stores tool output
+capped at 4000 characters with an explicit marker and
+`metadata.output_truncated`. The live `ToolResult` is untouched, so
+`subtask.result`, verification and recovery see the full value — only the
+persisted history is bounded.
 
 ## Adding a tool
 

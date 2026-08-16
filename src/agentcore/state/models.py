@@ -38,6 +38,63 @@ class AgentPhase(str, Enum):
         return self.value
 
 
+#: Hard ceiling on the characters of a single tool output persisted into run
+#: state. Run state is written to disk and replayed by ``agentcore history``,
+#: so an unbounded tool output would mean an unbounded state file. 4000 keeps
+#: an excerpt genuinely useful for debugging while capping growth; it is
+#: deliberately larger than the conversational bound (2000), which governs what
+#: a *model* sees, because a human debugging a run wants more context.
+MAX_STORED_OUTPUT_CHARS: int = 4000
+
+#: Appended when a stored output was cut. Explicit, so nobody mistakes a
+#: prefix for the whole result.
+STORED_TRUNCATION_MARKER: str = "… [truncated]"
+
+
+def bound_tool_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of a tool-call payload with its output bounded.
+
+    Only ``result.output`` is touched. ``ok``, ``error``, ``metadata``,
+    ``decision``, ``args`` and ``duration_ms`` are preserved exactly, because
+    verification and recovery branch on them and must keep their current
+    semantics.
+
+    Non-string outputs are rendered to a string only when they are too large,
+    so small structured outputs keep their type and shape for existing
+    consumers.
+    """
+    result = payload.get("result")
+    if not isinstance(result, dict) or "output" not in result:
+        return payload
+    output = result["output"]
+    if output is None:
+        return payload
+
+    if isinstance(output, str):
+        if len(output) <= MAX_STORED_OUTPUT_CHARS:
+            return payload
+        original = len(output)
+        keep = MAX_STORED_OUTPUT_CHARS - len(STORED_TRUNCATION_MARKER)
+        bounded: Any = output[:keep] + STORED_TRUNCATION_MARKER
+    else:
+        rendered = str(output)
+        if len(rendered) <= MAX_STORED_OUTPUT_CHARS:
+            return payload
+        original = len(rendered)
+        keep = MAX_STORED_OUTPUT_CHARS - len(STORED_TRUNCATION_MARKER)
+        bounded = rendered[:keep] + STORED_TRUNCATION_MARKER
+
+    new_result = dict(result)
+    new_result["output"] = bounded
+    metadata = dict(new_result.get("metadata") or {})
+    metadata["output_truncated"] = True
+    metadata["output_original_chars"] = original
+    new_result["metadata"] = metadata
+    new_payload = dict(payload)
+    new_payload["result"] = new_result
+    return new_payload
+
+
 _ALLOWED_PHASES: dict[AgentPhase, frozenset[AgentPhase]] = {
     AgentPhase.IDLE: frozenset({AgentPhase.PLANNING, AgentPhase.EXECUTING,
                                 AgentPhase.DONE, AgentPhase.ERROR}),
@@ -166,6 +223,10 @@ class AgentState:
     """The complete working state of one agent run."""
 
     run_id: str = field(default_factory=lambda: new_id("run"))
+    #: Canonical workspace this run belongs to. ``None`` means the run predates
+    #: workspace pinning; such legacy state still loads, and resume treats it
+    #: as a match rather than refusing to continue old work.
+    workspace: str | None = None
     phase: AgentPhase = AgentPhase.IDLE
     current_task: Task | None = None
     active_subtask_id: str | None = None
@@ -206,9 +267,16 @@ class AgentState:
         return entry
 
     def record_tool_call(self, invocation: Any) -> dict[str, Any]:
-        """Append a tool invocation record (accepts anything with ``to_dict``)."""
+        """Append a tool invocation record (accepts anything with ``to_dict``).
+
+        The stored copy is **bounded** (see :func:`bound_tool_payload`). The
+        live ``invocation`` is untouched, so the runner still assigns the full
+        output to ``subtask.result`` and verification sees the real thing —
+        only the persisted history is capped.
+        """
         payload = (invocation.to_dict() if hasattr(invocation, "to_dict")
                    else dict(invocation))
+        payload = bound_tool_payload(payload)
         self.tool_calls.append(payload)
         self.record(HistoryEntry(
             kind="tool_call",
@@ -361,6 +429,7 @@ class AgentState:
     def to_dict(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
+            "workspace": self.workspace,
             "phase": self.phase.value,
             "current_task": self.current_task.to_dict() if self.current_task else None,
             "active_subtask_id": self.active_subtask_id,
@@ -380,6 +449,8 @@ class AgentState:
     def from_dict(cls, data: dict[str, Any]) -> AgentState:
         return cls(
             run_id=data.get("run_id") or new_id("run"),
+            # Absent in legacy state: stays None, never invented.
+            workspace=data.get("workspace"),
             phase=AgentPhase(data.get("phase", "idle")),
             current_task=Task.from_dict(data["current_task"])
             if data.get("current_task") else None,

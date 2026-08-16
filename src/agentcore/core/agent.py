@@ -28,6 +28,8 @@ from agentcore.core.plan_signature import (
 from agentcore.core.replan import ReplanLedger, ReplanOutcome
 from agentcore.core.runner import RunReport, TaskRunner
 from agentcore.errors import AgentError, StateError
+from agentcore.fs.guard import WorkspaceGuard
+from agentcore.fs.paths import WorkspaceMismatchError
 from agentcore.observability.events import Events
 from agentcore.observability.logging import configure_logging, get_logger
 from agentcore.permissions.policy import ApprovalGate, PermissionPolicy
@@ -84,9 +86,16 @@ class Agent:
         self.registry.register_all(list(
             default_tools() if deps.tools is None else deps.tools))
 
+        # The canonical workspace root is established exactly once, here, and
+        # handed to tools through the guard. Nothing downstream re-derives it.
+        self.workspace = WorkspaceGuard(
+            self.config.canonical_workspace(),
+            config=self.config.filesystem,
+        )
+
         self.executor = ToolExecutor(
             self.registry, self.policy,
-            workspace_dir=self.config.workspace_dir,
+            workspace=self.workspace,
             tool_settings=self.config.tools.settings,
         )
 
@@ -120,7 +129,8 @@ class Agent:
         self.runner = TaskRunner(self.executor, verifier=self.verifier,
                                  recovery=self.recovery,
                                  logger=get_logger("core.runner"))
-        self.state = AgentState()
+        # New runs are pinned to this workspace from the outset.
+        self.state = AgentState(workspace=self.workspace.identity)
         self.log.info(Events.AGENT_STARTED, run_id=self.state.run_id,
                       permission_level=str(self.policy.level),
                       tools=self.registry.names(),
@@ -764,12 +774,35 @@ class Agent:
         self.log.debug(Events.STATE_CHECKPOINT, **self.state.summary())
 
     def resume(self, run_id: str) -> AgentState:
-        self.state = self.state_store.load(run_id)
+        """Load a persisted run, refusing one that belongs elsewhere.
+
+        A resumed autonomous task must not silently execute against a
+        different project directory, so the run's pinned workspace is compared
+        against this agent's canonical root *before* the state is adopted.
+        Nothing runs on mismatch: ``self.state`` is left untouched, so no tool
+        can execute.
+
+        Legacy runs recorded before pinning carry ``workspace=None`` and are
+        accepted unchanged.
+        """
+        loaded = self.state_store.load(run_id)
+        pinned = getattr(loaded, "workspace", None)
+        if not self.workspace.matches(pinned):
+            self.log.warning(Events.STATE_RESUMED, run_id=run_id,
+                             workspace_mismatch=True)
+            raise WorkspaceMismatchError(
+                "run belongs to a different workspace; refusing to resume",
+                run_id=run_id, run_workspace=pinned,
+                current_workspace=self.workspace.identity)
+        self.state = loaded
+        if self.state.workspace is None:
+            # Adopt the current workspace so the next checkpoint is pinned.
+            self.state.workspace = self.workspace.identity
         self.log.info(Events.STATE_RESUMED, **self.state.summary())
         return self.state
 
     def reset(self) -> AgentState:
-        self.state = AgentState()
+        self.state = AgentState(workspace=self.workspace.identity)
         return self.state
 
     def status(self) -> dict[str, Any]:

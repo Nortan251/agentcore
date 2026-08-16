@@ -116,17 +116,34 @@ class ToolResult:
                 "metadata": self.metadata}
 
 
-@dataclass
+@dataclass(frozen=True)
 class ToolContext:
     """Ambient services handed to a tool at call time.
 
     Passing these in (rather than letting tools import globals) keeps tools
     unit-testable and lets the runtime swap logger/config per invocation.
+
+    **Frozen.** The security-relevant fields — ``workspace_dir`` and
+    ``workspace`` — must not be reassignable, or a tool could widen its own
+    sandbox and influence a later invocation. Freezing the whole dataclass was
+    verified to break nothing: the executor builds a fresh context per call and
+    no code in the project ever assigned to a context attribute.
+
+    ``metadata`` remains a mutable mapping so a tool can still stash
+    per-invocation scratch data; it is rebuilt per call and is not
+    security-relevant. Freezing the dataclass blocks *rebinding* the field,
+    which is what matters.
     """
 
     config: Mapping[str, Any] = field(default_factory=dict)
     logger: Any = None
+    #: Canonical workspace root as a string. Kept for backward compatibility
+    #: with existing tools; prefer ``workspace`` for anything path-related.
     workspace_dir: str = "."
+    #: The :class:`~agentcore.fs.guard.WorkspaceGuard` for this run, or None
+    #: when the context was built outside an agent. Filesystem tools must use
+    #: this rather than interpreting ``workspace_dir`` themselves.
+    workspace: Any = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

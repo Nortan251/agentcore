@@ -22,6 +22,7 @@ from agentcore.config.schema import (
     ConversationConfig,
     RecoveryConfig,
     FeatureFlags,
+    FilesystemConfig,
     LoggingConfig,
     MemoryConfig,
     ModelConfig,
@@ -280,6 +281,37 @@ def _build_conversation(data: Mapping[str, Any]) -> ConversationConfig:
     )
 
 
+def _build_filesystem(data: Mapping[str, Any]) -> FilesystemConfig:
+    d = FilesystemConfig()
+    return FilesystemConfig(
+        max_file_bytes=_coerce(int, data.get("max_file_bytes",
+                                             d.max_file_bytes),
+                               "filesystem.max_file_bytes"),
+        read_chunk_bytes=_coerce(int, data.get("read_chunk_bytes",
+                                               d.read_chunk_bytes),
+                                 "filesystem.read_chunk_bytes"),
+        max_directory_entries=_coerce(
+            int, data.get("max_directory_entries", d.max_directory_entries),
+            "filesystem.max_directory_entries"),
+        max_result_chars=_coerce(int, data.get("max_result_chars",
+                                               d.max_result_chars),
+                                 "filesystem.max_result_chars"),
+        max_path_length=_coerce(int, data.get("max_path_length",
+                                              d.max_path_length),
+                                "filesystem.max_path_length"),
+        max_path_depth=_coerce(int, data.get("max_path_depth",
+                                             d.max_path_depth),
+                               "filesystem.max_path_depth"),
+        allow_internal_symlinks=_coerce(
+            bool, data.get("allow_internal_symlinks",
+                           d.allow_internal_symlinks),
+            "filesystem.allow_internal_symlinks"),
+        deny_sensitive_paths=_coerce(
+            bool, data.get("deny_sensitive_paths", d.deny_sensitive_paths),
+            "filesystem.deny_sensitive_paths"),
+    )
+
+
 def _build_features(data: Mapping[str, Any]) -> FeatureFlags:
     d = FeatureFlags()
     return FeatureFlags(**{
@@ -318,6 +350,7 @@ def load_config(
         logging=_build_logging(data.get("logging", {})),
         memory=_build_memory(data.get("memory", {})),
         conversation=_build_conversation(data.get("conversation", {})),
+        filesystem=_build_filesystem(data.get("filesystem", {})),
         features=_build_features(data.get("features", {})),
     )
     return config.validate()

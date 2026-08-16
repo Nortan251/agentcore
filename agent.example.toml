@@ -97,6 +97,29 @@ tools_enabled = false
 max_tool_rounds = 3               # bound on tool -> model -> tool per turn
 max_tool_result_chars = 2000      # tool output is truncated with a marker
 
+[filesystem]                      # workspace-scoped filesystem safety
+# Bounds and policy for filesystem access. No filesystem TOOL exists yet; this
+# section configures the safety layer such a tool will be built on, so the
+# limits live in configuration rather than inside a tool.
+#
+# Every requested path is resolved against the canonical workspace root and
+# must stay inside it. Absolute paths, Windows drive/UNC forms, backslashes
+# and ".." are refused outright.
+max_file_bytes = 1048576          # 1 MiB ceiling, enforced WHILE reading
+read_chunk_bytes = 65536          # clamped down if it exceeds max_file_bytes
+max_directory_entries = 1000      # cap on entries a listing may return
+max_result_chars = 10000          # cap on a rendered filesystem result
+max_path_length = 4096            # matches the common POSIX PATH_MAX
+max_path_depth = 64               # bounds pathological nesting
+# Strictest safe default: reject ANY symlinked component, even one that stays
+# inside the workspace, so escape is impossible by construction. Setting this
+# true still refuses links whose target resolves outside the workspace.
+allow_internal_symlinks = false
+# Deny credential-bearing paths (.env, id_rsa, *.pem, .ssh/, .aws/, ...)
+# before any bytes are read. This is independent of [permissions]: fs.read is
+# allowed at OBSERVE, so it cannot protect these files.
+deny_sensitive_paths = true
+
 [recovery]
 max_attempts = 3                  # total attempts per subtask, including the first
 base_delay_seconds = 0.5

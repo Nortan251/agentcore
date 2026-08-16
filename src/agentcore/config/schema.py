@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from agentcore.errors import ConfigError
 # Re-exported so callers see a single configuration surface; defined in their
 # own packages to keep the layering acyclic.
 from agentcore.conversation.config import ConversationConfig  # noqa: E402
+from agentcore.fs.config import FilesystemConfig  # noqa: E402 (leaf module)
 from agentcore.memory.config import MemoryConfig  # noqa: E402 (leaf module)
 from agentcore.permissions.config import PermissionConfig
 from agentcore.recovery.config import RecoveryConfig  # noqa: E402 (leaf module; see recovery/__init__)
@@ -142,6 +144,7 @@ class AgentConfig:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     conversation: ConversationConfig = field(
         default_factory=ConversationConfig)
+    filesystem: FilesystemConfig = field(default_factory=FilesystemConfig)
     features: FeatureFlags = field(default_factory=FeatureFlags)
 
     def validate(self) -> AgentConfig:
@@ -154,4 +157,18 @@ class AgentConfig:
         self.logging.validate()
         self.memory.validate()
         self.conversation.validate()
+        self.filesystem.validate()
+        # Fail here rather than at first filesystem use: an unusable workspace
+        # is a configuration error, and the canonical root is security-relevant.
+        self.canonical_workspace()
         return self
+
+    def canonical_workspace(self) -> Path:
+        """The one absolute, symlink-free workspace root for this config.
+
+        Every layer that needs the workspace should call this rather than
+        interpreting ``workspace_dir`` itself, so the root is defined once.
+        """
+        from agentcore.fs.paths import canonical_workspace
+
+        return canonical_workspace(self.workspace_dir)

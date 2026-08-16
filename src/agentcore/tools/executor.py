@@ -57,12 +57,18 @@ class ToolExecutor:
         policy: PermissionPolicy,
         *,
         workspace_dir: str = ".",
+        workspace: Any = None,
         tool_settings: Mapping[str, Mapping[str, Any]] | None = None,
         logger: StructuredLogger | None = None,
     ) -> None:
         self.registry = registry
         self.policy = policy
-        self.workspace_dir = workspace_dir
+        # A guard, when supplied, is authoritative for the workspace root: it
+        # has already canonicalised it. This keeps one definition of "the
+        # workspace" rather than letting the executor hold a second opinion.
+        self.workspace = workspace
+        self.workspace_dir = (str(workspace.root) if workspace is not None
+                              else workspace_dir)
         self._tool_settings = dict(tool_settings or {})
         self._log = logger or get_logger("tools.executor")
 
@@ -71,6 +77,7 @@ class ToolExecutor:
             config=dict(self._tool_settings.get(tool_name, {})),
             logger=self._log.bind(tool=tool_name),
             workspace_dir=self.workspace_dir,
+            workspace=self.workspace,
         )
 
     def invoke(self, tool_name: str, args: Mapping[str, Any] | None = None,

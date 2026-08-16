@@ -24,6 +24,7 @@ from agentcore.config.loader import load_config
 from agentcore.config.schema import AgentConfig
 from agentcore.core.agent import Agent, AgentDependencies
 from agentcore.errors import AgentError
+from agentcore.fs.paths import WorkspaceMismatchError
 from agentcore.integrations.base import IntegrationRegistry
 from agentcore.integrations.computer_control import ComputerControlAdapter
 from agentcore.observability.events import Events
@@ -1408,7 +1409,19 @@ def _command_resume(args: argparse.Namespace, config: AgentConfig) -> int:
     # --json). Re-quieten immediately afterwards.
     agent = Agent(config, AgentDependencies(state_store=store))
     _quiet_logging()
-    agent.resume(run_id)
+    try:
+        agent.resume(run_id)
+    except WorkspaceMismatchError as exc:
+        # A resumed autonomous run must not execute against a different
+        # project directory. Nothing has run at this point.
+        print(f"cannot resume run '{run_id}': {exc}", file=sys.stderr)
+        print(f"  run workspace:     {exc.details.get('run_workspace')}",
+              file=sys.stderr)
+        print(f"  current workspace: {exc.details.get('current_workspace')}",
+              file=sys.stderr)
+        print("re-run from the original workspace, or set workspace_dir "
+              "to match.", file=sys.stderr)
+        return 2
     try:
         report = agent.run_task()
     except AgentError as exc:
