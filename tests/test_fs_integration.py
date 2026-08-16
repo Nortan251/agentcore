@@ -489,12 +489,19 @@ def test_fs_package_contains_no_tools():
                 assert "Tool" not in bases, f"{path.name}:{node.name}"
 
 
-def test_no_read_file_or_list_directory_tool_is_registered(tmp_path):
+def test_only_read_file_was_added_no_other_filesystem_tool(tmp_path):
+    """Task 34 added ``read_file`` and nothing else.
+
+    The `fs` package itself still contains no tools (asserted above); the tool
+    lives in ``tools/builtin`` and consumes the guard. Writing, deleting and
+    directory listing remain unimplemented.
+    """
     agent = Agent(config_for(tmp_path))
     names = set(agent.registry.names())
-    assert "read_file" not in names
-    assert "list_directory" not in names
-    assert names == {"echo", "workspace_info"}
+    assert names == {"echo", "workspace_info", "read_file"}
+    for absent in ("list_directory", "write_file", "delete_file",
+                   "move_file", "shell", "find_files"):
+        assert absent not in names
 
 
 def test_permission_behaviour_is_unchanged(tmp_path):

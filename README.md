@@ -13,9 +13,9 @@ the seams described below.
 
 ```bash
 pip install -e ".[dev]"
-pytest                       # 2263 tests
+pytest                       # 2695 tests
 agentcore doctor             # verify wiring and integrations
-agentcore tools              # list registered tools
+agentcore tools              # list registered tools (echo, workspace_info, read_file)
 agentcore run "some objective"   # persists the run, prints its run_id
 agentcore approve <run_id>       # allow a pending action -> resumable
 agentcore reject  <run_id>       # refuse it -> terminal
@@ -691,9 +691,9 @@ Not implemented, by design: mouse/keyboard control, screen capture, native
 Windows automation, browser automation, autonomous email, payments, credential
 extraction, destructive filesystem operations, system administration.
 
-No filesystem **tool** exists yet either. `agentcore.fs` provides the safety
-primitives (containment, symlink policy, sensitive-path denial, bounds); the
-`read_file` / `list_directory` tools that consume them are a later task.
+The only filesystem tool is `read_file`, which reads UTF-8 text from inside
+the workspace through `WorkspaceGuard`. Directory listing, writing, deleting,
+renaming and filesystem search are not implemented.
 
 Memory ships as a **foundation**: durable records, deterministic retrieval and
 the storage boundary. Embeddings, vector search, semantic similarity,
@@ -924,9 +924,10 @@ bypass permissions, skip verification, or turn a failure into a success.
 
 ## Filesystem safety foundation
 
-`agentcore.fs` holds the security primitives a filesystem tool must be built
-on. **It contains no tools.** `read_file` and `list_directory` do not exist
-yet; this layer is the prerequisite that makes them safe to add.
+`agentcore.fs` holds the security primitives every filesystem tool is built
+on. **The package itself still contains no tools**; `read_file` lives in
+`tools/builtin/` and consumes the guard. `list_directory`, writing and
+deleting do not exist.
 
 ```python
 guard = agent.workspace                          # a WorkspaceGuard
@@ -1063,6 +1064,47 @@ capped at 4000 characters with an explicit marker and
 `metadata.output_truncated`. The live `ToolResult` is untouched, so
 `subtask.result`, verification and recovery see the full value — only the
 persisted history is bounded.
+
+## The `read_file` tool
+
+The first real filesystem capability, and deliberately boring. It takes one
+argument, declares `FS_READ`, is read-only, and is registered by default:
+
+```
+read_file(path="src/app.py")
+  -> "def main():\n    return 42\n"
+```
+
+**It owns no security logic.** Every decision — containment, traversal,
+symlinks, sensitive paths, hardlinks, special files, the byte ceiling, the
+secure open — belongs to `WorkspaceGuard.open_file()`, which the tool calls and
+nothing else. An AST test fails the build if the tool ever references `open`,
+`os`, `pathlib`, `read_text`, `read_bytes` or any write API, so a second,
+weaker boundary cannot quietly appear.
+
+What the tool actually adds:
+
+* **Strict UTF-8 decoding.** Valid UTF-8 becomes text; anything else is a
+  structured `not_utf8_text` failure. No lossy codec, no U+FFFD substitution,
+  and the decision never depends on the file extension — a `.png` full of text
+  reads, a `.py` full of binary does not. The one exception is a multi-byte
+  character cut in half *by our own byte ceiling*, which is dropped rather than
+  misreported as binary.
+* **Explicit truncation.** `ToolResult.metadata` never reaches the model — the
+  conversational renderer sends only `output` — so a truncated read is
+  announced in the output itself: `[truncated: only the first N bytes of this
+  M-byte file are shown]`. The model never has to infer completeness from
+  length.
+* **Metadata** for programmatic callers: `path` (workspace-relative),
+  `bytes_read`, `size_bytes`, `truncated`, `encoding`.
+* **Safe errors.** Guard rejections keep their categorical `reason`
+  (`sensitive`, `traversal`, `multiple_hard_links`, …) and gain a short hint.
+  No absolute host path, no stack trace.
+
+An empty file is a success with empty content, not an error.
+
+Logging records only counters — bytes read, truncated, reason — never content,
+and not even the relative path, since filenames can themselves be sensitive.
 
 ## Adding a tool
 

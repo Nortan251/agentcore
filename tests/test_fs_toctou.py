@@ -525,3 +525,55 @@ def test_open_verified_requires_explicit_bounds():
     sig = inspect.signature(open_verified)
     for name in ("max_bytes", "allow_multiple_links", "relative"):
         assert sig.parameters[name].default is inspect.Parameter.empty
+
+
+# ===========================================================================
+# Truncation honesty (defect found while building read_file, Task 34)
+# ===========================================================================
+
+@POSIX_ONLY
+def test_file_growing_during_read_is_reported_truncated(workspace):
+    """A file that grows mid-read must never look complete.
+
+    ``read_from`` previously compared the byte count against the size recorded
+    at open time. A file that grew during the read filled the ceiling exactly
+    and was reported complete — silently presenting a prefix as the whole
+    file. Truncation is now decided by probing the descriptor.
+    """
+    path = workspace / "grow.bin"
+    path.write_bytes(b"a" * 300)
+    guard = WorkspaceGuard(workspace,
+                           config=FilesystemConfig(max_file_bytes=1000,
+                                                   read_chunk_bytes=128))
+    with guard.open_file("grow.bin") as handle:
+        assert handle.facts.size == 300
+        with open(path, "ab") as fh:
+            fh.write(b"b" * 100_000)
+        data, truncated = guard.read_from(handle)
+    assert len(data) == 1000
+    assert truncated is True
+
+
+@POSIX_ONLY
+def test_complete_file_is_not_reported_truncated(workspace):
+    path = workspace / "exact.bin"
+    path.write_bytes(b"a" * 1000)
+    guard = WorkspaceGuard(workspace,
+                           config=FilesystemConfig(max_file_bytes=1000,
+                                                   read_chunk_bytes=128))
+    with guard.open_file("exact.bin") as handle:
+        data, truncated = guard.read_from(handle)
+    assert len(data) == 1000
+    assert truncated is False
+
+
+@POSIX_ONLY
+def test_has_more_does_not_disturb_the_read_offset(workspace):
+    (workspace / "probe.txt").write_text("abcdefghij", encoding="utf-8")
+    guard = WorkspaceGuard(workspace)
+    with guard.open_file("probe.txt") as handle:
+        first = os.read(handle.fd, 4)
+        assert handle.has_more() is True
+        rest = os.read(handle.fd, 100)
+    assert first == b"abcd"
+    assert rest == b"efghij"

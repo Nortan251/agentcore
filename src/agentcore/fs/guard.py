@@ -293,11 +293,18 @@ class WorkspaceGuard:
 
         ``truncated`` says the ceiling stopped the read before the file ended,
         so a caller reports a prefix explicitly rather than silently.
+
+        Truncation is decided by asking the **descriptor**, at the moment the
+        read finished, whether anything remains — not by comparing against the
+        size captured at open time. A file that grows while being read would
+        otherwise fill the ceiling exactly and still be reported complete,
+        which is the one thing a bounded reader must never do.
         """
         data = b"".join(self.iter_from(handle))
-        ceiling = self._config.max_file_bytes
-        # Size comes from the descriptor, so this comparison is not stale.
-        return data, len(data) >= ceiling and handle.facts.size > ceiling
+        if len(data) < self._config.max_file_bytes:
+            # The read ended because the file ended.
+            return data, False
+        return data, handle.has_more()
 
     def read_path(self, requested: Any) -> tuple[bytes, FileFacts, bool]:
         """Convenience: validate, open, read and close in one call.

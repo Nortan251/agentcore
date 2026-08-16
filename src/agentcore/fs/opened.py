@@ -94,6 +94,26 @@ class OpenFile:
             # Already closed; nothing to release.
             pass
 
+    def has_more(self) -> bool:
+        """Whether any unread bytes remain, according to the descriptor.
+
+        Asked *after* a bounded read to decide truncation honestly. Comparing
+        the byte count against the size recorded at open time is not enough: a
+        file that grew during the read would fill the ceiling exactly and look
+        complete. This attempts a single one-byte read at the current offset
+        and restores the offset afterwards, so it is authoritative and has no
+        side effect on the caller's position.
+        """
+        try:
+            offset = os.lseek(self.fd, 0, os.SEEK_CUR)
+            probe = os.read(self.fd, 1)
+            os.lseek(self.fd, offset, os.SEEK_SET)
+            return bool(probe)
+        except OSError:
+            # Not seekable, or the descriptor is gone. Refuse to guess
+            # "complete": claiming completeness wrongly is the unsafe error.
+            return True
+
     def read_bounded(self, *, max_bytes: int,
                      chunk_bytes: int) -> Iterator[bytes]:
         """Yield chunks from the descriptor, stopping at ``max_bytes``.
