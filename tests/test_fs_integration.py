@@ -489,18 +489,18 @@ def test_fs_package_contains_no_tools():
                 assert "Tool" not in bases, f"{path.name}:{node.name}"
 
 
-def test_only_read_file_was_added_no_other_filesystem_tool(tmp_path):
-    """Task 34 added ``read_file`` and nothing else.
+def test_only_read_only_filesystem_tools_are_registered(tmp_path):
+    """Only ``read_file`` and ``list_directory`` exist.
 
-    The `fs` package itself still contains no tools (asserted above); the tool
-    lives in ``tools/builtin`` and consumes the guard. Writing, deleting and
-    directory listing remain unimplemented.
+    The `fs` package itself still contains no tools (asserted above); both
+    tools live in ``tools/builtin`` and consume the guard. Writing, deleting,
+    moving, searching and shell access remain unimplemented.
     """
     agent = Agent(config_for(tmp_path))
     names = set(agent.registry.names())
-    assert names == {"echo", "workspace_info", "read_file"}
-    for absent in ("list_directory", "write_file", "delete_file",
-                   "move_file", "shell", "find_files"):
+    assert names == {"echo", "workspace_info", "read_file", "list_directory"}
+    for absent in ("write_file", "delete_file", "move_file", "rename_file",
+                   "shell", "find_files", "search_files", "grep"):
         assert absent not in names
 
 

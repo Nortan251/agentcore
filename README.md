@@ -13,9 +13,9 @@ the seams described below.
 
 ```bash
 pip install -e ".[dev]"
-pytest                       # 2695 tests
+pytest                       # 2787 tests
 agentcore doctor             # verify wiring and integrations
-agentcore tools              # list registered tools (echo, workspace_info, read_file)
+agentcore tools              # echo, workspace_info, read_file, list_directory
 agentcore run "some objective"   # persists the run, prints its run_id
 agentcore approve <run_id>       # allow a pending action -> resumable
 agentcore reject  <run_id>       # refuse it -> terminal
@@ -691,9 +691,9 @@ Not implemented, by design: mouse/keyboard control, screen capture, native
 Windows automation, browser automation, autonomous email, payments, credential
 extraction, destructive filesystem operations, system administration.
 
-The only filesystem tool is `read_file`, which reads UTF-8 text from inside
-the workspace through `WorkspaceGuard`. Directory listing, writing, deleting,
-renaming and filesystem search are not implemented.
+The filesystem tools are `read_file` and `list_directory`, both read-only and
+both routed through `WorkspaceGuard`. Writing, deleting, renaming, recursive
+traversal and filesystem search are not implemented.
 
 Memory ships as a **foundation**: durable records, deterministic retrieval and
 the storage boundary. Embeddings, vector search, semantic similarity,
@@ -925,9 +925,9 @@ bypass permissions, skip verification, or turn a failure into a success.
 ## Filesystem safety foundation
 
 `agentcore.fs` holds the security primitives every filesystem tool is built
-on. **The package itself still contains no tools**; `read_file` lives in
-`tools/builtin/` and consumes the guard. `list_directory`, writing and
-deleting do not exist.
+on. **The package itself contains no tools**; `read_file` and `list_directory`
+live in `tools/builtin/` and consume the guard. Writing and deleting do not
+exist.
 
 ```python
 guard = agent.workspace                          # a WorkspaceGuard
@@ -1105,6 +1105,51 @@ An empty file is a success with empty content, not an error.
 
 Logging records only counters — bytes read, truncated, reason — never content,
 and not even the relative path, since filenames can themselves be sensitive.
+
+## The `list_directory` tool
+
+Discovery, not traversal. It lists the immediate entries of one
+workspace-relative directory — no recursion, no globbing, no sorting or
+filtering switches, and it never opens a file.
+
+```
+list_directory(path=".")
+  -> README.md  (regular)
+     src/  (directory)
+     alias  (symlink -> internal)
+     escape  (symlink -> external)
+     <redacted>  (regular)
+     [1 entry withheld: the name itself is treated as credential material]
+```
+
+Like `read_file`, it owns no security logic: `WorkspaceGuard.resolve_directory()`
+validates the path (accepting `"."` for the root, which `resolve_relative`
+rightly refuses for a file read) and `WorkspaceGuard.list_directory()` performs
+the classified, bounded walk. An AST test fails the build if the tool ever
+references `open`, `scandir`, `listdir`, `os`, `pathlib` or any write API.
+
+**Filenames are themselves disclosure.** `id_rsa` reveals that a private key
+exists; `.env.production` names an environment. So an entry matching
+`SensitivePathPolicy` keeps its **type** but loses its **name**, appearing as
+`<redacted>` with `sensitive: true`. The model learns something is there
+without learning what. This also covers an innocuously-named symlink whose
+*target* is credential material — reading through it is already refused with
+`sensitive_target`, and the listing is consistent with that. Ordinary files
+that merely mention credentials (`token_handling.py`, `id_rsa.pub`) stay fully
+visible.
+
+**Symlinks are classified, never followed.** Each entry is typed with `lstat`,
+so a link reports as `symlink`, not as its target. Links are resolved *only* to
+decide `internal` / `external` / `broken`, and the resolved path is discarded
+immediately — an external target's absolute path never appears in the result.
+A symlinked directory is never enumerated, and listing one is refused outright.
+
+**Bounds and ordering.** The walk stops at `max_directory_entries` (1000 by
+default) and truncation is reported explicitly in the output, since metadata
+never reaches the model. Ordering is by byte value of the entry name:
+deterministic, locale-independent and case-sensitive on every platform, so
+`Zebra` sorts before `apple` and a repeated listing of an unchanged directory
+is identical.
 
 ## Adding a tool
 

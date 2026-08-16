@@ -65,7 +65,10 @@ from typing import Any, Iterator
 from agentcore.fs.config import FilesystemConfig
 from agentcore.fs.opened import OpenFile, descriptor_path, open_verified
 from agentcore.fs.paths import (
+    DirectoryEntry,
+    DirectoryListing,
     FileFacts,
+    LinkTarget,
     PathKind,
     PathRejectedError,
     RejectionReason,
@@ -279,6 +282,137 @@ class WorkspaceGuard:
     def root_path(self) -> SafePath:
         """The workspace root itself as a :class:`SafePath`."""
         return SafePath(absolute=self._root, relative=".")
+
+    def resolve_directory(self, requested: Any) -> SafePath:
+        """Validate a requested directory path, allowing the workspace root.
+
+        ``resolve_relative`` refuses ``"."`` and ``""`` because a *file* read
+        must name something. Listing the workspace root is the ordinary case,
+        so it is accepted here and mapped onto :meth:`root_path`. Every other
+        value goes through the normal validation unchanged.
+        """
+        if isinstance(requested, Path):
+            requested = str(requested)
+        if isinstance(requested, str) and requested.strip() in {
+                ".", "./", "", "/"} and requested.strip() != "/":
+            return self.root_path()
+        return self.resolve_relative(requested)
+
+    # -- listing (discovery, never traversal) ------------------------------
+    def list_directory(self, safe: SafePath) -> DirectoryListing:
+        """List the immediate children of a validated directory.
+
+        Discovery only. This never opens a regular file, never follows a
+        symlink to describe it, and never descends into a subdirectory.
+
+        Each entry is classified with ``lstat`` (via
+        :func:`~agentcore.fs.paths.classify`), so a symlink reports as a
+        symlink rather than as whatever it points at. Sensitive entries keep
+        their type but lose their name, because a credential file's *name* is
+        itself disclosure.
+
+        The walk is bounded by ``max_directory_entries`` and stops as soon as
+        the cap is reached; ``truncated`` is set by probing for one more entry,
+        never by comparing against a total that was never counted.
+
+        Ordering is by byte value of the entry name (``sorted``), which is
+        deterministic, locale-independent and case-sensitive on every platform.
+        Sensitive entries are ordered by their real name before redaction, so
+        a repeated listing of an unchanged directory is stable.
+        """
+        self.require_directory(safe)
+        limit = self._config.max_directory_entries
+
+        try:
+            # os.scandir is lazy, but names must be sorted for determinism, so
+            # names alone are collected first. Names are small; file contents
+            # are never touched.
+            with os.scandir(safe.absolute) as scanner:
+                names = sorted(entry.name for entry in scanner)
+        except PermissionError as exc:
+            raise PathRejectedError(RejectionReason.UNREADABLE,
+                                    "directory is not readable",
+                                    path=safe.relative) from exc
+        except OSError as exc:
+            raise PathRejectedError(RejectionReason.UNREADABLE,
+                                    "directory could not be listed",
+                                    path=safe.relative,
+                                    errno=exc.errno) from exc
+
+        truncated = len(names) > limit
+        base = "" if safe.relative == "." else f"{safe.relative}/"
+        entries: list[DirectoryEntry] = []
+        sensitive_count = 0
+
+        for name in names[:limit]:
+            child = safe.absolute / name
+            kind = classify(child)
+            relative = f"{base}{name}"
+            link_target = (self._link_target(child)
+                           if kind is PathKind.SYMLINK else None)
+            is_sensitive = (
+                self._config.deny_sensitive_paths
+                and (self._sensitive.is_sensitive(relative)
+                     # A symlink whose *target* is credential material is
+                     # withheld too. Its own name may look innocuous, and
+                     # revealing "this link points at something you may not
+                     # read" is itself a hint about where secrets live. Reads
+                     # through it are already refused (SENSITIVE_TARGET); this
+                     # keeps the listing consistent with that.
+                     or self._links_to_sensitive(child, kind)))
+            if is_sensitive:
+                sensitive_count += 1
+            entries.append(DirectoryEntry(
+                name=None if is_sensitive else name,
+                kind=kind,
+                sensitive=is_sensitive,
+                link_target=link_target,
+            ))
+
+        return DirectoryListing(relative=safe.relative,
+                                entries=tuple(entries),
+                                truncated=truncated, limit=limit,
+                                sensitive_count=sensitive_count)
+
+    def _links_to_sensitive(self, child: Path, kind: PathKind) -> bool:
+        """Whether a symlink resolves to credential material inside the root.
+
+        Mirrors the effective-target rule ``resolve_relative`` applies to
+        reads, so a listing cannot hint at a secret that a read would refuse.
+        Only the *workspace-relative* form of the target is tested; an
+        external target is already reported as ``EXTERNAL`` without its path.
+        """
+        if kind is not PathKind.SYMLINK:
+            return False
+        try:
+            resolved = child.resolve()
+            if not resolved.is_relative_to(self._root):
+                return False
+            return self._sensitive.is_sensitive(
+                resolved.relative_to(self._root).as_posix())
+        except (OSError, RuntimeError, ValueError):
+            return False
+
+    def _link_target(self, child: Path) -> LinkTarget:
+        """Classify where a symlink points, without disclosing the target.
+
+        The link is resolved only to decide internal/external/broken. The
+        resolved path is discarded immediately: it is never returned, so an
+        external absolute path cannot leak through a listing. Nothing is
+        opened and no directory is entered.
+        """
+        try:
+            resolved = child.resolve()
+        except (OSError, RuntimeError):
+            # RuntimeError covers a symlink loop on some Python versions.
+            return LinkTarget.UNKNOWN
+        try:
+            if not resolved.exists():
+                return LinkTarget.BROKEN
+        except OSError:
+            return LinkTarget.UNKNOWN
+        return (LinkTarget.INTERNAL if resolved.is_relative_to(self._root)
+                else LinkTarget.EXTERNAL)
 
     # -- bounded reading (step 7) ------------------------------------------
     def iter_from(self, handle: OpenFile) -> Iterator[bytes]:

@@ -47,10 +47,11 @@ class ExplodingTool(Tool):
 # -- registry ---------------------------------------------------------------
 
 def test_registry_register_and_lookup(registry):
-    assert set(registry.names()) == {"echo", "workspace_info", "read_file"}
+    assert set(registry.names()) == {"echo", "workspace_info", "read_file",
+                                     "list_directory"}
     assert registry.has("echo")
     assert "echo" in registry
-    assert len(registry) == 3
+    assert len(registry) == 4
     assert registry.get("echo").spec.name == "echo"
 
 
@@ -70,7 +71,7 @@ def test_registry_unknown_tool_raises(registry):
 def test_registry_honours_config_disable():
     reg = ToolRegistry(ToolConfig(disabled=("echo",)))
     reg.register_all(default_tools())
-    assert reg.names() == ["read_file", "workspace_info"]
+    assert reg.names() == ["list_directory", "read_file", "workspace_info"]
 
 
 def test_registry_honours_config_allowlist():
@@ -81,11 +82,11 @@ def test_registry_honours_config_allowlist():
 
 def test_registry_queries(registry):
     assert [t.spec.name for t in registry.by_capability(Capability.FS_READ)] == [
-        "read_file", "workspace_info"]
-    assert len(registry.read_only_tools()) == 3
+        "list_directory", "read_file", "workspace_info"]
+    assert len(registry.read_only_tools()) == 4
     catalogue = registry.describe()
     assert {c["name"] for c in catalogue} == {"echo", "workspace_info",
-                                              "read_file"}
+                                              "read_file", "list_directory"}
     assert catalogue[0]["parameters"][0]["name"] == "message"
 
 

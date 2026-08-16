@@ -327,6 +327,91 @@ def _kind_from_mode(mode: int) -> PathKind:
     return PathKind.OTHER
 
 
+class LinkTarget(str, Enum):
+    """Where a symlink points, without disclosing the target path itself.
+
+    Determined by resolving the link *for classification only*. The resolved
+    path is never returned, logged or shown to a model: knowing that a link
+    escapes the workspace is useful, knowing the host layout it escapes to is
+    not.
+    """
+
+    #: Resolves to something inside the workspace.
+    INTERNAL = "internal"
+    #: Resolves outside the workspace. Reading it would be refused.
+    EXTERNAL = "external"
+    #: Points at something that does not exist.
+    BROKEN = "broken"
+    #: Could not be determined (permission error, resolution failure).
+    UNKNOWN = "unknown"
+
+    def __str__(self) -> str:
+        return self.value
+
+
+@dataclass(frozen=True)
+class DirectoryEntry:
+    """One immediate child of a listed directory.
+
+    Describes the entry *itself*. Nothing here requires opening a file,
+    following a link or descending into a subdirectory.
+
+    ``name`` is ``None`` for a sensitive entry: the filename is withheld
+    because a credential file's *name* can disclose as much as its contents
+    (``id_rsa`` says a private key is present; ``.env.production`` names an
+    environment). ``sensitive`` still reports that something is there.
+    """
+
+    #: The entry's own name, or ``None`` when withheld as sensitive.
+    name: str | None
+    kind: PathKind
+    sensitive: bool = False
+    #: Only meaningful when ``kind`` is :attr:`PathKind.SYMLINK`.
+    link_target: LinkTarget | None = None
+
+    @property
+    def display_name(self) -> str:
+        return self.name if self.name is not None else REDACTED_NAME
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"name": self.display_name,
+                                   "type": str(self.kind)}
+        if self.sensitive:
+            payload["sensitive"] = True
+        if self.link_target is not None:
+            payload["link"] = str(self.link_target)
+        return payload
+
+
+#: Stand-in shown instead of a sensitive entry's real name.
+REDACTED_NAME = "<redacted>"
+
+
+@dataclass(frozen=True)
+class DirectoryListing:
+    """The bounded, classified result of listing one directory."""
+
+    #: Workspace-relative path of the directory that was listed.
+    relative: str
+    entries: tuple[DirectoryEntry, ...]
+    #: True when the entry cap stopped the walk before the directory ended.
+    truncated: bool
+    #: The cap that was applied, so a caller can report it.
+    limit: int
+    #: Entries withheld because the sensitive policy matched their names.
+    sensitive_count: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "path": self.relative,
+            "entries": [e.to_dict() for e in self.entries],
+            "count": len(self.entries),
+            "truncated": self.truncated,
+            "entry_limit": self.limit,
+            "sensitive_entries": self.sensitive_count,
+        }
+
+
 @dataclass(frozen=True)
 class FileFacts:
     """Identity of a file as observed at validation time.
