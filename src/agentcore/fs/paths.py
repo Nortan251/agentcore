@@ -23,6 +23,7 @@ one: ``/workspace-other`` starts with ``/workspace`` but is not inside it.
 
 from __future__ import annotations
 
+import heapq
 import os
 import stat as stat_module
 from dataclasses import dataclass
@@ -385,6 +386,103 @@ class DirectoryEntry:
 
 #: Stand-in shown instead of a sensitive entry's real name.
 REDACTED_NAME = "<redacted>"
+
+
+class _Descending:
+    """Wraps a name so a min-heap behaves as a max-heap.
+
+    ``heapq`` provides only a min-heap, but retaining the *smallest* names
+    requires cheap access to the largest one held so far. Inverting the
+    comparison is the standard way to get that without a second structure.
+    """
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+    def __lt__(self, other: "_Descending") -> bool:
+        return self.value > other.value
+
+
+class BoundedNameSelector:
+    """Selects the lexicographically smallest names from a stream, in bounded
+    memory.
+
+    Why this exists
+    ---------------
+    Listing a directory previously did ``sorted(entry.name for entry in
+    scanner)`` and then sliced to the cap. The *output* was bounded but memory
+    was not: a directory with millions of entries built a list of millions of
+    strings before discarding nearly all of them.
+
+    This consumes the same stream while holding at most ``capacity`` names,
+    where ``capacity == limit + 1``.
+
+    Why the result is identical to a full sort
+    ------------------------------------------
+    The selector keeps the ``limit + 1`` smallest names seen so far. The
+    ``limit`` smallest names of the whole directory are necessarily a subset of
+    the ``limit + 1`` smallest, so sorting the retained set and slicing to
+    ``limit`` yields exactly the prefix ``sorted(all_names)[:limit]`` would
+    have produced. The final sort runs over at most ``limit + 1`` items, never
+    the whole directory.
+
+    Why one extra slot
+    ------------------
+    Truncation must distinguish "exactly ``limit`` entries" from "more than
+    ``limit``". Retaining one name beyond the cap makes that a fact about
+    stored data rather than an inference from ``len(result) == limit``, which
+    cannot tell the two cases apart.
+    """
+
+    __slots__ = ("_limit", "_capacity", "_heap", "peak_size", "seen")
+
+    def __init__(self, limit: int) -> None:
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+        self._limit = limit
+        #: One more than the cap, so "more exist" is observable.
+        self._capacity = limit + 1
+        self._heap: list[_Descending] = []
+        #: High-water mark of retained names. Asserted by tests as the
+        #: memory-bound invariant; never used by the algorithm itself.
+        self.peak_size = 0
+        #: Total names offered. A counter, not storage.
+        self.seen = 0
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity
+
+    @property
+    def retained(self) -> int:
+        """How many names are held right now."""
+        return len(self._heap)
+
+    def add(self, name: str) -> None:
+        """Offer one name. O(log capacity) time, O(capacity) space."""
+        self.seen += 1
+        heap = self._heap
+        if len(heap) < self._capacity:
+            heapq.heappush(heap, _Descending(name))
+        elif name < heap[0].value:
+            # Full: swap out the largest retained name for this smaller one.
+            heapq.heappushpop(heap, _Descending(name))
+        # Otherwise the name is larger than everything retained and cannot
+        # belong to the smallest `limit`; it is dropped immediately.
+        if len(heap) > self.peak_size:
+            self.peak_size = len(heap)
+
+    def result(self) -> tuple[list[str], bool]:
+        """Return ``(names, truncated)``.
+
+        ``names`` holds at most ``limit`` entries in ascending byte order;
+        ``truncated`` is ``True`` when more eligible entries existed.
+        """
+        ordered = sorted(item.value for item in self._heap)
+        truncated = len(ordered) > self._limit
+        return ordered[:self._limit], truncated
 
 
 @dataclass(frozen=True)

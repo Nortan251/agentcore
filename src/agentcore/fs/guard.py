@@ -65,6 +65,7 @@ from typing import Any, Iterator
 from agentcore.fs.config import FilesystemConfig
 from agentcore.fs.opened import OpenFile, descriptor_path, open_verified
 from agentcore.fs.paths import (
+    BoundedNameSelector,
     DirectoryEntry,
     DirectoryListing,
     FileFacts,
@@ -311,24 +312,33 @@ class WorkspaceGuard:
         their type but lose their name, because a credential file's *name* is
         itself disclosure.
 
-        The walk is bounded by ``max_directory_entries`` and stops as soon as
-        the cap is reached; ``truncated`` is set by probing for one more entry,
-        never by comparing against a total that was never counted.
+        Memory is bounded, not merely the output. Names stream out of
+        ``os.scandir`` into a :class:`~agentcore.fs.paths.BoundedNameSelector`
+        holding at most ``max_directory_entries + 1`` of them, so a directory
+        with millions of entries never materialises millions of strings. The
+        selector returns exactly the prefix a full sort would have produced —
+        see its docstring for why that is equivalent.
 
-        Ordering is by byte value of the entry name (``sorted``), which is
-        deterministic, locale-independent and case-sensitive on every platform.
-        Sensitive entries are ordered by their real name before redaction, so
-        a repeated listing of an unchanged directory is stable.
+        ``truncated`` comes from the retained extra slot, so "exactly the cap"
+        and "more than the cap" stay distinguishable; it is never inferred from
+        ``len(entries) == limit``.
+
+        Ordering is by byte value of the entry name, which is deterministic,
+        locale-independent and case-sensitive on every platform. Sensitive
+        entries are ordered by their real name before redaction, so a repeated
+        listing of an unchanged directory is stable.
         """
         self.require_directory(safe)
         limit = self._config.max_directory_entries
+        selector = BoundedNameSelector(limit)
 
         try:
-            # os.scandir is lazy, but names must be sorted for determinism, so
-            # names alone are collected first. Names are small; file contents
-            # are never touched.
+            # scandir is lazy and the selector is bounded, so the whole
+            # pipeline is streaming. Only names are touched here; nothing is
+            # opened, stat'ed or followed at this stage.
             with os.scandir(safe.absolute) as scanner:
-                names = sorted(entry.name for entry in scanner)
+                for entry in scanner:
+                    selector.add(entry.name)
         except PermissionError as exc:
             raise PathRejectedError(RejectionReason.UNREADABLE,
                                     "directory is not readable",
@@ -339,12 +349,12 @@ class WorkspaceGuard:
                                     path=safe.relative,
                                     errno=exc.errno) from exc
 
-        truncated = len(names) > limit
+        names, truncated = selector.result()
         base = "" if safe.relative == "." else f"{safe.relative}/"
         entries: list[DirectoryEntry] = []
         sensitive_count = 0
 
-        for name in names[:limit]:
+        for name in names:
             child = safe.absolute / name
             kind = classify(child)
             relative = f"{base}{name}"
