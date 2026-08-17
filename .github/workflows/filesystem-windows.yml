@@ -84,5 +84,37 @@ jobs:
       - name: Windows filesystem security tests
         run: python -m pytest tests/test_fs_windows.py -v -rs
 
+      - name: Timeline ordering diagnostic (Task 40)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          @'
+          import io, sys, tempfile
+          from contextlib import redirect_stdout
+          from pathlib import Path
+
+          sys.path.insert(0, "tests")
+          from test_cli_history import make_run  # noqa: E402
+          from agentcore.cli import build_timeline, main  # noqa: E402
+          from agentcore.state.store import JsonFileStateStore  # noqa: E402
+
+          tmp = Path(tempfile.mkdtemp(prefix="agentcore_tl_"))
+          run_id, _ = make_run(tmp)
+          store = JsonFileStateStore(tmp / "runs")
+          state = store.load(run_id)
+
+          print("=== build_timeline events (at | order | kind | title) ===")
+          for e in build_timeline(state):
+              at = e.at.isoformat() if e.at else None
+              print(f"  {at} | {e.order} | {e.kind} | {e.title}")
+
+          buf = io.StringIO()
+          with redirect_stdout(buf):
+              code = main(["--runs-dir", str(tmp / "runs"), "history", run_id])
+          print("=== RENDERED ===")
+          print(buf.getvalue())
+          print("=== exit code:", code)
+          '@ | python -
+
       - name: Full test suite
         run: python -m pytest -q -rs
