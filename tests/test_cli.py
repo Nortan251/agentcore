@@ -21,7 +21,8 @@ def test_status_command(capsys):
 def test_tools_command(capsys):
     assert main(["tools"]) == 0
     names = {t["name"] for t in _json_out(capsys)}
-    assert names == {"echo", "workspace_info", "read_file", "list_directory"}
+    assert names == {"echo", "workspace_info", "read_file", "list_directory",
+                     "inspect"}
 
 
 def test_doctor_reports_computer_control_unavailable(capsys):

@@ -75,7 +75,7 @@ def test_agent_boots_with_defaults(agent):
     status = agent.status()
     assert status["permission_level"] == "autonomous"
     assert set(status["tools"]) == {"echo", "workspace_info", "read_file",
-                                    "list_directory"}
+                                    "list_directory", "inspect"}
     assert agent.state.phase is AgentPhase.IDLE
     # optional seams are intentionally unwired
     assert agent.memory is None and agent.model is None
@@ -97,8 +97,8 @@ def test_config_disabled_tools_never_register(tmp_path):
         tools=ToolConfig(disabled=("echo",)),
         permissions=PermissionConfig(level=PermissionLevel.AUTONOMOUS),
         logging=LoggingConfig(level="CRITICAL"))
-    assert Agent(cfg).registry.names() == ["list_directory", "read_file",
-                                           "workspace_info"]
+    assert Agent(cfg).registry.names() == ["inspect", "list_directory",
+                                           "read_file", "workspace_info"]
 
 
 # -- tool calls -------------------------------------------------------------

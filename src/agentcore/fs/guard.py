@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterator
 
@@ -69,6 +70,7 @@ from agentcore.fs.paths import (
     DirectoryEntry,
     DirectoryListing,
     FileFacts,
+    Inspection,
     LinkTarget,
     PathKind,
     PathRejectedError,
@@ -77,10 +79,20 @@ from agentcore.fs.paths import (
     check_relative_form,
     classify,
     contain,
+    kind_from_lstat,
     symlinked_component,
     workspace_identity,
 )
 from agentcore.fs.sensitive import DEFAULT_SENSITIVE_POLICY, SensitivePathPolicy
+
+
+def _mtime_iso(st_mtime: float) -> str:
+    """Render an ``st_mtime`` float as a timezone-aware UTC ISO-8601 string.
+
+    Uses the filesystem modification time, never the agent event clock, and
+    returns a string so no raw epoch float reaches the model or state.
+    """
+    return datetime.fromtimestamp(st_mtime, tz=timezone.utc).isoformat()
 
 
 @dataclass(frozen=True)
@@ -304,6 +316,116 @@ class WorkspaceGuard:
                 ".", "./", "", "/"} and requested.strip() != "/":
             return self.root_path()
         return self.resolve_relative(requested)
+
+    # -- inspection (metadata only, never traversal or content) ------------
+
+    def inspect_path(self, requested: Any) -> Inspection:
+        """Describe one workspace entry without reading it or following links.
+
+        Metadata only. This never opens a file, never reads a byte, never
+        executes anything, never descends into a directory and never follows a
+        final-component link: a symlink or Windows reparse point is reported
+        as ``kind=symlink`` with a categorical :class:`LinkTarget`, never as
+        whatever it points at.
+
+        The root spelling ``"."`` / ``"./"`` is accepted here and mapped onto
+        the canonical workspace root, exactly as :meth:`resolve_directory`
+        does; ``check_relative_form`` itself is unchanged, so ``read_file``
+        keeps its existing ``"."`` rejection.
+
+        Ordering:
+
+        1. root spelling, or lexical validation via ``check_relative_form``;
+        2. sensitive-name policy, before any filesystem observation, so a
+           sensitive path is refused identically whether or not it exists
+           (no existence/metadata oracle);
+        3. parent components resolved through the normal guard machinery —
+           a link in a parent, an escaping parent or a sensitive parent is
+           refused before the final component is observed;
+        4. final component classified with ``lstat`` (never followed); a
+           reparse point counts as a symlink;
+        5. a link whose effective target is sensitive is refused with
+           ``SENSITIVE_TARGET`` and the target is never disclosed.
+
+        TOCTOU contract: this is a metadata snapshot, not a read. A concurrent
+        rename can make the snapshot describe a different object than existed
+        earlier, but no content is exposed, no unsafe target is exposed, and a
+        link swapped in is reported as a link, never followed. The hardlink
+        *read* refusal does not apply here: nothing is read.
+        """
+        if isinstance(requested, Path):
+            requested = requested.as_posix()
+        if isinstance(requested, str) and requested.strip() in {
+                ".", "./", ""}:
+            return self._inspect_child(".", self._root)
+
+        relative = check_relative_form(
+            requested,
+            max_length=self._config.max_path_length,
+            max_depth=self._config.max_path_depth,
+        )
+
+        # Sensitive policy on the requested name, before any filesystem
+        # access — mirroring resolve_relative, so inspection cannot answer
+        # "does a credential file exist here".
+        if self._config.deny_sensitive_paths:
+            reason = self._sensitive.reason(relative)
+            if reason is not None:
+                raise PathRejectedError(RejectionReason.SENSITIVE,
+                                        f"refused: {reason}",
+                                        path=relative.as_posix())
+
+        parts = relative.parts
+        if len(parts) > 1:
+            parent = self.resolve_directory(
+                PurePosixPath(*parts[:-1]).as_posix())
+            self.require_directory(parent)
+        else:
+            parent = self.root_path()
+        child = parent.absolute / parts[-1]
+        return self._inspect_child(relative.as_posix(), child)
+
+    def _inspect_child(self, relative: str, child: Path) -> Inspection:
+        """Classify one entry and build its :class:`Inspection`.
+
+        ``lstat`` only: the object is never opened or followed. Precise error
+        mapping replaces ``classify``'s coarse ``OTHER`` fold: a missing
+        object is ``NOT_FOUND``, a permission failure is ``UNREADABLE`` and
+        any other stat failure is ``UNREADABLE`` with its errno.
+        """
+        try:
+            st = child.lstat()
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            raise PathRejectedError(RejectionReason.NOT_FOUND,
+                                    "no such file in the workspace",
+                                    path=relative) from exc
+        except PermissionError as exc:
+            raise PathRejectedError(RejectionReason.UNREADABLE,
+                                    "path is not readable",
+                                    path=relative) from exc
+        except OSError as exc:
+            raise PathRejectedError(RejectionReason.UNREADABLE,
+                                    "path could not be inspected",
+                                    path=relative, errno=exc.errno) from exc
+
+        kind = kind_from_lstat(st)
+        if kind is PathKind.SYMLINK:
+            if self._config.deny_sensitive_paths and \
+                    self._links_to_sensitive(child, kind):
+                raise PathRejectedError(
+                    RejectionReason.SENSITIVE_TARGET,
+                    "refused: path resolves to a sensitive file",
+                    path=relative)
+            return Inspection(relative=relative, kind=kind,
+                              link_target=self._link_target(child))
+
+        size = st.st_size if kind is PathKind.REGULAR else None
+        links = st.st_nlink if kind is PathKind.REGULAR else None
+        modified_at = (_mtime_iso(st.st_mtime)
+                       if kind in {PathKind.REGULAR, PathKind.DIRECTORY}
+                       else None)
+        return Inspection(relative=relative, kind=kind, size=size,
+                          links=links, modified_at=modified_at)
 
     # -- listing (discovery, never traversal) ------------------------------
     def list_directory(self, safe: SafePath) -> DirectoryListing:

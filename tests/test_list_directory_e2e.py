@@ -275,10 +275,10 @@ def test_read_file_still_works_alongside(workspace):
     assert inv.ok and inv.result.output == "# Project\n"
 
 
-def test_all_four_builtin_tools_are_present(workspace):
+def test_all_builtin_tools_are_present(workspace):
     agent = Agent(build_config(workspace))
     assert set(agent.registry.names()) == {
-        "echo", "workspace_info", "read_file", "list_directory"}
+        "echo", "workspace_info", "read_file", "list_directory", "inspect"}
 
 
 @POSIX_ONLY

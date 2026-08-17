@@ -373,6 +373,18 @@ def classify(path: Path) -> PathKind:
         return PathKind.MISSING
     except OSError:
         return PathKind.OTHER
+    return kind_from_lstat(st)
+
+
+def kind_from_lstat(st: Any) -> PathKind:
+    """Classify an ``lstat``/:class:`os.stat_result` without following links.
+
+    The stat-taking counterpart of :func:`classify`, so a caller that already
+    holds a ``stat_result`` (and wants to react to its ``errno`` precisely
+    before classifying) does not re-derive type detection. On Windows a
+    reparse point is reported as :attr:`PathKind.SYMLINK` regardless of its
+    mode.
+    """
     if _is_windows_reparse(st):
         return PathKind.SYMLINK
     return _kind_from_mode(st.st_mode)
@@ -603,6 +615,51 @@ class FileFacts:
         # Deliberately no absolute path: safe to log.
         return {"path": self.relative, "kind": str(self.kind),
                 "size": self.size, "links": self.links}
+
+
+@dataclass(frozen=True)
+class Inspection:
+    """A bounded, safe description of one filesystem entry.
+
+    Produced by :meth:`~agentcore.fs.guard.WorkspaceGuard.inspect_path`. This
+    is metadata *about* an entry, never its contents: nothing here requires —
+    or permits — opening the object, following a link to describe its target,
+    or descending into a directory.
+
+    Field presence is kind-dependent and the ``to_dict`` whitelist omits
+    everything not listed, so no device/inode identifier, absolute path,
+    resolved link target or raw timestamp can leak through the safe
+    serialisation boundary.
+    """
+
+    #: Workspace-relative path as normalised by the guard. Never absolute.
+    relative: str
+    kind: PathKind
+    #: Size in bytes, regular files only (``None`` elsewhere).
+    size: int | None = None
+    #: ``st_nlink``, regular files only. >1 means the inode has other names;
+    #: inspection does not read bytes, so the hardlink *read* policy is not
+    #: applied here — the count is metadata.
+    links: int | None = None
+    #: Modification time as a timezone-aware ISO-8601 UTC string; regular
+    #: files and directories only.
+    modified_at: str | None = None
+    #: Categorical target for symlink/reparse-point entries only. Never the
+    #: resolved target path.
+    link_target: LinkTarget | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"path": self.relative,
+                                   "kind": str(self.kind)}
+        if self.size is not None:
+            payload["size"] = self.size
+        if self.links is not None:
+            payload["links"] = self.links
+        if self.modified_at is not None:
+            payload["modified_at"] = self.modified_at
+        if self.link_target is not None:
+            payload["link_target"] = str(self.link_target)
+        return payload
 
 
 #: ``O_NOFOLLOW`` refuses to open a final-component symlink at the syscall

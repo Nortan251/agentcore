@@ -490,15 +490,16 @@ def test_fs_package_contains_no_tools():
 
 
 def test_only_read_only_filesystem_tools_are_registered(tmp_path):
-    """Only ``read_file`` and ``list_directory`` exist.
+    """Only ``read_file``, ``list_directory`` and ``inspect`` exist.
 
-    The `fs` package itself still contains no tools (asserted above); both
-    tools live in ``tools/builtin`` and consume the guard. Writing, deleting,
-    moving, searching and shell access remain unimplemented.
+    The `fs` package itself still contains no tools (asserted above); all
+    three tools live in ``tools/builtin`` and consume the guard. Writing,
+    deleting, moving, searching and shell access remain unimplemented.
     """
     agent = Agent(config_for(tmp_path))
     names = set(agent.registry.names())
-    assert names == {"echo", "workspace_info", "read_file", "list_directory"}
+    assert names == {"echo", "workspace_info", "read_file", "list_directory",
+                     "inspect"}
     for absent in ("write_file", "delete_file", "move_file", "rename_file",
                    "shell", "find_files", "search_files", "grep"):
         assert absent not in names

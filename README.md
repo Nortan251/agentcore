@@ -15,7 +15,7 @@ the seams described below.
 pip install -e ".[dev]"
 pytest                       # 2787 tests
 agentcore doctor             # verify wiring and integrations
-agentcore tools              # echo, workspace_info, read_file, list_directory
+agentcore tools              # echo, workspace_info, read_file, list_directory, inspect
 agentcore run "some objective"   # persists the run, prints its run_id
 agentcore approve <run_id>       # allow a pending action -> resumable
 agentcore reject  <run_id>       # refuse it -> terminal
@@ -691,9 +691,9 @@ Not implemented, by design: mouse/keyboard control, screen capture, native
 Windows automation, browser automation, autonomous email, payments, credential
 extraction, destructive filesystem operations, system administration.
 
-The filesystem tools are `read_file` and `list_directory`, both read-only and
-both routed through `WorkspaceGuard`. Writing, deleting, renaming, recursive
-traversal and filesystem search are not implemented.
+The filesystem tools are `read_file`, `list_directory` and `inspect`, all
+read-only and all routed through `WorkspaceGuard`. Writing, deleting,
+renaming, recursive traversal and filesystem search are not implemented.
 
 Memory ships as a **foundation**: durable records, deterministic retrieval and
 the storage boundary. Embeddings, vector search, semantic similarity,
@@ -925,9 +925,9 @@ bypass permissions, skip verification, or turn a failure into a success.
 ## Filesystem safety foundation
 
 `agentcore.fs` holds the security primitives every filesystem tool is built
-on. **The package itself contains no tools**; `read_file` and `list_directory`
-live in `tools/builtin/` and consume the guard. Writing and deleting do not
-exist.
+on. **The package itself contains no tools**; `read_file`, `list_directory`
+and `inspect` live in `tools/builtin/` and consume the guard. Writing and
+deleting do not exist.
 
 ```python
 guard = agent.workspace                          # a WorkspaceGuard
@@ -1171,6 +1171,47 @@ never reaches the model. Ordering is by byte value of the entry name:
 deterministic, locale-independent and case-sensitive on every platform, so
 `Zebra` sorts before `apple` and a repeated listing of an unchanged directory
 is identical.
+
+## The `inspect` tool
+
+Metadata about one entry, never its contents. It describes a single
+workspace-relative path (or `.` for the workspace root) without opening the
+object, reading a byte, executing anything or following a link:
+
+```
+inspect(path="src/app.py")
+  -> src/app.py  (regular)  1234 bytes  modified 2026-08-17T12:00:00+00:00
+inspect(path="src")
+  -> src  (directory)  modified 2026-08-17T12:00:00+00:00
+inspect(path="alias")
+  -> alias  (symlink -> internal)
+inspect(path="dangling")
+  -> dangling  (symlink -> broken)
+```
+
+The safe metadata whitelist is exactly: `path` (workspace-relative), `kind`,
+`size` and `links` (regular files only), `modified_at` (ISO-8601 UTC; regular
+files and directories), and `link_target` (categorical, links only). Device
+and inode identifiers, absolute paths, resolved link targets, ownership, ACLs
+and file contents are never returned. `inspect` reports link counts without
+refusing multi-link files — it reads nothing, so the hardlink *read* refusal
+does not apply.
+
+Like `read_file` and `list_directory`, it owns no security logic:
+`WorkspaceGuard.inspect_path()` performs lexical validation, the
+sensitive-name check (before any filesystem observation, so a credential name
+is refused identically whether or not it exists — no metadata oracle),
+parent-link rejection, and `lstat`-based classification. Final-component
+symlinks and Windows junctions/reparse points are reported as `symlink` with a
+categorical `internal`/`external`/`broken` target, never followed; an
+innocuously-named link whose target is credential material is refused with
+`sensitive_target` and the target is never disclosed. The `.` root spelling is
+accepted by `inspect_path` exactly as `resolve_directory` accepts it, without
+changing `check_relative_form` — `read_file(".")` still fails as before.
+
+`inspect` is a metadata snapshot, not a read: a concurrent rename can change
+which object the snapshot describes, but no content is exposed, no unsafe
+target is exposed, and a link swapped in is reported as a link, never followed.
 
 ## Adding a tool
 

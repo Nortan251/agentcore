@@ -14,6 +14,7 @@ the security walk must refuse.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 
@@ -28,6 +29,7 @@ from agentcore.fs.paths import (
     RejectionReason,
 )
 from agentcore.tools.base import ToolContext
+from agentcore.tools.builtin.inspect import InspectTool
 from agentcore.tools.builtin.list_directory import ListDirectoryTool
 from agentcore.tools.builtin.read_file import ReadFileTool
 
@@ -457,3 +459,137 @@ def test_reserved_device_names_fail_closed(ws, name):
     guard = WorkspaceGuard(ws)
     with pytest.raises(PathRejectedError):
         guard.open_file(name)
+
+
+# ===========================================================================
+# inspect (Task 41.2)
+# ===========================================================================
+
+def _inspect(ws, path):
+    return InspectTool().run({"path": path},
+                             ToolContext(workspace=WorkspaceGuard(ws)))
+
+
+@WINDOWS_ONLY
+def test_inspect_root_regular_directory_and_mtime(ws):
+    (ws / "notes.txt").write_text("x", encoding="utf-8")
+    (ws / "d").mkdir()
+    root = _inspect(ws, ".")
+    assert root.ok and root.metadata["kind"] == "directory"
+    regular = _inspect(ws, "notes.txt")
+    assert regular.ok and regular.metadata["kind"] == "regular"
+    assert regular.metadata["size"] == 1
+    assert regular.metadata["modified_at"] is not None
+    directory = _inspect(ws, "d")
+    assert directory.ok and directory.metadata["kind"] == "directory"
+
+
+@WINDOWS_ONLY
+def test_inspect_junction_categorical_external(ws, outside):
+    """A junction is reported categorically, never followed."""
+    make_junction(ws / "j", outside)
+    r = _inspect(ws, "j")
+    assert r.ok is True
+    assert r.metadata["kind"] == "symlink"
+    assert r.metadata["link_target"] == "external"
+    assert "secret.txt" not in json.dumps(r.to_dict())
+    assert str(outside) not in json.dumps(r.to_dict())
+
+
+@WINDOWS_ONLY
+def test_inspect_true_symlink_categorical_external(ws, outside):
+    make_directory_symlink(ws / "s", outside)
+    r = _inspect(ws, "s")
+    assert r.ok is True
+    assert r.metadata["kind"] == "symlink"
+    assert r.metadata["link_target"] == "external"
+    assert "secret.txt" not in json.dumps(r.to_dict())
+    assert str(outside) not in json.dumps(r.to_dict())
+
+
+@WINDOWS_ONLY
+def test_inspect_internal_junction_categorical(ws):
+    (ws / "inner").mkdir()
+    (ws / "inner" / "ok.txt").write_text("x", encoding="utf-8")
+    make_junction(ws / "j", ws / "inner")
+    r = _inspect(ws, "j")
+    assert r.ok is True
+    assert r.metadata["kind"] == "symlink"
+    assert r.metadata["link_target"] == "internal"
+
+
+@WINDOWS_ONLY
+def test_inspect_nested_junction_parent_rejected(ws, outside):
+    (ws / "a").mkdir()
+    make_junction(ws / "a" / "b", outside)
+    r = _inspect(ws, "a/b/secret.txt")
+    assert r.ok is False
+    assert r.metadata["reason"] == "symlink"
+    assert str(outside) not in json.dumps(r.to_dict())
+
+
+@WINDOWS_ONLY
+def test_inspect_innocuous_link_to_sensitive_target(ws):
+    hidden = ws / "hidden"
+    hidden.mkdir()
+    (hidden / ".env").write_text("k=v", encoding="utf-8")
+    make_file_symlink(ws / "friendly", hidden / ".env")
+    r = _inspect(ws, "friendly")
+    assert r.ok is False
+    assert r.metadata["reason"] == "sensitive_target"
+    blob = json.dumps(r.to_dict())
+    assert "hidden" not in blob
+    assert ".env" not in blob
+
+
+@WINDOWS_ONLY
+@pytest.mark.parametrize("name", [
+    "notes.txt:hidden", "id_rsa::$DATA", "config.json:hidden",
+])
+def test_inspect_ads_rejected(ws, name):
+    r = _inspect(ws, name)
+    assert r.ok is False
+    assert r.metadata["reason"] == "ads"
+
+
+@WINDOWS_ONLY
+@pytest.mark.parametrize("requested,reason", [
+    ("C:/Windows/System32", "drive_qualified"),
+    ("C:\\Windows\\System32", "drive_qualified"),
+    ("\\\\server\\share\\x", "unc"),
+    ("..\\..\\x", "backslash"),
+    ("/etc/passwd", "absolute"),
+])
+def test_inspect_hostile_path_forms_rejected(ws, requested, reason):
+    r = _inspect(ws, requested)
+    assert r.ok is False
+    assert r.metadata["reason"] == reason
+
+
+@WINDOWS_ONLY
+@pytest.mark.parametrize("name", [
+    ".env", ".ENV", "id_rsa", "ID_RSA", "prod.env", "cert.pem",
+])
+def test_inspect_sensitive_names_rejected(ws, name):
+    (ws / name).write_text("x", encoding="utf-8")
+    r = _inspect(ws, name)
+    assert r.ok is False
+    assert r.metadata["reason"] == "sensitive"
+
+
+@WINDOWS_ONLY
+@pytest.mark.parametrize("name", ["NUL", "CON"])
+def test_inspect_reserved_names_never_open_or_hang(ws, name):
+    """Reserved device names must fail closed without opening anything.
+
+    Either ``lstat`` fails (categorical rejection) or the entry is classified
+    as a special/other kind — never as a regular file with a readable size.
+    """
+    guard = WorkspaceGuard(ws)
+    try:
+        r = guard.inspect_path(name)
+    except PathRejectedError:
+        return
+    assert r.kind in (PathKind.CHAR_DEVICE, PathKind.BLOCK_DEVICE,
+                      PathKind.OTHER)
+    assert r.size is None and r.links is None
