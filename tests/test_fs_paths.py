@@ -74,7 +74,12 @@ def test_relative_workspace_becomes_absolute(tmp_path, monkeypatch):
 
 
 def test_workspace_expands_user(monkeypatch, tmp_path):
-    monkeypatch.setenv("HOME", str(tmp_path))
+    # ``Path.expanduser()`` reads ``USERPROFILE`` on Windows and ``HOME``
+    # elsewhere; setting only ``HOME`` made this test POSIX-only by accident.
+    if os.name == "nt":
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    else:
+        monkeypatch.setenv("HOME", str(tmp_path))
     root = canonical_workspace("~/somewhere")
     assert str(root).startswith(str(tmp_path.resolve()))
 
