@@ -971,13 +971,18 @@ never uses one. Absolute paths, Windows drive paths (`C:\...`), UNC paths
 (`\\server\share`), backslashes and any `..` component are rejected on every
 platform, so a request means the same thing everywhere.
 
-**Symlink policy.** The default rejects *any* symlinked component — even one
-pointing inside the workspace — detected by walking components with
-`is_symlink()`, which never follows. That catches the subtle case of a
-symlinked *parent* directory. `allow_internal_symlinks = true` relaxes this to
-"contained targets only"; escape stays refused either way. Windows
-junctions/reparse points are **not verified** — the test exists but is skipped
-off Windows and needs a Windows CI job.
+**Symlink policy.** The default rejects *any* link component — even one
+pointing inside the workspace — detected by walking components with a link
+check that never follows. On Windows that check is the reparse-point
+attribute, not `is_symlink()`: a directory junction is a reparse point whose
+mode is a directory, and `Path.is_symlink()` reports `False` for it on current
+CPython, so the attribute is what closes that gap. The walk catches the subtle
+case of a linked *parent* directory. `allow_internal_symlinks = true` relaxes
+this to "contained targets only"; escape stays refused either way. Windows
+junction/reparse-point behaviour is **verified** on a real `windows-latest`
+runner (Python 3.13): an escaping junction is refused, and listings classify
+junctions as links without revealing their targets (see the `filesystem-windows`
+CI workflow).
 
 **Sensitive-file policy** (`fs/sensitive.py`) denies `.env*`, `id_rsa`,
 `*.pem`, `*.key`, `.netrc`, `.git-credentials`, `.ssh/`, `.aws/` and similar
@@ -1038,9 +1043,15 @@ filesystem-dependent (inode allocation, hardlink and symlink support all vary).
 Tests assert these admissions remain in the docs, so they cannot be quietly
 upgraded into false claims.
 
-**Windows is not verified.** Junction and reparse-point handling has never been
-executed; the test exists but is skipped off Windows and needs a Windows CI
-job before any claim is made.
+**Windows is verified for junctions/reparse points on Python 3.13** (via the
+`filesystem-windows` GitHub Actions workflow on `windows-latest`): junctions are
+refused by the link walk (`RejectionReason.SYMLINK`), escaping junctions cannot
+expose outside content, and listings neither follow nor leak junction targets.
+Residual, unverified Windows concerns are documented in the workflow's
+diagnostic step: alternate data streams (`file.txt:stream`) and reserved device
+names (`NUL`, `CON`) are not explicitly blocked, and case-insensitive volumes
+are not tested against the sensitive-name policy. Python 3.11/3.12 are not
+covered by the job.
 
 **Read-only by construction:** every open uses `O_RDONLY`, the guard exposes no
 write, delete or rename operation, and an AST test fails if the `fs` package

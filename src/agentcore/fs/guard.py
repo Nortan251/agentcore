@@ -176,7 +176,8 @@ class WorkspaceGuard:
             if link is not None:
                 raise PathRejectedError(
                     RejectionReason.SYMLINK,
-                    "path crosses a symbolic link, which is not permitted",
+                    "path crosses a symbolic link or reparse point, which is "
+                    "not permitted",
                     path=link)
 
         # 2 + 3. Canonicalise, then containment against the resolved target.

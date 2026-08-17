@@ -460,20 +460,19 @@ def test_broken_symlink_rejected(guard, workspace):
                     reason="junction/reparse-point behaviour requires Windows; "
                            "see the module note on Windows CI")
 def test_windows_junction_rejected(tmp_path):  # pragma: no cover - needs Windows
-    """Windows junctions/reparse points are refused by the symlink walk.
+    """Windows junctions/reparse points are refused by the link walk.
 
-    NOT verified in this project's Linux sandbox. ``Path.is_symlink()`` reports
-    True for directory junctions on modern CPython (they carry the
-    ``FILE_ATTRIBUTE_REPARSE_POINT`` attribute), so the same component walk that
-    rejects POSIX symlinks should reject a junction — but that must be proven by
-    an actual Windows CI job before anyone relies on it.
+    Verified on a real ``windows-latest`` runner (Python 3.13): a directory
+    junction is *not* reported as a symlink by ``Path.is_symlink()`` — it is a
+    reparse point whose ``st_mode`` is a directory — so the walk detects it via
+    the reparse-point attribute and refuses it exactly like a symlink.
 
     The setup is asserted, not assumed. A silent ``mklink`` failure would leave
-    no junction behind, and a missing path is *not* a symlink rejection, so the
-    old generic ``pytest.raises(PathRejectedError)`` could not tell the two
-    apart. This test now fails loudly if the junction is not created, if Python
-    stops reporting junctions as symlinks, or if the guard rejects the path for
-    any reason other than the documented symlink policy.
+    no junction behind, and a missing path is *not* a link rejection, so a
+    generic ``pytest.raises(PathRejectedError)`` could not tell the two apart.
+    This test fails loudly if the junction is not created, if it does not
+    materialise as a reparse point, or if the guard rejects the path for any
+    reason other than the documented link policy.
     """
     import subprocess
 
@@ -494,19 +493,21 @@ def test_windows_junction_rejected(tmp_path):  # pragma: no cover - needs Window
         f"junction creation failed: stdout={result.stdout!r} "
         f"stderr={result.stderr!r}")
 
-    # The premise the guard's symlink walk depends on: junctions report as
-    # symlinks. If a future Python stops doing that, this must fail loudly
-    # rather than silently exercise nothing.
-    assert link.is_symlink(), (
-        "junction not reported as a symlink on this Python build; "
+    # The premise the link walk depends on: the junction is a reparse point.
+    # Path.is_symlink() reports False for it on current CPython, so asserting
+    # the attribute is the honest check — and fails loudly if that ever
+    # changes.
+    st = link.lstat()
+    assert st.st_file_attributes & 0x400, (
+        "junction did not materialise as a reparse point; "
         "the documented rejection path cannot apply")
 
     guard = WorkspaceGuard(root)
     with pytest.raises(PathRejectedError) as exc:
         guard.resolve_relative("j/anything.txt")
-    # Precisely the symlink-walk guarantee, not merely "any rejection": a
+    # Precisely the link-walk guarantee, not merely "any rejection": a
     # NOT_FOUND from failed setup, or a future reclassification, would
-    # otherwise satisfy the old generic assertion.
+    # otherwise satisfy a generic assertion.
     assert exc.value.reason is RejectionReason.SYMLINK
 
 

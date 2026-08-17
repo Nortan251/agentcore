@@ -218,20 +218,60 @@ def check_relative_form(requested: Any, *, max_length: int,
     return PurePosixPath(*parts)
 
 
-def symlinked_component(root: Path, relative: PurePosixPath) -> str | None:
-    """Return the first component of ``relative`` that is a symlink, if any.
+#: ``FILE_ATTRIBUTE_REPARSE_POINT``. On Windows this bit is set for symlinks,
+#: directory junctions and every other reparse point — the mechanism by which
+#: a name can redirect elsewhere. POSIX ``stat`` results have no such
+#: attribute, so the link test falls back to the symlink bit alone there.
+_REPARSE_POINT = 0x400
 
-    Walks from the workspace root outward using :meth:`Path.is_symlink`, which
-    does *not* follow links, so a symlinked parent directory is detected before
-    it can be traversed. Returns the workspace-relative component path so the
-    caller can report it without leaking the absolute layout.
+
+def _is_windows_reparse(st: Any) -> bool:
+    """Whether a ``stat_result`` carries the Windows reparse-point attribute.
+
+    Always ``False`` off Windows. On Windows this is the one signal that is
+    present for junctions (and other reparse points) even though their
+    ``st_mode`` says "directory" and ``Path.is_symlink()`` reports ``False``
+    for them on current CPython.
+    """
+    if os.name != "nt":
+        return False
+    return bool(getattr(st, "st_file_attributes", 0) & _REPARSE_POINT)
+
+
+def _is_link(path: Path) -> bool:
+    """Whether ``path`` is a redirecting link.
+
+    True for a symlink on any platform, and on Windows for any reparse point
+    (which is how a directory junction is represented). ``Path.is_symlink()``
+    alone is not enough on Windows: a junction is a reparse point whose mode
+    is a directory, so the attribute check is what closes that gap.
+    """
+    if path.is_symlink():
+        return True
+    if os.name != "nt":
+        return False
+    try:
+        st = path.lstat()
+    except OSError:
+        return False
+    return bool(getattr(st, "st_file_attributes", 0) & _REPARSE_POINT)
+
+
+def symlinked_component(root: Path, relative: PurePosixPath) -> str | None:
+    """Return the first component of ``relative`` that is a link, if any.
+
+    Walks from the workspace root outward using :func:`_is_link`, which does
+    *not* follow links, so a symlinked — or, on Windows, junctioned — parent
+    directory is detected before it can be traversed. Returns the
+    workspace-relative component path so the caller can report it without
+    leaking the absolute layout.
     """
     current = root
     walked: list[str] = []
     for part in relative.parts:
         current = current / part
         walked.append(part)
-        if current.is_symlink():
+        if _is_link(current):
             return "/".join(walked)
     return None
 
@@ -295,7 +335,10 @@ def classify(path: Path) -> PathKind:
     """Classify a path without following symlinks.
 
     Uses ``lstat`` so a symlink reports as :attr:`PathKind.SYMLINK` rather than
-    silently reporting whatever it points at.
+    silently reporting whatever it points at. On Windows a reparse point — a
+    junction, or any other reparse tag — is also reported as
+    :attr:`PathKind.SYMLINK`, because it redirects exactly like a symlink even
+    though its ``st_mode`` says "directory".
 
     This is a *pathname* check and is therefore advisory: by the time the
     result is used the name may refer to something else. Security decisions
@@ -307,6 +350,8 @@ def classify(path: Path) -> PathKind:
         return PathKind.MISSING
     except OSError:
         return PathKind.OTHER
+    if _is_windows_reparse(st):
+        return PathKind.SYMLINK
     return _kind_from_mode(st.st_mode)
 
 
