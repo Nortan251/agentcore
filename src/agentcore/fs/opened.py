@@ -150,7 +150,7 @@ def open_verified(
     try:
         fd = os.open(path, _OPEN_FLAGS)
     except OSError as exc:
-        raise _open_failure(exc, relative) from exc
+        raise _open_failure(exc, path, relative) from exc
 
     try:
         st = os.fstat(fd)
@@ -195,7 +195,7 @@ def open_verified(
     return OpenFile(fd=fd, facts=facts, relative=relative)
 
 
-def _open_failure(exc: OSError, relative: str) -> PathRejectedError:
+def _open_failure(exc: OSError, path: Path, relative: str) -> PathRejectedError:
     """Translate an ``os.open`` errno into a categorical rejection."""
     if exc.errno in _SYMLINK_ERRNOS:
         return PathRejectedError(
@@ -207,6 +207,19 @@ def _open_failure(exc: OSError, relative: str) -> PathRejectedError:
                                  "no such file in the workspace",
                                  path=relative)
     if exc.errno == errno.EACCES:
+        # Windows cannot open a directory with ``os.open`` at all (it lacks
+        # FILE_FLAG_BACKUP_SEMANTICS), so a directory fails with EACCES there
+        # instead of EISDIR. Report the type error it actually is. The check
+        # only refines a *refusal*; it never grants access.
+        if os.name == "nt":
+            try:
+                if path.is_dir():
+                    return PathRejectedError(
+                        RejectionReason.NOT_A_REGULAR_FILE,
+                        "path is a directory, not a file",
+                        path=relative)
+            except OSError:
+                pass
         return PathRejectedError(RejectionReason.UNREADABLE,
                                  "file is not readable", path=relative)
     if exc.errno == errno.EISDIR:

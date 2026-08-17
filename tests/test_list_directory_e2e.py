@@ -75,7 +75,7 @@ def workspace(tmp_path):
     (root / "src").mkdir(parents=True)
     (root / "src" / "app.py").write_text("def main():\n    return 42\n",
                                          encoding="utf-8")
-    (root / "README.md").write_text("# Project\n", encoding="utf-8")
+    (root / "README.md").write_bytes(b"# Project\n")
     return root
 
 

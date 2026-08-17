@@ -156,7 +156,11 @@ def check_relative_form(requested: Any, *, max_length: int,
     Returns the normalised relative path (``.`` segments removed).
     """
     if isinstance(requested, Path):
-        requested = str(requested)
+        # ``str()`` uses platform separators, so a WindowsPath would inject
+        # backslashes and be rejected as if the caller had typed them.
+        # ``as_posix()`` is the portable spelling and is identical to
+        # ``str()`` on POSIX.
+        requested = requested.as_posix()
     if not isinstance(requested, str):
         raise PathRejectedError(RejectionReason.NOT_A_STRING,
                                 "path must be a string",

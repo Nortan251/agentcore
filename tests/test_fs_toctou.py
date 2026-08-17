@@ -257,8 +257,15 @@ def test_hardlink_policy_can_be_opted_out(workspace, outside):
     assert b"TOP SECRET" in data
 
 
+@POSIX_ONLY
 def test_directories_are_not_caught_by_the_link_policy(workspace):
-    """Directories always have st_nlink >= 2; the policy is for regular files."""
+    """Directories always have st_nlink >= 2 on POSIX; the policy is for
+    regular files only.
+
+    POSIX-gated because NTFS reports ``st_nlink == 1`` for directories — the
+    hardlink policy applies to regular files either way, so nothing about the
+    Windows behaviour is weakened by not asserting this POSIX detail there.
+    """
     guard = WorkspaceGuard(workspace)
     facts = guard.require_directory(guard.resolve_relative("hidden"))
     assert facts.kind is PathKind.DIRECTORY
