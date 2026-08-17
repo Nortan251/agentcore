@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import errno
 import os
-import resource
 import subprocess
 import tempfile
 from pathlib import Path
@@ -470,6 +469,9 @@ def test_open_file_is_not_serialisable_into_state():
 @POSIX_ONLY
 def test_many_sequential_reads_do_not_exhaust_descriptors(workspace):
     """Guards against a slow leak that only shows up under load."""
+    # ``resource`` is POSIX-only; import it here, inside the POSIX-gated test,
+    # so the module still collects on Windows.
+    import resource
     soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
     guard = WorkspaceGuard(workspace)
     for _ in range(min(500, soft // 2)):
