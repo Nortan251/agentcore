@@ -27,6 +27,17 @@ from agentcore.memory.conflicts import ConflictStatus, PendingConflict
 from agentcore.memory.resolve import ConflictResolution, ResolutionStatus
 from agentcore.models.messages import Role
 
+
+def _toml(path):
+    """Render a path for a TOML basic string.
+
+    Backslashes are escape characters in TOML basic strings, and Windows paths
+    use them as separators, so forward slashes (equally accepted by Windows)
+    are used instead. Without this, a config written on Windows fails to parse.
+    """
+    return str(path).replace("\\", "/")
+
+
 SECRET = "sk-conflicts-chat-must-not-leak"
 
 
@@ -34,7 +45,7 @@ SECRET = "sk-conflicts-chat-must-not-leak"
 def workspace(tmp_path):
     path = tmp_path / "agent.toml"
     path.write_text(
-        f'workspace_dir = "{tmp_path}"\n'
+        f'workspace_dir = "{_toml(tmp_path)}"\n'
         '[model]\nprovider = "echo"\nname = "echo"\n'
         '[logging]\nlevel = "CRITICAL"\n'
         '[features]\nmemory = true\n', encoding="utf-8")
@@ -131,7 +142,7 @@ def test_missing_related_memory_is_reported_honestly(workspace):
 
 def test_memory_disabled(tmp_path):
     path = tmp_path / "agent.toml"
-    path.write_text(f'workspace_dir = "{tmp_path}"\n'
+    path.write_text(f'workspace_dir = "{_toml(tmp_path)}"\n'
                     '[logging]\nlevel = "CRITICAL"\n', encoding="utf-8")
     agent = Agent(load_config(path, env={}))
     assert lines_for(agent) == ["[Memory] Memory is not enabled, so there "

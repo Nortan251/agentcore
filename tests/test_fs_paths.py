@@ -43,7 +43,7 @@ def workspace(tmp_path):
     (root / "src" / "utils").mkdir(parents=True)
     (root / "src" / "app.py").write_text("print('hi')\n", encoding="utf-8")
     (root / "src" / "utils" / "test.py").write_text("x = 1\n", encoding="utf-8")
-    (root / "notes.txt").write_text("plain notes\n", encoding="utf-8")
+    (root / "notes.txt").write_bytes(b"plain notes\n")
     return root
 
 

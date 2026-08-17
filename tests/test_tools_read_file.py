@@ -45,10 +45,9 @@ POSIX_ONLY = pytest.mark.skipif(
 def workspace(tmp_path):
     root = tmp_path / "workspace"
     (root / "src" / "utils").mkdir(parents=True)
-    (root / "src" / "app.py").write_text("print('hello')\n", encoding="utf-8")
-    (root / "src" / "utils" / "helper.py").write_text("X = 1\n",
-                                                      encoding="utf-8")
-    (root / "notes.txt").write_text("plain notes\n", encoding="utf-8")
+    (root / "src" / "app.py").write_bytes(b"print('hello')\n")
+    (root / "src" / "utils" / "helper.py").write_bytes(b"X = 1\n")
+    (root / "notes.txt").write_bytes(b"plain notes\n")
     (root / "empty.txt").write_bytes(b"")
     return root
 
@@ -159,7 +158,7 @@ def test_empty_file_is_success_not_an_error(workspace):
 
 def test_unicode_text_round_trips(workspace):
     content = "héllo wörld ✓ 日本語 🎉 emoji\n"
-    (workspace / "unicode.txt").write_text(content, encoding="utf-8")
+    (workspace / "unicode.txt").write_bytes(content.encode("utf-8"))
     result = run_tool(workspace, "unicode.txt")
     assert result.ok and result.output == content
 
@@ -200,8 +199,7 @@ def test_binary_content_is_never_lossily_decoded(workspace):
 
 def test_decision_is_not_based_on_file_extension(workspace):
     """A .png holding UTF-8 text reads; a .py holding binary does not."""
-    (workspace / "actually_text.png").write_text("just text\n",
-                                                 encoding="utf-8")
+    (workspace / "actually_text.png").write_bytes(b"just text\n")
     (workspace / "actually_binary.py").write_bytes(b"\xff\xfe\xfd\xfc")
 
     text_result = run_tool(workspace, "actually_text.png")

@@ -35,6 +35,17 @@ from agentcore.memory import (
 from agentcore.memory.store import InMemoryMemoryStore
 from agentcore.util.clock import utc_now
 
+
+def _toml(path):
+    """Render a path for a TOML basic string.
+
+    Backslashes are escape characters in TOML basic strings, and Windows paths
+    use them as separators, so forward slashes (equally accepted by Windows)
+    are used instead. Without this, a config written on Windows fails to parse.
+    """
+    return str(path).replace("\\", "/")
+
+
 QUIET = LoggingConfig(level="CRITICAL")
 
 
@@ -76,7 +87,7 @@ def test_memory_config_loads_from_toml(tmp_path):
     path = tmp_path / "agent.toml"
     path.write_text(
         "[memory]\n"
-        f'directory = "{tmp_path / "mem"}"\n'
+        f'directory = "{_toml(tmp_path / "mem")}"\n'
         "max_records = 50\n"
         "max_search_results = 5\n"
         "max_content_chars = 100\n"

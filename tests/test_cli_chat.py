@@ -34,6 +34,17 @@ from agentcore.memory.resolve import ResolutionOutcome, ResolutionStatus
 from agentcore.models.messages import Message, Role
 from agentcore.observability.logging import configure_logging
 
+
+def _toml(path):
+    """Render a path for a TOML basic string.
+
+    Backslashes are escape characters in TOML basic strings, and Windows paths
+    use them as separators, so forward slashes (equally accepted by Windows)
+    are used instead. Without this, a config written on Windows fails to parse.
+    """
+    return str(path).replace("\\", "/")
+
+
 SECRET = "sk-chat-tests-must-not-leak-42"
 
 
@@ -42,7 +53,7 @@ def workspace(tmp_path):
     """A config file wiring the deterministic echo provider to a workspace."""
     path = tmp_path / "agent.toml"
     path.write_text(
-        f'workspace_dir = "{tmp_path}"\n'
+        f'workspace_dir = "{_toml(tmp_path)}"\n'
         '[model]\nprovider = "echo"\nname = "echo"\n'
         '[logging]\nlevel = "CRITICAL"\n'
         '[features]\nmemory = true\n', encoding="utf-8")
@@ -376,7 +387,7 @@ def test_targeted_forget_reports_deletion(workspace, capsys):
 
 def test_memory_disabled_still_converses(tmp_path, capsys):
     path = tmp_path / "agent.toml"
-    path.write_text(f'workspace_dir = "{tmp_path}"\n'
+    path.write_text(f'workspace_dir = "{_toml(tmp_path)}"\n'
                     '[model]\nprovider = "echo"\nname = "echo"\n'
                     '[logging]\nlevel = "CRITICAL"\n'
                     '[features]\nmemory = false\n', encoding="utf-8")
@@ -396,7 +407,7 @@ def test_model_failure_is_reported_without_a_fabricated_reply(tmp_path,
                                                               capsys):
     """provider = "none" leaves the agent with no model at all."""
     path = tmp_path / "agent.toml"
-    path.write_text(f'workspace_dir = "{tmp_path}"\n'
+    path.write_text(f'workspace_dir = "{_toml(tmp_path)}"\n'
                     '[logging]\nlevel = "CRITICAL"\n'
                     '[features]\nmemory = true\n', encoding="utf-8")
     with mock.patch("builtins.input", side_effect=["hello", "/exit"]):
@@ -409,7 +420,7 @@ def test_model_failure_is_reported_without_a_fabricated_reply(tmp_path,
 
 def test_the_loop_survives_a_turn_error(tmp_path, capsys):
     path = tmp_path / "agent.toml"
-    path.write_text(f'workspace_dir = "{tmp_path}"\n'
+    path.write_text(f'workspace_dir = "{_toml(tmp_path)}"\n'
                     '[logging]\nlevel = "CRITICAL"\n', encoding="utf-8")
     with mock.patch("builtins.input", side_effect=["one", "two", "/exit"]):
         assert main(["--config", str(path), "chat"]) == 0
@@ -558,7 +569,7 @@ def test_one_shot_json_reports_memory(workspace, capsys):
 
 def test_one_shot_json_on_failure(tmp_path, capsys):
     path = tmp_path / "agent.toml"
-    path.write_text(f'workspace_dir = "{tmp_path}"\n'
+    path.write_text(f'workspace_dir = "{_toml(tmp_path)}"\n'
                     '[logging]\nlevel = "CRITICAL"\n', encoding="utf-8")
     assert main(["--config", str(path), "chat", "--message", "hi",
                  "--json"]) == 1
