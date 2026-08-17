@@ -455,21 +455,54 @@ def test_broken_symlink_rejected(guard, workspace):
                     reason="junction/reparse-point behaviour requires Windows; "
                            "see the module note on Windows CI")
 def test_windows_junction_rejected(tmp_path):  # pragma: no cover - needs Windows
-    """Windows junctions/reparse points.
+    """Windows junctions/reparse points are refused by the symlink walk.
 
     NOT verified in this project's Linux sandbox. ``Path.is_symlink()`` reports
-    True for junctions on modern CPython, so the same walk should reject them,
-    but that must be proven by an actual Windows CI job before anyone relies
-    on it.
+    True for directory junctions on modern CPython (they carry the
+    ``FILE_ATTRIBUTE_REPARSE_POINT`` attribute), so the same component walk that
+    rejects POSIX symlinks should reject a junction — but that must be proven by
+    an actual Windows CI job before anyone relies on it.
+
+    The setup is asserted, not assumed. A silent ``mklink`` failure would leave
+    no junction behind, and a missing path is *not* a symlink rejection, so the
+    old generic ``pytest.raises(PathRejectedError)`` could not tell the two
+    apart. This test now fails loudly if the junction is not created, if Python
+    stops reporting junctions as symlinks, or if the guard rejects the path for
+    any reason other than the documented symlink policy.
     """
+    import subprocess
+
     root = tmp_path / "ws"
     root.mkdir()
     target = tmp_path / "outside"
     target.mkdir()
-    os.system(f'mklink /J "{root / "j"}" "{target}"')
+
+    link = root / "j"
+    # ``mklink /J`` creates a junction and, unlike ``mklink /D`` (a true
+    # symbolic link), needs no elevation. It is a cmd builtin, so it must run
+    # through ``cmd /c``; the argument list avoids os.system's shell quoting.
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True, text=True, errors="replace",
+    )
+    assert result.returncode == 0, (
+        f"junction creation failed: stdout={result.stdout!r} "
+        f"stderr={result.stderr!r}")
+
+    # The premise the guard's symlink walk depends on: junctions report as
+    # symlinks. If a future Python stops doing that, this must fail loudly
+    # rather than silently exercise nothing.
+    assert link.is_symlink(), (
+        "junction not reported as a symlink on this Python build; "
+        "the documented rejection path cannot apply")
+
     guard = WorkspaceGuard(root)
-    with pytest.raises(PathRejectedError):
+    with pytest.raises(PathRejectedError) as exc:
         guard.resolve_relative("j/anything.txt")
+    # Precisely the symlink-walk guarantee, not merely "any rejection": a
+    # NOT_FOUND from failed setup, or a future reclassification, would
+    # otherwise satisfy the old generic assertion.
+    assert exc.value.reason is RejectionReason.SYMLINK
 
 
 # ===========================================================================
