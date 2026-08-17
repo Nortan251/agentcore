@@ -1,0 +1,100 @@
+name: filesystem-windows
+
+# Verifies the filesystem security foundation (WorkspaceGuard, junctions and
+# reparse points) on a real Windows filesystem. Task 37 deliberately did not
+# claim Windows verification because the only available environment was Linux;
+# this job closes that gap. No third-party runtime dependencies are added:
+# the project's own `dev` extra installs pytest, nothing else.
+#
+# A junction/reparse-point failure must fail the job loudly, so the
+# junction test runs as its own step before the full suite.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  windows:
+    name: Windows filesystem verification
+    runs-on: windows-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Requires >= 3.11 per pyproject.toml. 3.13 is used because
+          # pathlib.Path.resolve() only follows symlinks/junctions on Windows
+          # from 3.13, which several existing tests rely on.
+          python-version: "3.13"
+
+      - name: Install project with dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Windows junction/reparse-point test
+        run: python -m pytest tests/test_fs_paths.py -k junction -v -rs
+
+      - name: Windows filesystem security tests
+        run: python -m pytest tests/test_fs_windows.py -v -rs
+
+      - name: Full test suite
+        run: python -m pytest -q -rs
+
+      - name: Probe reserved names and ADS (diagnostic, non-failing)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          @'
+          import os, tempfile
+          from pathlib import Path
+          from agentcore.fs.guard import WorkspaceGuard
+          from agentcore.fs.paths import PathRejectedError
+
+          d = Path(tempfile.mkdtemp(prefix="agentcore_probe_"))
+          guard = WorkspaceGuard(d)
+
+          print("=== reserved device names (CON/NUL) ===")
+          for name in ("NUL", "CON"):
+              try:
+                  with guard.open_file(name) as h:
+                      data, _ = guard.read_from(h)
+                  print(f"{name}: READ {len(data)} bytes: {data[:40]!r}")
+              except PathRejectedError as e:
+                  print(f"{name}: rejected reason={e.reason}")
+              except Exception as e:  # noqa: BLE001
+                  print(f"{name}: {type(e).__name__}: {e}")
+
+          print("=== alternate data stream (ADS) ===")
+          (d / "notes.txt").write_text("visible", encoding="utf-8")
+          try:
+              with open(d / "notes.txt:hidden", "w", encoding="utf-8") as f:
+                  f.write("SECRET-STREAM")
+              print("notes.txt:hidden created")
+          except OSError as e:
+              print(f"ADS create failed: {e}")
+          try:
+              with guard.open_file("notes.txt:hidden") as h:
+                  data, _ = guard.read_from(h)
+              print(f"ADS read: {data!r}")
+          except PathRejectedError as e:
+              print(f"ADS: rejected reason={e.reason}")
+          except Exception as e:  # noqa: BLE001
+              print(f"ADS: {type(e).__name__}: {e}")
+
+          print("=== case variation vs sensitive-name policy ===")
+          (d / ".ENV").write_text("API_KEY=UPPERCASE", encoding="utf-8")
+          try:
+              with guard.open_file(".ENV") as h:
+                  data, _ = guard.read_from(h)
+              print(f".ENV read: {data!r}")
+          except PathRejectedError as e:
+              print(f".ENV: rejected reason={e.reason}")
+          except Exception as e:  # noqa: BLE001
+              print(f".ENV: {type(e).__name__}: {e}")
+          '@ | python -
