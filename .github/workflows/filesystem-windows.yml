@@ -94,12 +94,18 @@ jobs:
           from pathlib import Path
 
           sys.path.insert(0, "tests")
-          from test_cli_history import make_run  # noqa: E402
+          from test_cli_history import (  # noqa: E402
+              SeqPlanner, Verifier, make_run, VerificationStatus)
           from agentcore.cli import build_timeline, main  # noqa: E402
           from agentcore.state.store import JsonFileStateStore  # noqa: E402
 
           tmp = Path(tempfile.mkdtemp(prefix="agentcore_tl_"))
-          run_id, _ = make_run(tmp)
+          run_id, _ = make_run(
+              tmp,
+              planner=SeqPlanner("A", "A", "B"),
+              verifier=Verifier(VerificationStatus.FAILED,
+                                VerificationStatus.PASSED),
+              max_replans=2)
           store = JsonFileStateStore(tmp / "runs")
           state = store.load(run_id)
 
