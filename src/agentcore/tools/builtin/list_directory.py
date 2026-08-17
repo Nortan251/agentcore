@@ -63,6 +63,8 @@ _REASON_HINTS: dict[RejectionReason, str] = {
     RejectionReason.TRAVERSAL: "paths containing '..' are not accepted",
     RejectionReason.ABSOLUTE:
         "give a path relative to the workspace, not an absolute one",
+    RejectionReason.ADS:
+        "alternate data streams are not supported",
     RejectionReason.UNREADABLE: "this directory could not be read",
 }
 

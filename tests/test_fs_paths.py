@@ -314,6 +314,20 @@ def test_windows_reserved_form_is_covered_by_drive_check():
     assert PurePosixPath("C:\\Windows").is_absolute() is False
 
 
+@POSIX_ONLY
+def test_colon_is_a_legal_filename_character_on_posix(workspace):
+    """ADS rejection is Windows-only: a colon filename stays usable on POSIX.
+
+    ``notes:archive.txt`` is an ordinary filename on ext4/tmpfs and must not
+    be mistaken for a Windows alternate data stream (Task 39 F-01).
+    """
+    (workspace / "notes:archive.txt").write_text("legit", encoding="utf-8")
+    guard = WorkspaceGuard(workspace)
+    data, facts, _ = guard.read_path("notes:archive.txt")
+    assert data == b"legit"
+    assert facts.kind is PathKind.REGULAR
+
+
 # ===========================================================================
 # Degenerate input
 # ===========================================================================

@@ -178,3 +178,91 @@ def test_windows_path_forms_rejected_on_real_windows(ws, requested, reason):
     with pytest.raises(PathRejectedError) as exc:
         guard.resolve_relative(requested)
     assert exc.value.reason is reason
+
+
+# ===========================================================================
+# Alternate data streams (Task 39 F-01)
+# ===========================================================================
+
+@WINDOWS_ONLY
+@pytest.mark.parametrize("requested", [
+    "id_rsa::$DATA",
+    "id_rsa:hidden",
+    "config.json:hidden",
+    "notes.txt:hidden",
+    "ordinary:stream",
+])
+def test_ads_requests_are_rejected_outright(ws, requested):
+    """Any stream-qualified request fails closed as ``ads``, never normalised.
+
+    The guard must refuse the qualified name before any resolution, so
+    ``id_rsa::$DATA`` cannot silently become ``id_rsa`` and open.
+    """
+    guard = WorkspaceGuard(ws)
+    with pytest.raises(PathRejectedError) as exc:
+        guard.resolve_relative(requested)
+    assert exc.value.reason is RejectionReason.ADS
+
+
+@WINDOWS_ONLY
+def test_ads_sensitive_names_cannot_bypass_the_sensitive_policy(ws):
+    """The exact audit finding: a stream qualifier must not dodge the
+    sensitive-name policy, and the base file must not be reached."""
+    (ws / "id_rsa").write_text("PRIVATE KEY BODY", encoding="utf-8")
+    (ws / "config.json").write_text('{"secret": "value"}', encoding="utf-8")
+    guard = WorkspaceGuard(ws)
+    for name in ("id_rsa::$DATA", "id_rsa:hidden", "config.json:hidden"):
+        result = ReadFileTool().run({"path": name},
+                                    ToolContext(workspace=guard))
+        assert result.ok is False
+        assert result.metadata["reason"] == "ads"
+        # Neither the base file's bytes nor the (absent) stream leak.
+        assert "PRIVATE KEY BODY" not in str(result.output)
+        assert "value" not in str(result.output)
+
+
+@WINDOWS_ONLY
+def test_ads_read_is_rejected_while_ordinary_name_still_reads(ws):
+    """``notes.txt`` succeeds; ``notes.txt:hidden`` is refused.
+
+    The stream is created if the volume supports it, to prove the rejection
+    applies to a *real* alternate data stream and not merely to the string.
+    """
+    (ws / "notes.txt").write_text("visible body", encoding="utf-8")
+    try:
+        # Create the stream if the volume supports it; the rejection must
+        # hold either way.
+        with open(ws / "notes.txt:hidden", "w", encoding="utf-8") as fh:
+            fh.write("SECRET-STREAM-BODY")
+    except OSError:
+        pass
+
+    guard = WorkspaceGuard(ws)
+
+    ordinary = ReadFileTool().run({"path": "notes.txt"},
+                                  ToolContext(workspace=guard))
+    assert ordinary.ok is True
+    assert "visible body" in ordinary.output
+
+    denied = ReadFileTool().run({"path": "notes.txt:hidden"},
+                                ToolContext(workspace=guard))
+    assert denied.ok is False
+    assert denied.metadata["reason"] == "ads"
+    assert "SECRET-STREAM-BODY" not in str(denied.output)
+    assert "visible body" not in str(denied.output)
+
+    # Also refused by list_directory, which shares the same validation path.
+    listed = ListDirectoryTool().run({"path": "notes.txt:hidden"},
+                                     ToolContext(workspace=guard))
+    assert listed.ok is False
+    assert listed.metadata["reason"] == "ads"
+
+
+@WINDOWS_ONLY
+def test_ads_rejection_has_no_path_detail_bypass(ws):
+    """The rejection is the same category no matter the qualifier shape."""
+    guard = WorkspaceGuard(ws)
+    for name in ("file.txt::$DATA", "file.txt:anything"):
+        with pytest.raises(PathRejectedError) as exc:
+            guard.resolve_relative(name)
+        assert exc.value.reason is RejectionReason.ADS

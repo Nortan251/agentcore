@@ -64,6 +64,8 @@ _REASON_HINTS: dict[RejectionReason, str] = {
         "paths containing '..' are not accepted",
     RejectionReason.ABSOLUTE:
         "give a path relative to the workspace, not an absolute one",
+    RejectionReason.ADS:
+        "alternate data streams are not supported",
     RejectionReason.NOT_A_REGULAR_FILE:
         "only regular files can be read",
     RejectionReason.TOO_LARGE:

@@ -309,7 +309,11 @@ def test_innocuous_symlink_to_sensitive_target_denied_when_symlinks_allowed(
     with pytest.raises(PathRejectedError) as exc:
         guard.resolve_relative("notes-alias.txt")
     assert exc.value.reason is RejectionReason.SENSITIVE_TARGET
-    assert exc.value.details["target"] == "hidden/.env"
+    # The resolved sensitive target location is deliberately NOT included:
+    # rejection details flow into logs and persisted state, and "where the
+    # credential lives" is itself disclosure (Task 39 F-04).
+    assert "target" not in exc.value.details
+    assert exc.value.details["path"] == "notes-alias.txt"
 
 
 @POSIX_ONLY

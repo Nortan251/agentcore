@@ -50,6 +50,12 @@ class RejectionReason(str, Enum):
     DRIVE_QUALIFIED = "drive_qualified"
     UNC = "unc"
     BACKSLASH = "backslash"
+    #: Windows alternate-data-stream syntax (``name:stream`` or
+    #: ``name::$DATA``). A stream is a second, hidden fork of a file's data
+    #: that a name-based policy cannot see, and this project does not support
+    #: streams, so such requests fail closed rather than resolving to the
+    #: base filename.
+    ADS = "ads"
     TRAVERSAL = "traversal"
     ESCAPES_WORKSPACE = "escapes_workspace"
     SYMLINK = "symlink"
@@ -199,6 +205,19 @@ def check_relative_form(requested: Any, *, max_length: int,
                                     "UNC paths are not accepted")
         raise PathRejectedError(RejectionReason.DRIVE_QUALIFIED,
                                 "drive-qualified paths are not accepted")
+
+    # Windows alternate data streams (``name:stream`` or ``name::$DATA``) are
+    # not supported, so stream-qualified syntax must fail closed rather than
+    # resolving to the base filename — ``id_rsa::$DATA`` must not become
+    # ``id_rsa`` and open. On Windows the colon is reserved for exactly this
+    # (the drive-letter form is already rejected above), so any remaining
+    # colon denotes a stream. POSIX allows ``:`` in ordinary filenames
+    # (``notes:archive.txt`` is legal), so the check is Windows-only and the
+    # existing POSIX semantics are preserved.
+    if os.name == "nt" and ":" in requested:
+        raise PathRejectedError(RejectionReason.ADS,
+                                "alternate data streams are not supported",
+                                path=requested)
 
     pure = PurePosixPath(requested)
     if pure.is_absolute():

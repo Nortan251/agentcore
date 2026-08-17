@@ -19,11 +19,41 @@ from agentcore.errors import (
     PermissionDeniedError,
     ToolValidationError,
 )
+from agentcore.fs.sensitive import DEFAULT_SENSITIVE_POLICY
 from agentcore.observability.events import Events
 from agentcore.observability.logging import StructuredLogger, get_logger
 from agentcore.permissions.policy import Decision, PermissionPolicy
 from agentcore.tools.base import ToolContext, ToolResult
 from agentcore.tools.registry import ToolRegistry
+
+
+#: Placeholder used when a value is withheld from a log line.
+_REDACTED = "***"
+
+#: Rejection categories whose *message* names a sensitive file. The guard's
+#: reason string embeds the filename (``"'.env' is a known credential
+#: file"``), so the raw error must not reach the structured log; the
+#: categorical reason is enough for operations.
+_SENSITIVE_FAILURE_REASONS = frozenset({"sensitive", "sensitive_target"})
+
+
+def _safe_args_for_log(args: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy of tool args with sensitive-path-shaped values redacted.
+
+    The executor is the single point where an invocation is logged, so this is
+    where a model-supplied path such as ``.env`` or ``id_rsa`` must be kept out
+    of the structured log. It reuses the authoritative sensitive-path policy
+    (the same one the filesystem guard enforces) rather than a second,
+    divergent list, so the log can never disclose a path that a read would
+    refuse. Ordinary paths (``notes.txt``, ``src/app.py``) are left intact.
+    """
+    safe: dict[str, Any] = {}
+    for key, value in args.items():
+        if isinstance(value, str) and DEFAULT_SENSITIVE_POLICY.is_sensitive(value):
+            safe[key] = _REDACTED
+        else:
+            safe[key] = value
+    return safe
 
 
 @dataclass
@@ -90,7 +120,9 @@ class ToolExecutor:
         args = dict(args or {})
         log = self._log.bind(tool=tool_name, **context_meta)
         tool = self.registry.get(tool_name)  # raises ToolNotFoundError
-        log.info(Events.TOOL_INVOKED, args=args)
+        # Raw args are logged, but a sensitive filesystem path supplied as an
+        # argument (e.g. ``{"path": ".env"}``) must not reach the log.
+        log.info(Events.TOOL_INVOKED, args=_safe_args_for_log(args))
         started = time.perf_counter()
 
         def elapsed() -> float:
@@ -144,6 +176,15 @@ class ToolExecutor:
         if result.ok:
             log.info(Events.TOOL_SUCCEEDED, duration_ms=round(duration, 3))
         else:
-            log.warning(Events.TOOL_FAILED, error=result.error,
-                        duration_ms=round(duration, 3))
+            # A sensitive rejection's error message names the protected file;
+            # log only the categorical reason so the filename never reaches
+            # the structured log (Task 39 F-03). Everything else keeps the
+            # full message for debugging.
+            reason = result.metadata.get("reason") if result.metadata else None
+            if reason in _SENSITIVE_FAILURE_REASONS:
+                log.warning(Events.TOOL_FAILED, reason=reason,
+                            duration_ms=round(duration, 3))
+            else:
+                log.warning(Events.TOOL_FAILED, error=result.error,
+                            duration_ms=round(duration, 3))
         return ToolInvocation(tool_name, cleaned, result, duration, decision)

@@ -1052,12 +1052,12 @@ junctions cannot expose outside content, listings classify junctions as links
 drive-qualified, UNC, backslash and absolute path forms are refused on Windows
 as on POSIX. Reserved device names are refused (``NUL`` → `not_a_regular_file`;
 ``CON`` → `not_found`) and the case-insensitive sensitive-name policy works on
-Windows (`.ENV` is refused). One verified limitation: **alternate data streams
-are readable** — `read_file("notes.txt:hidden")` returns the stream's bytes, not
-an error. The stream belongs to a workspace-contained file, so this is not a
-workspace escape, but a model could be handed content that is not the file's
-default stream; blocking ADS is left as a future hardening. Python 3.11/3.12
-are not covered by the job.
+Windows (`.ENV` is refused). **Alternate data streams are rejected outright**:
+any stream-qualified request (``notes.txt:hidden``, ``id_rsa::$DATA``) fails
+closed with `RejectionReason.ADS` before resolution — it is never normalised
+to the base filename, and the base file stays readable through its own name.
+The check is Windows-only: a colon in a filename remains legal on POSIX.
+Python 3.11/3.12 are not covered by the job.
 
 **Read-only by construction:** every open uses `O_RDONLY`, the guard exposes no
 write, delete or rename operation, and an AST test fails if the `fs` package

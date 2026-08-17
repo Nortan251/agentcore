@@ -195,10 +195,15 @@ class WorkspaceGuard:
             if effective != relative.as_posix():
                 reason = self._sensitive.reason(effective)
                 if reason is not None:
+                    # Deliberately no ``target=effective`` detail: the resolved
+                    # location of a protected sensitive target is itself
+                    # disclosure, and rejection details flow into logs and
+                    # persisted run state (Task 39 F-04). The categorical
+                    # reason plus the *requested* path are all a caller needs.
                     raise PathRejectedError(
                         RejectionReason.SENSITIVE_TARGET,
                         f"refused: path resolves to a sensitive file ({reason})",
-                        path=relative.as_posix(), target=effective)
+                        path=relative.as_posix())
 
         return SafePath(absolute=resolved, relative=relative.as_posix())
 
