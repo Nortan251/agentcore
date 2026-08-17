@@ -1043,15 +1043,21 @@ filesystem-dependent (inode allocation, hardlink and symlink support all vary).
 Tests assert these admissions remain in the docs, so they cannot be quietly
 upgraded into false claims.
 
-**Windows is verified for junctions/reparse points on Python 3.13** (via the
-`filesystem-windows` GitHub Actions workflow on `windows-latest`): junctions are
-refused by the link walk (`RejectionReason.SYMLINK`), escaping junctions cannot
-expose outside content, and listings neither follow nor leak junction targets.
-Residual, unverified Windows concerns are documented in the workflow's
-diagnostic step: alternate data streams (`file.txt:stream`) and reserved device
-names (`NUL`, `CON`) are not explicitly blocked, and case-insensitive volumes
-are not tested against the sensitive-name policy. Python 3.11/3.12 are not
-covered by the job.
+**Windows is verified on Python 3.13** via the `filesystem-windows` GitHub
+Actions workflow on `windows-latest` (full suite green: 2726 passed, 107
+skipped — the skips are POSIX-only tests). Verified behaviour: junctions are
+refused by the link walk (`RejectionReason.SYMLINK`), escaping and nested
+junctions cannot expose outside content, listings classify junctions as links
+(`internal`/`external`) without revealing or following their targets, and
+drive-qualified, UNC, backslash and absolute path forms are refused on Windows
+as on POSIX. Reserved device names are refused (``NUL`` → `not_a_regular_file`;
+``CON`` → `not_found`) and the case-insensitive sensitive-name policy works on
+Windows (`.ENV` is refused). One verified limitation: **alternate data streams
+are readable** — `read_file("notes.txt:hidden")` returns the stream's bytes, not
+an error. The stream belongs to a workspace-contained file, so this is not a
+workspace escape, but a model could be handed content that is not the file's
+default stream; blocking ADS is left as a future hardening. Python 3.11/3.12
+are not covered by the job.
 
 **Read-only by construction:** every open uses `O_RDONLY`, the guard exposes no
 write, delete or rename operation, and an AST test fails if the `fs` package
