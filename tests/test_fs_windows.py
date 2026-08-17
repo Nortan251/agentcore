@@ -39,8 +39,9 @@ def make_junction(link, target):
     """Create a directory junction, asserting every premise along the way.
 
     A silent ``mklink`` failure would leave no junction behind, and a missing
-    path is *not* a symlink rejection, so the setup is verified before any
-    security assertion is made.
+    path is *not* a link rejection, so the setup is verified before any
+    security assertion is made. The premise is the reparse-point attribute:
+    ``Path.is_symlink()`` reports ``False`` for junctions on current CPython.
     """
     result = subprocess.run(
         ["cmd", "/c", "mklink", "/J", str(link), str(target)],
@@ -49,8 +50,8 @@ def make_junction(link, target):
     assert result.returncode == 0, (
         f"junction creation failed: stdout={result.stdout!r} "
         f"stderr={result.stderr!r}")
-    assert link.is_symlink(), (
-        "junction not reported as a symlink on this Python build; "
+    assert link.lstat().st_file_attributes & 0x400, (
+        "junction did not materialise as a reparse point; "
         "the documented rejection path cannot apply")
 
 
