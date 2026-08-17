@@ -46,20 +46,10 @@ jobs:
         run: |
           @'
           import os, platform, subprocess, sys, tempfile
-          from datetime import datetime, timezone
           from pathlib import Path
 
           print("python:", sys.version)
           print("runner:", platform.platform())
-
-          # Wall-clock resolution / monotonicity probe (Task 40 §4/§8).
-          vals = [datetime.now(timezone.utc) for _ in range(1000)]
-          deltas = [(vals[i] - vals[i - 1]).total_seconds()
-                    for i in range(1, len(vals))]
-          neg = sum(1 for d in deltas if d < 0)
-          print("clock probe: unique=", len(set(vals)), "/1000",
-                "non_monotonic=", neg,
-                "min_delta_s=", (min(deltas) if deltas else None))
 
           d = Path(tempfile.mkdtemp(prefix="agentcore_rep_"))
           (d / "target").mkdir()
@@ -83,44 +73,6 @@ jobs:
 
       - name: Windows filesystem security tests
         run: python -m pytest tests/test_fs_windows.py -v -rs
-
-      - name: Timeline ordering diagnostic (Task 40)
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          @'
-          import io, sys, tempfile
-          from contextlib import redirect_stdout
-          from pathlib import Path
-
-          sys.path.insert(0, "tests")
-          from test_cli_history import (  # noqa: E402
-              SeqPlanner, Verifier, make_run, VerificationStatus)
-          from agentcore.cli import build_timeline, main  # noqa: E402
-          from agentcore.state.store import JsonFileStateStore  # noqa: E402
-
-          tmp = Path(tempfile.mkdtemp(prefix="agentcore_tl_"))
-          run_id, _ = make_run(
-              tmp,
-              planner=SeqPlanner("A", "A", "B"),
-              verifier=Verifier(VerificationStatus.FAILED,
-                                VerificationStatus.PASSED),
-              max_replans=2)
-          store = JsonFileStateStore(tmp / "runs")
-          state = store.load(run_id)
-
-          print("=== build_timeline events (at | order | kind | title) ===")
-          for e in build_timeline(state):
-              at = e.at.isoformat() if e.at else None
-              print(f"  {at} | {e.order} | {e.kind} | {e.title}")
-
-          buf = io.StringIO()
-          with redirect_stdout(buf):
-              code = main(["--runs-dir", str(tmp / "runs"), "history", run_id])
-          print("=== RENDERED ===")
-          print(buf.getvalue())
-          print("=== exit code:", code)
-          '@ | python -
 
       - name: Full test suite
         run: python -m pytest -q -rs
