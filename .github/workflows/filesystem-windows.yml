@@ -1,24 +1,31 @@
 name: filesystem-windows
 
-# Verifies the filesystem security foundation (WorkspaceGuard, junctions and
-# reparse points) on a real Windows filesystem. Task 37 deliberately did not
-# claim Windows verification because the only available environment was Linux;
-# this job closes that gap. No third-party runtime dependencies are added:
-# the project's own `dev` extra installs pytest, nothing else.
+# Verifies the filesystem security foundation on a real Windows filesystem
+# across every supported Python version (pyproject requires >= 3.11):
+# junction/reparse-point rejection, true NTFS symlinks, ADS rejection, path
+# forms, case-insensitive sensitive names, and the full suite.
 #
-# A junction/reparse-point failure must fail the job loudly, so the
-# junction test runs as its own step before the full suite.
+# No third-party runtime dependencies: the project's own `dev` extra installs
+# pytest, nothing else. Security tests are gating — nothing here uses
+# `continue-on-error`.
 
 on:
   push:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   windows:
-    name: Windows filesystem verification
+    name: Windows fs verification (py${{ matrix.python-version }})
     runs-on: windows-latest
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
 
     steps:
       - name: Check out repository
@@ -27,79 +34,37 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          # Requires >= 3.11 per pyproject.toml. 3.13 is used because
-          # pathlib.Path.resolve() only follows symlinks/junctions on Windows
-          # from 3.13, which several existing tests rely on.
-          python-version: "3.13"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install project with dev dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
 
-      - name: Windows reparse-point diagnostic
+      - name: Version / reparse-point report
         shell: pwsh
         run: |
           @'
-          import os, sys, tempfile, subprocess
+          import os, platform, subprocess, sys, tempfile
           from pathlib import Path
-          from agentcore.fs.guard import WorkspaceGuard
-          from agentcore.fs.paths import PathRejectedError
 
           print("python:", sys.version)
-          d = Path(tempfile.mkdtemp(prefix="agentcore_diag_"))
-          root = d / "ws"; root.mkdir()
-          outside = d / "outside"; outside.mkdir()
-          (outside / "secret.txt").write_text("TOP SECRET OUTSIDE", encoding="utf-8")
-          (root / "inner").mkdir()
-          (root / "inner" / "ok.txt").write_text("inner ok", encoding="utf-8")
+          print("runner:", platform.platform())
+          d = Path(tempfile.mkdtemp(prefix="agentcore_rep_"))
+          (d / "target").mkdir()
 
-          def junction(link, target):
-              r = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
-                                 capture_output=True, text=True)
-              print(f"mklink rc={r.returncode} out={r.stdout.strip()!r} err={r.stderr.strip()!r}")
+          def run(label, cmd):
+              r = subprocess.run(cmd, capture_output=True, text=True)
+              print(f"{label}: rc={r.returncode} out={r.stdout.strip()!r} err={r.stderr.strip()!r}")
 
-          j = root / "j"
-          junction(j, outside)
-          st = j.lstat()
-          print("is_symlink(j) =", j.is_symlink())
-          print("os.path.isjunction(j) =", os.path.isjunction(j) if hasattr(os.path, "isjunction") else "n/a")
-          print("is_dir(j) =", j.is_dir())
-          print("j.resolve() =", j.resolve())
-          print("j.lstat st_mode =", oct(st.st_mode))
-          print("st_file_attributes =", hex(getattr(st, "st_file_attributes", 0)))
-          print("REPARSE_POINT bit set =", bool(getattr(st, "st_file_attributes", 0) & 0x400))
-
-          guard = WorkspaceGuard(root)
-          try:
-              s = guard.resolve_relative("j/secret.txt")
-              print("resolve_relative('j/secret.txt') -> OK", s)
-          except PathRejectedError as e:
-              print("resolve_relative('j/secret.txt') -> REJECTED reason=", e.reason, "msg=", e.message)
-
-          try:
-              with guard.open_file("j/secret.txt") as h:
-                  data, _ = guard.read_from(h)
-              print("open_file('j/secret.txt') -> OPENED content=", data[:60])
-          except PathRejectedError as e:
-              print("open_file('j/secret.txt') -> REJECTED reason=", e.reason)
-          except Exception as e:  # noqa: BLE001
-              print("open_file('j/secret.txt') -> EXC", type(e).__name__, e)
-
-          ji = root / "ji"
-          junction(ji, root / "inner")
-          try:
-              s = guard.resolve_relative("ji/ok.txt")
-              print("resolve_relative('ji/ok.txt') [internal junction] -> OK", s)
-          except PathRejectedError as e:
-              print("resolve_relative('ji/ok.txt') [internal junction] -> REJECTED reason=", e.reason)
-
-          try:
-              listing = guard.list_directory(guard.resolve_directory("."))
-              for e in listing.entries:
-                  print("entry:", e.display_name, e.kind, e.link_target)
-          except Exception as e:  # noqa: BLE001
-              print("listing exc:", type(e).__name__, e)
+          run("mklink /J", ["cmd", "/c", "mklink", "/J", str(d / "j"), str(d / "target")])
+          run("mklink /D", ["cmd", "/c", "mklink", "/D", str(d / "s"), str(d / "target")])
+          for name in ("j", "s"):
+              p = d / name
+              print(f"{name}: is_symlink={p.is_symlink()} "
+                    f"isjunction={getattr(os.path, 'isjunction', lambda x: 'n/a')(p)} "
+                    f"resolve={p.resolve()} realpath={os.path.realpath(p)} "
+                    f"attrs={hex(getattr(p.lstat(), 'st_file_attributes', 0))}")
           '@ | python -
 
       - name: Windows junction/reparse-point test
