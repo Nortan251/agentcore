@@ -980,9 +980,9 @@ CPython, so the attribute is what closes that gap. The walk catches the subtle
 case of a linked *parent* directory. `allow_internal_symlinks = true` relaxes
 this to "contained targets only"; escape stays refused either way. Windows
 junction/reparse-point behaviour is **verified** on a real `windows-latest`
-runner (Python 3.13): an escaping junction is refused, and listings classify
-junctions as links without revealing their targets (see the `filesystem-windows`
-CI workflow).
+runner (Python 3.11–3.13): an escaping junction is refused, and listings
+classify junctions as links without revealing their targets (see the
+`filesystem-windows` CI workflow).
 
 **Sensitive-file policy** (`fs/sensitive.py`) denies `.env*`, `id_rsa`,
 `*.pem`, `*.key`, `.netrc`, `.git-credentials`, `.ssh/`, `.aws/` and similar
@@ -1043,21 +1043,25 @@ filesystem-dependent (inode allocation, hardlink and symlink support all vary).
 Tests assert these admissions remain in the docs, so they cannot be quietly
 upgraded into false claims.
 
-**Windows is verified on Python 3.13** via the `filesystem-windows` GitHub
-Actions workflow on `windows-latest` (full suite green: 2726 passed, 107
-skipped — the skips are POSIX-only tests). Verified behaviour: junctions are
-refused by the link walk (`RejectionReason.SYMLINK`), escaping and nested
-junctions cannot expose outside content, listings classify junctions as links
+**Windows is verified on Python 3.11, 3.12 and 3.13** via the
+`filesystem-windows` GitHub Actions workflow (a `windows-latest` matrix; the
+full suite is green on all three, with only POSIX-only tests skipped).
+Verified behaviour: junctions are refused by the link walk
+(`RejectionReason.SYMLINK`), true NTFS symbolic links obey the same rules
+(default: refused; `allow_internal_symlinks`: contained targets allowed,
+escaping and sensitive targets still refused), escaping and nested links cannot
+expose outside content, listings classify links as links
 (`internal`/`external`) without revealing or following their targets, and
 drive-qualified, UNC, backslash and absolute path forms are refused on Windows
-as on POSIX. Reserved device names are refused (``NUL`` → `not_a_regular_file`;
+as on POSIX. Reserved device names fail closed (``NUL`` → `not_a_regular_file`;
 ``CON`` → `not_found`) and the case-insensitive sensitive-name policy works on
 Windows (`.ENV` is refused). **Alternate data streams are rejected outright**:
 any stream-qualified request (``notes.txt:hidden``, ``id_rsa::$DATA``) fails
 closed with `RejectionReason.ADS` before resolution — it is never normalised
 to the base filename, and the base file stays readable through its own name.
 The check is Windows-only: a colon in a filename remains legal on POSIX.
-Python 3.11/3.12 are not covered by the job.
+Recorded event timestamps are strictly monotonic (`utc_now()`), so run history
+orders correctly on Windows Python versions whose wall clock is coarse.
 
 **Read-only by construction:** every open uses `O_RDONLY`, the guard exposes no
 write, delete or rename operation, and an AST test fails if the `fs` package
