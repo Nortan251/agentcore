@@ -170,22 +170,51 @@ Current autonomous execution also remains one run at a time per `Agent` because
 `read_only` proves effect class, not thread safety or resource independence.
 Later concurrency requires an explicit audited `concurrency_safe` contract.
 
-Newest input supersedes the active turn in the same session. The old turn moves
-to `CANCELLING`; the new one becomes the current generation and waits for any
-required lane. At most one successor waits. A still-queued predecessor becomes
-`CANCELLED/SUPERSEDED_BEFORE_START`, so every accepted input has an auditable
-terminal record. The user message is appended once, in generation order, under
-the session mutation lease before model work; an interrupted user message stays
-in the transcript, while stale/partial assistant output does not. Waiting for
-approval holds no model/tool lane. Interruption during verification or recovery
-stops further decisions; during tool execution it requests cancellation but
-cannot erase possible effects.
+### Process and turn-store ownership
 
-Coordinator, session, model-lane, action-lane, and persistence locks are never
-waited on while another is held. The coordinator mutex only updates generation
-and leases, then releases. Store I/O and callbacks occur outside locks. If an
+Version 1 supports one owning AgentCore process for a given turn/session store.
+Multi-process concurrent ownership is unsupported and must fail safely rather
+than permit competing writers. `TurnCoordinator` owns in-process admission
+linearization with a short per-session mutex. The durable turn store must expose
+optimistic compare-and-swap semantics, conceptually:
+
+```python
+def compare_and_swap(
+    self,
+    turn_id: str,
+    expected_version: int,
+    next_record: TurnRecord,
+) -> TurnRecord: ...
+```
+
+`TurnController.transition()` uses the record version plus `operation_id` for
+idempotent replay and stale-transition rejection. Disk persistence must be
+crash-safe and atomic, but atomic file replacement alone is not multi-process
+concurrency control. If a conflict is detected, the losing operation reloads
+and rechecks the record and must never overwrite a newer turn record.
+
+Store I/O and callbacks happen outside coordinator, session, model-lane, and
+action-lane locks. Those locks are never waited on while another is held. If an
 implementation ever must acquire more than one, order is coordinator → session
 → model → action → store; reverse acquisition is forbidden.
+
+### Successor admission
+
+Coordinator-lock acquisition order is the only version-1 definition of
+“newest”; UI timestamps and wall-clock time do not determine ordering. When
+another user input arrives for the same session, the active turn is cancelled
+with `SUPERSEDED`. There may be only one queued successor. If one is already
+queued, it is cancelled with `SUPERSEDED_BEFORE_START` and replaced by the
+newly admitted successor. Every accepted input still has its own durable
+terminal turn record. No model or tool work begins for a turn after its
+generation is no longer current.
+
+The user message is appended once, in generation order, under the session
+mutation lease before model work; an interrupted user message stays in the
+transcript, while stale/partial assistant output does not. Waiting for approval
+holds no model/tool lane. Interruption during verification or recovery stops
+further decisions; during tool execution it requests cancellation but cannot
+erase possible effects.
 
 Every callback is accepted only when `(session_id, turn_id, generation,
 operation_id)` matches the current lease and expected phase. Stale model events
@@ -273,8 +302,22 @@ retryable failure; recovery does not run for cancelled/timed-out turns.
 ## D. Provider-neutral streaming
 
 The core consumes a synchronous, pull-based iterator—natural backpressure, no
-queue, thread, `asyncio`, or third-party dependency. Proposed events all carry
-turn/generation/request/attempt IDs and a monotonic sequence:
+queue, thread, `asyncio`, or third-party dependency. Every proposed event uses
+this common correlation envelope:
+
+```python
+@dataclass(frozen=True)
+class StreamEventEnvelope:
+    turn_id: str
+    session_id: str
+    generation: int
+    operation_id: str
+    request_id: str
+    attempt_id: str
+    sequence: int  # Monotonically increasing within one attempt.
+```
+
+The event payload variants remain:
 
 ```python
 StreamStarted(model, provider)
@@ -384,6 +427,46 @@ only judges that evidence. Otherwise recovery escalates to an operator.
 `UNKNOWN` is never converted to success by model, verifier, recovery, or
 restart logic.
 
+Proposed, not implemented:
+
+```python
+class ActionBoundary(Protocol):
+    def mark_started(self, *, action_id: str) -> ActionRecord: ...
+    def acknowledge(
+        self, *, action_id: str, receipt: Mapping[str, str]
+    ) -> ActionRecord: ...
+    def fail(self, *, action_id: str, error: ErrorRecord) -> ActionRecord: ...
+    def mark_unknown(self, *, action_id: str, reason: str) -> ActionRecord: ...
+```
+
+`ToolExecutor` creates and durably records `PREPARED` only after real argument
+validation and permission allow. A future mutation-capable tool receives this
+trusted context and must call `mark_started()` immediately before its first
+external side effect. It cannot report definitive success without authoritative
+acknowledgement or evidence. Cancellation, timeout, crash, or physical return
+after `STARTED` without decisive acknowledgement produces `UNKNOWN`. Future
+reconciliation remains a separately admitted read-only action through
+`ToolExecutor`. `ActionBoundary` is trusted execution context for future
+controlled capabilities and is never supplied through model-controlled
+arguments.
+
+### Future Gmail and external API integration contract
+
+Gmail is not implemented in Task 42.1 or Task 42.2. Any future Gmail or external
+API integration must use OAuth with least-privilege, user-granted scopes; it
+must never place passwords or tokens in source, normal configuration, logs,
+state, or prompts. Read, draft, send, modify, and delete are separate
+capabilities. Recipient resolution occurs before an action, and sending requires
+explicit confirmation by default.
+
+External mutations use action IDs/idempotency keys or provider message
+identifiers to prevent duplicate sends on retry and retain durable, redacted
+intent/result records. Cancellation distinguishes “not submitted” from
+“submission outcome unknown.” Incoming email and API text is untrusted data,
+never authority or system instructions. Every external action routes through
+the same `ToolExecutor`, permission, action-journal, verification, and recovery
+boundaries.
+
 ## G. Observability, latency, and privacy
 
 Add canonical events: `turn.created`, `turn.queued`, `turn.admitted`,
@@ -450,7 +533,7 @@ become configuration only with evidence that operators need tuning.
 
 ## Adversarial acceptance scenarios
 
-| Scenario | Owner and evidence | Accepted result; recovery/escalation |
+| Scenario | Owner and persisted evidence | Accepted result; recovery/escalation |
 |---|---|---|
 | Interrupt before model start | Coordinator; queued/cancel transition | `CANCELLED`; no recovery/escalation. |
 | Interrupt during output | Model stage; partial counts and cancel reason | `CANCELLED`; partial not persisted; no recovery. |
