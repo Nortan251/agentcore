@@ -463,7 +463,14 @@ def test_conversation_path_failures_stay_safe_and_categorical(
     assert "FileNotFoundError" not in blob
     assert "OSError" not in blob
     assert "Traceback" not in blob
-    assert str(workspace) not in blob
+    # AgentState.workspace intentionally persists the pinned workspace identity;
+    # resolved target paths remain forbidden from runtime-visible result surfaces.
+    runtime_blob = "\n".join([
+        tool_body(model),
+        serialised(result.session),
+        serialised(outcome.invocation),
+    ])
+    assert str(workspace) not in runtime_blob
 
 
 def test_sensitive_existing_and_missing_paths_have_same_observable_failure(
