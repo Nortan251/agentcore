@@ -193,6 +193,12 @@ crash-safe and atomic, but atomic file replacement alone is not multi-process
 concurrency control. If a conflict is detected, the losing operation reloads
 and rechecks the record and must never overwrite a newer turn record.
 
+The file-backed store flushes record contents before atomic replacement on all
+supported platforms. POSIX additionally fsyncs the containing directory for
+stronger metadata durability. Windows does not claim a directory-metadata
+flush, so sudden power loss may lose the newest replacement despite the
+concurrent-write/CAS guarantees remaining intact.
+
 Store I/O and callbacks happen outside coordinator, session, model-lane, and
 action-lane locks. Those locks are never waited on while another is held. If an
 implementation ever must acquire more than one, order is coordinator → session

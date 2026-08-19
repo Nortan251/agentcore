@@ -603,6 +603,36 @@ def test_json_store_rejects_path_traversal_and_closed_use(tmp_path):
         store.list_turns()
 
 
+def test_json_store_pins_relative_directory_across_cwd_changes(
+        tmp_path, monkeypatch):
+    original_cwd = tmp_path / "original"
+    alternate_cwd = tmp_path / "alternate"
+    original_cwd.mkdir()
+    alternate_cwd.mkdir()
+    (alternate_cwd / "turns").mkdir()
+    monkeypatch.chdir(original_cwd)
+    store = JsonFileTurnStore("turns")
+    record = None
+    try:
+        monkeypatch.chdir(alternate_cwd)
+        record = store.create(_new_record())
+        queued = _queued_candidate(record)
+        store.compare_and_swap(record.turn_id, 0, queued)
+
+        assert store.load(record.turn_id) == queued
+        assert (original_cwd / "turns" / f"{record.turn_id}.json").exists()
+        assert not (alternate_cwd / "turns" / f"{record.turn_id}.json").exists()
+        assert list((alternate_cwd / "turns").glob(".turn-*.tmp")) == []
+    finally:
+        store.close()
+    assert record is not None
+    reopened = JsonFileTurnStore(original_cwd / "turns")
+    try:
+        assert reopened.load(record.turn_id) == queued
+    finally:
+        reopened.close()
+
+
 def _transition(controller, record, target, number, **kwargs):
     controller.transition(
         record.phase, target, expected_version=record.version,

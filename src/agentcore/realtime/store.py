@@ -8,7 +8,7 @@ import os
 import re
 import tempfile
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO, Protocol, runtime_checkable
 
@@ -44,6 +44,9 @@ class TurnStore(Protocol):
 
     def list_turns(self) -> list[str]: ...
 
+    @property
+    def admission_coordination(self) -> _AdmissionCoordination: ...
+
     def close(self) -> None: ...
 
     def __enter__(self) -> TurnStore: ...
@@ -57,7 +60,12 @@ class InMemoryTurnStore:
     def __init__(self) -> None:
         self._data: dict[str, dict] = {}
         self._lock = threading.RLock()
+        self._admission_coordination = _AdmissionCoordination()
         self._closed = False
+
+    @property
+    def admission_coordination(self) -> _AdmissionCoordination:
+        return self._admission_coordination
 
     def _require_open(self) -> None:
         if self._closed:
@@ -121,6 +129,14 @@ class InMemoryTurnStore:
         self.close()
 
 
+class _AdmissionCoordination:
+    """Process-local admission lanes shared by one backing store domain."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.lanes: dict[str, object] = {}
+
+
 @dataclass
 class _StoreDomain:
     key: str
@@ -128,6 +144,8 @@ class _StoreDomain:
     mutex: threading.RLock
     owner_pid: int
     references: int = 1
+    admission_coordination: _AdmissionCoordination = field(
+        default_factory=_AdmissionCoordination)
 
 
 _DOMAINS: dict[str, _StoreDomain] = {}
@@ -258,10 +276,14 @@ class JsonFileTurnStore:
     def __init__(self, directory: str | Path) -> None:
         self._owner_pid = os.getpid()
         self._closed = True
-        self.directory = Path(directory)
-        self.directory.mkdir(parents=True, exist_ok=True)
-        self._domain = _acquire_domain(self.directory)
+        self._directory = Path(directory).resolve()
+        self._directory.mkdir(parents=True, exist_ok=True)
+        self._domain = _acquire_domain(self._directory)
         self._closed = False
+
+    @property
+    def admission_coordination(self) -> _AdmissionCoordination:
+        return self._domain.admission_coordination
 
     def _require_owner_process(self) -> None:
         if self._owner_pid != os.getpid() or \
@@ -274,7 +296,7 @@ class JsonFileTurnStore:
             raise TurnStoreError("turn store is closed")
 
     def _path(self, turn_id: str) -> Path:
-        return self.directory / f"{_require_turn_id(turn_id)}.json"
+        return self._directory / f"{_require_turn_id(turn_id)}.json"
 
     def create(self, record: TurnRecord) -> TurnRecord:
         self._require_owner_process()
@@ -316,7 +338,7 @@ class JsonFileTurnStore:
         self._require_owner_process()
         with self._domain.mutex:
             self._require_open()
-            turn_ids = [path.stem for path in self.directory.glob("turn_*.json")]
+            turn_ids = [path.stem for path in self._directory.glob("turn_*.json")]
             for turn_id in turn_ids:
                 _require_turn_id(turn_id)
             return sorted(turn_ids)
@@ -342,7 +364,7 @@ class JsonFileTurnStore:
         except (TypeError, ValueError) as exc:
             raise TurnValidationError("turn record is not JSON serializable") from exc
         descriptor, temporary = tempfile.mkstemp(
-            dir=self.directory, prefix=".turn-", suffix=".tmp")
+            dir=self._directory, prefix=".turn-", suffix=".tmp")
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8",
                            newline="\n") as handle:
@@ -350,7 +372,7 @@ class JsonFileTurnStore:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, path)
-            _fsync_directory(self.directory)
+            _fsync_directory(self._directory)
         except BaseException:
             Path(temporary).unlink(missing_ok=True)
             raise
@@ -384,7 +406,14 @@ class JsonFileTurnStore:
 
 
 def _fsync_directory(directory: Path) -> None:
-    """Best-effort directory metadata flush; unsupported on Windows."""
+    """Flush POSIX directory metadata; Windows makes no such durability claim.
+
+    Record contents are flushed before atomic replacement on every platform.
+    POSIX additionally flushes the containing directory for stronger metadata
+    durability.  The standard-library Windows path deliberately does not claim
+    that the replacement directory entry survives sudden power loss; this does
+    not weaken CAS or concurrent-writer exclusion.
+    """
     if os.name == "nt":
         return
     descriptor = os.open(directory, os.O_RDONLY)

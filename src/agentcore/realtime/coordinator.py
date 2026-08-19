@@ -13,7 +13,11 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from agentcore.realtime.cancellation import CancellationReason
-from agentcore.realtime.errors import TurnCoordinatorError
+from agentcore.realtime.errors import (
+    TurnAlreadyExistsError,
+    TurnCoordinatorError,
+    TurnVersionConflictError,
+)
 from agentcore.realtime.store import TurnStore
 from agentcore.realtime.turn import (
     Deadline,
@@ -28,6 +32,9 @@ from agentcore.realtime.turn import (
 )
 from agentcore.util.clock import Clock, SystemClock
 from agentcore.util.ids import new_id
+
+
+_MAX_SUPERSESSION_RECLASSIFICATIONS = 8
 
 
 @dataclass(frozen=True)
@@ -109,8 +116,7 @@ class TurnCoordinator:
         self._store = store
         self._clock = clock or SystemClock()
         self._id_factory = id_factory
-        self._lanes: dict[str, _AdmissionLane] = {}
-        self._lanes_lock = threading.Lock()
+        self._admission_coordination = store.admission_coordination
 
     def admit(
         self,
@@ -143,19 +149,24 @@ class TurnCoordinator:
             self._release_lane(session_id, lane)
 
     def _lane(self, session_id: str) -> _AdmissionLane:
-        with self._lanes_lock:
-            lane = self._lanes.get(session_id)
+        coordination = self._admission_coordination
+        with coordination.lock:
+            lane = coordination.lanes.get(session_id)
             if lane is None:
                 lane = _AdmissionLane()
-                self._lanes[session_id] = lane
+                coordination.lanes[session_id] = lane
+            elif not isinstance(lane, _AdmissionLane):
+                raise TurnCoordinatorError(
+                    "store admission coordination domain is invalid")
             lane.users += 1
             return lane
 
     def _release_lane(self, session_id: str, lane: _AdmissionLane) -> None:
-        with self._lanes_lock:
+        coordination = self._admission_coordination
+        with coordination.lock:
             lane.users -= 1
-            if lane.users == 0 and self._lanes.get(session_id) is lane:
-                self._lanes.pop(session_id, None)
+            if lane.users == 0 and coordination.lanes.get(session_id) is lane:
+                coordination.lanes.pop(session_id, None)
 
     def _admit_owned(
         self,
@@ -182,12 +193,22 @@ class TurnCoordinator:
             clock=self._clock,
             id_factory=lambda prefix: turn_id,
         )
+        # Creation is inside the guarded region because an atomic replace may
+        # succeed even if the following directory fsync reports an error.  A
+        # categorical collision, however, proves this attempt created nothing
+        # and must never authorize cleanup of the pre-existing identity.
         try:
-            # Creation is inside the guarded region because an atomic replace
-            # may succeed even if the following directory fsync reports an
-            # error.  Cleanup therefore probes the durable identity on every
-            # create-or-later failure.
             self._store.create(prepared)
+        except TurnAlreadyExistsError:
+            raise
+        except BaseException:
+            try:
+                self._fail_prepared(prepared, allow_progressed=False)
+            except BaseException:
+                pass
+            raise
+
+        try:
             active = state.active
             superseded_active: TurnSnapshot | None = None
             if active is not None:
@@ -205,7 +226,7 @@ class TurnCoordinator:
             # runnable work behind; any cleanup failure remains explicit for
             # the restart reconciler and never masks the original exception.
             try:
-                self._fail_prepared(prepared.turn_id)
+                self._fail_prepared(prepared, allow_progressed=True)
             except BaseException:
                 pass
             raise
@@ -265,16 +286,31 @@ class TurnCoordinator:
     def _supersede_active(
         self,
         record: TurnRecord,
-    ) -> tuple[TurnRecord, TurnSnapshot | None]:
-        if record.phase in {TurnPhase.CANCELLING, TurnPhase.FINALIZING}:
-            return record, None
-        updated = self._transition(
-            record,
-            TurnPhase.CANCELLING,
-            cancellation_reason=CancellationReason.SUPERSEDED,
-            requested_terminal=TurnPhase.CANCELLED,
+    ) -> tuple[TurnRecord | None, TurnSnapshot | None]:
+        for _ in range(_MAX_SUPERSESSION_RECLASSIFICATIONS):
+            current = self._store.load(record.turn_id)
+            if current.is_terminal:
+                return None, None
+            if current.phase in {TurnPhase.CANCELLING, TurnPhase.FINALIZING}:
+                return current, None
+            try:
+                updated = self._transition(
+                    current,
+                    TurnPhase.CANCELLING,
+                    cancellation_reason=CancellationReason.SUPERSEDED,
+                    requested_terminal=TurnPhase.CANCELLED,
+                )
+                return updated, updated.snapshot()
+            except TurnVersionConflictError:
+                # The stage owner advanced the record after our classification.
+                # Reload and classify its newer legal state; never reuse the
+                # stale candidate or overwrite the accepted transition.
+                continue
+        raise TurnCoordinatorError(
+            "active turn changed during every supersession attempt",
+            turn_id=record.turn_id,
+            attempts=_MAX_SUPERSESSION_RECLASSIFICATIONS,
         )
-        return updated, updated.snapshot()
 
     def _cancel_before_start(self, record: TurnRecord) -> TurnSnapshot:
         cancelling = self._transition(
@@ -292,9 +328,21 @@ class TurnCoordinator:
         return self._transition(
             finalizing, TurnPhase.CANCELLED).snapshot()
 
-    def _fail_prepared(self, turn_id: str) -> None:
+    def _fail_prepared(
+        self,
+        prepared: TurnRecord,
+        *,
+        allow_progressed: bool,
+    ) -> None:
+        cleanup_authorized = False
         while True:
-            current = self._store.load(turn_id)
+            current = self._store.load(prepared.turn_id)
+            if not _is_current_admission_record(
+                    current, prepared,
+                    allow_progressed=(allow_progressed
+                                      if not cleanup_authorized else True)):
+                return
+            cleanup_authorized = True
             if current.is_terminal:
                 return
             if current.phase is TurnPhase.FINALIZING:
@@ -353,3 +401,28 @@ class TurnCoordinator:
     def _operation_id(self) -> str:
         value = self._next_id("op")
         return new_operation_id(id_factory=lambda prefix: value)
+
+
+def _is_current_admission_record(
+    current: TurnRecord,
+    prepared: TurnRecord,
+    *,
+    allow_progressed: bool,
+) -> bool:
+    """Authorize cleanup only for the identity created by this admission."""
+    if not allow_progressed:
+        return current == prepared
+    return (
+        current.turn_id == prepared.turn_id
+        and current.session_id == prepared.session_id
+        and current.generation == prepared.generation
+        and current.created_at == prepared.created_at
+        and current.schema_version == prepared.schema_version
+        and current.run_id == prepared.run_id
+        and current.task_id == prepared.task_id
+        and current.subtask_id == prepared.subtask_id
+        and current.deadline_at == prepared.deadline_at
+        and current.counters == prepared.counters
+        and current.action_refs == prepared.action_refs
+        and current.version >= prepared.version
+    )
