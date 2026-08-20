@@ -64,6 +64,12 @@ class AgentDependencies:
     #: store exists.
     memory_conflicts: Any | None = None
     model: ModelProvider | None = None
+    #: Realtime turn coordinator (Task 42.3). Strictly opt-in: nothing is ever
+    #: constructed automatically, no ``JsonFileTurnStore`` is created, and with
+    #: ``None`` the agent, conversation and CLI behave exactly as before. An
+    #: injected durable store is host-owned; its ownership failures surface
+    #: categorically rather than degrading to in-memory state.
+    turn_coordinator: Any | None = None
 
 
 class Agent:
@@ -129,6 +135,10 @@ class Agent:
         self.runner = TaskRunner(self.executor, verifier=self.verifier,
                                  recovery=self.recovery,
                                  logger=get_logger("core.runner"))
+        # Realtime turn lifecycle. Opt-in only: with no injected coordinator
+        # this stays None and the conversation path is the pre-Task-42.3 one.
+        self.turn_coordinator: Any | None = deps.turn_coordinator
+        self._turns: Any | None = self._build_turn_bridge()
         # New runs are pinned to this workspace from the outset.
         self.state = AgentState(workspace=self.workspace.identity)
         self.log.info(Events.AGENT_STARTED, run_id=self.state.run_id,
@@ -136,6 +146,37 @@ class Agent:
                       tools=self.registry.names(),
                       planner=type(self.planner).__name__,
                       features=self.config.features.enabled_flags())
+
+    # -- realtime turns ----------------------------------------------------
+    def _build_turn_bridge(self) -> Any | None:
+        """Wrap an injected turn coordinator; never construct one.
+
+        Task 42.3 adds no configuration, no CLI flag and no automatic
+        ``JsonFileTurnStore``. Only an explicit host injection turns the
+        realtime lifecycle on, and only then is the bridge — with this agent's
+        single reentrant stage lease and narrow session lock — created.
+        """
+        if self.turn_coordinator is None:
+            return None
+
+        from agentcore.conversation.turns import TurnBridge
+
+        bridge = TurnBridge(self.turn_coordinator,
+                            logger=get_logger("conversation.turns"))
+        self.log.info(Events.TURN_BRIDGE_CONFIGURED,
+                      coordinator=type(self.turn_coordinator).__name__)
+        return bridge
+
+    def reconcile_turns(self) -> tuple:
+        """Explicit host-side restart reconciliation for the injected store.
+
+        Deliberately explicit, never hidden in construction or load: an
+        interrupted turn is terminalized truthfully by the Task 42.2
+        reconciler and is never silently resumed.
+        """
+        if self._turns is None:
+            return ()
+        return self._turns.reconcile()
 
     # -- recovery ----------------------------------------------------------
     def _build_recovery(self) -> RecoveryStrategy:
@@ -403,6 +444,7 @@ class Agent:
             capture=self.memory_capture, resolver=self.memory_resolver,
             sessions=store, tools=tools if tools is not None
             else self._build_tool_runner(), state=self.state,
+            turns=self._turns,
             config=self.config.conversation,
             system_prompt=system_prompt or SYSTEM_PROMPT,
             logger=get_logger("conversation.runtime"))
@@ -822,6 +864,10 @@ class Agent:
         return describe()
 
     def shutdown(self) -> None:
+        # Cooperative only: a live turn is asked to stop and terminalizes at
+        # its next fence. Nothing is killed and no provider call is aborted.
+        if self._turns is not None:
+            self._turns.shutdown()
         self.checkpoint()
         self.log.info(Events.AGENT_STOPPED, **self.state.summary())
 

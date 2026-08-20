@@ -126,6 +126,18 @@ class Events:
     CONVERSATION_TOOL_APPROVAL_REQUIRED: Final = "conversation.tool_approval_required"
     CONVERSATION_TOOL_ROUNDS_EXHAUSTED: Final = "conversation.tool_rounds_exhausted"
 
+    # realtime turn lifecycle (Task 42.3 opt-in conversational integration).
+    # These carry the opaque turn-session correlation key, never a raw
+    # conversation session id, message text, tool output or arguments.
+    TURN_BRIDGE_CONFIGURED: Final = "turn.bridge_configured"
+    TURN_ADMITTED: Final = "turn.admitted"
+    TURN_MODEL_STARTED: Final = "turn.model_started"
+    TURN_TOOL_STARTED: Final = "turn.tool_started"
+    TURN_TOOL_FINISHED: Final = "turn.tool_finished"
+    TURN_STALE_RESULT_REJECTED: Final = "turn.stale_result_rejected"
+    TURN_FINALIZATION_STARTED: Final = "turn.finalization_started"
+    TURN_FINALIZED: Final = "turn.finalized"
+
     # model layer
     MODEL_CONFIGURED: Final = "model.configured"
     MODEL_UNAVAILABLE: Final = "model.unavailable"

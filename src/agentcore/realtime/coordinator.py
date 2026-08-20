@@ -122,6 +122,16 @@ class TurnCoordinator:
         self._owner_pids = (
             os.getpid(), self._admission_coordination.owner_pid)
 
+    @property
+    def store(self) -> TurnStore:
+        """The durable authority this coordinator admits into.
+
+        Exposed read-only so a stage owner can build a ``TurnController`` for
+        a record it already owns.  The coordinator remains the sole admission
+        authority and the store remains the sole durable authority.
+        """
+        return self._store
+
     def admit(
         self,
         session_id: str,

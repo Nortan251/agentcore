@@ -7,6 +7,7 @@ the durable state machine approved by Task 42.1.
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 from collections.abc import Callable, Mapping
@@ -45,6 +46,14 @@ _TASK_ID = re.compile(r"^task_[0-9a-f]{12}$")
 _SUBTASK_ID = re.compile(r"^sub_[0-9a-f]{12}$")
 _SAFE_LINK_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _CATEGORICAL_NOTES = frozenset({"", "restart reconciliation"})
+
+# Domain separator for the opaque turn-session correlation key.  It is fixed
+# and reserved for this derivation so the digest cannot collide with any other
+# AgentCore key material.  The trailing NUL terminates the domain, so no raw
+# session id can extend the domain string and forge another key.
+_SESSION_KEY_DOMAIN = b"agentcore.realtime.turn.session.v1\x00"
+_SESSION_KEY_PREFIX = "session_"
+_SESSION_KEY_HEX_CHARS = 32
 
 
 class TurnPhase(str, Enum):
@@ -559,14 +568,36 @@ class TurnRecord:
 
 @dataclass(frozen=True)
 class Deadline:
-    """Monotonic decision deadline with a UTC persistence projection."""
+    """Monotonic decision deadline with a UTC persistence projection.
 
-    monotonic_expires_at: float
-    expires_at_utc: datetime
+    Both fields are ``None`` for the unbounded deadline defined by the Task
+    42.3 amendment.  An unbounded deadline never expires, carries no synthetic
+    far-future timestamp, and is never persisted as an actual expiry.  It is
+    scaffolding for the ``OperationContext`` a stale fence needs, not timeout
+    enforcement.
+    """
+
+    monotonic_expires_at: float | None
+    expires_at_utc: datetime | None
 
     def __post_init__(self) -> None:
+        if self.monotonic_expires_at is None or self.expires_at_utc is None:
+            if self.monotonic_expires_at is not None or \
+                    self.expires_at_utc is not None:
+                raise TurnValidationError(
+                    "an unbounded deadline carries neither expiry")
+            return
         _validate_monotonic(self.monotonic_expires_at)
         _ensure_utc(self.expires_at_utc, "expires_at_utc")
+
+    @classmethod
+    def unbounded(cls) -> Deadline:
+        """A named deadline that never expires and is never persisted."""
+        return cls(None, None)
+
+    @property
+    def is_unbounded(self) -> bool:
+        return self.monotonic_expires_at is None
 
     @classmethod
     def after(cls, seconds: float, *, clock: Clock) -> Deadline:
@@ -586,20 +617,29 @@ class Deadline:
 
     def remaining(self, clock: Clock) -> float:
         now_mono = _validate_monotonic(clock.monotonic())
+        if self.is_unbounded:
+            return math.inf
         remaining = self.monotonic_expires_at - now_mono
         if not math.isfinite(remaining):
             raise TurnValidationError("monotonic deadline range is invalid")
         return max(0.0, remaining)
 
     def expired(self, clock: Clock) -> bool:
-        return _validate_monotonic(clock.monotonic()) >= \
-            self.monotonic_expires_at
+        now_mono = _validate_monotonic(clock.monotonic())
+        if self.is_unbounded:
+            return False
+        return now_mono >= self.monotonic_expires_at
 
     def child(self, max_seconds: float, *, clock: Clock) -> Deadline:
         duration = _validate_duration(max_seconds)
         now_mono = _validate_monotonic(clock.monotonic())
         now_utc = _ensure_utc(clock.now(), "clock.now")
         requested_mono = _checked_monotonic_add(now_mono, duration)
+        if self.is_unbounded:
+            # A child may shorten an unbounded parent; it can never extend one,
+            # because an unbounded parent has no expiry to extend.
+            return Deadline(requested_mono,
+                            _checked_utc_add(now_utc, duration))
         child_mono = min(self.monotonic_expires_at, requested_mono)
         actual = max(0.0, child_mono - now_mono)
         child_utc = min(self.expires_at_utc,
@@ -745,8 +785,11 @@ class TurnController:
             if context.cancellation.requested or \
                     context.deadline.expired(self._clock):
                 return False
-            if current.deadline_at is not None and \
-                    context.deadline.expires_at_utc > current.deadline_at:
+            if current.deadline_at is not None and (
+                    context.deadline.expires_at_utc is None
+                    or context.deadline.expires_at_utc > current.deadline_at):
+                # A record-bound deadline is authoritative; an unbounded or
+                # longer operation deadline can never satisfy it.
                 return False
             return True
         except (RealtimeError, ValueError):
@@ -809,6 +852,26 @@ def new_operation_id(*,
 def require_session_id(value: Any) -> str:
     """Validate one conversation-session correlation identifier."""
     return _require_link_id(value, "session_id")
+
+
+def derive_session_key(raw_session_id: str) -> str:
+    """Map a raw conversation session id onto its opaque correlation key.
+
+    Task 42.3 stores this derived key in ``TurnRecord.session_id`` instead of
+    the raw ``ConversationSession`` identifier, so raw ids keeping spaces,
+    Unicode, ``#``, ``.`` or ``..`` stay valid at the conversation layer while
+    durable turn records keep the safe link-id charset.  The derivation is a
+    domain-separated SHA-256 over the exact UTF-8 bytes of the raw id: it is
+    deterministic, collision-resistant, and one way, so the raw id cannot be
+    recovered from a record, an error, or an event.  An empty raw id is a
+    caller error, never a valid key.
+    """
+    if not isinstance(raw_session_id, str) or not raw_session_id:
+        raise TurnValidationError("conversation session id is required")
+    digest = hashlib.sha256(
+        _SESSION_KEY_DOMAIN + raw_session_id.encode("utf-8")).hexdigest()
+    return _require_link_id(
+        _SESSION_KEY_PREFIX + digest[:_SESSION_KEY_HEX_CHARS], "session_id")
 
 
 def next_generation(previous: int | None) -> int:

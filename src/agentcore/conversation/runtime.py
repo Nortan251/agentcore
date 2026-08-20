@@ -27,6 +27,7 @@ Two rules govern the design:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from contextlib import nullcontext
 from typing import Any, Sequence
 
 from agentcore.conversation.config import ConversationConfig
@@ -67,6 +68,35 @@ application performs and reports memory changes; you do not.
 CURRENT_TURN_LABEL = "CURRENT USER MESSAGE"
 
 
+class _NullFence:
+    """The legacy turn fence: every hook is a no-op.
+
+    Used whenever no realtime turn coordinator is injected, so the
+    pre-Task-42.3 conversation path runs with no added behavior, no added
+    locking, and no import of the realtime package.
+    """
+
+    __slots__ = ()
+
+    def check(self) -> None:
+        return None
+
+    def enter_tool_round(self) -> None:
+        return None
+
+    def leave_tool_round(self) -> None:
+        return None
+
+    def commit(self) -> None:
+        return None
+
+    def session_lock(self) -> Any:
+        return nullcontext()
+
+
+_NO_FENCE = _NullFence()
+
+
 @dataclass
 class TurnResult:
     """Everything one turn produced — including what did *not* happen.
@@ -95,6 +125,11 @@ class TurnResult:
     #: Populated when a memory write failed. The reply is still valid; the
     #: caller must not claim the information was remembered.
     memory_error: str | None = None
+    #: Realtime turn correlation, populated only when a turn coordinator is
+    #: injected (Task 42.3). Safe identifiers only — never the raw session id.
+    turn_id: str | None = None
+    turn_generation: int | None = None
+    turn_phase: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -143,6 +178,10 @@ class TurnResult:
         if self.correction is not None:
             payload["correction"] = getattr(
                 getattr(self.correction, "status", None), "value", "unknown")
+        if self.turn_id is not None:
+            payload["turn_id"] = self.turn_id
+            payload["turn_generation"] = self.turn_generation
+            payload["turn_phase"] = self.turn_phase
         return payload
 
 
@@ -158,6 +197,7 @@ class ConversationRuntime:
                  capture: Any = None, resolver: Any = None,
                  sessions: Any = None, tools: Any = None,
                  state: Any = None,
+                 turns: Any = None,
                  config: ConversationConfig | None = None,
                  system_prompt: str = SYSTEM_PROMPT,
                  logger: StructuredLogger | None = None) -> None:
@@ -173,6 +213,10 @@ class ConversationRuntime:
         # needs human approval, reusing the existing escalation mechanism
         # rather than inventing a conversational one.
         self.state = state
+        # Optional realtime turn bridge (Task 42.3). Strictly opt-in: with
+        # ``None`` every turn runs the pre-Task-42.3 path unchanged, creates no
+        # realtime record, and never imports the realtime package.
+        self.turns = turns
         self.config = config or ConversationConfig()
         self.config.validate()
         self.system_prompt = system_prompt
@@ -225,6 +269,12 @@ class ConversationRuntime:
         4. only then capture, so a failed model call cannot leave the
            conversation half-formed;
         5. save the session last, once its contents are final.
+
+        With a realtime turn bridge injected (Task 42.3) the same flow runs
+        under a durable turn: the turn is admitted *before* any session
+        mutation or model work, a newer input supersedes it, and a superseded
+        turn can neither persist a late assistant message nor report success.
+        Without one, the path below is exactly the pre-Task-42.3 path.
         """
         # `is None`, never truthiness: ConversationSession defines __len__, so
         # a brand-new empty session is falsy and `session or ...` would
@@ -232,13 +282,35 @@ class ConversationRuntime:
         if session is None:
             session = self.start(session_id=session_id)
         message = text if isinstance(text, Message) else Message.user(str(text))
+        if self.turns is None:
+            return self._run_turn(session, message)
+        return self.turns.run(self, session, message)
+
+    def _superseded_result(self, session: ConversationSession,
+                           reason: str) -> TurnResult:
+        """An honest, content-free outcome for a turn that lost its lease.
+
+        No assistant message is fabricated and nothing is persisted, exactly
+        as for a failed generation.
+        """
+        return TurnResult(session=session, error=reason)
+
+    def _run_turn(self, session: ConversationSession, message: Message,
+                  *, fence: Any = None) -> TurnResult:
+        """The turn itself. ``fence`` is a no-op unless a turn owns this call.
+
+        Every hook below is a no-op on the legacy path, so behavior with no
+        injected coordinator is unchanged.
+        """
+        fence = fence if fence is not None else _NO_FENCE
         result = TurnResult(session=session)
 
         try:
-            session.append(
-                message,
-                max_messages=self.config.max_session_messages,
-                max_message_chars=self.config.max_message_chars)
+            with fence.session_lock():
+                session.append(
+                    message,
+                    max_messages=self.config.max_session_messages,
+                    max_message_chars=self.config.max_message_chars)
         except Exception as exc:  # noqa: BLE001 - reject, never truncate
             result.error = f"message rejected: {getattr(exc, 'message', exc)}"
             self._log.warning(Events.CONVERSATION_FAILED, stage="append",
@@ -260,7 +332,7 @@ class ConversationRuntime:
 
         try:
             reply = self._generate(session, message, memory_context,
-                                   result)
+                                   result, fence=fence)
         except ResponseGenerationError as exc:
             # No fabricated assistant message, and nothing captured from a
             # turn whose outcome is unknown.
@@ -268,10 +340,15 @@ class ConversationRuntime:
             self._log.warning(Events.CONVERSATION_FAILED, stage="generate",
                               session_id=session.id,
                               error=exc.details.get("error_type", "unknown"))
-            self.save(session)
+            with fence.session_lock():
+                self.save(session)
             return result
 
-        session.append(reply, max_messages=self.config.max_session_messages)
+        # Fix this turn's terminal outcome before any assistant output is
+        # persisted. A superseded turn stops here and never appends.
+        fence.commit()
+        with fence.session_lock():
+            session.append(reply, max_messages=self.config.max_session_messages)
         result.reply = reply
         self._log.info(Events.ASSISTANT_MESSAGE_GENERATED,
                        session_id=session.id, chars=len(reply.content))
@@ -282,7 +359,8 @@ class ConversationRuntime:
         if correction is None:
             self._capture(message, session, result)
 
-        self.save(session)
+        with fence.session_lock():
+            self.save(session)
         self._log.info(Events.CONVERSATION_TURN_COMPLETED, **result.describe())
         return result
 
@@ -409,7 +487,8 @@ class ConversationRuntime:
 
     def _generate(self, session: ConversationSession, message: Message,
                   memory_context: dict[str, Any] | None,
-                  result: TurnResult | None = None) -> Message:
+                  result: TurnResult | None = None,
+                  *, fence: Any = None) -> Message:
         """Produce the assistant reply, running tools when the model asks.
 
         The loop is ``model -> tool calls? -> execute -> model``, bounded by
@@ -420,7 +499,11 @@ class ConversationRuntime:
         When the budget is exhausted the model is asked once more *without*
         tools, so the turn ends with a real answer rather than a dangling
         tool request.
+
+        ``fence`` is consulted at every externally observable boundary when a
+        turn owns this call; on the legacy path every hook is a no-op.
         """
+        fence = fence if fence is not None else _NO_FENCE
         if self.model is None:
             raise ResponseGenerationError(
                 "no model provider is configured for this conversation",
@@ -434,7 +517,9 @@ class ConversationRuntime:
             offer_tools = self._tools_available() and round_index < rounds
             request = self.build_request(session, message, memory_context,
                                          extra=extra, with_tools=offer_tools)
+            fence.check()
             text, tool_calls = self._call_model(request)
+            fence.check()
 
             if not tool_calls:
                 break
@@ -445,8 +530,14 @@ class ConversationRuntime:
                                   session_id=session.id, rounds=rounds)
                 break
 
+            # A superseded turn stops here, before any tool is asked to run,
+            # so supersession can never cause a duplicate tool execution.
+            fence.enter_tool_round()
             round_result = self.tools.run_calls(tool_calls,
                                                 session_id=session.id)
+            # A result that arrives after supersession stays truthful
+            # invocation evidence, but it may not re-enter the conversation.
+            fence.leave_tool_round()
             if result is not None:
                 result.tool_rounds.append(round_result)
             for outcome in round_result.outcomes:
@@ -455,8 +546,10 @@ class ConversationRuntime:
                 tool_message = outcome.to_message()
                 extra.append(tool_message)
                 # Tool traffic joins the conversation, never durable memory.
-                session.append(tool_message,
-                               max_messages=self.config.max_session_messages)
+                with fence.session_lock():
+                    session.append(
+                        tool_message,
+                        max_messages=self.config.max_session_messages)
 
         if not isinstance(text, str) or not text.strip():
             # An empty reply is a failure, not a silent empty assistant turn.
