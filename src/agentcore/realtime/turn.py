@@ -53,7 +53,13 @@ _CATEGORICAL_NOTES = frozenset({"", "restart reconciliation"})
 # session id can extend the domain string and forge another key.
 _SESSION_KEY_DOMAIN = b"agentcore.realtime.turn.session.v1\x00"
 _SESSION_KEY_PREFIX = "session_"
-_SESSION_KEY_HEX_CHARS = 32
+#: Length of a complete lowercase SHA-256 hexadecimal digest.  The whole digest
+#: is used: the approved amendment requires the safe representation to carry no
+#: transformation, truncation, or escaping.
+SESSION_KEY_DIGEST_CHARS = 64
+#: ``session_`` plus the full digest — well inside the 128-character safe
+#: link-id bound, so no truncation is ever needed to satisfy the charset rules.
+SESSION_KEY_CHARS = len(_SESSION_KEY_PREFIX) + SESSION_KEY_DIGEST_CHARS
 
 
 class TurnPhase(str, Enum):
@@ -861,17 +867,19 @@ def derive_session_key(raw_session_id: str) -> str:
     the raw ``ConversationSession`` identifier, so raw ids keeping spaces,
     Unicode, ``#``, ``.`` or ``..`` stay valid at the conversation layer while
     durable turn records keep the safe link-id charset.  The derivation is a
-    domain-separated SHA-256 over the exact UTF-8 bytes of the raw id: it is
-    deterministic, collision-resistant, and one way, so the raw id cannot be
-    recovered from a record, an error, or an event.  An empty raw id is a
-    caller error, never a valid key.
+    domain-separated SHA-256 over the exact UTF-8 bytes of the raw id, rendered
+    as the *complete* lowercase hexadecimal digest: it is deterministic,
+    collision-resistant, and one way, so the raw id cannot be recovered from a
+    record, an error, or an event.  The raw id is never normalized, stripped,
+    case-folded, or otherwise transformed before hashing, and the digest is
+    never truncated or escaped.  An empty raw id is a caller error, never a
+    valid key.
     """
     if not isinstance(raw_session_id, str) or not raw_session_id:
         raise TurnValidationError("conversation session id is required")
     digest = hashlib.sha256(
         _SESSION_KEY_DOMAIN + raw_session_id.encode("utf-8")).hexdigest()
-    return _require_link_id(
-        _SESSION_KEY_PREFIX + digest[:_SESSION_KEY_HEX_CHARS], "session_id")
+    return _require_link_id(_SESSION_KEY_PREFIX + digest, "session_id")
 
 
 def next_generation(previous: int | None) -> int:

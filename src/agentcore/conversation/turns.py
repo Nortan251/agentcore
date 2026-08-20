@@ -126,6 +126,7 @@ class _TurnFence:
         self._session_lock = session_lock
         self._log = log
         self._phase = TurnPhase.QUEUED
+        self._staged: list[Any] = []
         self.committed = False
 
     # -- fencing -----------------------------------------------------------
@@ -179,17 +180,44 @@ class _TurnFence:
         self._log.info(Events.TURN_TOOL_FINISHED)
 
     def commit(self) -> None:
-        """Fix this turn's terminal outcome before any reply is persisted.
+        """Fix this turn's terminal outcome before any transcript is published.
 
         Reaching ``FINALIZING`` is the linearization point for success: the
-        coordinator will no longer cancel a finalizing record, so the outcome
-        can no longer change underneath the assistant message about to be
-        appended. A turn that loses this compare-and-swap never appends.
+        coordinator will no longer cancel a finalizing record, so neither the
+        staged tool traffic nor the assistant message about to be published can
+        be overtaken by a successor. A turn that loses this compare-and-swap
+        publishes nothing at all.
         """
         self._advance(TurnPhase.GENERATING, TurnPhase.FINALIZING,
                       requested_terminal=TurnPhase.COMPLETED)
         self.committed = True
-        self._log.info(Events.TURN_FINALIZATION_STARTED)
+        self._log.info(Events.TURN_FINALIZATION_STARTED,
+                       staged_messages=len(self._staged))
+
+    def stage_tool_message(self, session: Any, message: Any, *,
+                           max_messages: int) -> None:
+        """Hold this turn's tool traffic out of shared conversation history.
+
+        Admission deliberately takes neither the stage lease nor the session
+        lock, so a successor may supersede this turn at any point after the
+        ``EXECUTING_TOOL -> GENERATING`` fence. Appending here would therefore
+        always leave a check-then-append window. Staging closes it: the message
+        exists only inside this turn until :meth:`flush_staged` runs behind the
+        commit point. ``ConversationRuntime`` still puts the same message into
+        its ``extra`` list, which is the model-context source for the rest of
+        this turn, so nothing the model sees changes.
+        """
+        self._staged.append(message)
+
+    def flush_staged(self, session: Any, *, max_messages: int) -> None:
+        """Publish staged tool traffic. Only legal after a successful commit."""
+        if not self.committed:  # pragma: no cover - guarded by the call site
+            raise TurnCoordinatorError(
+                "staged transcript may only be published after finalizing",
+                turn_id=self.turn_id)
+        for message in self._staged:
+            session.append(message, max_messages=max_messages)
+        self._staged.clear()
 
     def session_lock(self) -> ContextManager[Any]:
         """Narrow lock, taken inside the stage lease, for append/save only."""

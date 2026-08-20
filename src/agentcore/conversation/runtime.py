@@ -73,7 +73,8 @@ class _NullFence:
 
     Used whenever no realtime turn coordinator is injected, so the
     pre-Task-42.3 conversation path runs with no added behavior, no added
-    locking, and no import of the realtime package.
+    locking, and no import of the realtime package. Tool traffic therefore
+    still joins the transcript as it happens, exactly as it always has.
     """
 
     __slots__ = ()
@@ -88,6 +89,13 @@ class _NullFence:
         return None
 
     def commit(self) -> None:
+        return None
+
+    def stage_tool_message(self, session: Any, message: Message, *,
+                           max_messages: int) -> None:
+        session.append(message, max_messages=max_messages)
+
+    def flush_staged(self, session: Any, *, max_messages: int) -> None:
         return None
 
     def session_lock(self) -> Any:
@@ -344,10 +352,15 @@ class ConversationRuntime:
                 self.save(session)
             return result
 
-        # Fix this turn's terminal outcome before any assistant output is
-        # persisted. A superseded turn stops here and never appends.
+        # Fix this turn's terminal outcome before any generated transcript is
+        # published. Reaching FINALIZING is the linearization point: the
+        # coordinator will not cancel a finalizing record, so everything below
+        # is safe from supersession. A superseded turn stops here and leaves no
+        # staged tool message and no assistant message behind.
         fence.commit()
         with fence.session_lock():
+            fence.flush_staged(
+                session, max_messages=self.config.max_session_messages)
             session.append(reply, max_messages=self.config.max_session_messages)
         result.reply = reply
         self._log.info(Events.ASSISTANT_MESSAGE_GENERATED,
@@ -546,9 +559,15 @@ class ConversationRuntime:
                 tool_message = outcome.to_message()
                 extra.append(tool_message)
                 # Tool traffic joins the conversation, never durable memory.
+                # Under an owned turn it is only *staged* here: admission does
+                # not take the session lock, so a successor can supersede this
+                # turn at any instant between the tool fence and an append.
+                # Staging removes that window entirely — shared history is
+                # mutated only after the turn's outcome is committed. ``extra``
+                # remains the model-context source either way.
                 with fence.session_lock():
-                    session.append(
-                        tool_message,
+                    fence.stage_tool_message(
+                        session, tool_message,
                         max_messages=self.config.max_session_messages)
 
         if not isinstance(text, str) or not text.strip():
