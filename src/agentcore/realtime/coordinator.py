@@ -8,6 +8,7 @@ store I/O and injected callbacks execute outside coordinator locks.
 
 from __future__ import annotations
 
+import os
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -16,6 +17,7 @@ from agentcore.realtime.cancellation import CancellationReason
 from agentcore.realtime.errors import (
     TurnAlreadyExistsError,
     TurnCoordinatorError,
+    TurnStoreOwnershipError,
     TurnVersionConflictError,
 )
 from agentcore.realtime.store import TurnStore
@@ -117,6 +119,8 @@ class TurnCoordinator:
         self._clock = clock or SystemClock()
         self._id_factory = id_factory
         self._admission_coordination = store.admission_coordination
+        self._owner_pids = (
+            os.getpid(), self._admission_coordination.owner_pid)
 
     def admit(
         self,
@@ -129,6 +133,7 @@ class TurnCoordinator:
         action_refs: tuple[str, ...] = (),
     ) -> TurnAdmission:
         """Create the newest turn and supersede older session work safely."""
+        self._require_owner_process()
         session_id = require_session_id(session_id)
         lane = self._lane(session_id)
         entered = False
@@ -149,6 +154,7 @@ class TurnCoordinator:
             self._release_lane(session_id, lane)
 
     def _lane(self, session_id: str) -> _AdmissionLane:
+        self._require_owner_process()
         coordination = self._admission_coordination
         with coordination.lock:
             lane = coordination.lanes.get(session_id)
@@ -162,11 +168,19 @@ class TurnCoordinator:
             return lane
 
     def _release_lane(self, session_id: str, lane: _AdmissionLane) -> None:
+        self._require_owner_process()
         coordination = self._admission_coordination
         with coordination.lock:
             lane.users -= 1
             if lane.users == 0 and coordination.lanes.get(session_id) is lane:
                 coordination.lanes.pop(session_id, None)
+
+    def _require_owner_process(self) -> None:
+        """Reject inherited coordination before touching cached mutexes."""
+        current_pid = os.getpid()
+        if self._owner_pids != (current_pid, current_pid):
+            raise TurnStoreOwnershipError(
+                "turn coordinator instance belongs to another process")
 
     def _admit_owned(
         self,

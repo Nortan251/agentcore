@@ -129,12 +129,24 @@ class InMemoryTurnStore:
         self.close()
 
 
+@dataclass(frozen=True)
+class _CoordinationOwnership:
+    """Immutable process identity for one admission coordination domain."""
+
+    owner_pid: int
+
+
 class _AdmissionCoordination:
     """Process-local admission lanes shared by one backing store domain."""
 
     def __init__(self) -> None:
+        self._ownership = _CoordinationOwnership(os.getpid())
         self.lock = threading.Lock()
         self.lanes: dict[str, object] = {}
+
+    @property
+    def owner_pid(self) -> int:
+        return self._ownership.owner_pid
 
 
 @dataclass

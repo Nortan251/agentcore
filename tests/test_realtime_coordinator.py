@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import os
+import select
+import signal
 import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
+
+import agentcore.realtime.coordinator as coordinator_module
 
 from agentcore.realtime import (
     CancellationReason,
@@ -17,6 +22,7 @@ from agentcore.realtime import (
     TurnPhase,
     TurnStore,
     TurnStoreError,
+    TurnStoreOwnershipError,
     TurnVersionConflictError,
     new_turn,
     reconcile_nonterminal_turns,
@@ -439,6 +445,96 @@ def test_two_coordinators_share_store_domain_admission_lane(backend, tmp_path):
         stores[0].close()
 
 
+def test_inherited_pid_fence_precedes_every_cached_lane_access(monkeypatch):
+    store = InMemoryTurnStore()
+    coordinator = _coordinator(store, _Ids())
+    lane = coordinator._lane("conv_0000000000ef")
+    original_pid = os.getpid()
+    monkeypatch.setattr(coordinator_module.os, "getpid",
+                        lambda: original_pid + 1)
+    try:
+        with pytest.raises(TurnStoreOwnershipError):
+            coordinator.admit("conv_0000000000ef")
+        with pytest.raises(TurnStoreOwnershipError):
+            coordinator._lane("conv_0000000000ef")
+        with pytest.raises(TurnStoreOwnershipError):
+            coordinator._release_lane("conv_0000000000ef", lane)
+    finally:
+        monkeypatch.setattr(coordinator_module.os, "getpid",
+                            lambda: original_pid)
+        coordinator._release_lane("conv_0000000000ef", lane)
+        store.close()
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_forked_child_rejects_inherited_coordinator_before_cached_lock(
+        tmp_path):
+    store = JsonFileTurnStore(tmp_path)
+    coordinator = _coordinator(store, _Ids())
+    coordination = store.admission_coordination
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+    child_read, child_write = os.pipe()
+    child_pid = None
+    child_reaped = False
+
+    def hold_admission_lock() -> None:
+        with coordination.lock:
+            lock_held.set()
+            release_lock.wait()
+
+    holder = threading.Thread(target=hold_admission_lock)
+    holder.start()
+    try:
+        assert lock_held.wait(timeout=5), "parent admission lock was not held"
+        child_pid = os.fork()
+        if child_pid == 0:  # pragma: no cover - assertions run in child
+            os.close(child_read)
+            try:
+                coordinator.admit("conv_0000000000f0")
+            except TurnStoreOwnershipError:
+                os.write(child_write, b"ownership")
+                os._exit(0)
+            except BaseException:
+                os.write(child_write, b"unexpected")
+                os._exit(2)
+            else:
+                os.write(child_write, b"admitted")
+                os._exit(3)
+
+        os.close(child_write)
+        child_write = -1
+        readable, _, _ = select.select([child_read], [], [], 5)
+        assert child_read in readable, (
+            "forked child hung on the inherited admission lock")
+        assert os.read(child_read, 32) == b"ownership"
+        waited_pid, status = os.waitpid(child_pid, 0)
+        child_reaped = True
+        assert waited_pid == child_pid
+        assert os.waitstatus_to_exitcode(status) == 0
+    finally:
+        release_lock.set()
+        holder.join(timeout=5)
+        assert not holder.is_alive()
+        if child_pid not in (None, 0) and not child_reaped:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(child_pid, 0)
+            except ChildProcessError:
+                pass
+        for descriptor in (child_read, child_write):
+            if descriptor < 0:
+                continue
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        store.close()
+
+
 class _AdvanceOnCreateStore:
     def __init__(self, delegate, advance):
         self._delegate = delegate
@@ -541,6 +637,136 @@ def test_admission_reclassifies_active_after_stage_transition(advance_to):
                            else CancellationReason.USER_INTERRUPT)
         assert current.cancellation_reason is expected_reason
         assert successor.queued == successor.admitted
+
+
+class _AdvanceInsideActiveCasStore:
+    """Persist a stage-owner transition at the coordinator CAS boundary."""
+
+    def __init__(self, delegate, active_id, target, clock):
+        self._delegate = delegate
+        self._active_id = active_id
+        self._target = target
+        self._clock = clock
+        self.injected = None
+
+    @property
+    def admission_coordination(self):
+        return self._delegate.admission_coordination
+
+    def create(self, record):
+        return self._delegate.create(record)
+
+    def load(self, turn_id):
+        return self._delegate.load(turn_id)
+
+    def compare_and_swap(self, turn_id, expected_version, next_record):
+        if self.injected is None and turn_id == self._active_id and \
+                next_record.phase is TurnPhase.CANCELLING and \
+                next_record.cancellation_reason is \
+                CancellationReason.SUPERSEDED:
+            self.injected = self._advance_active()
+        return self._delegate.compare_and_swap(
+            turn_id, expected_version, next_record)
+
+    def list_turns(self):
+        return self._delegate.list_turns()
+
+    def close(self):
+        return self._delegate.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def _advance_active(self):
+        record = self._delegate.load(self._active_id)
+        controller = TurnController(
+            self._delegate, record.turn_id, clock=self._clock)
+        operation = 0xD00
+
+        def transition(target, **kwargs):
+            nonlocal record, operation
+            controller.transition(
+                record.phase,
+                target,
+                expected_version=record.version,
+                operation_id=f"op_{operation:012x}",
+                **kwargs,
+            )
+            record = self._delegate.load(self._active_id)
+            operation += 1
+
+        if self._target is TurnPhase.COMPLETED:
+            transition(TurnPhase.GENERATING)
+            transition(
+                TurnPhase.FINALIZING,
+                requested_terminal=TurnPhase.COMPLETED,
+            )
+            transition(TurnPhase.COMPLETED)
+            return record
+
+        outcomes = {
+            TurnPhase.CANCELLING: (
+                CancellationReason.USER_INTERRUPT, TurnPhase.CANCELLED),
+            TurnPhase.FINALIZING: (
+                CancellationReason.USER_INTERRUPT, TurnPhase.CANCELLED),
+            TurnPhase.CANCELLED: (
+                CancellationReason.USER_INTERRUPT, TurnPhase.CANCELLED),
+            TurnPhase.TIMED_OUT: (
+                CancellationReason.DEADLINE_EXCEEDED, TurnPhase.TIMED_OUT),
+            TurnPhase.FAILED: (
+                CancellationReason.INTERNAL_FAILURE, TurnPhase.FAILED),
+        }
+        reason, terminal = outcomes[self._target]
+        transition(
+            TurnPhase.CANCELLING,
+            cancellation_reason=reason,
+            requested_terminal=terminal,
+        )
+        if self._target is TurnPhase.CANCELLING:
+            return record
+        transition(
+            TurnPhase.FINALIZING,
+            cancellation_reason=reason,
+            requested_terminal=terminal,
+        )
+        if self._target is TurnPhase.FINALIZING:
+            return record
+        transition(terminal)
+        return record
+
+
+@pytest.mark.parametrize("competing_phase", [
+    TurnPhase.CANCELLING,
+    TurnPhase.FINALIZING,
+    TurnPhase.CANCELLED,
+    TurnPhase.TIMED_OUT,
+    TurnPhase.FAILED,
+    TurnPhase.COMPLETED,
+])
+def test_admission_reclassifies_transition_inside_active_cas(competing_phase):
+    delegate = InMemoryTurnStore()
+    clock = FixedClock(NOW)
+    ids = _Ids()
+    first = _coordinator(delegate, ids).admit("conv_000000000021")
+    store = _AdvanceInsideActiveCasStore(
+        delegate, first.admitted.turn_id, competing_phase, clock)
+
+    successor = _coordinator(store, ids).admit("conv_000000000021")
+
+    assert store.injected is not None
+    assert delegate.load(first.admitted.turn_id) == store.injected
+    persisted_successor = delegate.load(successor.admitted.turn_id)
+    assert persisted_successor.phase is TurnPhase.QUEUED
+    assert persisted_successor.generation == 2
+    if competing_phase.is_terminal:
+        assert successor.active == persisted_successor.snapshot()
+        assert successor.queued is None
+    else:
+        assert successor.active == store.injected.snapshot()
+        assert successor.queued == persisted_successor.snapshot()
 
 
 def test_independent_store_domains_keep_independent_admission_lanes():
@@ -778,3 +1004,125 @@ def test_restart_during_admission_boundaries_never_leaves_live_work(boundary):
     assert all(record.is_terminal for record in records)
     assert all(record.final_terminal is not TurnPhase.COMPLETED
                for record in records)
+
+
+class _FailAfterJsonAdmissionBoundary:
+    """Raise once after the selected real JSON write has completed."""
+
+    def __init__(self, delegate, boundary):
+        self._delegate = delegate
+        self._boundary = boundary
+        self.fired = False
+
+    @property
+    def admission_coordination(self):
+        return self._delegate.admission_coordination
+
+    def create(self, record):
+        persisted = self._delegate.create(record)
+        if self._boundary == "prepared_create" and not self.fired:
+            self._fail()
+        return persisted
+
+    def load(self, turn_id):
+        return self._delegate.load(turn_id)
+
+    def compare_and_swap(self, turn_id, expected_version, next_record):
+        persisted = self._delegate.compare_and_swap(
+            turn_id, expected_version, next_record)
+        if not self.fired and self._matches(persisted):
+            self._fail()
+        return persisted
+
+    def list_turns(self):
+        return self._delegate.list_turns()
+
+    def close(self):
+        return self._delegate.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def _matches(self, record):
+        return {
+            "active_superseded": (
+                record.phase is TurnPhase.CANCELLING
+                and record.cancellation_reason is
+                CancellationReason.SUPERSEDED
+            ),
+            "queued_cancelling": (
+                record.phase is TurnPhase.CANCELLING
+                and record.cancellation_reason is
+                CancellationReason.SUPERSEDED_BEFORE_START
+            ),
+            "queued_finalizing": (
+                record.phase is TurnPhase.FINALIZING
+                and record.cancellation_reason is
+                CancellationReason.SUPERSEDED_BEFORE_START
+            ),
+            "queued_terminal": (
+                record.phase is TurnPhase.CANCELLED
+                and record.cancellation_reason is
+                CancellationReason.SUPERSEDED_BEFORE_START
+            ),
+            "successor_queued": record.phase is TurnPhase.QUEUED,
+        }.get(self._boundary, False)
+
+    def _fail(self):
+        self.fired = True
+        raise TurnStoreError(
+            "injected failure after JSON admission persistence",
+            boundary=self._boundary,
+        )
+
+
+@pytest.mark.parametrize(("boundary", "existing_admissions"), [
+    ("prepared_create", 2),
+    ("active_superseded", 1),
+    ("queued_cancelling", 2),
+    ("queued_finalizing", 2),
+    ("queued_terminal", 2),
+    ("successor_queued", 2),
+])
+def test_json_restart_after_each_admission_persistence_boundary(
+        tmp_path, boundary, existing_admissions):
+    directory = tmp_path / boundary
+    ids = _Ids()
+    store = JsonFileTurnStore(directory)
+    coordinator = _coordinator(store, ids)
+    for _ in range(existing_admissions):
+        coordinator.admit("conv_000000000061")
+
+    faulting = _FailAfterJsonAdmissionBoundary(store, boundary)
+    try:
+        with pytest.raises(TurnStoreError) as captured:
+            _coordinator(faulting, ids).admit("conv_000000000061")
+        assert captured.value.details["boundary"] == boundary
+        assert faulting.fired
+        assert len(store.list_turns()) == existing_admissions + 1
+    finally:
+        store.close()
+
+    reopened = JsonFileTurnStore(directory)
+    try:
+        before = [reopened.load(turn_id)
+                  for turn_id in reopened.list_turns()]
+        generations = [record.generation for record in before]
+        assert len(generations) == len(set(generations))
+        assert len([record for record in before if not record.is_terminal]) <= 2
+
+        reconcile_nonterminal_turns(reopened, clock=FixedClock(NOW))
+
+        after = [reopened.load(turn_id)
+                 for turn_id in reopened.list_turns()]
+        assert len(after) == existing_admissions + 1
+        assert all(record.is_terminal for record in after)
+        assert not [record for record in after
+                    if record.phase in {TurnPhase.CREATED, TurnPhase.QUEUED}]
+        assert all(record.final_terminal is not TurnPhase.COMPLETED
+                   for record in after)
+    finally:
+        reopened.close()
