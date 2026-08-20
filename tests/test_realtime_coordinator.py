@@ -449,6 +449,19 @@ def test_inherited_pid_fence_precedes_every_cached_lane_access(monkeypatch):
     store = InMemoryTurnStore()
     coordinator = _coordinator(store, _Ids())
     lane = coordinator._lane("conv_0000000000ef")
+    entered = False
+    left = False
+
+    def record_enter():
+        nonlocal entered
+        entered = True
+
+    def record_leave():
+        nonlocal left
+        left = True
+
+    monkeypatch.setattr(lane, "enter", record_enter)
+    monkeypatch.setattr(lane, "leave", record_leave)
     original_pid = os.getpid()
     monkeypatch.setattr(coordinator_module.os, "getpid",
                         lambda: original_pid + 1)
@@ -458,12 +471,131 @@ def test_inherited_pid_fence_precedes_every_cached_lane_access(monkeypatch):
         with pytest.raises(TurnStoreOwnershipError):
             coordinator._lane("conv_0000000000ef")
         with pytest.raises(TurnStoreOwnershipError):
+            coordinator._enter_lane(lane)
+        with pytest.raises(TurnStoreOwnershipError):
+            coordinator._leave_lane(lane)
+        with pytest.raises(TurnStoreOwnershipError):
             coordinator._release_lane("conv_0000000000ef", lane)
+        assert not entered
+        assert not left
     finally:
         monkeypatch.setattr(coordinator_module.os, "getpid",
                             lambda: original_pid)
         coordinator._release_lane("conv_0000000000ef", lane)
         store.close()
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_fork_during_admission_fences_inherited_lane_cleanup(tmp_path):
+    store = JsonFileTurnStore(tmp_path)
+    coordination = store.admission_coordination
+    parent_pid = os.getpid()
+    hold_requested = threading.Event()
+    condition_held = threading.Event()
+    release_condition = threading.Event()
+    forked = threading.Event()
+    child_read, child_write = os.pipe()
+    child_pid = []
+    child_reaped = False
+    parent_results = []
+    parent_errors = []
+
+    class ForkingIds(_Ids):
+        def __init__(self):
+            super().__init__()
+            self._forked_once = False
+
+        def __call__(self, prefix):
+            if prefix == "turn" and not self._forked_once:
+                self._forked_once = True
+                hold_requested.set()
+                if not condition_held.wait(timeout=5):
+                    raise AssertionError("lane condition was not held")
+                pid = os.fork()
+                if pid == 0:  # pragma: no cover - assertions run in child
+                    os.close(child_read)
+                else:
+                    child_pid.append(pid)
+                    forked.set()
+            return super().__call__(prefix)
+
+    coordinator = _coordinator(store, ForkingIds())
+
+    def hold_lane_condition() -> None:
+        assert hold_requested.wait(timeout=5)
+        with coordination.lock:
+            assert len(coordination.lanes) == 1
+            lane = next(iter(coordination.lanes.values()))
+        with lane.condition:
+            condition_held.set()
+            release_condition.wait()
+
+    def run_admission() -> None:
+        try:
+            result = coordinator.admit("conv_0000000000ee")
+        except TurnStoreOwnershipError:
+            if os.getpid() == parent_pid:
+                parent_errors.append("parent ownership failure")
+                return
+            os.write(child_write, b"ownership")
+            os._exit(0)
+        except BaseException as exc:
+            if os.getpid() == parent_pid:
+                parent_errors.append(exc)
+                return
+            os.write(child_write, b"unexpected")
+            os._exit(2)
+        if os.getpid() != parent_pid:  # pragma: no cover - child failure
+            os.write(child_write, b"admitted")
+            os._exit(3)
+        parent_results.append(result)
+
+    holder = threading.Thread(target=hold_lane_condition)
+    admission = threading.Thread(target=run_admission)
+    holder.start()
+    admission.start()
+    try:
+        assert forked.wait(timeout=5), "admission did not fork"
+        os.close(child_write)
+        child_write = -1
+        readable, _, _ = select.select([child_read], [], [], 5)
+        assert child_read in readable, (
+            "forked child hung while leaving its inherited lane")
+        assert os.read(child_read, 32) == b"ownership"
+        exited, _, _ = select.select([child_read], [], [], 5)
+        assert child_read in exited, "forked child did not exit"
+        assert os.read(child_read, 1) == b""
+        waited_pid, status = os.waitpid(child_pid[0], os.WNOHANG)
+        assert waited_pid == child_pid[0]
+        child_reaped = True
+        assert os.waitstatus_to_exitcode(status) == 0
+    finally:
+        release_condition.set()
+        admission.join(timeout=5)
+        holder.join(timeout=5)
+        assert not admission.is_alive()
+        assert not holder.is_alive()
+        if child_pid and not child_reaped:
+            try:
+                os.kill(child_pid[0], signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(child_pid[0], 0)
+            except ChildProcessError:
+                pass
+        for descriptor in (child_read, child_write):
+            if descriptor < 0:
+                continue
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        store.close()
+
+    assert parent_errors == []
+    assert len(parent_results) == 1
+    assert store.admission_coordination.lanes == {}
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")

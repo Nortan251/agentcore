@@ -138,7 +138,7 @@ class TurnCoordinator:
         lane = self._lane(session_id)
         entered = False
         try:
-            lane.enter()
+            self._enter_lane(lane)
             entered = True
             return self._admit_owned(
                 session_id,
@@ -150,8 +150,18 @@ class TurnCoordinator:
             )
         finally:
             if entered:
-                lane.leave()
+                self._leave_lane(lane)
             self._release_lane(session_id, lane)
+
+    def _enter_lane(self, lane: _AdmissionLane) -> None:
+        """Enter only coordination owned by this process."""
+        self._require_owner_process()
+        lane.enter()
+
+    def _leave_lane(self, lane: _AdmissionLane) -> None:
+        """Leave only coordination owned by this process."""
+        self._require_owner_process()
+        lane.leave()
 
     def _lane(self, session_id: str) -> _AdmissionLane:
         self._require_owner_process()
