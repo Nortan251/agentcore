@@ -570,3 +570,228 @@ state/concurrency/cancellation/stream/deadline/effect/observability/configuratio
 decision, defines stale and unknown semantics, covers the adversarial cases,
 and supplies independently testable implementation stages. **No runtime code
 was implemented.**
+
+## Task 42.3 integration amendment — 2026-08-21
+
+Status: **approved project-lead decisions; architecture only, no runtime code
+implemented by this amendment.**
+
+Baseline: this document plus accepted Task 42.2 implementation
+`797e2f5c8087423d72a2e972adaa350b47b4393f`. Task 42.2 is complete.
+
+This amendment settles the integration questions raised against stage 2
+(*Admission and one-shot conversation integration*) in section H. It refines
+the wording of sections B, E, G and H where noted; it does not introduce a new
+architecture, a new capability, a new configuration key, or a new durable
+schema version. `TURN_SCHEMA_VERSION` remains `1`. Every invariant in *Scope
+and invariants* stands unchanged: `ToolExecutor` remains the only execution
+authority, permissions and filesystem behavior are frozen, and personality and
+presentation remain above runtime authority.
+
+### 1. Per-Agent stage lease (settles C-1)
+
+Stage 2 adds one **per-`Agent` reentrant stage lease**. It is the concrete
+implementation of the "stage lease" referenced in section B's successor
+admission sequence, and it is the only mechanism permitted to serialize model
+and tool work within one `Agent`.
+
+Ownership and ordering rules:
+
+- Admission never waits for the stage lease and never holds it.
+  `TurnCoordinator.admit` continues to acquire only its short per-session
+  admission lane.
+- A newly admitted successor may therefore cancel the active turn and queue
+  itself **while its predecessor is physically running**. Supersession
+  ordering remains coordinator-lock acquisition order, never wall time.
+- The stage owner acquires the stage lease **before** transitioning
+  `QUEUED → GENERATING`.
+- The owner holds the lease across: the synchronous provider call; any
+  conversation tool round; the stale-fence decision; every session mutation
+  owned by that turn; and the turn's final durable transition.
+- The owner **terminalizes its durable turn record before releasing the
+  lease**.
+- A successor cannot begin model or tool work until the predecessor has
+  terminalized and released the lease. This preserves the coordinator's
+  requirement that at most one non-terminal turn per session is past `QUEUED`.
+
+Lock-discipline rules, which refine the section B sentence "Store I/O and
+callbacks happen outside coordinator, session, model-lane, and action-lane
+locks":
+
+- No coordinator mutex is held while waiting for or acquiring the stage lease.
+- No session lock is held while waiting for the stage lease.
+- Session locking is narrow. It may be taken **inside** the stage lease, and
+  only for append and save operations.
+- No `TurnStore` internal lock is held while calling provider or tool code.
+- The minimal trusted `TurnStore` and session persistence required to
+  terminalize a turn and hand off to a successor **may** occur while the stage
+  lease is held.
+
+The final bullet is the intended refinement. The older blanket wording is
+superseded for stage 2 only, and only for this minimal terminalize-and-hand-off
+persistence; it remains in force for coordinator, session and action lanes and
+for all other store I/O.
+
+Cancellation remains **cooperative only** in Task 42.3, consistent with
+section C. A provider or tool that ignores cancellation keeps the successor
+waiting until physical return, exactly as section E's "quarantined until
+physical return" already states. Task 42.3 therefore delivers correct turn
+accounting, supersession and stale fencing, and **must not claim barge-in
+latency, forced interruption, or preemption**. No worker thread is introduced.
+
+### 2. Opaque turn-session correlation key (settles C-2)
+
+Existing `ConversationSession` and CLI session-ID validation is **not**
+tightened. Session identity remains whatever current session behavior accepts.
+
+`TurnRecord.session_id` stores a **derived correlation key**, never the raw
+`ConversationSession` identifier:
+
+- Derive from the exact UTF-8 bytes of the raw session ID using a
+  domain-separated SHA-256 digest, rendered as lowercase hexadecimal and
+  prefixed with `session_`.
+- The domain separator is a fixed constant reserved for this purpose, so the
+  digest cannot collide with any other AgentCore key derivation.
+- The result satisfies the existing safe `TurnRecord` link-ID charset and
+  length rules without transformation, truncation, or escaping.
+- Derivation is deterministic, collision-resistant, and one-way: the raw
+  session ID is not recoverable from the record.
+- Session IDs containing spaces, Unicode, `#`, `.`, `..`, or any length the
+  current session layer accepts remain compatible, because none of those bytes
+  reach the turn record.
+- The caller still rejects an empty raw session ID before derivation; an empty
+  input is a caller error, not a valid correlation key.
+
+Observability follows the same rule. Turn events, turn metrics and any
+turn-result correlation field expose the safe derived key only. The raw session
+ID is never written into a `TurnRecord`, a turn event, or a turn metric. This
+refines section G's binding requirement accordingly.
+
+### 3. Durable turn-store ownership is opt-in (settles C-3)
+
+Task 42.3 is **opt-in**:
+
+- Existing `Agent` and CLI behavior is unchanged when no realtime coordinator
+  or turn store is explicitly injected. With nothing injected, conversation
+  behaves exactly as it does today; this is the stage-2 rollback boundary
+  required by section H.
+- Task 42.3 does **not** automatically create a `JsonFileTurnStore`.
+- Task 42.3 adds **no** configuration for turn-store placement, and section H's
+  "first foundational slice needs no configuration" continues to apply.
+- An explicit host-injected durable `JsonFileTurnStore` is responsible for
+  single-process ownership, exactly as *Process and turn-store ownership*
+  already specifies.
+- If explicit durable ownership fails, the failure is **categorical**. It never
+  silently downgrades to `InMemoryTurnStore`, and it never continues without
+  the durability the host asked for.
+
+This preserves today's multiple-CLI-process behavior until a later deployment
+and configuration task defines durable-store placement and ownership policy.
+That later task owns the decision; Task 42.3 does not pre-empt it.
+
+### 4. Counters and session lookup cost (settles C-4)
+
+- Task 42.3 does **not** mutate frozen `TurnRecord` counters. The accepted
+  Task 42.2 CAS contract holds all non-transition fields, including
+  `TurnCounters`, invariant for a record's life. Section A's counter list
+  therefore describes reserved schema-v1 capacity, not a stage-2 write path.
+- Stale-result, model-request and tool-call counts are reported through the
+  privacy-safe observability events in section G. Those events carry
+  categorical outcomes, counts and safe identifiers only, never raw text,
+  arguments, tool content, or resolved paths.
+- The coordinator's per-admission session lookup is O(all turns) in the store
+  domain. This is recorded as a **known performance limitation** of stage 2.
+  It is explicitly **not** a reason to redesign the turn store, add an index,
+  or change CAS semantics during Task 42.3. A later task owns any bounded or
+  indexed lookup.
+
+### 5. `Deadline.unbounded()` scaffolding (settles C-5)
+
+Stage 2 must not fabricate a far-future deadline to satisfy
+`OperationContext`. Instead a named, non-enforcing semantic is defined:
+
+- `Deadline.unbounded()` carries **no** monotonic expiry and **no** UTC expiry.
+- `expired()` is always false for an unbounded deadline.
+- No deadline is persisted on the turn record; `deadline_at` stays absent.
+- A child deadline may later shorten an unbounded parent during the
+  deadline-integration stage, consistent with section E's rule that a child is
+  `min(parent, requested budget)` and can never extend an outer deadline.
+- It is explicit scaffolding for the `OperationContext` the stale fence
+  requires. It is **not** timeout enforcement, and it must never be described
+  as one.
+
+Turn, model-request, tool and cleanup budgets remain unimplemented in Task
+42.3. Section E's migration ordering is unchanged: deadlines are threaded
+through trusted contexts in the later stage, and tool preemption is still not
+claimed.
+
+### 6. Approval and provider-failure categories (settles C-6 and C-7)
+
+- Existing approval behavior remains **non-blocking** in Task 42.3. A tool call
+  that requires human approval is still pre-checked without executing, still
+  escalates through the existing `PendingAction` path, and the turn may still
+  complete normally with a truthful non-executed outcome.
+- `WAITING_APPROVAL` and its `→ QUEUED` re-admission edge are **not used** in
+  Task 42.3. They remain reserved in the section A state machine for the later
+  stage that makes approval blocking. Leaving them unused is a deliberate,
+  recorded deviation from the section A diagram, not a redesign of it.
+- Ordinary provider generation failure terminalizes as `FAILED` with the
+  existing `INTERNAL_FAILURE` cancellation category. No schema enum value is
+  added in Task 42.3, because the cancellation vocabulary is durable
+  schema-v1 state.
+- This is **known categorical imprecision**: an external provider fault is
+  recorded under an internal-failure category. It is accepted for Task 42.3 and
+  assigned to whichever later stage revises the durable cancellation
+  vocabulary under schema review.
+
+### 7. Supersession vocabulary unchanged (settles C-9)
+
+Task 42.3 does **not** change the existing `SUPERSEDED` /
+`SUPERSEDED_BEFORE_START` vocabulary or the conditions under which the
+coordinator selects between them. Both already terminalize as `CANCELLED` with
+a durable, truthful record, so the distinction is audit vocabulary only.
+Accepted Task 42.2 behavior stands.
+
+### Task 42.3 acceptance checklist
+
+Task 42.3 is accepted when all of the following hold:
+
+1. A turn is created and admitted before any conversational model work, and
+   every accepted input has its own durable terminal turn record.
+2. At most one active logical turn per session, with at most one queued
+   successor, is observable in the durable store at all times.
+3. Session mutation and model calls are serialized per `Agent` by the stage
+   lease and narrow session locking described above, with the stated
+   acquisition and non-holding rules respected.
+4. A successor admitted during a live turn supersedes it safely and begins
+   model or tool work only after the predecessor has terminalized and released
+   the stage lease.
+5. A stale model result or a late tool result cannot mutate conversation
+   history, a successor turn, or a terminal outcome; the interrupted user
+   message still remains in the transcript.
+6. Final turn state is durably persisted for success, failure, and
+   cancellation, with no stranded non-terminal turn after error, shutdown, or
+   restart reconciliation.
+7. The existing synchronous one-shot provider path is unchanged and remains the
+   compatibility adapter and rollback boundary.
+8. `ToolExecutor` remains the single execution path, and all permission and
+   approval behavior is byte-for-byte preserved.
+9. `AgentState`, conversation session state, durable memory, and `TurnRecord`
+   remain four separate stores linked only by opaque identifiers.
+10. With no coordinator or turn store injected, behavior is identical to the
+    pre-Task-42.3 baseline.
+11. Turn records, turn events and turn metrics contain no raw session ID, user
+    or model text, tool arguments or output, secrets, or resolved filesystem
+    paths.
+
+### Task 42.3 non-goals
+
+Task 42.3 implements no streaming, no provider change, no voice, no turn
+detection or barge-in, no browser or computer control, no shell, process or
+network capability, no scheduler or background worker, no action journal or
+effect classes, no mutation tooling, no deadline or timeout enforcement, no
+tool preemption, no forced interruption, no blocking approval, no new
+capability, no new configuration key, no dependency change, and no durable
+schema change. It does not alter `AgentState` phases, `ToolExecutor`,
+permissions, filesystem rules, verification, recovery, or existing persistence
+behavior.
