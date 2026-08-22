@@ -67,6 +67,7 @@ from agentcore.tools.base import Tool, ToolResult, tool_spec
 from agentcore.tools.builtin import default_tools
 from agentcore.tools.builtin.inspect import InspectTool
 from agentcore.util.clock import FixedClock
+from agentcore.util.ids import new_id
 
 #: Bound for every synchronisation wait. Reaching it is a test failure, not a
 #: retry: the condition it guards is deterministic.
@@ -1610,3 +1611,136 @@ def test_approval_escalation_remains_unchanged_under_supersession(tmp_path):
     assert results["second"].ok
     assert TurnPhase.WAITING_APPROVAL not in {
         t.to_phase for r in _records(store) for t in r.transitions}
+
+
+# ===========================================================================
+# 18. P1 — a queued successor that starts must not break a newer admission
+# ===========================================================================
+class _GatedTurnIds:
+    """Production ids; the Nth *turn* id pauses that admission mid-flight.
+
+    ``TurnCoordinator._admit_owned`` generates the turn id after reading
+    the session (so the queued successor has already been classified) and
+    before acting on that classification — exactly the classification/act
+    window the repair hardens. Everything else passes through untouched.
+    """
+
+    def __init__(self, pause_on_turn: int) -> None:
+        self._pause_on = pause_on_turn
+        self._turns = 0
+        self._lock = threading.Lock()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def __call__(self, prefix: str):
+        if prefix != "turn":
+            return new_id(prefix)
+        with self._lock:
+            self._turns += 1
+            count = self._turns
+        if count == self._pause_on:
+            self.entered.set()
+            assert self.release.wait(WAIT), "admission gate never released"
+        return new_id(prefix)
+
+
+def test_third_admission_reclassifies_a_queued_successor_that_started(tmp_path):
+    """The audited P1 interleaving, forced through the real runtime.
+
+    Deterministic, no sleeps::
+
+        T1 gated inside model call 1        (holds the stage lease)
+        T2 admitted -> QUEUED               (blocked on the stage lease)
+        T3 admission paused after _read_session classified T2 as QUEUED
+            (gated turn-id factory)
+        T1 terminalizes CANCELLED and releases the lease
+        T2 acquires the lease, activates -> GENERATING, gated inside
+            model call 2
+        T3 resumes: it must reload, see T2 started, supersede it as active
+        work with the truthful SUPERSEDED vocabulary, and admit cleanly.
+    """
+    model = ScriptedModel(_reply("first reply"), _reply("second reply"),
+                          _reply("third reply"), _reply("fourth reply"))
+    gate_first = model.gate(1)
+    gate_second = model.gate(2)
+    ids = _GatedTurnIds(pause_on_turn=3)
+    store = InMemoryTurnStore()
+    coordinator = RecordingCoordinator(TurnCoordinator(store, id_factory=ids))
+    agent = _agent(_config(tmp_path), model, coordinator=coordinator)
+    runtime = agent.conversation()
+    session = runtime.start()
+    results: dict[str, object] = {}
+
+    def send(name, text):
+        results[name] = runtime.send(text, session=session)
+
+    first = threading.Thread(target=send, args=("first", "one"), daemon=True)
+    first.start()
+    model.wait_entered(1)                    # T1 is inside its provider call
+
+    second = threading.Thread(target=send, args=("second", "two"),
+                              daemon=True)
+    second.start()
+    queued = coordinator.wait_for(2)         # T2 durably QUEUED, never started
+    assert queued.admitted.phase is TurnPhase.QUEUED
+    assert queued.superseded_active is not None
+    t1_id = coordinator.admissions[0].admitted.turn_id
+    t2_id = queued.admitted.turn_id
+    assert store.load(t1_id).phase is TurnPhase.CANCELLING
+    assert store.load(t2_id).phase is TurnPhase.QUEUED
+
+    third = threading.Thread(target=send, args=("third", "three"),
+                             daemon=True)
+    third.start()
+    # T3 has read the session (T1 CANCELLING + T2 QUEUED) and is now parked
+    # inside its turn-id generation, before it acts on either record.
+    assert ids.entered.wait(WAIT), "third admission never reached its gate"
+
+    gate_first.set()                         # T1 finishes and terminalizes
+    model.wait_entered(2)                    # T2 activated, inside model call
+    assert store.load(t1_id).phase is TurnPhase.CANCELLED
+    assert store.load(t2_id).phase is TurnPhase.GENERATING
+
+    ids.release.set()                        # T3 resumes on a live successor
+    fresh = coordinator.wait_for(3)
+
+    gate_second.set()                        # T2 discovers its supersession
+    for thread in (first, second, third):
+        thread.join(WAIT)
+        assert not thread.is_alive()
+
+    # 1-2. No conflict escaped; the third input was admitted, not failed.
+    third_record = store.load(fresh.admitted.turn_id)
+    assert third_record.phase is not TurnPhase.FAILED
+    # 3. Truthful vocabulary: T2 started, so it was superseded, never
+    # replaced before start; the admission evidence agrees.
+    assert fresh.superseded_before_start is None
+    assert fresh.superseded_active is not None
+    assert fresh.superseded_active.cancellation_reason is \
+        CancellationReason.SUPERSEDED
+    t1, t2 = store.load(t1_id), store.load(t2_id)
+    assert t1.cancellation_reason is CancellationReason.SUPERSEDED
+    assert t2.cancellation_reason is CancellationReason.SUPERSEDED
+    # 4. Neither superseded turn published its generated reply.
+    assert "first reply" not in _texts(session)
+    assert "second reply" not in _texts(session)
+    assert "second reply" not in [
+        m.content for m in runtime.sessions.load(session.id).messages]
+    # 5. T3 is the surviving turn and its reply is the one that persisted.
+    assert results["third"].ok
+    assert results["third"].reply.content == "third reply"
+    assert _texts(session) == ["one", "two", "three", "third reply"]
+    # 6-7. Every accepted input is terminal, in monotonic generations.
+    records = sorted(_records(store), key=lambda r: r.generation)
+    assert [r.generation for r in records] == [1, 2, 3]
+    assert [r.phase for r in records] == [
+        TurnPhase.CANCELLED, TurnPhase.CANCELLED, TurnPhase.COMPLETED]
+    # 8. Exactly one model call per turn; nothing ran concurrently.
+    assert model.calls == 3
+    assert model.overlaps == 0
+    # 9. The session admits an ordinary turn afterwards.
+    final = runtime.send("finally", session=session)
+    assert final.ok
+    assert final.reply.content == "fourth reply"
+    assert final.turn_generation == 4
+    assert store.load(final.turn_id).phase is TurnPhase.COMPLETED
