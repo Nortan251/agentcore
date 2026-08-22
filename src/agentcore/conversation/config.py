@@ -11,6 +11,7 @@ memory participation is already governed by ``features.memory``.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from agentcore.errors import ConfigError
@@ -48,6 +49,12 @@ class ConversationConfig:
     #: Characters of a single tool result placed into model context. Truncation
     #: is deterministic and explicitly marked.
     max_tool_result_chars: int = 2000
+    #: Realtime turn deadline, in seconds, from admission through final
+    #: response (Task 42.4a). Consumed only when a realtime turn coordinator
+    #: is injected: with no coordinator the conversation path is unchanged
+    #: and this bound is not applied. Queue/stage-lease waiting consumes the
+    #: budget; every admitted successor receives its own independent budget.
+    turn_deadline_seconds: float = 120.0
 
     def validate(self) -> None:
         for name in ("max_context_messages", "max_context_chars",
@@ -57,6 +64,17 @@ class ConversationConfig:
             if getattr(self, name) < 1:
                 raise ConfigError(f"conversation.{name} must be at least 1",
                                   value=getattr(self, name))
+        deadline = self.turn_deadline_seconds
+        if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) \
+                or not math.isfinite(deadline):
+            raise ConfigError(
+                "conversation.turn_deadline_seconds must be a finite number",
+                value=deadline)
+        if not 1.0 <= deadline <= 3600.0:
+            raise ConfigError(
+                "conversation.turn_deadline_seconds must be between "
+                "1.0 and 3600.0 seconds",
+                value=deadline)
         if self.max_session_messages < self.max_context_messages:
             raise ConfigError(
                 "conversation.max_session_messages must be at least "

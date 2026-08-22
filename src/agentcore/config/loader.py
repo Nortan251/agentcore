@@ -278,6 +278,9 @@ def _build_conversation(data: Mapping[str, Any]) -> ConversationConfig:
         max_tool_result_chars=_coerce(
             int, data.get("max_tool_result_chars", d.max_tool_result_chars),
             "conversation.max_tool_result_chars"),
+        turn_deadline_seconds=_coerce(
+            float, data.get("turn_deadline_seconds", d.turn_deadline_seconds),
+            "conversation.turn_deadline_seconds"),
     )
 
 

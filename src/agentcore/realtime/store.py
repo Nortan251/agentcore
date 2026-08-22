@@ -527,12 +527,18 @@ def reconcile_nonterminal_turns(
     """Terminate interrupted turns without resuming stage execution.
 
     Active phases become ``FAILED`` through normal cancellation/finalizing
-    transitions with ``INTERNAL_FAILURE`` evidence. A record already in
-    ``CANCELLING`` keeps its primary reason. A record finalizing a cancellation
-    or failure completes that fixed outcome. A record finalizing success fails
-    safely because the crash prevents authoritative success acknowledgement;
-    its requested ``COMPLETED`` outcome remains durable evidence. Terminal
-    records are unchanged. Action references and prior evidence survive.
+    transitions with ``INTERNAL_FAILURE`` evidence — unless the record's
+    immutable ``deadline_at`` already lies at or before the trusted
+    reconciliation clock's UTC now, in which case the interruption evidence
+    supports ``TIMED_OUT`` with ``DEADLINE_EXCEEDED`` (Task 42.4a). A record
+    already in ``CANCELLING`` keeps its primary reason. A record finalizing a
+    cancellation or failure completes that fixed outcome. A record finalizing
+    success fails safely because the crash prevents authoritative success
+    acknowledgement; its requested ``COMPLETED`` outcome remains durable
+    evidence. Terminal records are unchanged. Action references and prior
+    evidence survive. The persisted UTC deadline is restart *evidence* only:
+    live deadline decisions always use monotonic time, and no interrupted
+    turn is ever resumed.
     """
     resolved_clock = clock or SystemClock()
     results: list[TurnSnapshot] = []
@@ -578,6 +584,16 @@ def reconcile_nonterminal_turns(
                     cancellation_reason=reason,
                 )
                 continue
+            # Outcome still choosable: an already-expired durable deadline is
+            # truthful TIMED_OUT evidence; anything else stays an internal
+            # interruption. Only the trusted clock's UTC now is consulted —
+            # monotonic budget cannot survive a restart.
+            reason = CancellationReason.INTERNAL_FAILURE
+            terminal = TurnPhase.FAILED
+            if record.deadline_at is not None and \
+                    record.deadline_at <= resolved_clock.now():
+                reason = CancellationReason.DEADLINE_EXCEEDED
+                terminal = TurnPhase.TIMED_OUT
             controller.transition(
                 record.phase,
                 TurnPhase.CANCELLING,
@@ -585,8 +601,8 @@ def reconcile_nonterminal_turns(
                 operation_id=_reconciliation_operation_id(
                     turn_id, record.version, TurnPhase.CANCELLING),
                 note="restart reconciliation",
-                requested_terminal=TurnPhase.FAILED,
-                cancellation_reason=CancellationReason.INTERNAL_FAILURE,
+                requested_terminal=terminal,
+                cancellation_reason=reason,
             )
     return tuple(results)
 

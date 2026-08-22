@@ -151,18 +151,23 @@ class Agent:
     def _build_turn_bridge(self) -> Any | None:
         """Wrap an injected turn coordinator; never construct one.
 
-        Task 42.3 adds no configuration, no CLI flag and no automatic
-        ``JsonFileTurnStore``. Only an explicit host injection turns the
-        realtime lifecycle on, and only then is the bridge — with this agent's
-        single reentrant stage lease and narrow session lock — created.
+        Task 42.3 adds no CLI flag and no automatic ``JsonFileTurnStore``.
+        Only an explicit host injection turns the realtime lifecycle on, and
+        only then is the bridge — with this agent's single reentrant stage
+        lease and narrow session lock — created. Task 42.4a threads the one
+        approved configuration value, the realtime turn deadline, into the
+        bridge; with no coordinator it is never consumed.
         """
         if self.turn_coordinator is None:
             return None
 
         from agentcore.conversation.turns import TurnBridge
 
-        bridge = TurnBridge(self.turn_coordinator,
-                            logger=get_logger("conversation.turns"))
+        bridge = TurnBridge(
+            self.turn_coordinator,
+            turn_deadline_seconds=(
+                self.config.conversation.turn_deadline_seconds),
+            logger=get_logger("conversation.turns"))
         self.log.info(Events.TURN_BRIDGE_CONFIGURED,
                       coordinator=type(self.turn_coordinator).__name__)
         return bridge

@@ -135,6 +135,7 @@ class Events:
     TURN_TOOL_STARTED: Final = "turn.tool_started"
     TURN_TOOL_FINISHED: Final = "turn.tool_finished"
     TURN_STALE_RESULT_REJECTED: Final = "turn.stale_result_rejected"
+    TURN_TIMED_OUT: Final = "turn.timed_out"
     TURN_FINALIZATION_STARTED: Final = "turn.finalization_started"
     TURN_FINALIZED: Final = "turn.finalized"
 
