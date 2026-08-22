@@ -122,6 +122,16 @@ class TurnCoordinator:
         self._owner_pids = (
             os.getpid(), self._admission_coordination.owner_pid)
 
+    @property
+    def store(self) -> TurnStore:
+        """The durable authority this coordinator admits into.
+
+        Exposed read-only so a stage owner can build a ``TurnController`` for
+        a record it already owns.  The coordinator remains the sole admission
+        authority and the store remains the sole durable authority.
+        """
+        return self._store
+
     def admit(
         self,
         session_id: str,
@@ -240,7 +250,15 @@ class TurnCoordinator:
 
             replaced: TurnSnapshot | None = None
             if state.queued is not None:
-                replaced = self._cancel_before_start(state.queued)
+                remaining, superseded, before_start = \
+                    self._replace_queued(state.queued)
+                replaced = before_start
+                if superseded is not None:
+                    # The classified successor had actually started, so its
+                    # supersession is active-work truth, never before-start.
+                    superseded_active = superseded
+                if remaining is not None and active is None:
+                    active = remaining
 
             admitted = self._transition(
                 prepared, TurnPhase.QUEUED).snapshot()
@@ -336,21 +354,93 @@ class TurnCoordinator:
             attempts=_MAX_SUPERSESSION_RECLASSIFICATIONS,
         )
 
-    def _cancel_before_start(self, record: TurnRecord) -> TurnSnapshot:
-        cancelling = self._transition(
-            record,
-            TurnPhase.CANCELLING,
-            cancellation_reason=CancellationReason.SUPERSEDED_BEFORE_START,
-            requested_terminal=TurnPhase.CANCELLED,
+    def _replace_queued(
+        self,
+        record: TurnRecord,
+    ) -> tuple[TurnRecord | None, TurnSnapshot | None, TurnSnapshot | None]:
+        """Replace the classified queued successor with this admission.
+
+        The record was ``QUEUED`` when the session was read, but admission
+        takes neither the stage lease nor the session lock, so the record's
+        stage owner may have acquired the lease and activated it since.
+        Reload and classify the record as it is *now* rather than trusting
+        that classification:
+
+        * still ``QUEUED`` — it never started; terminalize it as
+          ``SUPERSEDED_BEFORE_START`` exactly as before;
+        * past ``QUEUED`` into started work — it is no longer a queued
+          successor; supersede it as active work through the existing
+          conflict-hardened path, truthfully ``SUPERSEDED``;
+        * ``CANCELLING``/``FINALIZING``/terminal under any other outcome —
+          already leaving; never overwrite an accepted transition or
+          regress its cancellation reason.
+
+        Returns ``(remaining, superseded, replaced)``: a prior record still
+        winding down (or ``None``), evidence a *started* turn was superseded,
+        and evidence a never-started successor was replaced. At most one of
+        the two evidence snapshots is set.
+
+        Every step reloads before it acts, and a lost compare-and-swap means
+        the record moved underneath this admission — including its own stage
+        owner terminalizing, in parallel, the cancellation this method
+        started — so the loop reclassifies instead of leaking the version
+        conflict. ``SUPERSEDED_BEFORE_START`` is fixed by the first
+        successful step, which proves the turn never left ``QUEUED``, and
+        stays truthful through every retry.
+        """
+        reason = CancellationReason.SUPERSEDED_BEFORE_START
+        for _ in range(_MAX_SUPERSESSION_RECLASSIFICATIONS):
+            current = self._store.load(record.turn_id)
+            if current.is_terminal:
+                if current.cancellation_reason is reason:
+                    # Its stage owner finished terminalizing the
+                    # replacement this admission started.
+                    return None, None, current.snapshot()
+                return None, None, None
+            if current.phase is TurnPhase.QUEUED:
+                try:
+                    self._transition(
+                        current,
+                        TurnPhase.CANCELLING,
+                        cancellation_reason=reason,
+                        requested_terminal=TurnPhase.CANCELLED,
+                    )
+                except TurnVersionConflictError:
+                    # It advanced between the reload and the CAS.
+                    continue
+                continue
+            if current.phase is TurnPhase.CANCELLING and \
+                    current.cancellation_reason is reason:
+                try:
+                    self._transition(
+                        current,
+                        TurnPhase.FINALIZING,
+                        cancellation_reason=reason,
+                        requested_terminal=TurnPhase.CANCELLED,
+                    )
+                except TurnVersionConflictError:
+                    continue
+                continue
+            if current.phase is TurnPhase.FINALIZING and \
+                    current.cancellation_reason is reason and \
+                    current.requested_terminal is TurnPhase.CANCELLED:
+                try:
+                    terminal = self._transition(
+                        current, TurnPhase.CANCELLED)
+                except TurnVersionConflictError:
+                    continue
+                return None, None, terminal.snapshot()
+            # Anything else advanced past the replacement this admission
+            # owns. Reuse the active-turn supersession so reclassification
+            # lives in exactly one place; it leaves records that are already
+            # cancelling or finalizing untouched.
+            advanced, superseded = self._supersede_active(current)
+            return advanced, superseded, None
+        raise TurnCoordinatorError(
+            "queued turn changed during every replacement attempt",
+            turn_id=record.turn_id,
+            attempts=_MAX_SUPERSESSION_RECLASSIFICATIONS,
         )
-        finalizing = self._transition(
-            cancelling,
-            TurnPhase.FINALIZING,
-            cancellation_reason=CancellationReason.SUPERSEDED_BEFORE_START,
-            requested_terminal=TurnPhase.CANCELLED,
-        )
-        return self._transition(
-            finalizing, TurnPhase.CANCELLED).snapshot()
 
     def _fail_prepared(
         self,

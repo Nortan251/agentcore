@@ -996,6 +996,163 @@ def test_admission_conflict_reclassification_is_bounded_and_fails_safe():
     assert any(record.phase is TurnPhase.FAILED for record in records)
 
 
+@pytest.mark.parametrize("advance_to", [
+    "generating",
+    "executing_tool",
+    "finalizing_committed",
+])
+def test_admission_reclassifies_queued_successor_that_started(advance_to):
+    delegate = InMemoryTurnStore()
+    clock = FixedClock(NOW)
+    ids = _Ids()
+    coordinator = _coordinator(delegate, ids)
+    first = coordinator.admit("conv_000000000031")
+    second = coordinator.admit("conv_000000000031")
+    queued_id = second.admitted.turn_id
+
+    def advance():
+        record = delegate.load(queued_id)
+        controller = TurnController(delegate, record.turn_id, clock=clock)
+        controller.transition(
+            TurnPhase.QUEUED, TurnPhase.GENERATING,
+            expected_version=record.version,
+            operation_id="op_e00000000001")
+        if advance_to == "executing_tool":
+            generating = delegate.load(queued_id)
+            controller.transition(
+                TurnPhase.GENERATING, TurnPhase.EXECUTING_TOOL,
+                expected_version=generating.version,
+                operation_id="op_e00000000002")
+        elif advance_to == "finalizing_committed":
+            generating = delegate.load(queued_id)
+            controller.transition(
+                TurnPhase.GENERATING, TurnPhase.FINALIZING,
+                expected_version=generating.version,
+                operation_id="op_e00000000003",
+                requested_terminal=TurnPhase.COMPLETED)
+
+    # The queued successor's stage owner activates it while the newer
+    # admission sits between its session read and its replacement attempt:
+    # _AdvanceOnCreateStore fires the activation at exactly that boundary.
+    store = _AdvanceOnCreateStore(delegate, advance)
+    store.enabled = True
+
+    # Before the fix this raised TurnVersionConflictError: the stale
+    # QUEUED snapshot lost the CAS against the successor that started.
+    third = _coordinator(store, ids).admit("conv_000000000031")
+
+    started = delegate.load(queued_id)
+    newest = delegate.load(third.admitted.turn_id)
+    if advance_to == "finalizing_committed":
+        # A committed, finalizing turn is never superseded or regressed.
+        assert started.phase is TurnPhase.FINALIZING
+        assert started.requested_terminal is TurnPhase.COMPLETED
+        assert started.cancellation_reason is None
+        assert third.superseded_active is None
+        assert third.superseded_before_start is None
+    else:
+        # It started, so its replacement is active-work supersession with
+        # the truthful SUPERSEDED vocabulary, never before-start.
+        assert started.phase is TurnPhase.CANCELLING
+        assert started.cancellation_reason is CancellationReason.SUPERSEDED
+        assert started.requested_terminal is TurnPhase.CANCELLED
+        assert third.superseded_active == started.snapshot()
+        assert third.superseded_before_start is None
+    assert newest.phase is TurnPhase.QUEUED
+    assert newest.generation == 3
+    active = delegate.load(first.admitted.turn_id)
+    assert active.cancellation_reason is CancellationReason.SUPERSEDED
+
+
+class _OwnerTerminalizeInsideReplacementCasStore:
+    """The queued record's owner terminalizes during its own replacement.
+
+    Fires once, at the compare-and-swap that would carry the queued
+    successor's replacement from CANCELLING to FINALIZING: at that instant
+    the record's own stage owner (which acquired the stage lease after the
+    first replacement CAS) drives the very same cancellation to terminal
+    first. The admission's CAS loses and must reclassify, not leak.
+    """
+
+    def __init__(self, delegate, queued_id, clock):
+        self._delegate = delegate
+        self._queued_id = queued_id
+        self._clock = clock
+        self.injected = False
+
+    @property
+    def admission_coordination(self):
+        return self._delegate.admission_coordination
+
+    def create(self, record):
+        return self._delegate.create(record)
+
+    def load(self, turn_id):
+        return self._delegate.load(turn_id)
+
+    def compare_and_swap(self, turn_id, expected_version, next_record):
+        if not self.injected and turn_id == self._queued_id and \
+                next_record.phase is TurnPhase.FINALIZING and \
+                next_record.cancellation_reason is \
+                CancellationReason.SUPERSEDED_BEFORE_START:
+            self.injected = True
+            record = self._delegate.load(turn_id)
+            controller = TurnController(
+                self._delegate, turn_id, clock=self._clock)
+            controller.transition(
+                TurnPhase.CANCELLING, TurnPhase.FINALIZING,
+                expected_version=record.version,
+                operation_id="op_e00000000004",
+                cancellation_reason=record.cancellation_reason,
+                requested_terminal=record.requested_terminal)
+            record = self._delegate.load(turn_id)
+            controller.transition(
+                TurnPhase.FINALIZING, TurnPhase.CANCELLED,
+                expected_version=record.version,
+                operation_id="op_e00000000005")
+        return self._delegate.compare_and_swap(
+            turn_id, expected_version, next_record)
+
+    def list_turns(self):
+        return self._delegate.list_turns()
+
+    def close(self):
+        return self._delegate.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+
+def test_admission_survives_owner_terminalizing_the_replacement_in_parallel():
+    delegate = InMemoryTurnStore()
+    clock = FixedClock(NOW)
+    ids = _Ids()
+    coordinator = _coordinator(delegate, ids)
+    coordinator.admit("conv_000000000032")
+    second = coordinator.admit("conv_000000000032")
+    store = _OwnerTerminalizeInsideReplacementCasStore(
+        delegate, second.admitted.turn_id, clock)
+
+    # Before the fix the second replacement transition raised
+    # TurnVersionConflictError and destroyed the newer admission.
+    third = _coordinator(store, ids).admit("conv_000000000032")
+
+    assert store.injected
+    replaced = delegate.load(second.admitted.turn_id)
+    assert replaced.phase is TurnPhase.CANCELLED
+    assert replaced.cancellation_reason is \
+        CancellationReason.SUPERSEDED_BEFORE_START
+    assert replaced.final_terminal is TurnPhase.CANCELLED
+    assert third.superseded_before_start == replaced.snapshot()
+    assert third.superseded_active is None
+    newest = delegate.load(third.admitted.turn_id)
+    assert newest.phase is TurnPhase.QUEUED
+    assert newest.generation == 3
+
+
 @pytest.mark.parametrize("existing_kind", [
     "active",
     "terminal",
