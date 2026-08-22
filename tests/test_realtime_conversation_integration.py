@@ -38,6 +38,7 @@ from agentcore.config.schema import (
 from agentcore.conversation.tool_use import ConversationToolRunner, ToolCallOutcome
 from agentcore.conversation.turns import (
     SUPERSEDED_TURN_ERROR,
+    TIMED_OUT_TURN_ERROR,
     StageLease,
     TurnBridge,
     TurnSuperseded,
@@ -2187,6 +2188,65 @@ def test_completion_cas_beats_later_clock_advance(tmp_path):
     assert record.phase is TurnPhase.COMPLETED
     assert record.cancellation_reason is None
     assert _texts(result.session) == ["hello", "committed reply"]
+
+
+def test_outward_error_distinguishes_timeout_from_supersession(tmp_path):
+    """The TurnResult error text follows the durable terminal outcome.
+
+    A timed-out turn must not claim it was superseded; a superseded turn
+    keeps the existing message. Durable lifecycle, CAS and deadline
+    semantics are untouched — this is outward vocabulary only.
+    """
+    # Timeout: the provider physically returns after the deadline.
+    model = ScriptedModel(_reply("late"))
+    release = model.gate(1)
+    clock = FixedClock(T0)
+    agent, runtime, store, _ = _opted_in_deadline(tmp_path, model, clock)
+    session = runtime.start()
+    results: list = []
+    thread = threading.Thread(
+        target=lambda: results.append(runtime.send("hello", session=session)),
+        daemon=True)
+    thread.start()
+    model.wait_entered(1)
+    clock.advance(EXPIRE_BY)
+    release.set()
+    thread.join(WAIT)
+
+    timed_out = results[0]
+    assert not timed_out.ok
+    assert timed_out.error == TIMED_OUT_TURN_ERROR
+    assert timed_out.turn_phase == "timed_out"
+    assert _records(store)[0].phase is TurnPhase.TIMED_OUT
+
+    # Supersession: the existing outward message is unchanged.
+    supersede_model = ScriptedModel(_reply("first"), _reply("second"))
+    release_first = supersede_model.gate(1)
+    supersede_agent, supersede_runtime, supersede_store, coordinator = \
+        _opted_in_deadline(tmp_path, supersede_model, FixedClock(T0))
+    supersede_session = supersede_runtime.start()
+    outcomes: dict[str, object] = {}
+
+    def send(name, text):
+        outcomes[name] = supersede_runtime.send(
+            text, session=supersede_session)
+
+    first = threading.Thread(target=send, args=("first", "one"),
+                             daemon=True)
+    first.start()
+    supersede_model.wait_entered(1)
+    second = threading.Thread(target=send, args=("second", "two"),
+                              daemon=True)
+    second.start()
+    coordinator.wait_for(2)
+    release_first.set()
+    first.join(WAIT)
+    second.join(WAIT)
+
+    assert not outcomes["first"].ok
+    assert outcomes["first"].error == SUPERSEDED_TURN_ERROR
+    assert outcomes["first"].turn_phase == "cancelled"
+    assert outcomes["second"].ok
 
 
 def test_turn_timed_out_event_is_categorical(tmp_path):

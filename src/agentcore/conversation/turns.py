@@ -62,6 +62,11 @@ _MAX_TERMINALIZATION_STEPS = 32
 #: turn outcome, not a model failure, so no assistant message is fabricated.
 SUPERSEDED_TURN_ERROR = "this turn was superseded by a newer message"
 
+#: Outward explanation when the turn's own deadline expired instead. The
+#: durable record already says TIMED_OUT/DEADLINE_EXCEEDED; the outward
+#: error must not claim supersession.
+TIMED_OUT_TURN_ERROR = "this turn exceeded its deadline"
+
 
 class TurnSuperseded(Exception):
     """Internal signal: this turn is no longer the current one.
@@ -368,7 +373,12 @@ class TurnBridge:
 
     def _superseded(self, runtime: Any, session: Any, fence: _TurnFence,
                     record: TurnRecord) -> Any:
-        result = runtime._superseded_result(session, SUPERSEDED_TURN_ERROR)
+        # The durable terminal record owns the truthful outward vocabulary:
+        # a turn that timed out must not claim it was superseded.
+        message = (TIMED_OUT_TURN_ERROR
+                   if record.phase is TurnPhase.TIMED_OUT
+                   else SUPERSEDED_TURN_ERROR)
+        result = runtime._superseded_result(session, message)
         _annotate(result, fence, record)
         return result
 
