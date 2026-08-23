@@ -678,6 +678,8 @@ class OperationContext:
 class _TurnStore(Protocol):
     def load(self, turn_id: str) -> TurnRecord: ...
 
+    def bind_run(self, turn_id: str, run_id: str) -> TurnRecord: ...
+
     def compare_and_swap(self, turn_id: str, expected_version: int,
                          next_record: TurnRecord) -> TurnRecord: ...
 
@@ -782,11 +784,7 @@ class TurnController:
         - lifecycle phase/version/transitions unchanged
         """
         run_id = _require_run_id(run_id)
-        # Store is expected to expose bind_run; if not, raise validation
-        bind = getattr(self._store, "bind_run", None)
-        if not callable(bind):
-            raise TurnValidationError("turn store does not support bind_run")
-        record = bind(self._turn_id, run_id)
+        record = self._store.bind_run(self._turn_id, run_id)
         return record.snapshot()
 
     def accepts(self, context: OperationContext, *,

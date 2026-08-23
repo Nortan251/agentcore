@@ -249,6 +249,18 @@ class AgentState:
         self.updated_at = utc_now()
         self.version += 1
 
+    def set_origin_turn_id(self, turn_id: str) -> None:
+        """Set the immutable conversation origin with normal mutation semantics."""
+        if self.origin_turn_id is not None:
+            if self.origin_turn_id != turn_id:
+                raise StateError("run already has a different origin turn",
+                                 run_id=self.run_id,
+                                 existing_origin=self.origin_turn_id,
+                                 origin_turn_id=turn_id)
+            return
+        self.origin_turn_id = turn_id
+        self._touch()
+
     def transition_phase(self, target: AgentPhase, *, note: str = "") -> None:
         if target is not self.phase and target not in _ALLOWED_PHASES[self.phase]:
             raise StateError("illegal phase transition", run_id=self.run_id,

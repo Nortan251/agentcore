@@ -902,7 +902,8 @@ def test_persisted_state_contains_only_opaque_origin(tmp_path):
     serialized = json.dumps(agent.state.to_dict())
     assert turn_id in serialized
     # No raw session id
-    assert "raw" not in serialized.lower() or True
+    assert "RAW_SESSION_SECRET_42_4D" not in serialized
+    assert turn_id in serialized
 
 
 def test_malformed_origin_id_rejected_before_path(tmp_path):
@@ -979,7 +980,8 @@ def test_replan_does_not_change_origin(tmp_path):
     # Origin should remain same after replan
     assert agent.state.origin_turn_id == turn_id
     # New task objective is different, but origin unchanged
-    assert agent.state.current_task.objective == "new objective" or agent.state.current_task.objective == "test objective" or True
+    assert agent.state.current_task.objective == "new objective"
+    assert planner.plans == 1
     # Actually after replan, task should be replacement with new objective, but origin still same
     assert agent.state.origin_turn_id == turn_id
 
@@ -991,6 +993,37 @@ def test_reset_does_not_retain_origin(tmp_path):
     agent.bind_origin_turn(turn_id)
     assert agent.state.origin_turn_id == turn_id
 
+    old_run_id = agent.state.run_id
     new_state = agent.reset()
+    assert agent.state is new_state
     assert new_state.origin_turn_id is None
-    assert new_state.run_id != agent.state.run_id or True
+    assert new_state.run_id != old_run_id
+
+# Admission fences: public correlation cannot race executable work.
+def test_public_bind_rejected_while_physical_tool_is_active(tmp_path):
+    tool = GatedTool()
+    agent, store, _ = make_agent(tmp_path, [tool])
+    origin_id, _ = complete_turn(store)
+    thread = threading.Thread(target=lambda: agent.run_task(make_task("gate")))
+    thread.start()
+    assert tool.entered.wait(WAIT)
+    with pytest.raises(TurnCorrelationConflictError):
+        agent.bind_origin_turn(origin_id)
+    assert agent.state.origin_turn_id is None
+    assert store.load(origin_id).run_id is None
+    tool.release.set()
+    thread.join(WAIT)
+    assert not thread.is_alive()
+    assert agent.state.origin_turn_id is None
+
+
+def test_direct_invoke_is_execution_evidence_and_cannot_gain_first_origin(tmp_path):
+    tool = CountingTool()
+    agent, store, _ = make_agent(tmp_path, [tool])
+    invocation = agent.executor.invoke("count", {}, run_id=agent.state.run_id)
+    agent.state.record_tool_call(invocation)
+    origin_id, _ = complete_turn(store)
+    with pytest.raises(TurnCorrelationConflictError):
+        agent.bind_origin_turn(origin_id)
+    assert len(agent.state.tool_calls) == 1
+    assert agent.state.origin_turn_id is None

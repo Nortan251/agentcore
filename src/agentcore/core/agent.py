@@ -665,23 +665,40 @@ class Agent:
 
         return record
 
+    def _has_autonomous_execution_evidence(self) -> bool:
+        """Return whether this run has progressed beyond an untouched task."""
+        task = self.state.current_task
+        if self.state.tool_calls or self.state.verifications or self.state.active_subtask_id:
+            return True
+        if task is not None and (task.status is not TaskStatus.PENDING or
+                                 any(s.status is not TaskStatus.PENDING for s in task.subtasks)):
+            return True
+        return any(entry.kind in {"tool_call", "verification"} for entry in self.state.history)
+
     def bind_origin_turn(self, turn_id: str) -> RunCorrelation:
-        """Establish reciprocal durable correlation between this run and a COMPLETED turn.
+        """Publicly establish correlation only while no autonomous run is active."""
+        with self._autonomy_lock:
+            if self._active_run:
+                raise TurnCorrelationConflictError(
+                    "cannot bind origin while autonomous run is active",
+                    run_id=self.state.run_id, turn_id=turn_id)
+            return self._establish_origin_turn(turn_id)
 
-        Trusted host API. No planner, tool, permission decision, capability grant.
+    def _establish_origin_turn(self, turn_id: str) -> RunCorrelation:
+        """Trusted state-first durable handshake for a reserved autonomous run.
 
-        Order (state-first, safe handshake):
-        1. pre-flight validate turn COMPLETED, run_id None or this run_id, state origin None or this turn_id
-        2. set state.origin_turn_id = turn_id
-        3. checkpoint AgentState
-        4. atomically TurnController.bind_run(state.run_id)
-        5. reload/verify reciprocal
-        6. emit RUN_CORRELATED event, return RunCorrelation
-
-        No executable work may begin before step 5 succeeds.
+        No planner, tool, permission decision, or capability grant is involved.
         """
+
         turn_id = require_turn_id(turn_id)
         run_id = require_run_id(self.state.run_id)
+
+        # A first origin is historical provenance, not a label that may be
+        # attached after work. An untouched PENDING assignment remains valid.
+        if self.state.origin_turn_id is None and self._has_autonomous_execution_evidence():
+            raise TurnCorrelationConflictError(
+                "cannot establish origin after autonomous work began",
+                run_id=self.state.run_id, turn_id=turn_id)
 
         # 1. pre-flight
         store = self._require_turn_store()
@@ -689,9 +706,7 @@ class Agent:
 
         # 2. set state origin (immutable once set, idempotent same id)
         if self.state.origin_turn_id is None:
-            # Validate turn_id format already done, now set
-            # Use direct assignment; AgentState is mutable for this field, but we enforce immutability via check above
-            self.state.origin_turn_id = turn_id
+            self.state.set_origin_turn_id(turn_id)
         # If already same, idempotent
 
         # 3. checkpoint state
@@ -732,10 +747,13 @@ class Agent:
         origin = loaded_state.origin_turn_id
         if origin is None:
             return
-        # Require coordinator/store
+        require_turn_id(origin)
+        # Require coordinator/store without mutating the live state.
         store = self._require_turn_store()
         try:
             record = store.load(origin)
+        except TurnNotFoundError:
+            raise
         except Exception as exc:
             raise TurnCorrelationError("origin turn missing during heal", turn_id=origin) from exc
 
@@ -749,6 +767,8 @@ class Agent:
             try:
                 controller = TurnController(store, origin)
                 controller.bind_run(loaded_state.run_id)
+            except TurnCorrelationConflictError:
+                raise
             except Exception as exc:
                 raise TurnCorrelationError("failed to heal correlation", turn_id=origin) from exc
             # Verify after heal
@@ -818,7 +838,7 @@ class Agent:
                 # If param equals existing, idempotent
                 # If param differs, fail before work (handled in _validate_origin_turn)
                 # If no coordinator, _require_turn_store will raise categorical failure before work
-                self.bind_origin_turn(effective_origin)
+                self._establish_origin_turn(effective_origin)
 
             if task is not None:
                 self.assign(task)
@@ -1184,51 +1204,8 @@ class Agent:
                 run_id=run_id, run_workspace=pinned,
                 current_workspace=self.workspace.identity)
 
-        # Task 42.4d: correlation validation before adopting
-        origin = loaded.origin_turn_id
-        if origin is not None:
-            # Require coordinator/store
-            try:
-                store = self._require_turn_store()
-            except Exception as exc:
-                # Fail closed, current state unchanged
-                raise exc
-
-            # Validate origin_turn_id format
-            try:
-                require_turn_id(origin)
-            except Exception as exc:
-                raise exc
-
-            # Load originating turn
-            try:
-                record = store.load(origin)
-            except Exception as exc:
-                raise exc
-
-            if record.phase is not TurnPhase.COMPLETED:
-                raise TurnCorrelationError(
-                    "origin turn is not COMPLETED",
-                    turn_id=origin, phase=record.phase.value)
-
-            # Heal crash window: state has origin X, turn X has run_id None -> bind
-            if record.run_id is None:
-                try:
-                    controller = TurnController(store, origin)
-                    controller.bind_run(loaded.run_id)
-                except Exception as exc:
-                    raise TurnCorrelationError("failed to heal correlation during resume", turn_id=origin) from exc
-                # Reload after heal
-                record = store.load(origin)
-
-            if record.run_id != loaded.run_id:
-                raise TurnCorrelationConflictError(
-                    "origin turn bound to different run during resume",
-                    turn_id=origin, existing_run_id=record.run_id, new_run_id=loaded.run_id)
-
-            # Verify reciprocal exact match
-            if loaded.origin_turn_id != origin or record.run_id != loaded.run_id:
-                raise TurnCorrelationError("reciprocal mismatch during resume", turn_id=origin)
+        # Validate and crash-heal the reciprocal relation before adoption.
+        self._heal_correlation_if_needed(loaded)
 
         self.state = loaded
         if self.state.workspace is None:
