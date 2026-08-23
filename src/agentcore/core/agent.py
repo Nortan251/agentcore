@@ -940,44 +940,39 @@ class Agent:
     def _finalise_run(self, report: RunReport) -> None:
         """Settle the agent phase once the loop has stopped.
 
-        Task 42.4c: CANCELLED settles to DONE with truthful categorical note,
-        using existing phases only. For CANCELLED from PLANNING, the approved
-        bridge PLANNING->IDLE->DONE is used. FAILED preserves ERROR semantics
-        and does NOT fall back to DONE on transition failure.
+        Exact rules (final cleanup):
+        COMPLETED -> DONE (no catch, fail-loud if illegal)
+        FAILED -> ERROR (no fallback to DONE)
+        CANCELLED: only PLANNING gets IDLE bridge, else DONE directly.
+        Only PLANNING gets explicit IDLE bridge. No ERROR special-case.
+        No StateError catch/pass. Checkpoint after settlement succeeds.
         """
         if report.status is TaskStatus.COMPLETED:
-            # Completion wins: transition to DONE, may need IDLE stepping if currently PLANNING etc.
-            try:
-                self.state.transition_phase(AgentPhase.DONE, note="task completed")
-            except StateError:
-                # If currently PLANNING (replan path) or similar, step via IDLE
-                if self.state.phase in (AgentPhase.PLANNING, AgentPhase.RECOVERING, AgentPhase.ERROR):
-                    try:
-                        if self.state.phase is not AgentPhase.IDLE:
-                            self.state.transition_phase(AgentPhase.IDLE, note="reset before task completed")
-                    except StateError:
-                        pass
-                self.state.transition_phase(AgentPhase.DONE, note="task completed")
+            self.state.transition_phase(
+                AgentPhase.DONE,
+                note="task completed",
+            )
         elif report.status is TaskStatus.FAILED:
-            # FAILED must remain ERROR, not fall back to DONE (P2-3)
-            self.state.transition_phase(AgentPhase.ERROR, note="task failed")
+            self.state.transition_phase(
+                AgentPhase.ERROR,
+                note="task failed",
+            )
         elif report.status is TaskStatus.CANCELLED:
             reason = report.cancellation_reason or "cancelled"
-            # Approved bridge for cancellation from PLANNING: PLANNING->IDLE->DONE
-            try:
-                self.state.transition_phase(AgentPhase.DONE, note=f"task cancelled: {reason}")
-            except StateError:
-                if self.state.phase is AgentPhase.PLANNING:
-                    self.state.transition_phase(AgentPhase.IDLE, note=f"reset before task cancelled: {reason}")
-                    self.state.transition_phase(AgentPhase.DONE, note=f"task cancelled: {reason}")
-                elif self.state.phase is AgentPhase.ERROR:
-                    try:
-                        self.state.transition_phase(AgentPhase.IDLE, note=f"reset before task cancelled: {reason}")
-                    except StateError:
-                        pass
-                    self.state.transition_phase(AgentPhase.DONE, note=f"task cancelled: {reason}")
-                else:
-                    raise
+            if self.state.phase is AgentPhase.PLANNING:
+                self.state.transition_phase(
+                    AgentPhase.IDLE,
+                    note=f"reset before task cancelled: {reason}",
+                )
+                self.state.transition_phase(
+                    AgentPhase.DONE,
+                    note=f"task cancelled: {reason}",
+                )
+            else:
+                self.state.transition_phase(
+                    AgentPhase.DONE,
+                    note=f"task cancelled: {reason}",
+                )
         else:
             self.state.update_resume_point(note="task blocked")
         self.checkpoint()

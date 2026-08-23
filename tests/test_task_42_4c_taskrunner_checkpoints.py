@@ -760,10 +760,10 @@ def test_shutdown_while_active_no_competing_save(tmp_path):
 def test_shutdown_save_gated_run_attempt_blocked_until_save_completes(tmp_path):
     """P1-1 B: no active run, shutdown save starts gated, run attempts blocked."""
     gated_store = GatedStateStore()
-    agent = make_agent(tmp_path, [CountingTool()], state_store=gated_store)
+    tool = CountingTool()
+    agent = make_agent(tmp_path, [tool], state_store=gated_store)
     task = make_task_with_tools(["count"])
 
-    # No active run initially
     assert not agent._active_run
 
     shutdown_done = threading.Event()
@@ -776,35 +776,26 @@ def test_shutdown_save_gated_run_attempt_blocked_until_save_completes(tmp_path):
 
     def do_run():
         run_started.set()
-        # This will attempt to acquire autonomy_lock which is held by shutdown's checkpoint
         try:
             run_results.append(agent.run_task(task))
         except Exception as exc:
             run_results.append(exc)
 
-    # Start shutdown in separate thread so its save() blocks
     t_shutdown = threading.Thread(target=do_shutdown, daemon=True)
     t_shutdown.start()
     assert gated_store.entered.wait(WAIT), "shutdown save never entered"
 
-    # While save is gated, attempt run_task
     t_run = threading.Thread(target=do_run, daemon=True)
     t_run.start()
     assert run_started.wait(WAIT)
 
-    # Run should be blocked on autonomy_lock, not yet set active
-    # Give a moment for run to attempt lock (no sleep race, just check active flag remains False while gated)
-    # Since shutdown holds lock across checkpoint, _active_run is still False but lock is held, so run blocks
-    # We can check that run thread is still alive and no tool executed
     assert t_run.is_alive()
-    assert gated_store.save_calls == ["idle"] or len(gated_store.save_calls) >= 1
+    assert tool.runs == 0
 
-    # Release shutdown save
     gated_store.release.set()
     t_shutdown.join(WAIT)
     assert shutdown_done.is_set()
 
-    # Now run should proceed, but root already cancelled, so it should immediately inherit AGENT_SHUTDOWN
     t_run.join(WAIT)
 
     assert len(run_results) == 1
@@ -812,17 +803,10 @@ def test_shutdown_save_gated_run_attempt_blocked_until_save_completes(tmp_path):
     assert isinstance(result, RunReport)
     assert result.status is TaskStatus.CANCELLED
     assert result.cancellation_reason == CancellationReason.AGENT_SHUTDOWN.value
-    # No tool run
-    # CountingTool runs tracked via agent's tool? We used CountingTool in agent, but we need to check
-    # Since task was cancelled before tool, no tool should have run
-    # The agent's tool list contains CountingTool, but we didn't track runs separately; we can check state.tool_calls
-    # After cancellation before tool, no tool_calls
-    assert len(agent.state.tool_calls) == 0 or agent.state.tool_calls[0]["tool"] != "count" or result.status is TaskStatus.CANCELLED
+    assert tool.runs == 0
+    assert agent.state.tool_calls == []
 
 
-# ---------------------------------------------------------------------------
-# 17. second concurrent autonomous run rejected
-# ---------------------------------------------------------------------------
 def test_second_concurrent_run_rejected(tmp_path):
     gate_tool = GateTool()
     agent = make_agent(tmp_path, [gate_tool])
@@ -870,11 +854,13 @@ def test_permission_deny_unchanged(tmp_path):
     report = agent.runner.run(task, agent.state)
 
     assert write_tool.runs == 0
-    # ToolInvocation should be permission_denied
     assert len(agent.state.tool_calls) == 1
-    assert agent.state.tool_calls[0]["result"]["ok"] is False
-    assert "permission_denied" in json.dumps(agent.state.tool_calls[0]).lower() or "denied" in agent.state.tool_calls[0]["result"]["error"].lower()
-    # Report failed reflects denial
+
+    invocation = agent.state.tool_calls[0]
+
+    assert invocation["result"]["ok"] is False
+    assert invocation["result"]["metadata"]["kind"] == "permission_denied"
+
     assert report.failed == 1
     assert task.subtasks[0].status is TaskStatus.FAILED
     assert task.status is TaskStatus.FAILED
@@ -914,9 +900,9 @@ def test_toolexecutor_checkpoint_cannot_grant_denied(tmp_path):
 
     invocation = executor.invoke("write", {}, checkpoint=checkpoint_ok, run_id="run_test")
 
-    assert not invocation.ok
+    assert invocation.ok is False
+    assert invocation.result.metadata["kind"] == "permission_denied"
     assert write_tool.runs == 0
-    assert invocation.result.metadata.get("kind") == "permission_denied" or "denied" in invocation.result.error.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -1066,3 +1052,98 @@ def test_replan_ledger_consumed_when_planner_entered_then_cancelled(tmp_path):
     assert ledger.records[0].outcome == "cancelled"
     # Replacement plan NOT adopted
     assert agent.state.current_task.id == task.id
+
+# ---------------------------------------------------------------------------
+# Lifecycle finalization regressions (final cleanup)
+# ---------------------------------------------------------------------------
+def test_finalise_completed_plus_error_raises_and_stays_error(tmp_path):
+    """COMPLETED + ERROR must raise StateError and NOT become DONE."""
+    tool = CountingTool()
+    agent = make_agent(tmp_path, [tool])
+    task = make_task_with_tools(["count"])
+    task.subtasks[0].transition_to(TaskStatus.RUNNING)
+    task.subtasks[0].transition_to(TaskStatus.COMPLETED)
+    task.transition_to(TaskStatus.RUNNING)
+    task.transition_to(TaskStatus.COMPLETED)
+    agent.state.set_task(task)
+    agent.state.transition_phase(AgentPhase.EXECUTING, note="test")
+    agent.state.transition_phase(AgentPhase.ERROR, note="test error")
+
+    report = RunReport(task_id=task.id, status=TaskStatus.COMPLETED)
+
+    with pytest.raises(StateError):
+        agent._finalise_run(report)
+
+    assert agent.state.phase is AgentPhase.ERROR
+
+
+def test_finalise_cancelled_plus_error_raises_and_stays_error(tmp_path):
+    """CANCELLED + ERROR must raise StateError and remain ERROR."""
+    tool = CountingTool()
+    agent = make_agent(tmp_path, [tool])
+    task = make_task_with_tools(["count"])
+    task.transition_to(TaskStatus.RUNNING)
+    task.transition_to(TaskStatus.CANCELLED)
+    agent.state.set_task(task)
+    agent.state.transition_phase(AgentPhase.EXECUTING, note="test")
+    agent.state.transition_phase(AgentPhase.ERROR, note="test error")
+
+    report = RunReport(task_id=task.id, status=TaskStatus.CANCELLED, cancellation_reason=CancellationReason.AGENT_SHUTDOWN.value)
+
+    with pytest.raises(StateError):
+        agent._finalise_run(report)
+
+    assert agent.state.phase is AgentPhase.ERROR
+
+
+def test_finalise_cancelled_plus_planning_succeeds_to_done(tmp_path):
+    """CANCELLED + PLANNING must succeed via IDLE bridge to DONE with categorical reason."""
+    agent = make_agent(tmp_path, [CountingTool()])
+    task = make_task_with_tools(["count"])
+    task.transition_to(TaskStatus.RUNNING)
+    task.transition_to(TaskStatus.CANCELLED)
+    agent.state.set_task(task)
+    agent.state.transition_phase(AgentPhase.EXECUTING, note="test")
+    agent.state.transition_phase(AgentPhase.RECOVERING, note="test")
+    agent.state.transition_phase(AgentPhase.PLANNING, note="test planning")
+
+    report = RunReport(task_id=task.id, status=TaskStatus.CANCELLED, cancellation_reason=CancellationReason.DEADLINE_EXCEEDED.value)
+
+    agent._finalise_run(report)
+
+    assert agent.state.phase is AgentPhase.DONE
+    # Note contains categorical reason
+    assert "deadline_exceeded" in agent.state.history[-1].data.get("note", "") or "deadline_exceeded" in str(agent.state.resume_point.note)
+
+
+def test_finalise_completed_plus_executing_to_done(tmp_path):
+    agent = make_agent(tmp_path, [CountingTool()])
+    task = make_task_with_tools(["count"])
+    task.subtasks[0].transition_to(TaskStatus.RUNNING)
+    task.subtasks[0].transition_to(TaskStatus.COMPLETED)
+    task.transition_to(TaskStatus.RUNNING)
+    task.transition_to(TaskStatus.COMPLETED)
+    agent.state.set_task(task)
+    agent.state.transition_phase(AgentPhase.EXECUTING, note="test")
+
+    report = RunReport(task_id=task.id, status=TaskStatus.COMPLETED)
+
+    agent._finalise_run(report)
+
+    assert agent.state.phase is AgentPhase.DONE
+
+
+def test_finalise_cancelled_plus_recovering_to_done(tmp_path):
+    agent = make_agent(tmp_path, [CountingTool()])
+    task = make_task_with_tools(["count"])
+    task.transition_to(TaskStatus.RUNNING)
+    task.transition_to(TaskStatus.CANCELLED)
+    agent.state.set_task(task)
+    agent.state.transition_phase(AgentPhase.EXECUTING, note="test")
+    agent.state.transition_phase(AgentPhase.RECOVERING, note="test")
+
+    report = RunReport(task_id=task.id, status=TaskStatus.CANCELLED, cancellation_reason=CancellationReason.AGENT_SHUTDOWN.value)
+
+    agent._finalise_run(report)
+
+    assert agent.state.phase is AgentPhase.DONE
