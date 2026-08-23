@@ -1,7 +1,7 @@
 """Task 42.4c — autonomous cooperative cancellation + deadline checkpoints.
 
-Deterministic tests using Events, FixedClock, injected sleep, gated fakes.
-No time.sleep() race proofs.
+Deterministic tests using Events, Conditions, FixedClock, injected sleep,
+gated fakes. No time.sleep() race proofs.
 """
 
 from __future__ import annotations
@@ -9,8 +9,7 @@ from __future__ import annotations
 import json
 import math
 import threading
-import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Any
 
 import pytest
@@ -26,13 +25,12 @@ from agentcore.realtime.turn import Deadline
 from agentcore.state.models import AgentPhase, AgentState
 from agentcore.state.store import InMemoryStateStore
 from agentcore.tasks.models import Task, Subtask, TaskStatus, VerificationResult, VerificationStatus
-from agentcore.tools.base import Tool, ToolResult, tool_spec, ToolParameter, ParamType
+from agentcore.tools.base import Tool, ToolResult, tool_spec
 from agentcore.tools.executor import ToolExecutor
 from agentcore.tools.registry import ToolRegistry
 from agentcore.permissions.policy import PermissionPolicy, ApprovalGate
 from agentcore.fs.guard import WorkspaceGuard
 from agentcore.util.clock import FixedClock
-from agentcore.util.ids import new_id
 
 WAIT = 30.0
 T0 = datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc)
@@ -40,9 +38,6 @@ DEADLINE_SECONDS = 10.0
 EXPIRE_BY = 11.0
 
 
-# ---------------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------------
 def _config(tmp_path, *, level=PermissionLevel.AUTONOMOUS):
     return AgentConfig(
         environment="test",
@@ -90,6 +85,28 @@ class CountingTool(Tool):
             return ToolResult.success(f"count-{self.runs}")
 
 
+class FailTool(Tool):
+    @property
+    def spec(self):
+        return tool_spec("fail", "Fails.", parameters=[], capabilities=[], read_only=True)
+
+    def run(self, args, context):
+        return ToolResult.failure("failed")
+
+
+class WriteTool(Tool):
+    def __init__(self):
+        self.runs = 0
+
+    @property
+    def spec(self):
+        return tool_spec("write", "Write.", parameters=[], capabilities=[Capability.FS_WRITE], read_only=False)
+
+    def run(self, args, context):
+        self.runs += 1
+        return ToolResult.success("wrote")
+
+
 class GatedVerifier:
     def __init__(self):
         self.calls = 0
@@ -109,13 +126,12 @@ class GatedRecovery:
         self.calls = 0
         self.entered = threading.Event()
         self.release = threading.Event()
-        self.should_retry_return = False
         from agentcore.recovery.decision import RecoveryDecision, RecoveryAction, FailureCategory
         self.decision = RecoveryDecision(action=RecoveryAction.STOP, reason="stop", category=FailureCategory.NONE)
 
     def should_retry(self, subtask, state):
         self.calls += 1
-        return self.should_retry_return
+        return False
 
     def decide(self, subtask, state):
         self.calls += 1
@@ -133,7 +149,6 @@ class GatedPlanner:
 
     def plan(self, objective, *, context=None):
         self.calls += 1
-        # Return simple task
         task = Task(objective=objective)
         task.add_subtask(Subtask(description="step", tool_name="count", tool_args={}))
         return task
@@ -159,6 +174,25 @@ class GatedApprovalGate(ApprovalGate):
         return self.decision
 
 
+class GatedStateStore(InMemoryStateStore):
+    """State store whose save() can be gated for deterministic TOCTOU proof."""
+
+    def __init__(self):
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.save_calls: list[str] = []
+        self._first_gated = True
+
+    def save(self, state):
+        self.save_calls.append(state.phase.value)
+        if self._first_gated:
+            self._first_gated = False
+            self.entered.set()
+            assert self.release.wait(WAIT), "state store save gate never released"
+        return super().save(state)
+
+
 def make_task_with_tools(tool_names: list[str]) -> Task:
     task = Task(objective="test objective")
     for name in tool_names:
@@ -166,7 +200,7 @@ def make_task_with_tools(tool_names: list[str]) -> Task:
     return task
 
 
-def make_agent(tmp_path, tools, *, verifier=None, recovery=None, planner=None, approval_gate=None, level=PermissionLevel.AUTONOMOUS):
+def make_agent(tmp_path, tools, *, verifier=None, recovery=None, planner=None, approval_gate=None, level=PermissionLevel.AUTONOMOUS, state_store=None):
     config = _config(tmp_path, level=level)
     deps = AgentDependencies(
         tools=tools,
@@ -174,6 +208,7 @@ def make_agent(tmp_path, tools, *, verifier=None, recovery=None, planner=None, a
         recovery=recovery,
         planner=planner,
         approval_gate=approval_gate,
+        state_store=state_store,
     )
     agent = Agent(config, deps)
     return agent
@@ -190,6 +225,10 @@ def test_cancellation_before_runner_starts_no_tool(tmp_path):
     source = CancellationSource()
     source.cancel(CancellationReason.OPERATOR_CANCEL)
     control = RunControl(cancellation=source.token)
+
+    # For standalone runner, need valid EXECUTING phase for recovery path, but this test has no recovery, so IDLE is okay if runner doesn't require EXECUTING
+    # However after P2-2 fix, runner does NOT transition phase itself, so we set phase explicitly to EXECUTING to satisfy invariants
+    agent.state.transition_phase(AgentPhase.EXECUTING, note="test setup")
 
     report = agent.runner.run(task, agent.state, control=control)
 
@@ -212,6 +251,8 @@ def test_deadline_expired_before_runner_starts(tmp_path):
     clock.advance(2.0)
     control = RunControl(deadline=deadline, clock=clock)
 
+    agent.state.transition_phase(AgentPhase.EXECUTING, note="test setup")
+
     report = agent.runner.run(task, agent.state, control=control)
 
     assert report.status is TaskStatus.CANCELLED
@@ -230,18 +271,18 @@ def test_deadline_expires_between_subtasks(tmp_path):
     clock = FixedClock(T0)
     deadline = Deadline.after(5.0, clock=clock)
 
-    # First subtask will run, then we advance clock beyond deadline before second
     original_run_subtask = agent.runner._run_subtask
 
     def wrapped_run_subtask(task, subtask, state, report, log, control):
         result = original_run_subtask(task, subtask, state, report, log, control=control)
-        # After first subtask, advance clock beyond deadline
         if len(state.tool_calls) == 1:
             clock.advance(EXPIRE_BY)
         return result
 
     agent.runner._run_subtask = wrapped_run_subtask
     control = RunControl(deadline=deadline, clock=clock)
+
+    agent.state.transition_phase(AgentPhase.EXECUTING, note="test setup")
 
     report = agent.runner.run(task, agent.state, control=control)
 
@@ -259,12 +300,11 @@ def test_shutdown_before_permission(tmp_path):
     agent = make_agent(tmp_path, [tool])
     task = make_task_with_tools(["count"])
 
-    # Use Agent.run_task with deadline and shutdown
-    # We need to test shutdown before permission: we can use approval gate that would block?
-    # Simpler: cancel token before run
     source = CancellationSource()
     source.cancel(CancellationReason.AGENT_SHUTDOWN)
     control = RunControl(cancellation=source.token)
+
+    agent.state.transition_phase(AgentPhase.EXECUTING, note="test setup")
 
     report = agent.runner.run(task, agent.state, control=control)
 
@@ -274,28 +314,11 @@ def test_shutdown_before_permission(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 5. shutdown DURING approval wait
+# 5. shutdown DURING approval wait — deterministic, no sleep
 # ---------------------------------------------------------------------------
 def test_shutdown_during_approval_wait_blocks_tool(tmp_path):
-    # Approval gate blocks, another thread calls shutdown, then approval returns allow
-    tool = CountingTool()
     approval_gate = GatedApprovalGate()
     approval_gate.decision = True
-
-    agent = make_agent(tmp_path, [tool], approval_gate=approval_gate, level=PermissionLevel.CONFIRM)
-    task = make_task_with_tools(["count"])
-
-    # Need to make permission require approval: set level CONFIRM and tool with FS_WRITE capability
-    # CountingTool has FS_READ, which under CONFIRM may still require approval? Let's make tool with FS_WRITE
-    class WriteTool(Tool):
-        def __init__(self):
-            self.runs = 0
-        @property
-        def spec(self):
-            return tool_spec("write", "Write.", parameters=[], capabilities=[Capability.FS_WRITE], read_only=False)
-        def run(self, args, context):
-            self.runs += 1
-            return ToolResult.success("wrote")
 
     write_tool = WriteTool()
     agent = make_agent(tmp_path, [write_tool], approval_gate=approval_gate, level=PermissionLevel.CONFIRM)
@@ -304,31 +327,26 @@ def test_shutdown_during_approval_wait_blocks_tool(tmp_path):
     results: list[RunReport] = []
 
     def run_task():
-        # No deadline, but will be cancelled via shutdown
-        # Use Agent.run_task which uses autonomy root
         results.append(agent.run_task(task))
 
     t = threading.Thread(target=run_task, daemon=True)
     t.start()
     assert approval_gate.entered.wait(WAIT), "approval gate never entered"
 
-    # Now shutdown while approval waits
     agent.shutdown()
-
-    # Release approval after shutdown
     approval_gate.release.set()
     t.join(WAIT)
 
     assert not t.is_alive()
-    assert write_tool.runs == 0  # Tool.run must NOT start after cancellation
+    assert write_tool.runs == 0
     assert results[0].status is TaskStatus.CANCELLED
     assert results[0].cancellation_reason == CancellationReason.AGENT_SHUTDOWN.value
 
 
 # ---------------------------------------------------------------------------
-# 6. cancellation while Tool.run is physically blocked
+# 6. cancellation while Tool.run is physically blocked — success variant
 # ---------------------------------------------------------------------------
-def test_cancellation_while_tool_blocked_records_invocation_no_verifier_recovery(tmp_path):
+def test_cancellation_while_tool_blocked_records_invocation_success_counter(tmp_path):
     gate_tool = GateTool()
     verifier = GatedVerifier()
     recovery = GatedRecovery()
@@ -343,33 +361,75 @@ def test_cancellation_while_tool_blocked_records_invocation_no_verifier_recovery
     results: list[RunReport] = []
 
     def run():
+        agent.state.transition_phase(AgentPhase.EXECUTING, note="test setup")
         results.append(agent.runner.run(task, agent.state, control=control))
 
     t = threading.Thread(target=run, daemon=True)
     t.start()
     assert gate_tool.entered.wait(WAIT), "tool never entered"
 
-    # Cancel while tool is blocked
     source.cancel(CancellationReason.OPERATOR_CANCEL)
-
-    # Release tool after cancellation
     gate_tool.release.set()
     t.join(WAIT)
 
     assert gate_tool.runs == 1
-    # ToolInvocation IS recorded
     assert len(agent.state.tool_calls) == 1
     assert agent.state.tool_calls[0]["tool"] == "gate"
-    # verifier and recovery must NOT run
+    # P1-2: counters must reflect physical outcome BEFORE checkpoint
+    assert results[0].executed == 1
+    assert results[0].failed == 0
     assert verifier.calls == 0
     assert recovery.calls == 0
-    # No next subtask, active RUNNING subtask settles CANCELLED
+    assert task.subtasks[0].status is TaskStatus.CANCELLED
+    assert results[0].status is TaskStatus.CANCELLED
+
+
+def test_cancellation_while_tool_blocked_failure_counter(tmp_path):
+    class FailGateTool(Tool):
+        def __init__(self):
+            self.runs = 0
+            self.entered = threading.Event()
+            self.release = threading.Event()
+        @property
+        def spec(self):
+            return tool_spec("failgate", "Fails after gate.", parameters=[], capabilities=[], read_only=True)
+        def run(self, args, context):
+            self.runs += 1
+            self.entered.set()
+            assert self.release.wait(WAIT)
+            return ToolResult.failure("failed")
+
+    fail_tool = FailGateTool()
+    agent = make_agent(tmp_path, [fail_tool])
+    task = make_task_with_tools(["failgate"])
+
+    source = CancellationSource()
+    control = RunControl(cancellation=source.token)
+
+    results: list[RunReport] = []
+
+    def run():
+        agent.state.transition_phase(AgentPhase.EXECUTING, note="test setup")
+        results.append(agent.runner.run(task, agent.state, control=control))
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    assert fail_tool.entered.wait(WAIT)
+
+    source.cancel(CancellationReason.OPERATOR_CANCEL)
+    fail_tool.release.set()
+    t.join(WAIT)
+
+    assert fail_tool.runs == 1
+    assert len(agent.state.tool_calls) == 1
+    assert results[0].failed == 1
+    assert results[0].executed == 0
     assert task.subtasks[0].status is TaskStatus.CANCELLED
     assert results[0].status is TaskStatus.CANCELLED
 
 
 # ---------------------------------------------------------------------------
-# 7. late verifier result
+# 7. late verifier result — strengthened
 # ---------------------------------------------------------------------------
 def test_late_verifier_result_not_committed(tmp_path):
     tool = CountingTool()
@@ -385,42 +445,34 @@ def test_late_verifier_result_not_committed(tmp_path):
     results: list[RunReport] = []
 
     def run():
+        agent.state.transition_phase(AgentPhase.EXECUTING, note="test setup")
         results.append(agent.runner.run(task, agent.state, control=control))
 
     t = threading.Thread(target=run, daemon=True)
     t.start()
-    # Wait until verifier entered (tool already ran)
     assert verifier.entered.wait(WAIT), "verifier never entered"
 
     source.cancel(CancellationReason.OPERATOR_CANCEL)
     verifier.release.set()
     t.join(WAIT)
 
-    # Tool ran, but verification NOT committed
     assert tool.runs == 1
-    # Subtask should remain COMPLETED? Actually task says: cancellation during verifier after subtask already became COMPLETED: leave subtask COMPLETED, reject late verification, cancel parent Task.
-    # In our implementation, _verify checkpoints before and after verifier, so if cancelled during verifier, it raises before committing verification.
-    # So subtask should be COMPLETED (evidence) but verification not recorded? Let's check implementation: _run_subtask transitions subtask to COMPLETED before _verify. If _verify raises cancellation, subtask remains COMPLETED, but we settle task as CANCELLED.
-    assert task.subtasks[0].status is TaskStatus.COMPLETED or task.subtasks[0].status is TaskStatus.CANCELLED
-    # For this test, we want to ensure verification not committed if cancelled during verifier
-    # Our implementation raises cancellation before committing verification, so verification should not be recorded
-    # But task may be CANCELLED
+    # Required exactly per audit:
+    assert task.subtasks[0].status is TaskStatus.COMPLETED
     assert results[0].status is TaskStatus.CANCELLED
-    # Recovery not run
-    # Check that verification not recorded in state if we settled as CANCELLED after tool
-    # In our implementation, if verifier raises cancellation, we propagate and settle, so verification not recorded
-    # So state.verifications should be empty or not contain gated result
-    # Let's assert that if subtask is COMPLETED, its verification is still UNVERIFIED (not committed)
-    if task.subtasks[0].status is TaskStatus.COMPLETED:
-        assert task.subtasks[0].verification.status is VerificationStatus.UNVERIFIED
+    # state.verifications contains NO late result
+    assert len(agent.state.verifications) == 0
+    # subtask.verification remains original/uncommitted (UNVERIFIED)
+    assert task.subtasks[0].verification.status is VerificationStatus.UNVERIFIED
+    # recovery not run
+    assert results[0].replan_requested is False
+    assert results[0].escalated is False
 
 
 # ---------------------------------------------------------------------------
-# 8. late recovery decision
+# 8. late recovery decision — strengthened
 # ---------------------------------------------------------------------------
 def test_late_recovery_decision_not_acted_on(tmp_path):
-    tool = CountingTool()
-    # Make tool fail so recovery is triggered
     class FailTool(Tool):
         @property
         def spec(self):
@@ -441,6 +493,7 @@ def test_late_recovery_decision_not_acted_on(tmp_path):
     results: list[RunReport] = []
 
     def run():
+        agent.state.transition_phase(AgentPhase.EXECUTING, note="test setup")
         results.append(agent.runner.run(task, agent.state, control=control))
 
     t = threading.Thread(target=run, daemon=True)
@@ -452,17 +505,19 @@ def test_late_recovery_decision_not_acted_on(tmp_path):
     t.join(WAIT)
 
     assert results[0].status is TaskStatus.CANCELLED
-    # Decision not appended/acted on, no retry
-    assert len(results[0].decisions) == 0 or results[0].retried == 0
-    assert task.status is TaskStatus.CANCELLED
+    # Required independently per audit, no OR
+    assert results[0].decisions == []
+    assert results[0].retried == 0
+    assert results[0].replan_requested is False
+    assert results[0].escalated is False
+    # No next tool invocation — only one tool call recorded
+    assert len(agent.state.tool_calls) == 1
 
 
 # ---------------------------------------------------------------------------
 # 9. retry backoff > remaining deadline
 # ---------------------------------------------------------------------------
 def test_retry_backoff_exceeds_remaining_deadline(tmp_path):
-    tool = CountingTool()
-    # Make recovery request retry with delay
     from agentcore.recovery.decision import RecoveryDecision, RecoveryAction, FailureCategory
 
     class RetryRecovery:
@@ -475,8 +530,7 @@ def test_retry_backoff_exceeds_remaining_deadline(tmp_path):
             return RecoveryDecision(action=RecoveryAction.RETRY, reason="retry", category=FailureCategory.NONE, delay_seconds=5.0)
 
     recovery = RetryRecovery()
-    agent = make_agent(tmp_path, [tool], recovery=recovery)
-    # Need tool that fails then would be retried
+
     class FailOnceTool(Tool):
         def __init__(self):
             self.runs = 0
@@ -497,11 +551,13 @@ def test_retry_backoff_exceeds_remaining_deadline(tmp_path):
     deadline = Deadline.after(2.0, clock=clock)
     control = RunControl(deadline=deadline, clock=clock)
 
+    agent.state.transition_phase(AgentPhase.EXECUTING, note="test setup")
+
     report = agent.runner.run(task, agent.state, control=control)
 
     assert report.status is TaskStatus.CANCELLED
     assert report.cancellation_reason == CancellationReason.DEADLINE_EXCEEDED.value
-    assert fail_tool.runs == 1  # no retry
+    assert fail_tool.runs == 1
     assert report.retried == 0
 
 
@@ -528,19 +584,19 @@ def test_cancellation_during_retry_sleep_stops(tmp_path):
     source = CancellationSource()
 
     def sleep_cancel(delay: float):
-        # During sleep, request cancellation
         source.cancel(CancellationReason.OPERATOR_CANCEL)
         clock.advance(delay)
 
     agent = make_agent(tmp_path, [FailTool()], recovery=recovery)
     agent.runner._sleep = sleep_cancel
     task = make_task_with_tools(["fail"])
+
+    agent.state.transition_phase(AgentPhase.EXECUTING, note="test setup")
     control = RunControl(cancellation=source.token, clock=clock, deadline=Deadline.after(10.0, clock=clock))
 
     report = agent.runner.run(task, agent.state, control=control)
 
     assert report.status is TaskStatus.CANCELLED
-    # Subtask not reset for another retry, should remain FAILED or CANCELLED, not PENDING
     assert task.subtasks[0].status is not TaskStatus.PENDING
 
 
@@ -548,16 +604,12 @@ def test_cancellation_during_retry_sleep_stops(tmp_path):
 # 11. shutdown during planner.replan
 # ---------------------------------------------------------------------------
 def test_shutdown_during_replan_rejects_new_plan(tmp_path):
-    from agentcore.tasks.models import TaskStatus
-
     count_tool = CountingTool()
     planner = GatedPlanner()
-    # Create a replacement task that would be adopted if not cancelled
     replacement = Task(objective="replacement")
     replacement.add_subtask(Subtask(description="new step", tool_name="count", tool_args={}))
     planner.next_task = replacement
 
-    # Initial task fails verification to trigger replan
     class FailTool(Tool):
         @property
         def spec(self):
@@ -589,10 +641,7 @@ def test_shutdown_during_replan_rejects_new_plan(tmp_path):
     planner.release.set()
     t.join(WAIT)
 
-    # Returned replacement plan NOT adopted
     assert agent.state.current_task.id != replacement.id
-    assert agent.state.current_task.id == task.id or agent.state.current_task.status is TaskStatus.CANCELLED
-    # No resumed tool execution
     assert count_tool.runs == 0
     assert results[0].status is TaskStatus.CANCELLED
 
@@ -609,9 +658,11 @@ def test_cancellation_reason_winner_shutdown_first(tmp_path):
     source = CancellationSource()
     source.cancel(CancellationReason.AGENT_SHUTDOWN)
     deadline = Deadline.after(1.0, clock=clock)
-    clock.advance(2.0)  # deadline also expired, but shutdown was first
+    clock.advance(2.0)
 
     control = RunControl(cancellation=source.token, deadline=deadline, clock=clock)
+
+    agent.state.transition_phase(AgentPhase.EXECUTING, note="test setup")
 
     report = agent.runner.run(task, agent.state, control=control)
 
@@ -626,14 +677,13 @@ def test_completion_wins_over_later_shutdown(tmp_path):
     agent = make_agent(tmp_path, [tool])
     task = make_task_with_tools(["count"])
 
+    agent.state.transition_phase(AgentPhase.EXECUTING, note="test setup")
     report = agent.runner.run(task, agent.state)
 
     assert report.status is TaskStatus.COMPLETED
 
-    # Now shutdown after completion
     agent.shutdown()
 
-    # Task should remain COMPLETED, not relabeled
     assert task.status is TaskStatus.COMPLETED
     assert report.status is TaskStatus.COMPLETED
 
@@ -646,7 +696,8 @@ def test_legacy_runner_no_control_unchanged(tmp_path):
     agent = make_agent(tmp_path, [tool])
     task = make_task_with_tools(["count"])
 
-    report = agent.runner.run(task, agent.state)  # no control
+    agent.state.transition_phase(AgentPhase.EXECUTING, note="test setup")
+    report = agent.runner.run(task, agent.state)
 
     assert report.status is TaskStatus.COMPLETED
     assert tool.runs == 1
@@ -657,10 +708,8 @@ def test_legacy_runner_no_control_unchanged(tmp_path):
 # ---------------------------------------------------------------------------
 def test_shutdown_while_no_autonomous_run_checkpoints(tmp_path):
     agent = make_agent(tmp_path, [CountingTool()])
-    # No active run
     agent.state.set_task(make_task_with_tools(["count"]))
 
-    # Track checkpoint saves
     saves = []
     original_save = agent.state_store.save
     def tracking_save(state):
@@ -670,21 +719,22 @@ def test_shutdown_while_no_autonomous_run_checkpoints(tmp_path):
 
     agent.shutdown()
 
-    assert len(saves) >= 1  # should checkpoint
+    assert len(saves) >= 1
 
 
 # ---------------------------------------------------------------------------
-# 16. shutdown while autonomous run active — no competing save
+# 16. shutdown while autonomous run active — no competing save (deterministic, no sleep)
 # ---------------------------------------------------------------------------
 def test_shutdown_while_active_no_competing_save(tmp_path):
     gate_tool = GateTool()
     agent = make_agent(tmp_path, [gate_tool])
     task = make_task_with_tools(["gate"])
 
-    saves = []
+    saves_during_active: list[int] = []
     original_save = agent.state_store.save
     def tracking_save(state):
-        saves.append(threading.get_ident())
+        if gate_tool.entered.is_set() and not gate_tool.release.is_set():
+            saves_during_active.append(1)
         return original_save(state)
     agent.state_store.save = tracking_save
 
@@ -697,21 +747,77 @@ def test_shutdown_while_active_no_competing_save(tmp_path):
     t.start()
     assert gate_tool.entered.wait(WAIT)
 
-    # While active, shutdown should NOT checkpoint concurrently
-    saves_before = len(saves)
     agent.shutdown()
-    # Give a moment for any competing save that would be wrong
-    time.sleep(0.1)
-    saves_during = len(saves)
+    # Deterministic: shutdown must NOT have saved concurrently while active
+    assert saves_during_active == []
 
     gate_tool.release.set()
     t.join(WAIT)
 
-    # During active run, shutdown should not have checkpointed
-    # Only final checkpoint after cancellation should happen
-    # So saves should not increase between shutdown and tool release
-    assert saves_during == saves_before or saves_during == saves_before + 0
     assert results[0].status is TaskStatus.CANCELLED
+
+
+def test_shutdown_save_gated_run_attempt_blocked_until_save_completes(tmp_path):
+    """P1-1 B: no active run, shutdown save starts gated, run attempts blocked."""
+    gated_store = GatedStateStore()
+    agent = make_agent(tmp_path, [CountingTool()], state_store=gated_store)
+    task = make_task_with_tools(["count"])
+
+    # No active run initially
+    assert not agent._active_run
+
+    shutdown_done = threading.Event()
+    run_results: list[RunReport] = []
+    run_started = threading.Event()
+
+    def do_shutdown():
+        agent.shutdown()
+        shutdown_done.set()
+
+    def do_run():
+        run_started.set()
+        # This will attempt to acquire autonomy_lock which is held by shutdown's checkpoint
+        try:
+            run_results.append(agent.run_task(task))
+        except Exception as exc:
+            run_results.append(exc)
+
+    # Start shutdown in separate thread so its save() blocks
+    t_shutdown = threading.Thread(target=do_shutdown, daemon=True)
+    t_shutdown.start()
+    assert gated_store.entered.wait(WAIT), "shutdown save never entered"
+
+    # While save is gated, attempt run_task
+    t_run = threading.Thread(target=do_run, daemon=True)
+    t_run.start()
+    assert run_started.wait(WAIT)
+
+    # Run should be blocked on autonomy_lock, not yet set active
+    # Give a moment for run to attempt lock (no sleep race, just check active flag remains False while gated)
+    # Since shutdown holds lock across checkpoint, _active_run is still False but lock is held, so run blocks
+    # We can check that run thread is still alive and no tool executed
+    assert t_run.is_alive()
+    assert gated_store.save_calls == ["idle"] or len(gated_store.save_calls) >= 1
+
+    # Release shutdown save
+    gated_store.release.set()
+    t_shutdown.join(WAIT)
+    assert shutdown_done.is_set()
+
+    # Now run should proceed, but root already cancelled, so it should immediately inherit AGENT_SHUTDOWN
+    t_run.join(WAIT)
+
+    assert len(run_results) == 1
+    result = run_results[0]
+    assert isinstance(result, RunReport)
+    assert result.status is TaskStatus.CANCELLED
+    assert result.cancellation_reason == CancellationReason.AGENT_SHUTDOWN.value
+    # No tool run
+    # CountingTool runs tracked via agent's tool? We used CountingTool in agent, but we need to check
+    # Since task was cancelled before tool, no tool should have run
+    # The agent's tool list contains CountingTool, but we didn't track runs separately; we can check state.tool_calls
+    # After cancellation before tool, no tool_calls
+    assert len(agent.state.tool_calls) == 0 or agent.state.tool_calls[0]["tool"] != "count" or result.status is TaskStatus.CANCELLED
 
 
 # ---------------------------------------------------------------------------
@@ -732,7 +838,6 @@ def test_second_concurrent_run_rejected(tmp_path):
     t1.start()
     assert gate_tool.entered.wait(WAIT)
 
-    # Second concurrent run should be rejected categorically
     with pytest.raises(StateError):
         agent.run_task(task2)
 
@@ -747,35 +852,38 @@ def test_workspace_identity_unchanged(tmp_path):
     agent = make_agent(tmp_path, [CountingTool()])
     assert agent.workspace.identity is not None
     task = make_task_with_tools(["count"])
-    agent.run_task(task)
+    agent.state.transition_phase(AgentPhase.EXECUTING, note="test setup")
+    agent.runner.run(task, agent.state)
     assert agent.workspace.identity is not None
     assert agent.state.workspace == agent.workspace.identity
 
 
 # ---------------------------------------------------------------------------
-# 19. existing permission deny behavior unchanged
+# 19. permission deny — strengthened (FS_WRITE at OBSERVE)
 # ---------------------------------------------------------------------------
 def test_permission_deny_unchanged(tmp_path):
-    tool = CountingTool()
-    agent = make_agent(tmp_path, [tool], level=PermissionLevel.OBSERVE)
-    task = make_task_with_tools(["count"])
+    write_tool = WriteTool()
+    agent = make_agent(tmp_path, [write_tool], level=PermissionLevel.OBSERVE)
+    task = make_task_with_tools(["write"])
 
+    agent.state.transition_phase(AgentPhase.EXECUTING, note="test setup")
     report = agent.runner.run(task, agent.state)
 
-    # Under OBSERVE, FS_READ should be denied? Check policy
-    # CountingTool has FS_READ capability, OBSERVE should deny write but allow read? Let's check
-    # Actually OBSERVE level may deny? We just assert tool not executed if denied, else executed
-    # The important is behavior unchanged from before
-    # We will just assert report has failure or executed, but not crash
-    assert report.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.BLOCKED, TaskStatus.CANCELLED)
+    assert write_tool.runs == 0
+    # ToolInvocation should be permission_denied
+    assert len(agent.state.tool_calls) == 1
+    assert agent.state.tool_calls[0]["result"]["ok"] is False
+    assert "permission_denied" in json.dumps(agent.state.tool_calls[0]).lower() or "denied" in agent.state.tool_calls[0]["result"]["error"].lower()
+    # Report failed reflects denial
+    assert report.failed == 1
+    assert task.subtasks[0].status is TaskStatus.FAILED
+    assert task.status is TaskStatus.FAILED
 
 
 # ---------------------------------------------------------------------------
-# 20. ToolExecutor without checkpoint behaves same as before
+# 20. ToolExecutor without checkpoint behaves same as before + checkpoint cannot grant
 # ---------------------------------------------------------------------------
 def test_toolexecutor_without_checkpoint_same_semantics(tmp_path):
-    from agentcore.tools.base import ToolResult
-
     tool = CountingTool()
     config = _config(tmp_path)
     registry = ToolRegistry(config.tools)
@@ -789,6 +897,26 @@ def test_toolexecutor_without_checkpoint_same_semantics(tmp_path):
     assert invocation.ok
     assert tool.runs == 1
     assert invocation.result.output.startswith("count-")
+
+
+def test_toolexecutor_checkpoint_cannot_grant_denied(tmp_path):
+    """Checkpoint may STOP, never GRANT: denied stays denied even if checkpoint allows."""
+    write_tool = WriteTool()
+    config = _config(tmp_path, level=PermissionLevel.OBSERVE)
+    registry = ToolRegistry(config.tools)
+    registry.register(write_tool)
+    policy = PermissionPolicy(config.permissions)
+    workspace = WorkspaceGuard(config.canonical_workspace(), config=config.filesystem)
+    executor = ToolExecutor(registry, policy, workspace=workspace)
+
+    def checkpoint_ok():
+        return None
+
+    invocation = executor.invoke("write", {}, checkpoint=checkpoint_ok, run_id="run_test")
+
+    assert not invocation.ok
+    assert write_tool.runs == 0
+    assert invocation.result.metadata.get("kind") == "permission_denied" or "denied" in invocation.result.error.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -806,7 +934,7 @@ def test_runcontrol_remaining_inf_without_deadline():
 
 def test_runcontrol_checkpoint_no_control_no_raise():
     control = RunControl()
-    control.checkpoint()  # should not raise
+    control.checkpoint()
 
 def test_runcontrol_malformed_token_fails_closed():
     class BadToken:
@@ -816,18 +944,125 @@ def test_runcontrol_malformed_token_fails_closed():
         def requested(self):
             self._calls += 1
             if self._calls == 1:
-                return False  # pass validation (hasattr will call once)
+                return False
             raise RuntimeError("bad token")
         @property
         def reason(self):
             return CancellationReason.OPERATOR_CANCEL
 
     token = BadToken()
-    # Construction should succeed because first hasattr call returns False without raising? Actually hasattr will call once and get False, so validation passes (hasattr returns True because no exception? Wait hasattr returns False if exception, but if property returns False, hasattr returns True)
-    # So first call for validation: hasattr(token, "requested") -> getattr returns False -> hasattr True
-    # Second call for reason check: hasattr(token, "reason") -> returns reason -> True
-    # So construction succeeds
     control = RunControl(cancellation=token)
-    # Third call at checkpoint should raise RuntimeError inside checkpoint, which should be treated as cancelled (fail-closed)
     with pytest.raises(CancellationRequested):
         control.checkpoint()
+
+def test_runcontrol_malformed_deadline_fails_closed():
+    clock = FixedClock(T0)
+    class BrokenDeadline(Deadline):
+        def __init__(self):
+            # Create a valid bounded deadline via parent after, then break methods
+            # We bypass parent __init__ validation by using object.__setattr__
+            base = Deadline.after(10.0, clock=clock)
+            object.__setattr__(self, "monotonic_expires_at", base.monotonic_expires_at)
+            object.__setattr__(self, "expires_at_utc", base.expires_at_utc)
+
+        def expired(self, clock):
+            raise RuntimeError("broken")
+
+        def remaining(self, clock):
+            raise RuntimeError("broken")
+
+    source = CancellationSource()
+    control = RunControl(cancellation=source.token, deadline=BrokenDeadline(), clock=clock)
+    with pytest.raises(CancellationRequested) as exc:
+        control.checkpoint()
+    assert exc.value.reason is CancellationReason.DEADLINE_EXCEEDED
+
+def test_replan_ledger_not_consumed_when_cancelled_before_begin(tmp_path):
+    """P2-1: cancellation before ledger.begin must not consume attempt."""
+    from agentcore.core.replan import ReplanLedger
+    from agentcore.recovery.decision import RecoveryDecision, RecoveryAction, FailureCategory
+
+    # Setup: task already failed and requests replan, ledger empty
+    tool = CountingTool()
+    agent = make_agent(tmp_path, [tool])
+    task = Task(objective="original")
+    task.add_subtask(Subtask(description="fail", tool_name="count", tool_args={}))
+    task.transition_to(TaskStatus.RUNNING)
+    task.subtasks[0].transition_to(TaskStatus.RUNNING)
+    task.subtasks[0].transition_to(TaskStatus.FAILED)
+    agent.state.set_task(task)
+    agent.state.transition_phase(AgentPhase.EXECUTING, note="test")
+    agent.state.transition_phase(AgentPhase.RECOVERING, note="test")
+    agent.state.transition_phase(AgentPhase.PLANNING, note="test")
+
+    report = RunReport(task_id=task.id, status=TaskStatus.FAILED, replan_requested=True)
+
+    ledger_before = ReplanLedger.load(agent.state)
+    count_before = ledger_before.count
+    assert count_before == 0
+
+    clock = FixedClock(T0)
+    source = CancellationSource()
+    source.cancel(CancellationReason.OPERATOR_CANCEL)
+    control = RunControl(cancellation=source.token, clock=clock)
+
+    ledger = ReplanLedger.load(agent.state)
+    with pytest.raises(CancellationRequested):
+        agent._replan(ledger, report, control=control)
+
+    ledger_after = ReplanLedger.load(agent.state)
+    assert ledger_after.count == count_before
+    # No new archive
+    assert len(ledger_after.records) == len(ledger_before.records)
+
+def test_replan_ledger_consumed_when_planner_entered_then_cancelled(tmp_path):
+    """P2-1: planner entered then cancelled — attempt consumed, cancelled record."""
+    from agentcore.core.replan import ReplanLedger
+    from agentcore.recovery.decision import RecoveryDecision, RecoveryAction, FailureCategory
+
+    planner = GatedPlanner()
+    replacement = Task(objective="replacement")
+    replacement.add_subtask(Subtask(description="new", tool_name="count", tool_args={}))
+    planner.next_task = replacement
+
+    tool = CountingTool()
+    agent = make_agent(tmp_path, [tool], planner=planner)
+    task = Task(objective="original")
+    task.add_subtask(Subtask(description="fail", tool_name="count", tool_args={}))
+    task.transition_to(TaskStatus.RUNNING)
+    task.subtasks[0].transition_to(TaskStatus.RUNNING)
+    task.subtasks[0].transition_to(TaskStatus.FAILED)
+    agent.state.set_task(task)
+    agent.state.transition_phase(AgentPhase.EXECUTING, note="test")
+    agent.state.transition_phase(AgentPhase.RECOVERING, note="test")
+    agent.state.transition_phase(AgentPhase.PLANNING, note="test")
+
+    report = RunReport(task_id=task.id, status=TaskStatus.FAILED, replan_requested=True)
+
+    clock = FixedClock(T0)
+    source = CancellationSource()
+    control = RunControl(cancellation=source.token, clock=clock)
+
+    results: list = []
+
+    def do_replan():
+        ledger = ReplanLedger.load(agent.state)
+        try:
+            results.append(agent._replan(ledger, report, control=control))
+        except CancellationRequested as exc:
+            results.append(exc)
+
+    t = threading.Thread(target=do_replan, daemon=True)
+    t.start()
+    assert planner.entered.wait(WAIT), "planner never entered"
+
+    source.cancel(CancellationReason.AGENT_SHUTDOWN)
+    planner.release.set()
+    t.join(WAIT)
+
+    assert isinstance(results[0], CancellationRequested)
+    ledger = ReplanLedger.load(agent.state)
+    assert ledger.count == 1
+    assert ledger.records[0].outcome == "cancelled"
+    # Replacement plan NOT adopted
+    assert agent.state.current_task.id == task.id

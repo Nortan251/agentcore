@@ -20,6 +20,7 @@ class Events:
     TASK_COMPLETED: Final = "task.completed"
     TASK_FAILED: Final = "task.failed"
     TASK_BLOCKED: Final = "task.blocked"
+    TASK_CANCELLED: Final = "task.cancelled"
     SUBTASK_STARTED: Final = "subtask.started"
     SUBTASK_FINISHED: Final = "subtask.finished"
 

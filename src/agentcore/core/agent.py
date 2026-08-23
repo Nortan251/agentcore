@@ -8,10 +8,11 @@ or a local computer-control tool without editing this class.
 
 from __future__ import annotations
 
-import inspect
-import threading
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
+
+import inspect
+import threading
 
 from agentcore.config.schema import AgentConfig
 from agentcore.core.defaults import NoRetryStrategy, NullVerifier, PassthroughPlanner
@@ -49,7 +50,7 @@ from agentcore.tools.registry import ToolRegistry
 from agentcore.util.clock import Clock
 
 
-def _accepts_control_kwarg(func: Any) -> bool:
+def _accepts_control_kwarg(func):
     """Check if func accepts control kwarg explicitly (not via **kwargs)."""
     try:
         sig = inspect.signature(func)
@@ -113,6 +114,8 @@ class Agent:
         self.registry.register_all(list(
             default_tools() if deps.tools is None else deps.tools))
 
+        # The canonical workspace root is established exactly once, here, and
+        # handed to tools through the guard. Nothing downstream re-derives it.
         self.workspace = WorkspaceGuard(
             self.config.canonical_workspace(),
             config=self.config.filesystem,
@@ -124,13 +127,24 @@ class Agent:
             tool_settings=self.config.tools.settings,
         )
 
+        # Planner is resolved after the model, since the LLM planner needs it.
         self._injected_planner = deps.planner
+        # Verifier is resolved after the model (see _build_verifier).
         self._injected_verifier = deps.verifier
+        # Recovery is resolved after the model/registry (see _build_recovery).
         self._injected_recovery = deps.recovery
         self.state_store: StateStore = deps.state_store or InMemoryStateStore()
+        # Durable memory: injected store wins, else built only when the
+        # feature flag is on. With the flag off this stays None and nothing
+        # is ever written, exactly as before this layer existed.
         self.memory: MemoryStore | None = deps.memory or self._build_memory()
+        # An injected provider always wins; otherwise one is built from config.
+        # With the default ``provider = "none"`` this stays None, so an agent
+        # without model configuration behaves exactly as before.
         self.model: ModelProvider | None = deps.model or self._build_model()
         self.planner: Planner = self._build_planner()
+        # Capture needs the model, so it is resolved after it.
+        # Conflicts are built first: capture and the resolver both take one.
         self.memory_conflicts: Any | None = (
             deps.memory_conflicts or self._build_conflict_store())
         self.memory_capture: Any | None = (
@@ -143,8 +157,11 @@ class Agent:
         self.runner = TaskRunner(self.executor, verifier=self.verifier,
                                  recovery=self.recovery,
                                  logger=get_logger("core.runner"))
+        # Realtime turn lifecycle. Opt-in only: with no injected coordinator
+        # this stays None and the conversation path is the pre-Task-42.3 one.
         self.turn_coordinator: Any | None = deps.turn_coordinator
         self._turns: Any | None = self._build_turn_bridge()
+        # New runs are pinned to this workspace from the outset.
         self.state = AgentState(workspace=self.workspace.identity)
 
         # Task 42.4c: autonomous cancellation root and active-run marker.
@@ -164,6 +181,15 @@ class Agent:
 
     # -- realtime turns ----------------------------------------------------
     def _build_turn_bridge(self) -> Any | None:
+        """Wrap an injected turn coordinator; never construct one.
+
+        Task 42.3 adds no CLI flag and no automatic ``JsonFileTurnStore``.
+        Only an explicit host injection turns the realtime lifecycle on, and
+        only then is the bridge — with this agent's single reentrant stage
+        lease and narrow session lock — created. Task 42.4a threads the one
+        approved configuration value, the realtime turn deadline, into the
+        bridge; with no coordinator it is never consumed.
+        """
         if self.turn_coordinator is None:
             return None
 
@@ -179,12 +205,28 @@ class Agent:
         return bridge
 
     def reconcile_turns(self) -> tuple:
+        """Explicit host-side restart reconciliation for the injected store.
+
+        Deliberately explicit, never hidden in construction or load: an
+        interrupted turn is terminalized truthfully by the Task 42.2
+        reconciler and is never silently resumed.
+        """
         if self._turns is None:
             return ()
         return self._turns.reconcile()
 
     # -- recovery ----------------------------------------------------------
     def _build_recovery(self) -> RecoveryStrategy:
+        """Choose the recovery strategy, honouring injection and the flag.
+
+        Precedence mirrors the planner and verifier:
+          1. an explicitly injected strategy (always wins, flag irrelevant)
+          2. the real ``RecoveryPolicy`` when ``features.recovery`` is on
+          3. the existing ``NoRetryStrategy`` otherwise
+
+        With the flag off — the default — behaviour is unchanged: nothing is
+        ever retried, replanned or escalated.
+        """
         if self._injected_recovery is not None:
             return self._injected_recovery
         if not self.config.features.recovery:
@@ -192,6 +234,8 @@ class Agent:
 
         from agentcore.recovery.policy import RecoveryPolicy
 
+        # The registry is supplied so retry safety can be judged from the real
+        # tool contracts rather than assumed.
         policy = RecoveryPolicy(self.config.recovery, registry=self.registry)
         self.log.info(Events.RECOVERY_CONFIGURED,
                       max_attempts=policy.config.max_attempts,
@@ -200,6 +244,17 @@ class Agent:
 
     # -- verifier ----------------------------------------------------------
     def _build_verifier(self) -> Verifier:
+        """Choose the verifier, honouring injection and the feature flag.
+
+        Precedence mirrors the planner:
+          1. an explicitly injected verifier (always wins, flag irrelevant)
+          2. the real ``Verifier`` when ``features.verification`` is on — with
+             model-assisted escalation only if a model is available
+          3. the existing ``NullVerifier`` otherwise
+
+        With the flag off — the default — behaviour is unchanged: SKIPPED, and
+        no model is ever consulted.
+        """
         if self._injected_verifier is not None:
             return self._injected_verifier
         if not self.config.features.verification:
@@ -214,6 +269,17 @@ class Agent:
 
     # -- planner -----------------------------------------------------------
     def _build_planner(self) -> Planner:
+        """Choose the planner, honouring injection and the feature flag.
+
+        Precedence:
+          1. an explicitly injected planner (always wins, flag irrelevant)
+          2. the LLM planner, when ``features.planning`` is on AND a model is
+             available
+          3. the existing ``PassthroughPlanner`` otherwise
+
+        With the flag off — the default — behaviour is byte-for-byte what it
+        was before this task.
+        """
         if self._injected_planner is not None:
             return self._injected_planner
         if not self.config.features.planning:
@@ -230,10 +296,13 @@ class Agent:
             planner = LLMPlanner(
                 self.model, self.registry,
                 max_replans=self.config.recovery.max_replans,
+                # Memory is handed to the planner only when a store exists —
+                # i.e. when features.memory is on or one was injected. With no
+                # store the planner never looks memory up at all.
                 memory=self.memory,
                 max_memories=self.config.memory.max_planning_memories,
                 max_memory_chars=self.config.memory.max_planning_memory_chars)
-        except PlanningError as exc:  # pragma: no cover
+        except PlanningError as exc:  # pragma: no cover - defensive
             self.log.warning(Events.PLANNER_UNAVAILABLE,
                              error=type(exc).__name__, message=exc.message)
             return PassthroughPlanner()
@@ -242,6 +311,13 @@ class Agent:
 
     # -- model -------------------------------------------------------------
     def _build_model(self) -> ModelProvider | None:
+        """Construct a provider from configuration, if one is configured.
+
+        Imported lazily so the core package never depends on a concrete vendor
+        implementation at import time. A misconfigured provider is logged and
+        downgraded to ``None`` rather than preventing the agent from starting —
+        the model is optional until a Planner requires it.
+        """
         provider = (self.config.model.provider or "").strip().lower()
         if not provider or provider == "none":
             return None
@@ -259,6 +335,18 @@ class Agent:
 
     # -- memory ------------------------------------------------------------
     def _build_memory(self) -> MemoryStore | None:
+        """Construct the durable memory store, if the feature is enabled.
+
+        Precedence mirrors every other seam:
+          1. an explicitly injected store (handled by the caller; always wins)
+          2. the JSON-file store when ``features.memory`` is on
+          3. ``None`` otherwise
+
+        With the flag off — the default — the agent holds no memory store, so
+        it cannot read or write durable memory even by accident. Imported
+        lazily so the core package never depends on a concrete backend at
+        import time, matching ``_build_model``.
+        """
         if not self.config.features.memory:
             return None
 
@@ -268,6 +356,8 @@ class Agent:
         try:
             store = build_memory_store(self.config)
         except (MemoryLayerError, OSError) as exc:
+            # A misconfigured memory directory must not stop the agent from
+            # starting; memory is optional to every existing code path.
             self.log.warning(Events.MEMORY_UNREADABLE,
                              error=type(exc).__name__)
             return None
@@ -278,6 +368,16 @@ class Agent:
         return store
 
     def _build_memory_capture(self) -> Any | None:
+        """Build conversational capture, if there is a store and it is enabled.
+
+        Capture is strictly subordinate to the memory store: with no store
+        there is nowhere to write, so it stays ``None`` and no capture can
+        occur. ``memory.capture_enabled`` lets an operator keep memory for
+        retrieval while refusing automatic capture.
+
+        Building it does not make the agent capture anything — nothing calls
+        it implicitly. It is an explicit entry point (:meth:`remember_from`).
+        """
         if self.memory is None or not self.config.memory.capture_enabled:
             return None
 
@@ -295,6 +395,13 @@ class Agent:
             logger=get_logger("memory.capture"))
 
     def _build_memory_resolver(self) -> Any | None:
+        """Build the correction/resolution layer, if there is a store.
+
+        Unlike capture, this is *not* gated on ``capture_enabled``: an
+        operator must be able to correct or delete durable memory even when
+        automatic capture is switched off. With no store there is nothing to
+        resolve, so it stays ``None``.
+        """
         if self.memory is None:
             return None
 
@@ -304,6 +411,12 @@ class Agent:
                               logger=get_logger("memory.resolve"))
 
     def _build_conflict_store(self) -> Any | None:
+        """Durable pending conflicts, alongside the memory store.
+
+        Not gated on ``capture_enabled``: an operator must still be able to
+        see and settle conflicts recorded earlier even if automatic capture is
+        later switched off.
+        """
         if self.memory is None:
             return None
 
@@ -317,12 +430,14 @@ class Agent:
             return None
 
     def pending_memory_conflicts(self, *, limit: int | None = None) -> list:
+        """Unresolved memory contradictions awaiting an explicit decision."""
         if self.memory_resolver is None:
             return []
         return self.memory_resolver.list_pending_conflicts(limit=limit)
 
     def resolve_memory_conflict(self, conflict_id: str, choice: Any, *,
                                 operator: str | None = None) -> Any:
+        """Settle a persisted conflict. Never resolves one implicitly."""
         from agentcore.memory.resolve import ResolutionOutcome, ResolutionStatus
 
         if self.memory_resolver is None:
@@ -334,6 +449,18 @@ class Agent:
 
     def conversation(self, *, sessions: Any = None, tools: Any = None,
                      system_prompt: str | None = None) -> Any:
+        """Build a :class:`ConversationRuntime` from this agent's components.
+
+        The Agent is already the composition root — it owns the model, the
+        memory store, capture and the resolver — so the runtime is assembled
+        from what is here rather than constructing anything itself. Sessions
+        persist to ``<workspace_dir>/conversations`` unless a store is
+        injected.
+
+        Memory participation follows ``features.memory`` exactly: with it off
+        the agent holds no store, so the runtime simply converses without
+        retrieval or capture.
+        """
         from agentcore.conversation.runtime import (
             SYSTEM_PROMPT,
             ConversationRuntime,
@@ -360,6 +487,12 @@ class Agent:
             logger=get_logger("conversation.runtime"))
 
     def _build_tool_runner(self) -> Any | None:
+        """Conversational tool use, when ``conversation.tools_enabled`` is on.
+
+        Hands the runner this agent's *existing* executor, registry and
+        policy — the same objects the autonomous runner uses — so there is one
+        execution pipeline and one permission gate, not two.
+        """
         if not self.config.conversation.tools_enabled:
             return None
 
@@ -371,6 +504,11 @@ class Agent:
             logger=get_logger("conversation.tools"))
 
     def correct_memory(self, turns: Any, *, memory_id: str | None = None) -> Any:
+        """Act on a conversational correction ("forget that", "no longer true").
+
+        Returns a ``ResolutionOutcome``. An ambiguous or unmatched target
+        yields ``UNRESOLVED`` and changes nothing — never a best guess.
+        """
         from agentcore.memory.resolve import (
             ResolutionOutcome,
             ResolutionStatus,
@@ -396,6 +534,7 @@ class Agent:
             reason="no correction was requested")
 
     def resolve_memory(self, decision: Any, *, conflict: Any = None) -> Any:
+        """Apply a ``CaptureDecision`` — including a conflict resolution."""
         from agentcore.memory.resolve import ResolutionOutcome, ResolutionStatus
 
         if self.memory_resolver is None:
@@ -405,6 +544,17 @@ class Agent:
         return self.memory_resolver.apply(decision, conflict=conflict)
 
     def remember_from(self, turns: Any, *, persist: bool = True) -> Any:
+        """Consider conversation turns for durable memory. Explicit by design.
+
+        This is the integration seam for conversational capture. It is *not*
+        wired into ``run_task``/``execute``: the project has no persistent
+        conversation loop yet, and inventing one purely to force automatic
+        capture would be exactly the "store everything" behaviour this layer
+        exists to avoid.
+
+        Returns a ``CaptureResult`` (empty when capture is unavailable), so a
+        caller can always inspect what was decided and why.
+        """
         if self.memory_capture is None:
             from agentcore.memory.capture import CaptureResult
 
@@ -413,6 +563,11 @@ class Agent:
             turns, run_id=self.state.run_id, persist=persist)
 
     def memory_info(self) -> dict[str, Any] | None:
+        """Non-sensitive description of the memory backend, or None.
+
+        Reports shape only — backend, location and record count — never any
+        remembered content.
+        """
         if self.memory is None:
             return None
         info: dict[str, Any] = {"backend": type(self.memory).__name__}
@@ -424,12 +579,14 @@ class Agent:
         if callable(counter):
             try:
                 info["records"] = counter()
-            except Exception:  # pragma: no cover
+            except Exception:  # pragma: no cover - never break status()
                 info["records"] = None
         return info
 
     # -- tools -------------------------------------------------------------
     def register_tool(self, tool: Tool, *, replace: bool = False) -> bool:
+        """Add a tool at runtime. This is the integration point for later
+        adapters (e.g. a local Windows control client)."""
         return self.registry.register(tool, replace=replace)
 
     def available_tools(self) -> list[dict[str, Any]]:
@@ -437,6 +594,7 @@ class Agent:
 
     def call_tool(self, name: str, args: dict[str, Any] | None = None
                   ) -> ToolInvocation:
+        """Invoke a single tool outside of a task, recording it in state."""
         invocation = self.executor.invoke(name, args, run_id=self.state.run_id)
         self.state.record_tool_call(invocation)
         return invocation
@@ -454,17 +612,22 @@ class Agent:
         task.validate()
         self.state.set_task(task)
 
+
     def run_task(self, task: Task | None = None, *,
                  deadline: Deadline | None = None,
                  clock: Clock | None = None) -> RunReport:
         """Execute a task, replanning when recovery asks for a new approach.
 
-        Task 42.4c: adds optional trusted deadline/clock and cooperative
-        cancellation via autonomous root. One run per Agent is supported;
-        concurrent runs are rejected categorically.
+        The loop is ``execute -> (recovery says replan?) -> replan -> execute``,
+        bounded by ``config.recovery.max_replans``. Each iteration runs the
+        existing runner, so verification, permissions and recovery all apply
+        unchanged on every attempt.
 
-        Deadline requires clock, validated by RunControl. No deadline config
-        is introduced; host/test injection only.
+        Task 42.4c adds optional trusted deadline/clock and cooperative
+        cancellation via autonomous root. One run per Agent is supported;
+        concurrent runs are rejected categorically. Deadline requires clock,
+        validated by RunControl. No deadline config is introduced; host/test
+        injection only.
         """
         # Validate deadline requires clock before acquiring active-run marker
         if deadline is not None and clock is None:
@@ -472,7 +635,7 @@ class Agent:
         if deadline is not None and not isinstance(deadline, Deadline):
             raise TurnValidationError("deadline is invalid")
 
-        # One autonomous run per Agent
+        # One autonomous run per Agent — fail-loud, not shared
         with self._autonomy_lock:
             if self._active_run:
                 raise StateError("autonomous run already active",
@@ -513,7 +676,7 @@ class Agent:
                         note="replan budget exhausted; awaiting human input")
                     break
 
-                # Checkpoint before planner.replan
+                # Checkpoint before planner.replan (final gate before consuming attempt)
                 control.checkpoint()
                 outcome = self._replan(ledger, report, control=control)
                 if outcome is ReplanOutcome.ABANDON:
@@ -532,11 +695,7 @@ class Agent:
             # Cancellation settlement: task CANCELLED, not generic failure
             current = self.state.current_task
             if current is not None and not current.status.is_terminal:
-                try:
-                    current.transition_to(TaskStatus.CANCELLED)
-                except Exception:
-                    pass
-            # If report not yet defined (cancel before first execute), create one
+                current.transition_to(TaskStatus.CANCELLED)
             if 'report' not in locals():
                 tid = current.id if current is not None else "unknown"
                 report = RunReport(task_id=tid, status=TaskStatus.CANCELLED)
@@ -556,14 +715,10 @@ class Agent:
     # -- loop internals ----------------------------------------------------
     def _execute_once(self, *, resumed: bool = False,
                       control: RunControl | None = None) -> RunReport:
-        """Run the current task once through the existing runner.
-
-        Task 42.4c: accepts RunControl, handles CancellationRequested as
-        control outcome, not generic ERROR.
-        """
+        """Run the current task once through the existing runner."""
         control = control or RunControl()
         current = self.state.current_task
-        assert current is not None
+        assert current is not None  # guaranteed by run_task
         # Checkpoint before entering execution
         control.checkpoint()
         self.state.transition_phase(AgentPhase.EXECUTING, note="run_task")
@@ -579,13 +734,10 @@ class Agent:
             report = RunReport(task_id=current.id, status=TaskStatus.CANCELLED,
                                cancellation_reason=reason.value)
             if not current.status.is_terminal:
-                try:
-                    current.transition_to(TaskStatus.CANCELLED)
-                except Exception:
-                    pass
+                current.transition_to(TaskStatus.CANCELLED)
             self.state.set_active_subtask(None)
             return report
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 - state must reflect the failure
             self.state.record_error(exc)
             self.state.transition_phase(AgentPhase.ERROR, note=str(exc))
             self.checkpoint()
@@ -596,45 +748,54 @@ class Agent:
                 *, control: RunControl | None = None) -> ReplanOutcome:
         """Ask the planner for a new approach and judge the result.
 
+        Budget is consumed *before* the planner runs, so a planner that raises
+        or misbehaves still counts as an attempt and cannot loop forever.
+
+        Returns :class:`ReplanOutcome`: ``ADOPTED`` (execute the new plan),
+        ``RETRY`` (duplicate strategy refused, ask again if budget remains) or
+        ``ABANDON`` (unusable output; stop).
+
         Task 42.4c: checkpoints before/after planner.replan and before adopting.
-        If planner returns after cancellation, reject new task.
+        If planner returns after cancellation, reject new task. Ledger
+        linearization fixed: checkpoint BEFORE consuming attempt.
         """
         control = control or RunControl()
         previous = self.state.current_task
         assert previous is not None
         reason = self._replan_reason(report)
 
-        attempt = ledger.begin(reason, previous)
-        ledger.save(self.state)
-
+        # Transition into required recovery/planning phase as today
         if self.state.phase is not AgentPhase.PLANNING:
             self.state.transition_phase(AgentPhase.RECOVERING,
                                         note="replan requested")
         self.state.transition_phase(AgentPhase.PLANNING, note=reason)
+        self.log.info(Events.REPLAN_STARTED, attempt=0,
+                      max_replans=self.config.recovery.max_replans,
+                      task_id=previous.id, reason=reason)
+
+        # Final cooperative gate BEFORE consuming attempt (P2-1)
+        control.checkpoint()
+
+        attempt = ledger.begin(reason, previous)
+        ledger.save(self.state)
+
         self.log.info(Events.REPLAN_STARTED, attempt=attempt,
                       max_replans=self.config.recovery.max_replans,
                       task_id=previous.id, reason=reason)
 
-        # Checkpoint before planner.replan
-        control.checkpoint()
-
         try:
             new_task = self.planner.replan(previous, self.state)
         except CancellationRequested as exc:
-            # Cancellation during planner.replan: reject returned plan, cancel current
-            self.state.record_error(exc)
+            # Cancellation during planner.replan: attempt already consumed,
+            # finish ledger as cancelled, cancel current task. No error record (P2-4).
             ledger.finish(reason=reason, outcome="cancelled",
                           previous_task_id=previous.id,
                           detail=f"cancelled: {exc.reason.value if isinstance(exc.reason, CancellationReason) else 'unknown'}")
             ledger.save(self.state)
-            # Cancel current task
             if not previous.status.is_terminal:
-                try:
-                    previous.transition_to(TaskStatus.CANCELLED)
-                except Exception:
-                    pass
+                previous.transition_to(TaskStatus.CANCELLED)
             raise exc
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 - a bad planner must not crash the run
             self.state.record_error(exc)
             ledger.finish(reason=reason, outcome="error",
                           previous_task_id=previous.id,
@@ -650,16 +811,13 @@ class Agent:
         try:
             control.checkpoint()
         except CancellationRequested as exc:
-            # Late plan rejected
+            # Late plan after cancellation: attempt consumed, finish cancelled, never adopt
             ledger.finish(reason=reason, outcome="cancelled",
                           previous_task_id=previous.id,
                           detail="late plan after cancellation")
             ledger.save(self.state)
             if not previous.status.is_terminal:
-                try:
-                    previous.transition_to(TaskStatus.CANCELLED)
-                except Exception:
-                    pass
+                previous.transition_to(TaskStatus.CANCELLED)
             raise exc
 
         rejection = self._reject_reason(new_task, previous)
@@ -673,6 +831,10 @@ class Agent:
             self._abandon_replan(report, f"replan rejected: {rejection}")
             return ReplanOutcome.ABANDON
 
+        # Structurally sound, but is it the same failed strategy again? A
+        # duplicate is refused *before* execution. Unlike a structural
+        # rejection this leaves the request live, so the loop asks the planner
+        # again while budget remains — the attempt is already paid for.
         duplicate = self._duplicate_reason(new_task, ledger)
         if duplicate is not None:
             ledger.finish(reason=reason, outcome="rejected_duplicate",
@@ -683,9 +845,12 @@ class Agent:
                              detail=duplicate, kind="duplicate")
             self.state.update_resume_point(
                 note="replan rejected: duplicate of a failed approach")
+            # Keep the previous task in place; nothing about it changed.
             return ReplanOutcome.RETRY
 
-        # Accepted: checkpoint before adopting
+        # Accepted: carry the objective forward and swap in the new plan. The
+        # previous task is already archived in the ledger, so no history is lost.
+        # Checkpoint before adopting
         control.checkpoint()
 
         ledger.finish(reason=reason, outcome="accepted",
@@ -693,7 +858,7 @@ class Agent:
         ledger.save(self.state)
 
         self.state.set_task(new_task)
-        report.replan_requested = False
+        report.replan_requested = False  # this request has now been serviced
         self.log.info(Events.REPLAN_PLAN_ACCEPTED, attempt=attempt,
                       previous_task_id=previous.id, new_task_id=new_task.id,
                       subtasks=len(new_task.subtasks))
@@ -703,6 +868,18 @@ class Agent:
     def _reject_reason(self, new_task: Task | None,
                        previous: Task,
                        ledger: ReplanLedger | None = None) -> str | None:
+        """Validate a replanned task. Returns a reason string if unusable.
+
+        The planner is expected to validate its own output; this is the
+        orchestration-level backstop that also catches structural problems a
+        planner cannot see — notably a planner that hands back the very task
+        that just failed, which would loop forever.
+
+        When ``ledger`` is supplied it additionally rejects a plan whose
+        *executable signature* matches an archived plan that already failed for
+        a non-transient reason: being told about past failures does not stop a
+        model repeating them, so the duplicate is refused before it can run.
+        """
         if new_task is None:
             return "planner returned no task"
         if not isinstance(new_task, Task):
@@ -721,15 +898,22 @@ class Agent:
 
     @staticmethod
     def _proposal_signature(new_task: Task | None) -> str:
+        """Safe description of a proposed strategy: tool names only.
+
+        Recorded on rejections so a later replan can be told *what* it
+        proposed. Argument values are never included — see
+        :func:`describe_signature`.
+        """
         if not isinstance(new_task, Task):
             return ""
         try:
             return describe_signature(plan_signature(new_task))
-        except Exception:  # pragma: no cover
+        except Exception:  # pragma: no cover - never block a rejection
             return ""
 
     def _duplicate_reason(self, new_task: Task,
                           ledger: ReplanLedger) -> str | None:
+        """Reject a plan that repeats an already-failed executable strategy."""
         match = find_duplicate(new_task, ledger.archived_plans)
         if match is None:
             return None
@@ -741,6 +925,7 @@ class Agent:
         return match.reason()
 
     def _abandon_replan(self, report: RunReport, note: str) -> None:
+        """Leave the run in an honest failed/blocked state after a bad replan."""
         report.replan_requested = False
         report.escalated = True
         self.state.update_resume_point(note=note)
@@ -756,48 +941,51 @@ class Agent:
         """Settle the agent phase once the loop has stopped.
 
         Task 42.4c: CANCELLED settles to DONE with truthful categorical note,
-        using existing phases only. Handles intermediate PLANNING/ERROR phases
-        via IDLE stepping to avoid illegal transitions.
+        using existing phases only. For CANCELLED from PLANNING, the approved
+        bridge PLANNING->IDLE->DONE is used. FAILED preserves ERROR semantics
+        and does NOT fall back to DONE on transition failure.
         """
-        def _to_done(note: str) -> None:
-            try:
-                self.state.transition_phase(AgentPhase.DONE, note=note)
-                return
-            except StateError:
-                pass
-            # PLANNING -> IDLE -> DONE is valid; ERROR -> IDLE -> DONE etc.
-            try:
-                if self.state.phase is not AgentPhase.IDLE:
-                    self.state.transition_phase(AgentPhase.IDLE, note=f"reset before {note}")
-            except Exception:
-                pass
-            try:
-                self.state.transition_phase(AgentPhase.DONE, note=note)
-            except Exception:
-                # Best-effort: if still illegal (e.g., already DONE), just record note
-                self.state.update_resume_point(note=note)
-
         if report.status is TaskStatus.COMPLETED:
-            _to_done("task completed")
-        elif report.status is TaskStatus.FAILED:
+            # Completion wins: transition to DONE, may need IDLE stepping if currently PLANNING etc.
             try:
-                self.state.transition_phase(AgentPhase.ERROR, note="task failed")
+                self.state.transition_phase(AgentPhase.DONE, note="task completed")
             except StateError:
-                _to_done("task failed")
+                # If currently PLANNING (replan path) or similar, step via IDLE
+                if self.state.phase in (AgentPhase.PLANNING, AgentPhase.RECOVERING, AgentPhase.ERROR):
+                    try:
+                        if self.state.phase is not AgentPhase.IDLE:
+                            self.state.transition_phase(AgentPhase.IDLE, note="reset before task completed")
+                    except StateError:
+                        pass
+                self.state.transition_phase(AgentPhase.DONE, note="task completed")
+        elif report.status is TaskStatus.FAILED:
+            # FAILED must remain ERROR, not fall back to DONE (P2-3)
+            self.state.transition_phase(AgentPhase.ERROR, note="task failed")
         elif report.status is TaskStatus.CANCELLED:
             reason = report.cancellation_reason or "cancelled"
-            _to_done(f"task cancelled: {reason}")
+            # Approved bridge for cancellation from PLANNING: PLANNING->IDLE->DONE
+            try:
+                self.state.transition_phase(AgentPhase.DONE, note=f"task cancelled: {reason}")
+            except StateError:
+                if self.state.phase is AgentPhase.PLANNING:
+                    self.state.transition_phase(AgentPhase.IDLE, note=f"reset before task cancelled: {reason}")
+                    self.state.transition_phase(AgentPhase.DONE, note=f"task cancelled: {reason}")
+                elif self.state.phase is AgentPhase.ERROR:
+                    try:
+                        self.state.transition_phase(AgentPhase.IDLE, note=f"reset before task cancelled: {reason}")
+                    except StateError:
+                        pass
+                    self.state.transition_phase(AgentPhase.DONE, note=f"task cancelled: {reason}")
+                else:
+                    raise
         else:
             self.state.update_resume_point(note="task blocked")
         self.checkpoint()
 
     def execute(self, objective: str, *,
-                context: dict[str, Any] | None = None,
-                deadline: Deadline | None = None,
-                clock: Clock | None = None) -> RunReport:
-        """Convenience: plan then run, with optional deadline."""
-        task = self.create_task(objective, context=context)
-        return self.run_task(task, deadline=deadline, clock=clock)
+                context: dict[str, Any] | None = None) -> RunReport:
+        """Convenience: plan then run."""
+        return self.run_task(self.create_task(objective, context=context))
 
     # -- state -------------------------------------------------------------
     def checkpoint(self) -> None:
@@ -805,6 +993,17 @@ class Agent:
         self.log.debug(Events.STATE_CHECKPOINT, **self.state.summary())
 
     def resume(self, run_id: str) -> AgentState:
+        """Load a persisted run, refusing one that belongs elsewhere.
+
+        A resumed autonomous task must not silently execute against a
+        different project directory, so the run's pinned workspace is compared
+        against this agent's canonical root *before* the state is adopted.
+        Nothing runs on mismatch: ``self.state`` is left untouched, so no tool
+        can execute.
+
+        Legacy runs recorded before pinning carry ``workspace=None`` and are
+        accepted unchanged.
+        """
         loaded = self.state_store.load(run_id)
         pinned = getattr(loaded, "workspace", None)
         if not self.workspace.matches(pinned):
@@ -816,6 +1015,7 @@ class Agent:
                 current_workspace=self.workspace.identity)
         self.state = loaded
         if self.state.workspace is None:
+            # Adopt the current workspace so the next checkpoint is pinned.
             self.state.workspace = self.workspace.identity
         self.log.info(Events.STATE_RESUMED, **self.state.summary())
         return self.state
@@ -834,33 +1034,31 @@ class Agent:
         }
 
     def model_info(self) -> dict[str, Any] | None:
+        """Non-sensitive description of the active provider, or None."""
         describe = getattr(self.model, "describe", None)
         if describe is None:
             return None
         return describe()
 
     def shutdown(self) -> None:
-        # Task 42.4c: cancel autonomous root with AGENT_SHUTDOWN
+        # Task 42.4c P1-1 fix: atomic idle checkpoint
         try:
             self._autonomy_root.cancel(CancellationReason.AGENT_SHUTDOWN)
         except Exception:
             pass
         if self._turns is not None:
             self._turns.shutdown()
-        # Checkpoint safety: do not concurrently persist half-mutated state
-        # while autonomous run is active; active run will terminalize and
-        # checkpoint after observing cancellation.
-        should_checkpoint = False
+        # Atomic idle checkpoint: hold lock across check and save so new run
+        # cannot set _active_run=True until idle checkpoint completes.
         with self._autonomy_lock:
             if not self._active_run:
-                should_checkpoint = True
-        if should_checkpoint:
-            self.checkpoint()
+                self.checkpoint()
         self.log.info(Events.AGENT_STOPPED, **self.state.summary())
 
 
 def build_agent(config: AgentConfig | None = None,
                 tools: Iterable[Tool] | None = None,
                 **deps: Any) -> Agent:
+    """Small factory for the common case."""
     return Agent(config, AgentDependencies(
         tools=list(tools) if tools is not None else None, **deps))

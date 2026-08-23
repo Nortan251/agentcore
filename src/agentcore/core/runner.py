@@ -205,16 +205,6 @@ class TaskRunner:
             # A. after attaching/validating task but BEFORE starting executable work
             control.checkpoint()
 
-            # Ensure AgentState phase is EXECUTING for standalone runner usage
-            # (Agent._execute_once also does this, but direct runner usage starts IDLE)
-            if state.phase is not AgentPhase.EXECUTING:
-                try:
-                    state.transition_phase(AgentPhase.EXECUTING, note="run")
-                except Exception:
-                    # If already in a compatible phase (e.g., RECOVERING from previous retry),
-                    # ignore; _schedule_retry will handle its own transitions.
-                    pass
-
             if task.status in (TaskStatus.PENDING, TaskStatus.BLOCKED):
                 task.transition_to(TaskStatus.RUNNING)
             log.info(Events.TASK_STARTED, objective=task.objective,
@@ -262,36 +252,34 @@ class TaskRunner:
     def _settle_cancellation(self, task: Task, state: AgentState,
                              report: RunReport, exc: CancellationRequested,
                              log: StructuredLogger) -> None:
-        """Settle Task as CANCELLED preserving evidence."""
+        """Settle Task as CANCELLED preserving evidence.
+
+        Fail-loud: if active subtask is RUNNING, transition RUNNING->CANCELLED
+        must succeed; unexpected failure propagates and no contradictory
+        CANCELLED report is forged. Same for Task nonterminal -> CANCELLED.
+        Already-terminal tasks/subtasks are preserved exactly.
+        """
         reason = exc.reason if isinstance(exc.reason, CancellationReason) else CancellationReason.INTERNAL_FAILURE
+
         # Active subtask RUNNING -> CANCELLED if still RUNNING
-        try:
-            active_id = state.active_subtask_id
-            if active_id is not None:
-                # Find subtask by id
-                for sub in task.subtasks:
-                    if sub.id == active_id and sub.status is TaskStatus.RUNNING:
-                        try:
-                            sub.transition_to(TaskStatus.CANCELLED)
-                        except Exception:
-                            pass
-                        break
-        except Exception:
-            pass
+        active_id = state.active_subtask_id
+        if active_id is not None:
+            for sub in task.subtasks:
+                if sub.id == active_id:
+                    if sub.status is TaskStatus.RUNNING:
+                        sub.transition_to(TaskStatus.CANCELLED)
+                    # If already terminal, preserve exactly; if nonterminal but not RUNNING, leave as is (evidence)
+                    break
 
         # Task itself to CANCELLED if still nonterminal
         if not task.status.is_terminal:
-            try:
-                task.transition_to(TaskStatus.CANCELLED)
-            except Exception:
-                # If transition fails because already terminal, keep existing
-                pass
+            task.transition_to(TaskStatus.CANCELLED)
 
         state.set_active_subtask(None)
         report.status = TaskStatus.CANCELLED
         report.cancellation_reason = reason.value
         report.replan_requested = False
-        log.info(Events.TASK_CANCELLED if hasattr(Events, "TASK_CANCELLED") else "task.cancelled",
+        log.info(Events.TASK_CANCELLED,
                  reason=reason.value, executed=report.executed, failed=report.failed)
 
     # -- internals ---------------------------------------------------------
@@ -332,12 +320,9 @@ class TaskRunner:
                 run_id=state.run_id, task_id=task.id, subtask_id=subtask.id)
         except CancellationRequested as exc:
             # Cancellation before physical tool execution (pre-permission or post-permission)
-            # RUNNING -> CANCELLED, no tool invocation recorded
-            try:
-                if subtask.status is TaskStatus.RUNNING:
-                    subtask.transition_to(TaskStatus.CANCELLED)
-            except Exception:
-                pass
+            # RUNNING -> CANCELLED, no tool invocation recorded, fail-loud
+            if subtask.status is TaskStatus.RUNNING:
+                subtask.transition_to(TaskStatus.CANCELLED)
             state.set_active_subtask(None)
             raise exc
         except ToolNotFoundError as exc:
@@ -352,24 +337,29 @@ class TaskRunner:
         # Tool returned, record evidence FIRST
         state.record_tool_call(invocation)
 
-        # E. immediately AFTER recording, checkpoint before interpretation
+        # P1-2 fix: physical outcome counter must be reflected BEFORE checkpoint,
+        # so cancellation during physical Tool.run does not leave state.tool_calls
+        # with evidence but report.executed/failed =0.
+        if invocation.ok:
+            report.executed += 1
+        else:
+            report.failed += 1
+
+        # E. immediately AFTER recording and counter update, checkpoint before interpretation
         try:
             control.checkpoint()
         except CancellationRequested as exc:
             # Cancellation while tool was physically executing: tool evidence preserved,
             # active RUNNING subtask -> CANCELLED before result interpretation
-            try:
-                if subtask.status is TaskStatus.RUNNING:
-                    subtask.transition_to(TaskStatus.CANCELLED)
-            except Exception:
-                pass
+            # Report counters already reflect physical outcome (truthful).
+            if subtask.status is TaskStatus.RUNNING:
+                subtask.transition_to(TaskStatus.CANCELLED)
             state.set_active_subtask(None)
             raise exc
 
         if invocation.ok:
             subtask.result = invocation.result.output
             subtask.transition_to(TaskStatus.COMPLETED)
-            report.executed += 1
             self._verify(subtask, state, slog, control=control)
             if subtask.verification.status in _ADVERSE_VERDICTS:
                 self._recover(task, subtask, state, report, slog, control=control)
@@ -385,7 +375,6 @@ class TaskRunner:
             details=dict(invocation.result.metadata),
         ))
         subtask.transition_to(TaskStatus.FAILED)
-        report.failed += 1
         slog.warning(Events.SUBTASK_FINISHED, outcome="failed",
                      error=invocation.result.error)
 
@@ -461,21 +450,7 @@ class TaskRunner:
                 raise CancellationRequested(CancellationReason.DEADLINE_EXCEEDED)
 
         was_failed = subtask.status is TaskStatus.FAILED
-        try:
-            state.transition_phase(AgentPhase.RECOVERING, note="retrying subtask")
-        except Exception:
-            # If current phase cannot go directly to RECOVERING (e.g., IDLE from standalone usage),
-            # ensure we are in EXECUTING first, then RECOVERING.
-            try:
-                if state.phase is not AgentPhase.EXECUTING:
-                    state.transition_phase(AgentPhase.EXECUTING, note="run")
-            except Exception:
-                pass
-            try:
-                state.transition_phase(AgentPhase.RECOVERING, note="retrying subtask")
-            except Exception:
-                # If still fails, proceed without phase transition (best-effort, preserve evidence)
-                pass
+        state.transition_phase(AgentPhase.RECOVERING, note="retrying subtask")
         log.info(Events.RECOVERY_ATTEMPTED, attempts=subtask.attempts,
                  delay_seconds=round(delay, 3))
         if delay > 0:
@@ -491,10 +466,7 @@ class TaskRunner:
             report.executed -= 1
         report.retried += 1
         log.info(Events.RECOVERY_RETRY_SCHEDULED, attempts=subtask.attempts)
-        try:
-            state.transition_phase(AgentPhase.EXECUTING, note="retry scheduled")
-        except Exception:
-            pass
+        state.transition_phase(AgentPhase.EXECUTING, note="retry scheduled")
 
     def _verify(self, subtask: Subtask, state: AgentState,
                 log: StructuredLogger, *, control: RunControl) -> None:
