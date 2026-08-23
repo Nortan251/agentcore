@@ -49,6 +49,7 @@ from agentcore.realtime.errors import (
 from agentcore.realtime.turn import Deadline, TurnPhase, require_run_id, require_turn_id, TurnController
 from agentcore.state.models import AgentPhase, AgentState
 from agentcore.state.store import InMemoryStateStore, StateStore
+from agentcore.realtime.store import TurnStore
 from agentcore.tasks.models import Task, TaskStatus
 from agentcore.tools.base import Tool
 from agentcore.tools.builtin import default_tools
@@ -616,13 +617,14 @@ class Agent:
         self.state.set_task(task)
 
     # -- autonomous correlation (Task 42.4d) --------------------------------
-    def _require_turn_store(self):
-        """Require realtime coordinator/store for correlation."""
+    def _require_turn_store(self) -> TurnStore:
+        """Require the complete durable store contract for correlation."""
         if self.turn_coordinator is None:
             raise TurnCorrelationError("turn coordinator required for correlation")
         store = getattr(self.turn_coordinator, "store", None)
-        if store is None:
-            raise TurnCorrelationError("turn store required for correlation")
+        if not isinstance(store, TurnStore):
+            raise TurnCorrelationError(
+                "turn store does not support autonomous correlation")
         return store
 
     def _validate_origin_turn(self, turn_id: str, run_id: str):
@@ -667,6 +669,8 @@ class Agent:
 
     def _has_autonomous_execution_evidence(self) -> bool:
         """Return whether this run has progressed beyond an untouched task."""
+        if self.state.phase is not AgentPhase.IDLE or self.state.errors:
+            return True
         task = self.state.current_task
         if self.state.tool_calls or self.state.verifications or self.state.active_subtask_id:
             return True

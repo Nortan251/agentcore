@@ -36,6 +36,7 @@ from agentcore.realtime import (
 )
 from agentcore.realtime.cancellation import CancellationSource
 from agentcore.realtime.turn import new_turn
+from agentcore.realtime.store import TurnStore
 from agentcore.state.models import AgentPhase, AgentState
 from agentcore.state.store import InMemoryStateStore, JsonFileStateStore
 from agentcore.tasks.models import Task, Subtask, TaskStatus
@@ -136,13 +137,13 @@ def make_agent(tmp_path, tools, *, turn_store=None, state_store=None, level=Perm
     return agent, turn_store, coordinator
 
 
-def complete_turn(store, clock=None):
+def complete_turn(store, clock=None, *, raw_session_id="test_session"):
     """Create a COMPLETED turn via controller transitions."""
     clock = clock or FixedClock(T0)
     # Use new_turn then transition to COMPLETED via legal path
     # For simplicity, directly create record with phase COMPLETED using store's internal? Use controller
     # Create fresh record then transition: CREATED->QUEUED->GENERATING->FINALIZING(COMPLETED)->COMPLETED
-    session_key = derive_session_key("test_session")
+    session_key = derive_session_key(raw_session_id)
     deadline = Deadline.after(120.0, clock=clock)
     turn_id = new_id("turn")
     record = new_turn(session_key, 1, deadline=deadline, clock=clock, id_factory=lambda p: turn_id if p == "turn" else new_id(p))
@@ -377,7 +378,7 @@ def test_summary_exposes_safe_origin_only():
     summary = state.summary()
     assert summary["origin_turn_id"] == turn_id
     # No raw session id
-    assert "session" not in json.dumps(summary).lower() or "session_abc" not in json.dumps(summary)
+    assert "RAW_SESSION_SECRET_42_4D" not in json.dumps(summary)
 
 
 def test_reset_creates_new_run_with_origin_none():
@@ -499,7 +500,7 @@ def test_turn_already_bound_to_different_run_reject(tmp_path):
     with pytest.raises(TurnCorrelationConflictError):
         agent2.bind_origin_turn(turn_id)
 
-    assert agent2.state.origin_turn_id is None or agent2.state.origin_turn_id != turn_id
+    assert agent2.state.origin_turn_id is None
     assert tool.runs == 0
 
 
@@ -676,7 +677,7 @@ def test_resume_origin_bound_to_different_run_conflict(tmp_path):
 
         # Current in-memory state NOT replaced
         assert agent2.state.run_id == before_run_id
-        assert agent2.state.origin_turn_id is None or agent2.state.origin_turn_id != turn_id
+        assert agent2.state.origin_turn_id is None
     finally:
         turn_store.close()
 
@@ -847,28 +848,28 @@ def test_terminal_replay_after_bind_still_valid():
 def test_raw_session_id_never_copied_into_agentstate(tmp_path):
     tool = CountingTool()
     agent, store, _ = make_agent(tmp_path, [tool])
-    turn_id, _ = complete_turn(store)
-
+    raw_session = "RAW_SESSION_SECRET_42_4D"
+    turn_id, _ = complete_turn(store, raw_session_id=raw_session)
     agent.bind_origin_turn(turn_id)
-
-    # AgentState should contain only opaque turn id, not raw session id
     serialized = json.dumps(agent.state.to_dict())
-    assert "test_session" not in serialized
-    assert "my session with spaces" not in serialized
+    assert raw_session not in serialized
+    assert raw_session not in json.dumps(agent.state.summary())
     assert turn_id in serialized
+    assert agent.state.origin_turn_id == turn_id
 
 
 def test_correlation_event_contains_only_safe_ids(tmp_path):
     tool = CountingTool()
     agent, store, _ = make_agent(tmp_path, [tool])
-    turn_id, _ = complete_turn(store)
+    raw_session = "RAW_SESSION_SECRET_42_4D"
+    turn_id, _ = complete_turn(store, raw_session_id=raw_session)
 
     # Capture logs
     import io, logging
     from agentcore.observability.logging import configure_logging
     from agentcore.config.schema import LoggingConfig
 
-    configure_logging(LoggingConfig(level="DEBUG"))
+    configure_logging(LoggingConfig(level="DEBUG", format="json"))
     buffer = io.StringIO()
     handler = logging.StreamHandler(buffer)
     root = logging.getLogger("agentcore")
@@ -883,15 +884,19 @@ def test_correlation_event_contains_only_safe_ids(tmp_path):
         root.removeHandler(handler)
         configure_logging(LoggingConfig(level="CRITICAL"))
 
-    logs = buffer.getvalue()
-    assert turn_id in logs
-    assert agent.state.run_id in logs
-    # Not raw session, not user text, not objective, not tool args, not workspace path
-    assert "test_session" not in logs
-    assert "test objective" not in logs
-    assert "count" not in logs.lower() or "run.correlated" in logs  # tool name may appear in other logs, but correlation event itself should not contain tool output
-    # Check correlation event specifically
-    assert "run.correlated" in logs
+    events = [json.loads(line) for line in buffer.getvalue().splitlines() if line]
+    correlated = [event for event in events if event.get("event") == Events.RUN_CORRELATED]
+    assert len(correlated) == 1
+    event = correlated[0]
+    assert event["event"] == Events.RUN_CORRELATED
+    assert event["run_id"] == agent.state.run_id
+    assert event["origin_turn_id"] == turn_id
+    assert event["turn_phase"] == "completed"
+    event_json = json.dumps(event)
+    assert "RAW_SESSION_SECRET_42_4D" not in event_json
+    assert "test objective" not in event_json
+    assert "count" not in event_json
+    assert agent.workspace.identity not in event_json
 
 
 def test_persisted_state_contains_only_opaque_origin(tmp_path):
@@ -1027,3 +1032,104 @@ def test_direct_invoke_is_execution_evidence_and_cannot_gain_first_origin(tmp_pa
         agent.bind_origin_turn(origin_id)
     assert len(agent.state.tool_calls) == 1
     assert agent.state.origin_turn_id is None
+
+class CountingStateStore(InMemoryStateStore):
+    def __init__(self):
+        super().__init__(); self.save_count = 0
+    def save(self, state):
+        self.save_count += 1; return super().save(state)
+
+def test_active_public_bind_does_not_checkpoint(tmp_path):
+    tool = GatedTool(); state_store = CountingStateStore()
+    agent, store, _ = make_agent(tmp_path, [tool], state_store=state_store)
+    turn_id, _ = complete_turn(store)
+    thread = threading.Thread(target=lambda: agent.run_task(make_task("gate")))
+    thread.start(); assert tool.entered.wait(WAIT)
+    before = state_store.save_count
+    with pytest.raises(TurnCorrelationConflictError): agent.bind_origin_turn(turn_id)
+    assert state_store.save_count == before
+    assert agent.state.origin_turn_id is None; assert store.load(turn_id).run_id is None
+    tool.release.set(); thread.join(WAIT); assert not thread.is_alive()
+
+def test_completed_uncorrelated_run_cannot_be_bound(tmp_path):
+    agent, store, _ = make_agent(tmp_path, [CountingTool()])
+    assert agent.run_task(make_task("count")).status is TaskStatus.COMPLETED
+    turn_id, _ = complete_turn(store)
+    with pytest.raises(TurnCorrelationConflictError): agent.bind_origin_turn(turn_id)
+    assert agent.state.origin_turn_id is None; assert store.load(turn_id).run_id is None
+
+def test_public_call_tool_is_retroactive_evidence(tmp_path):
+    agent, store, _ = make_agent(tmp_path, [CountingTool()])
+    invocation = agent.call_tool("count", {})
+    turn_id, _ = complete_turn(store)
+    with pytest.raises(TurnCorrelationConflictError): agent.bind_origin_turn(turn_id)
+    assert agent.state.tool_calls[-1]["tool"] == invocation.tool
+    assert agent.state.origin_turn_id is None
+
+def test_preassigned_pending_task_can_be_correlated_and_run(tmp_path):
+    tool = CountingTool(); agent, store, _ = make_agent(tmp_path, [tool])
+    agent.assign(make_task("count")); turn_id, _ = complete_turn(store)
+    agent.bind_origin_turn(turn_id); assert agent.run_task().status is TaskStatus.COMPLETED
+    assert agent.state.origin_turn_id == turn_id
+    assert store.load(turn_id).run_id == agent.state.run_id
+
+def test_origin_version_idempotency_and_conflict(tmp_path):
+    agent, store, _ = make_agent(tmp_path, [CountingTool()])
+    first, _ = complete_turn(store); second, _ = complete_turn(store)
+    before_version = agent.state.version; before_updated = agent.state.updated_at
+    agent.bind_origin_turn(first)
+    assert agent.state.version == before_version + 1; assert agent.state.updated_at >= before_updated
+    version = agent.state.version; agent.bind_origin_turn(first); assert agent.state.version == version
+    with pytest.raises(TurnCorrelationConflictError): agent.bind_origin_turn(second)
+    assert agent.state.version == version
+
+def test_correlation_requires_full_turn_store_protocol(tmp_path):
+    class LegacyStore:
+        def __init__(self, delegate): self.delegate = delegate
+        @property
+        def admission_coordination(self): return self.delegate.admission_coordination
+        def create(self, record): return self.delegate.create(record)
+        def load(self, turn_id): return self.delegate.load(turn_id)
+        def compare_and_swap(self, *args): return self.delegate.compare_and_swap(*args)
+        def list_turns(self): return self.delegate.list_turns()
+        def close(self): return self.delegate.close()
+    legacy = LegacyStore(InMemoryTurnStore())
+    assert isinstance(InMemoryTurnStore(), TurnStore)
+    assert isinstance(JsonFileTurnStore(tmp_path / "turns"), TurnStore)
+    assert not isinstance(legacy, TurnStore)
+    agent = Agent(_config(tmp_path), AgentDependencies(
+        tools=[CountingTool()], turn_coordinator=TurnCoordinator(legacy), state_store=InMemoryStateStore()))
+    with pytest.raises(TurnCorrelationError): agent.bind_origin_turn(new_id("turn"))
+    assert agent.state.origin_turn_id is None; assert agent.state.version == 0
+
+def test_resume_competing_bind_conflict_is_exact_and_non_adopting(tmp_path):
+    base = InMemoryTurnStore(); gate = threading.Event(); entered = threading.Event()
+    class GatedStore:
+        admission_coordination = property(lambda self: base.admission_coordination)
+        def create(self, r): return base.create(r)
+        def load(self, i): return base.load(i)
+        def compare_and_swap(self, *a): return base.compare_and_swap(*a)
+        def bind_run(self, turn_id, run_id):
+            entered.set(); assert gate.wait(WAIT); return base.bind_run(turn_id, run_id)
+        def list_turns(self): return base.list_turns()
+        def close(self): return base.close()
+        def __enter__(self): return self
+        def __exit__(self, *args): self.close()
+    store = GatedStore(); turn_id, _ = complete_turn(store)
+    state_store = InMemoryStateStore(); seed = AgentState(workspace=str(tmp_path / "workspace"))
+    seed.origin_turn_id = turn_id; state_store.save(seed)
+    agent = Agent(_config(tmp_path), AgentDependencies(
+        tools=[CountingTool()], turn_coordinator=TurnCoordinator(store), state_store=state_store))
+    seed.workspace = agent.workspace.identity
+    state_store.save(seed)
+    result = []
+    thread = threading.Thread(target=lambda: result.append(_resume(agent, seed.run_id)))
+    thread.start(); assert entered.wait(WAIT)
+    winner = new_id("run"); base.bind_run(turn_id, winner); gate.set(); thread.join(WAIT)
+    assert not thread.is_alive(); assert isinstance(result[0], TurnCorrelationConflictError)
+    assert base.load(turn_id).run_id == winner; assert agent.state.origin_turn_id is None
+
+def _resume(agent, run_id):
+    try: agent.resume(run_id)
+    except Exception as exc: return exc
+    return None
