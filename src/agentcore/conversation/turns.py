@@ -159,13 +159,14 @@ class _TurnFence:
         a deadline. When active, the returned context carries the exact
         deadline object created at admission, so the ephemeral and durable
         views never drift.
+
+        Fail-closed: if the turn is active but context creation fails,
+        the exception propagates and the turn fails truthfully rather
+        than silently becoming unbounded.
         """
         if self._operation_id is None:
             return None
-        try:
-            return self._context()
-        except Exception:
-            return None
+        return self._context()
 
     @property
     def clock(self) -> Clock:

@@ -15,6 +15,7 @@ every provider automatically satisfies ``core.interfaces.ModelProvider``.
 
 from __future__ import annotations
 
+import inspect
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -22,10 +23,28 @@ from agentcore.config.schema import ModelConfig
 from agentcore.models.messages import ModelRequest, ModelResponse
 
 
+def _accepts_kwarg(func: Any, name: str) -> bool:
+    """Safe capability detection without invoking the callable."""
+    try:
+        sig = inspect.signature(func)
+    except (ValueError, TypeError):
+        return False
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+        if param.name == name and param.kind in (
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.POSITIONAL_ONLY,
+        ):
+            return True
+    return False
+
+
 class BaseModelProvider(ABC):
     """Common behaviour for all providers."""
 
-    #: Short provider identifier, e.g. ``"openai_compatible"``.
+    #: Short provider identifier, e.g. ``\"openai_compatible\"``.
     name: str = "base"
 
     def __init__(self, config: ModelConfig | None = None) -> None:
@@ -33,7 +52,8 @@ class BaseModelProvider(ABC):
 
     @abstractmethod
     def generate(self, request: ModelRequest, *,
-                 context: Any | None = None) -> ModelResponse:
+                 context: Any | None = None,
+                 clock: Any | None = None) -> ModelResponse:
         """Execute a request and return a normalised response.
 
         Implementations must raise a :class:`agentcore.models.errors.ModelError`
@@ -44,10 +64,15 @@ class BaseModelProvider(ABC):
         Providers that receive it must respect its remaining budget for
         every transport attempt and retry. Callers without a realtime
         context continue to work unchanged.
+
+        ``clock`` is the trusted clock that created the deadline
+        (Task 42.4b P1-2). When supplied, deadline remaining must be
+        evaluated against this same clock domain.
         """
 
     def complete(self, prompt: str, *, system: str | None = None,
                  context: Any | None = None,
+                 clock: Any | None = None,
                  **options: Any) -> str:
         """Satisfy the existing ``ModelProvider`` Protocol.
 
@@ -55,17 +80,22 @@ class BaseModelProvider(ABC):
         preserved. Callers needing usage, finish reason or tool calls should
         use :meth:`generate` directly.
 
-        ``context`` is forwarded to :meth:`generate` when supplied, so a
-        realtime caller can propagate its deadline even through the legacy
-        ``complete`` seam. Non-realtime callers omit it and retain old
-        behaviour.
+        ``context`` and ``clock`` are forwarded to :meth:`generate` when the
+        provider accepts them, so a realtime caller can propagate its deadline
+        even through the legacy ``complete`` seam. Non-realtime callers omit
+        them and retain old behaviour.
+
+        Safe capability detection ensures exactly one invocation per logical
+        attempt (P1-1).
         """
         request = ModelRequest.from_prompt(prompt, system=system, **options)
-        try:
-            return self.generate(request, context=context).text
-        except TypeError:
-            # Compatibility with providers that do not accept context.
-            return self.generate(request).text
+        kwargs: dict[str, Any] = {}
+        # Only forward context/clock if generate accepts them.
+        if context is not None and _accepts_kwarg(self.generate, "context"):
+            kwargs["context"] = context
+        if clock is not None and _accepts_kwarg(self.generate, "clock"):
+            kwargs["clock"] = clock
+        return self.generate(request, **kwargs).text
 
     def describe(self) -> dict[str, Any]:
         """Non-sensitive provider summary, safe to log or expose via the CLI."""

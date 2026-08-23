@@ -557,5 +557,214 @@ def test_secret_sanitization_with_context():
 
     blob = json.dumps(exc.value.to_dict())
     assert SECRET not in blob
-    # Also ensure deadline context not leaked into error details
-    assert "deadline" not in blob.lower() or "remaining" not in blob.lower() or True  # we don't put deadline in error
+    # Ensure no sensitive auth data leaks and deadline context is not put into error details.
+    assert "***" not in blob or SECRET not in blob
+    assert "Authorization" not in blob or "***" in blob or SECRET not in blob
+    # OperationContext should never be serialized into provider error details.
+    assert "OperationContext" not in blob
+    assert "turn_" not in blob
+
+
+# ---------------------------------------------------------------------------
+# P1-1 — UNSAFE TypeError FALLBACK REGRESSION
+# ---------------------------------------------------------------------------
+def test_context_aware_provider_internal_typeerror_calls_once():
+    """A provider that accepts context but raises internal TypeError must be invoked exactly once."""
+    from agentcore.conversation.runtime import ConversationRuntime
+
+    calls: list[int] = []
+
+    class ContextAwareProvider:
+        def generate(self, request, *, context=None):
+            calls.append(1)
+            assert context is not None
+            raise TypeError("internal provider bug")
+
+    clock = FixedClock(T0)
+    store = InMemoryTurnStore()
+    coordinator = TurnCoordinator(store, clock=clock)
+    bridge = TurnBridge(coordinator, clock=clock, turn_deadline_seconds=DEADLINE_SECONDS)
+    model = ContextAwareProvider()
+    runtime = ConversationRuntime(model=model, turns=bridge)
+
+    result = runtime.send("hello")
+
+    # Exactly one invocation, no fallback without context
+    assert len(calls) == 1
+    # Runtime normalizes failure, does not strip deadline context
+    assert not result.ok
+    assert result.reply is None
+    # Should be FAILED (internal failure), not silently retried without context
+    assert store.load(result.turn_id).phase is TurnPhase.FAILED
+
+
+def test_legacy_provider_without_context_executes_once():
+    from agentcore.conversation.runtime import ConversationRuntime
+
+    calls: list[int] = []
+
+    class LegacyProvider:
+        def generate(self, request):
+            calls.append(1)
+            return ModelResponse(text="legacy ok")
+
+    clock = FixedClock(T0)
+    store = InMemoryTurnStore()
+    coordinator = TurnCoordinator(store, clock=clock)
+    bridge = TurnBridge(coordinator, clock=clock, turn_deadline_seconds=DEADLINE_SECONDS)
+    model = LegacyProvider()
+    runtime = ConversationRuntime(model=model, turns=bridge)
+
+    result = runtime.send("hello")
+
+    assert len(calls) == 1
+    assert result.ok
+    assert result.reply.content == "legacy ok"
+
+
+# ---------------------------------------------------------------------------
+# P1-2 — CLOCK DOMAIN MUST MATCH DEADLINE CREATION
+# ---------------------------------------------------------------------------
+def test_same_clock_propagation_through_runtime_provider_transport(tmp_path):
+    """Deadline created with FixedClock must be evaluated with SAME clock in HttpClient.
+
+    Provider/client NOT preconfigured with FixedClock; runtime must propagate
+    fence clock. If it didn't, SystemClock would see the FixedClock deadline
+    as instantly expired.
+    """
+    from agentcore.models.providers.openai_compatible import OpenAICompatibleProvider
+    from agentcore.config.schema import ModelConfig
+
+    clock = FixedClock(T0)
+    transport = RecordingTransport([HttpResponse(status=200, body=json.dumps({
+        "id": "cmpl-1",
+        "model": "test-model",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    }).encode())])
+
+    # HttpClient uses default SystemClock and default sleep — NOT FixedClock.
+    # The runtime must propagate fence clock via post_json(clock=).
+    provider = OpenAICompatibleProvider(
+        ModelConfig(provider="openai_compatible", name="test-model",
+                    base_url="https://api.example.com/v1",
+                    timeout_seconds=30.0, max_retries=1,
+                    api_key_env="TEST_KEY"),
+        transport=transport,
+        retry=RetryPolicy(max_attempts=1, initial_backoff=0.01, jitter=False),
+    )
+
+    store = InMemoryTurnStore()
+    coordinator = TurnCoordinator(store, clock=clock)
+    bridge = TurnBridge(coordinator, clock=clock, turn_deadline_seconds=DEADLINE_SECONDS)
+    # Agent composition with our provider and coordinator
+    agent = Agent(_config(tmp_path), AgentDependencies(model=provider, turn_coordinator=coordinator))
+    agent._turns = bridge
+    runtime = agent.conversation()
+
+    # Need API key for OpenAI provider
+    import os
+    os.environ["TEST_KEY"] = "sk-test"
+
+    result = runtime.send("hello")
+
+    assert result.ok
+    assert len(transport.calls) == 1
+    # Effective timeout must be min(configured 30, remaining 120) = 30, not expired
+    assert transport.timeouts[0] == 30.0
+
+    # Now test retry timeout shrinks when FixedClock advances
+    clock2 = FixedClock(T0)
+    transport2 = RecordingTransport([
+        ModelConnectionError("flaky"),
+        HttpResponse(status=200, body=json.dumps({
+            "id": "cmpl-2",
+            "model": "test-model",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok after retry"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }).encode()),
+    ])
+    slept: list[float] = []
+
+    def sleep_and_advance(delay: float):
+        slept.append(delay)
+        clock2.advance(delay)
+
+    client2 = HttpClient(transport=transport2,
+                         retry=RetryPolicy(max_attempts=2, initial_backoff=1.0, jitter=False),
+                         sleep=sleep_and_advance,
+                         clock=None)  # default SystemClock, not FixedClock
+
+    provider2 = OpenAICompatibleProvider(
+        ModelConfig(provider="openai_compatible", name="test-model",
+                    base_url="https://api.example.com/v1",
+                    timeout_seconds=30.0, max_retries=2,
+                    api_key_env="TEST_KEY"),
+        client=client2,
+    )
+
+    store2 = InMemoryTurnStore()
+    coordinator2 = TurnCoordinator(store2, clock=clock2)
+    bridge2 = TurnBridge(coordinator2, clock=clock2, turn_deadline_seconds=10.0)
+    agent2 = Agent(_config(tmp_path), AgentDependencies(model=provider2, turn_coordinator=coordinator2))
+    agent2._turns = bridge2
+    runtime2 = agent2.conversation()
+
+    result2 = runtime2.send("hello retry")
+
+    assert result2.ok
+    assert len(transport2.timeouts) == 2
+    assert transport2.timeouts[0] == 10.0  # min(30,10)
+    # After 1s sleep, remaining 9, so second timeout = 9
+    assert transport2.timeouts[1] == pytest.approx(9.0, abs=0.01)
+
+
+# ---------------------------------------------------------------------------
+# P2-2 — DO NOT SWALLOW NON-TurnSuperseded FENCE FAILURES
+# ---------------------------------------------------------------------------
+def test_fence_check_failure_not_swallowed_after_provider_failure(tmp_path):
+    """If fence.check() raises non-TurnSuperseded after provider failure, it must not be ignored."""
+    from agentcore.conversation.runtime import ConversationRuntime
+
+    class FailingFence:
+        def __init__(self):
+            self._lock = threading.RLock()
+
+        def check(self):
+            raise RuntimeError("store ownership lost")
+
+        def operation_context(self):
+            return None
+
+        @property
+        def clock(self):
+            return None
+
+        def enter_tool_round(self):
+            return None
+
+        def leave_tool_round(self):
+            return None
+
+        def commit(self):
+            return None
+
+        def stage_tool_message(self, *args, **kwargs):
+            return None
+
+        def flush_staged(self, *args, **kwargs):
+            return None
+
+        def session_lock(self):
+            return threading.RLock()
+
+    class ExplodingModel:
+        def generate(self, request, *, context=None, clock=None):
+            raise ModelConnectionError("provider down")
+
+    runtime = ConversationRuntime(model=ExplodingModel())
+    session = runtime.start()
+    fence = FailingFence()
+
+    with pytest.raises(RuntimeError, match="store ownership lost"):
+        runtime._run_turn(session, Message.user("hello"), fence=fence)

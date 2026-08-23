@@ -34,13 +34,15 @@ class EchoProvider(BaseModelProvider):
         self.calls: list[ModelRequest] = []
 
     def generate(self, request: ModelRequest, *,
-                 context: Any | None = None) -> ModelResponse:
-        # ``context`` is accepted for API compatibility (Task 42.4b) but
-        # intentionally ignored: the echo provider performs no I/O and
-        # therefore has no transport timeout to bound. Deadline truth
-        # remains owned by the realtime fence, which will reject a late
+                 context: Any | None = None,
+                 clock: Any | None = None) -> ModelResponse:
+        # ``context`` and ``clock`` are accepted for API compatibility
+        # (Task 42.4b) but intentionally ignored: the echo provider performs
+        # no I/O and therefore has no transport timeout to bound. Deadline
+        # truth remains owned by the realtime fence, which will reject a late
         # echo result if the turn has already expired.
         _ = context
+        _ = clock
         self.calls.append(request)
         last_user = next(
             (m for m in reversed(request.messages) if m.role is Role.USER), None)

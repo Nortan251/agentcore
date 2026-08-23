@@ -173,7 +173,13 @@ class HttpClient:
 
     def _deadline_state(self, context: Any, clock: Clock
                         ) -> tuple[Any, float, bool]:
-        """Return (deadline, remaining, expired) or (None, inf, False)."""
+        """Return (deadline, remaining, expired) or (None, inf, False).
+
+        Fail-closed: if a trusted deadline object is present but its
+        methods fail, treat it as expired with zero remaining rather than
+        silently becoming unbounded. Legacy no-context path remains
+        unbounded by design.
+        """
         if context is None:
             return None, math.inf, False
         deadline = getattr(context, "deadline", None)
@@ -182,16 +188,23 @@ class HttpClient:
         try:
             expired = bool(deadline.expired(clock))
         except Exception:
-            expired = False
+            # Broken trusted deadline must not become unbounded.
+            return deadline, 0.0, True
         try:
             remaining = float(deadline.remaining(clock))
         except Exception:
-            remaining = math.inf
+            return deadline, 0.0, True
         if not math.isfinite(remaining):
+            # Unbounded deadline -> inf remaining, never expired by remaining.
+            # Only the explicit expired flag above can mark it expired.
             remaining = math.inf
+            return deadline, remaining, expired
+        if remaining <= 0:
+            expired = True
         return deadline, remaining, expired
 
     def _is_cancelled(self, context: Any) -> bool:
+        """Fail-closed: cancellation read failure is treated as cancelled."""
         if context is None:
             return False
         cancellation = getattr(context, "cancellation", None)
@@ -200,7 +213,8 @@ class HttpClient:
         try:
             return bool(getattr(cancellation, "requested", False))
         except Exception:
-            return False
+            # Broken trusted cancellation must not become "not cancelled".
+            return True
 
     def post_json(self, url: str, payload: Mapping[str, Any],
                   headers: Mapping[str, str], timeout: float,

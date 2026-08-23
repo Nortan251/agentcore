@@ -26,6 +26,7 @@ Two rules govern the design:
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass, field
 from contextlib import nullcontext
 from typing import Any, Sequence
@@ -68,6 +69,31 @@ application performs and reports memory changes; you do not.
 CURRENT_TURN_LABEL = "CURRENT USER MESSAGE"
 
 
+def _accepts_kwarg(func: Any, name: str) -> bool:
+    """Return True if ``func`` accepts ``name`` as a keyword argument.
+
+    Safe capability detection for Task 42.4b P1-1: inspects the signature
+    without invoking the callable, so an internal TypeError is never
+    misclassified as a missing-argument TypeError.
+
+    A ``**kwargs`` parameter is treated as accepting any name.
+    """
+    try:
+        sig = inspect.signature(func)
+    except (ValueError, TypeError):
+        return False
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+        if param.name == name and param.kind in (
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.POSITIONAL_ONLY,
+        ):
+            return True
+    return False
+
+
 class _NullFence:
     """The legacy turn fence: every hook is a no-op.
 
@@ -92,6 +118,10 @@ class _NullFence:
         return None
 
     def operation_context(self) -> None:
+        return None
+
+    @property
+    def clock(self) -> None:
         return None
 
     def stage_tool_message(self, session: Any, message: Message, *,
@@ -125,7 +155,7 @@ class TurnResult:
     memories_updated: list[Any] = field(default_factory=list)
     #: Durable conflicts detected and persisted. Never auto-resolved.
     conflicts: list[Any] = field(default_factory=list)
-    #: Outcome of a correction ("forget that"), when the turn was one.
+    #: Outcome of a correction (\"forget that\"), when the turn was one.
     correction: Any | None = None
     #: Memories retrieved and shown to the model this turn.
     memories_used: int = 0
@@ -274,7 +304,7 @@ class ConversationRuntime:
         Ordering is deliberate:
 
         1. record the user turn, so it is never lost;
-        2. handle an explicit correction first — "forget that" is an
+        2. handle an explicit correction first — \"forget that\" is an
            instruction about memory, not a fact to remember;
         3. retrieve memory and generate the reply;
         4. only then capture, so a failed model call cannot leave the
@@ -349,12 +379,16 @@ class ConversationRuntime:
             # (deadline, supersession, shutdown), truthfully surface that
             # instead of a generic model failure. This preserves 42.4a
             # winner ordering: an already-accepted cancellation reason wins.
+            # P2-2: do not swallow non-TurnSuperseded fence failures.
             try:
                 fence.check()
             except Exception as fence_exc:
                 from agentcore.conversation.turns import TurnSuperseded
                 if isinstance(fence_exc, TurnSuperseded):
                     raise fence_exc
+                # Unexpected fence/store failure must propagate, not become
+                # ordinary model failure.
+                raise fence_exc
             # No fabricated assistant message, and nothing captured from a
             # turn whose outcome is unknown.
             result.error = exc.message
@@ -486,7 +520,8 @@ class ConversationRuntime:
         return ModelRequest(messages=messages, tools=tools)
 
     def _call_model(self, request: ModelRequest, *,
-                  context: Any | None = None) -> tuple[str, list]:
+                  context: Any | None = None,
+                  clock: Any | None = None) -> tuple[str, list]:
         """One provider call. Returns ``(text, tool_calls)``.
 
         Supports both halves of the existing provider contract: ``generate``
@@ -494,30 +529,46 @@ class ConversationRuntime:
         Protocol. Only ``generate`` can carry tool calls, which is correct —
         the prompt-only Protocol has nowhere to put them.
 
-        When ``context`` is supplied (Task 42.4b), it is forwarded as a
-        trusted keyword-only argument. Legacy providers that do not accept
-        it continue to work via a compatibility fallback.
+        Task 42.4b: trusted ``context`` and ``clock`` are forwarded only when
+        the provider's signature accepts them, determined via
+        ``inspect.signature`` without invoking the provider. This guarantees
+        exactly one invocation per logical attempt and prevents an internal
+        TypeError from being misclassified as a missing-argument error.
         """
         try:
             generate = getattr(self.model, "generate", None)
             if callable(generate):
-                try:
-                    response = generate(request, context=context)
-                except TypeError:
-                    # Legacy provider without context support.
-                    response = generate(request)
+                kwargs: dict[str, Any] = {}
+                if context is not None and _accepts_kwarg(generate, "context"):
+                    kwargs["context"] = context
+                if clock is not None and _accepts_kwarg(generate, "clock"):
+                    kwargs["clock"] = clock
+                response = generate(request, **kwargs)
                 return response.text, list(
                     getattr(response, "tool_calls", []) or [])
+            # Fallback to core Protocol complete()
+            complete = getattr(self.model, "complete", None)
+            if not callable(complete):
+                raise AttributeError("model has neither generate nor complete")
+            kwargs = {}
+            if context is not None and _accepts_kwarg(complete, "context"):
+                kwargs["context"] = context
+            if clock is not None and _accepts_kwarg(complete, "clock"):
+                kwargs["clock"] = clock
             system = "\n\n".join(m.content for m in request.messages
                                  if m.role is Role.SYSTEM)
             body = "\n\n".join(
                 f"{m.role.value}: {m.content}" for m in request.messages
                 if m.role is not Role.SYSTEM)
-            try:
-                return self.model.complete(body, system=system,
-                                           context=context), []
-            except TypeError:
-                return self.model.complete(body, system=system), []
+            # complete signature is (prompt, *, system, context, clock, **options)
+            # We pass system positionally via kwargs to respect its keyword-only nature.
+            if _accepts_kwarg(complete, "system"):
+                kwargs["system"] = system
+                text = complete(body, **kwargs)
+            else:
+                # Very old protocol: complete(prompt, system=...)
+                text = complete(body, system=system, **kwargs) if kwargs else complete(body, system=system)
+            return text, []
         except Exception as exc:  # noqa: BLE001 - normalise provider failures
             from agentcore.conversation.turns import TurnSuperseded
             if isinstance(exc, TurnSuperseded):
@@ -560,13 +611,13 @@ class ConversationRuntime:
             request = self.build_request(session, message, memory_context,
                                          extra=extra, with_tools=offer_tools)
             # Trusted realtime context for model transport (Task 42.4b).
-            # The fence owns the exact deadline created at admission.
-            try:
-                model_context = fence.operation_context()
-            except Exception:
-                model_context = None
+            # The fence owns the exact deadline created at admission and its
+            # clock domain. Propagate both so HttpClient evaluates remaining
+            # against the SAME monotonic clock (P1-2).
+            model_context = fence.operation_context()
+            model_clock = fence.clock
             fence.check()
-            text, tool_calls = self._call_model(request, context=model_context)
+            text, tool_calls = self._call_model(request, context=model_context, clock=model_clock)
             fence.check()
 
             if not tool_calls:
