@@ -52,6 +52,14 @@ class TurnCoordinatorError(RealtimeError):
     """Durable session admission state violates coordinator invariants."""
 
 
+class TurnCorrelationError(RealtimeError):
+    """Correlation between TurnRecord and AgentState is invalid."""
+
+
+class TurnCorrelationConflictError(TurnCorrelationError):
+    """A turn is already bound to a different run, or vice versa."""
+
+
 class CancellationError(RealtimeError):
     """Base class for cancellation primitive failures."""
 

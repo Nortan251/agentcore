@@ -140,6 +140,9 @@ class Events:
     TURN_FINALIZATION_STARTED: Final = "turn.finalization_started"
     TURN_FINALIZED: Final = "turn.finalized"
 
+    # autonomous correlation (Task 42.4d)
+    RUN_CORRELATED: Final = "run.correlated"
+
     # model layer
     MODEL_CONFIGURED: Final = "model.configured"
     MODEL_UNAVAILABLE: Final = "model.unavailable"

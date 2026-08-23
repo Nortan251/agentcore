@@ -42,6 +42,8 @@ class TurnStore(Protocol):
     def compare_and_swap(self, turn_id: str, expected_version: int,
                          next_record: TurnRecord) -> TurnRecord: ...
 
+    def bind_run(self, turn_id: str, run_id: str) -> TurnRecord: ...
+
     def list_turns(self) -> list[str]: ...
 
     @property
@@ -111,6 +113,59 @@ class InMemoryTurnStore:
             self._data[current.turn_id] = next_record.to_dict()
             return TurnRecord.from_dict(self._data[current.turn_id])
 
+    def bind_run(self, turn_id: str, run_id: str) -> TurnRecord:
+        """Atomically bind a COMPLETED turn to a run_id (Task 42.4d).
+
+        Only COMPLETED unbound turn can gain first run_id. Same run is idempotent.
+        Different run raises correlation conflict. No lifecycle fields change.
+        """
+        with self._lock:
+            self._require_open()
+            turn_id = _require_turn_id(turn_id)
+            run_id = _require_run_id(run_id)
+            payload = self._data.get(turn_id)
+            if payload is None:
+                raise TurnNotFoundError("turn does not exist", turn_id=turn_id)
+            current = TurnRecord.from_dict(payload)
+            # Idempotent same run
+            if current.run_id == run_id:
+                return current
+            if current.run_id is not None and current.run_id != run_id:
+                from agentcore.realtime.errors import TurnCorrelationConflictError
+                raise TurnCorrelationConflictError(
+                    "turn already bound to a different run",
+                    turn_id=turn_id, existing_run_id=current.run_id, new_run_id=run_id)
+            if current.phase is not TurnPhase.COMPLETED:
+                from agentcore.realtime.errors import TurnCorrelationError
+                raise TurnCorrelationError(
+                    "only COMPLETED turns can be bound to a run",
+                    turn_id=turn_id, phase=current.phase.value)
+            # Persist identical record with ONLY run_id changed
+            from dataclasses import replace
+            next_record = replace(current, run_id=run_id)
+            # Validate but version/transitions unchanged, so validate should pass
+            next_record.validate()
+            # Ensure no lifecycle change
+            if (next_record.version != current.version or
+                next_record.transitions != current.transitions or
+                next_record.phase != current.phase or
+                next_record.updated_at != current.updated_at or
+                next_record.created_at != current.created_at or
+                next_record.session_id != current.session_id or
+                next_record.generation != current.generation or
+                next_record.deadline_at != current.deadline_at or
+                next_record.counters != current.counters or
+                next_record.action_refs != current.action_refs or
+                next_record.cancellation_reason != current.cancellation_reason or
+                next_record.requested_terminal != current.requested_terminal or
+                next_record.final_terminal != current.final_terminal or
+                next_record.active_operation_id != current.active_operation_id):
+                from agentcore.realtime.errors import TurnValidationError
+                raise TurnValidationError("bind_run must only change run_id",
+                                          turn_id=turn_id)
+            self._data[turn_id] = next_record.to_dict()
+            return TurnRecord.from_dict(self._data[turn_id])
+
     def list_turns(self) -> list[str]:
         with self._lock:
             self._require_open()
@@ -164,6 +219,7 @@ _DOMAINS: dict[str, _StoreDomain] = {}
 _DOMAINS_LOCK = threading.Lock()
 _OWNER_FILENAME = ".agentcore-turn-store.lock"
 _TURN_ID = re.compile(r"^turn_[0-9a-f]{12}$")
+_RUN_ID = re.compile(r"^run_[0-9a-f]{12}$")
 
 
 def _domain_key(directory: Path) -> str:
@@ -346,6 +402,50 @@ class JsonFileTurnStore:
             self._write_unlocked(path, next_record)
             return self._read_unlocked(path, str(turn_id))
 
+    def bind_run(self, turn_id: str, run_id: str) -> TurnRecord:
+        """Atomically bind a COMPLETED turn to a run_id (Task 42.4d)."""
+        self._require_owner_process()
+        with self._domain.mutex:
+            self._require_open()
+            turn_id = _require_turn_id(turn_id)
+            run_id = _require_run_id(run_id)
+            path = self._path(turn_id)
+            current = self._read_unlocked(path, turn_id)
+            if current.run_id == run_id:
+                return current
+            if current.run_id is not None and current.run_id != run_id:
+                from agentcore.realtime.errors import TurnCorrelationConflictError
+                raise TurnCorrelationConflictError(
+                    "turn already bound to a different run",
+                    turn_id=turn_id, existing_run_id=current.run_id, new_run_id=run_id)
+            if current.phase is not TurnPhase.COMPLETED:
+                from agentcore.realtime.errors import TurnCorrelationError
+                raise TurnCorrelationError(
+                    "only COMPLETED turns can be bound to a run",
+                    turn_id=turn_id, phase=current.phase.value)
+            from dataclasses import replace
+            next_record = replace(current, run_id=run_id)
+            next_record.validate()
+            if (next_record.version != current.version or
+                next_record.transitions != current.transitions or
+                next_record.phase != current.phase or
+                next_record.updated_at != current.updated_at or
+                next_record.created_at != current.created_at or
+                next_record.session_id != current.session_id or
+                next_record.generation != current.generation or
+                next_record.deadline_at != current.deadline_at or
+                next_record.counters != current.counters or
+                next_record.action_refs != current.action_refs or
+                next_record.cancellation_reason != current.cancellation_reason or
+                next_record.requested_terminal != current.requested_terminal or
+                next_record.final_terminal != current.final_terminal or
+                next_record.active_operation_id != current.active_operation_id):
+                from agentcore.realtime.errors import TurnValidationError
+                raise TurnValidationError("bind_run must only change run_id",
+                                          turn_id=turn_id)
+            self._write_unlocked(path, next_record)
+            return self._read_unlocked(path, turn_id)
+
     def list_turns(self) -> list[str]:
         self._require_owner_process()
         with self._domain.mutex:
@@ -469,6 +569,12 @@ def _validate_expected_version(value: int) -> None:
 def _require_turn_id(value: object) -> str:
     if not isinstance(value, str) or not _TURN_ID.fullmatch(value):
         raise TurnValidationError("turn id is invalid")
+    return value
+
+
+def _require_run_id(value: object) -> str:
+    if not isinstance(value, str) or not _RUN_ID.fullmatch(value):
+        raise TurnValidationError("run id is invalid")
     return value
 
 

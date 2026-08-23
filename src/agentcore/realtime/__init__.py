@@ -14,6 +14,8 @@ from agentcore.realtime.errors import (
     RealtimeError,
     TurnAlreadyExistsError,
     TurnCoordinatorError,
+    TurnCorrelationConflictError,
+    TurnCorrelationError,
     TurnNotFoundError,
     TurnOperationConflictError,
     TurnStoreError,
@@ -44,6 +46,8 @@ from agentcore.realtime.turn import (
     new_operation_id,
     new_turn,
     next_generation,
+    require_run_id,
+    require_turn_id,
     terminal_for_reason,
 )
 
@@ -67,6 +71,8 @@ __all__ = [
     "TurnAdmission",
     "TurnCoordinator",
     "TurnCoordinatorError",
+    "TurnCorrelationConflictError",
+    "TurnCorrelationError",
     "TurnController",
     "TurnCounters",
     "TurnIdentity",
@@ -85,6 +91,8 @@ __all__ = [
     "new_operation_id",
     "new_turn",
     "next_generation",
+    "require_run_id",
+    "require_turn_id",
     "reconcile_nonterminal_turns",
     "terminal_for_reason",
 ]

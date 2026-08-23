@@ -111,7 +111,14 @@ class TurnCoordinator:
         clock: Clock | None = None,
         id_factory: Callable[[str], str] = new_id,
     ) -> None:
-        if not isinstance(store, TurnStore):
+        # Admission predates the optional correlation operation.  Preserve
+        # compatibility with host-owned admission wrappers while the public
+        # TurnStore protocol still accurately requires bind_run for correlation.
+        # Correlation itself fails closed in TurnController if the operation is
+        # absent; ordinary conversation admission does not need it.
+        required = ("create", "load", "compare_and_swap", "list_turns",
+                    "admission_coordination", "close")
+        if not all(hasattr(store, name) for name in required):
             raise TurnCoordinatorError("turn store contract is invalid")
         if not callable(id_factory):
             raise TurnCoordinatorError("turn id factory is invalid")
