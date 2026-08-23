@@ -538,7 +538,7 @@ def test_provider_legacy_generate_without_context():
 
 
 # ---------------------------------------------------------------------------
-# 13. SECRET SANITIZATION
+# 13. SECRET SANITIZATION (P3 fixed)
 # ---------------------------------------------------------------------------
 def test_secret_sanitization_with_context():
     clock = FixedClock(T0)
@@ -549,20 +549,39 @@ def test_secret_sanitization_with_context():
                         retry=RetryPolicy(max_attempts=1, initial_backoff=0.01, jitter=False),
                         sleep=lambda _: None,
                         clock=clock)
-    ctx, _ = make_context(clock, remaining_seconds=10.0)
+    # Use distinctive identifiers in context so we can assert they don't leak
+    turn_id = "turn_deadbeef1234"
+    session_id = "session_abc123"
+    op_id = "op_abcdef123456"
+    source = CancellationSource()
+    deadline = Deadline.after(10.0, clock=clock)
+    ctx = OperationContext(
+        turn_id=turn_id,
+        session_id=session_id,
+        generation=1,
+        operation_id=op_id,
+        cancellation=source.token,
+        deadline=deadline,
+    )
 
     with pytest.raises(ModelProviderError) as exc:
         client.post_json("https://x.test", {}, {"Authorization": f"Bearer {SECRET}"}, 5.0,
                          secrets=(SECRET,), context=ctx)
 
     blob = json.dumps(exc.value.to_dict())
+    # Independent meaningful checks, no OR True escape hatch
     assert SECRET not in blob
-    # Ensure no sensitive auth data leaks and deadline context is not put into error details.
-    assert "***" not in blob or SECRET not in blob
-    assert "Authorization" not in blob or "***" in blob or SECRET not in blob
-    # OperationContext should never be serialized into provider error details.
+    # Raw Authorization header value must not appear (sanitized)
+    assert f"Bearer {SECRET}" not in blob
+    # OperationContext must not be serialized
     assert "OperationContext" not in blob
-    assert "turn_" not in blob
+    # Turn/session/operation identifiers from context must not leak
+    assert turn_id not in blob
+    assert session_id not in blob
+    assert op_id not in blob
+    # Clock representation must not leak
+    assert "FixedClock" not in blob
+    assert "SystemClock" not in blob
 
 
 # ---------------------------------------------------------------------------
@@ -768,3 +787,179 @@ def test_fence_check_failure_not_swallowed_after_provider_failure(tmp_path):
 
     with pytest.raises(RuntimeError, match="store ownership lost"):
         runtime._run_turn(session, Message.user("hello"), fence=fence)
+
+
+# ---------------------------------------------------------------------------
+# FINAL REPAIR — **kwargs legacy compatibility (P1) + malformed context
+# ---------------------------------------------------------------------------
+def test_legacy_complete_provider_with_kwargs_does_not_receive_trusted_context(tmp_path):
+    """Public ModelProvider Protocol is complete(..., **options); trusted context must NOT leak into **options."""
+    from agentcore.conversation.runtime import ConversationRuntime
+
+    class LegacyCompleteProvider:
+        def __init__(self):
+            self.calls = 0
+            self.options: dict[str, Any] | None = None
+
+        def complete(self, prompt, *, system=None, **options):
+            self.calls += 1
+            self.options = dict(options)
+            return "ok"
+
+    clock = FixedClock(T0)
+    store = InMemoryTurnStore()
+    coordinator = TurnCoordinator(store, clock=clock)
+    bridge = TurnBridge(coordinator, clock=clock, turn_deadline_seconds=DEADLINE_SECONDS)
+    model = LegacyCompleteProvider()
+    runtime = ConversationRuntime(model=model, turns=bridge)
+
+    result = runtime.send("hello")
+
+    assert model.calls == 1
+    assert result.ok
+    assert result.reply.content == "ok"
+    assert model.options is not None
+    assert "context" not in model.options
+    assert "clock" not in model.options
+    # Ensure no OperationContext or Clock leaks into generic options
+    for v in model.options.values():
+        assert not isinstance(v, OperationContext)
+        assert "turn_" not in str(v)
+    # Store should be COMPLETED
+    assert store.load(result.turn_id).phase is TurnPhase.COMPLETED
+
+
+def test_explicit_context_aware_provider_receives_both_context_and_clock(tmp_path):
+    """Explicit context+clock params must be forwarded (opt-in)."""
+    from agentcore.conversation.runtime import ConversationRuntime
+
+    seen: dict[str, Any] = {}
+
+    class ExplicitProvider:
+        def generate(self, request, *, context=None, clock=None):
+            seen["context"] = context
+            seen["clock"] = clock
+            return ModelResponse(text="explicit ok")
+
+    clock = FixedClock(T0)
+    store = InMemoryTurnStore()
+    coordinator = TurnCoordinator(store, clock=clock)
+    bridge = TurnBridge(coordinator, clock=clock, turn_deadline_seconds=DEADLINE_SECONDS)
+    model = ExplicitProvider()
+    runtime = ConversationRuntime(model=model, turns=bridge)
+
+    result = runtime.send("hello explicit")
+
+    assert result.ok
+    assert seen["context"] is not None
+    assert isinstance(seen["context"], OperationContext)
+    assert seen["clock"] is clock
+    # Deadline in context must be same object created at admission
+    assert seen["context"].deadline is not None
+
+
+def test_malformed_context_missing_deadline_fails_closed():
+    """If trusted context is non-None but deadline missing, treat as expired (fail-closed)."""
+    clock = FixedClock(T0)
+    transport = RecordingTransport([http_ok()])
+
+    class MissingDeadlineContext:
+        # Has cancellation but no deadline attribute
+        def __init__(self):
+            source = CancellationSource()
+            self.cancellation = source.token
+
+    ctx = MissingDeadlineContext()
+    client = HttpClient(transport=transport,
+                        retry=RetryPolicy(max_attempts=1, initial_backoff=0.01, jitter=False),
+                        sleep=lambda _: None,
+                        clock=clock)
+
+    with pytest.raises(ModelTimeoutError):
+        client.post_json("https://x.test", {}, {}, 5.0, context=ctx)
+
+    assert transport.calls == []
+
+
+def test_malformed_context_missing_cancellation_fails_closed():
+    """If trusted context is non-None but cancellation missing, treat as cancelled (fail-closed)."""
+    clock = FixedClock(T0)
+    transport = RecordingTransport([http_ok()])
+
+    class MissingCancellationContext:
+        def __init__(self):
+            self.deadline = Deadline.after(10.0, clock=clock)
+            # No cancellation attribute
+
+    ctx = MissingCancellationContext()
+    client = HttpClient(transport=transport,
+                        retry=RetryPolicy(max_attempts=1, initial_backoff=0.01, jitter=False),
+                        sleep=lambda _: None,
+                        clock=clock)
+
+    with pytest.raises(ModelTimeoutError):
+        client.post_json("https://x.test", {}, {}, 5.0, context=ctx)
+
+    assert transport.calls == []
+
+
+def test_malformed_deadline_methods_fail_closed():
+    """Deadline methods raising should be treated as expired, not unbounded."""
+    clock = FixedClock(T0)
+    transport = RecordingTransport([http_ok()])
+
+    class BrokenDeadline:
+        def expired(self, clock):
+            raise RuntimeError("broken expired")
+
+        def remaining(self, clock):
+            raise RuntimeError("broken remaining")
+
+    class BrokenContext:
+        def __init__(self):
+            source = CancellationSource()
+            self.cancellation = source.token
+            self.deadline = BrokenDeadline()
+
+    ctx = BrokenContext()
+    client = HttpClient(transport=transport,
+                        retry=RetryPolicy(max_attempts=1, initial_backoff=0.01, jitter=False),
+                        sleep=lambda _: None,
+                        clock=clock)
+
+    with pytest.raises(ModelTimeoutError):
+        client.post_json("https://x.test", {}, {}, 5.0, context=ctx)
+
+    assert transport.calls == []
+
+
+def test_positional_only_param_not_treated_as_keyword():
+    """POSITIONAL_ONLY should not be considered keyword-compatible."""
+    from agentcore.conversation.runtime import _accepts_kwarg
+    from agentcore.models.base import _accepts_kwarg as base_accepts
+
+    def pos_only(a, /, *, b=None):
+        pass
+
+    def kw_only(*, context=None):
+        pass
+
+    def pos_or_kw(context=None):
+        pass
+
+    def with_kwargs(**kwargs):
+        pass
+
+    # POSITIONAL_ONLY 'a' should not be accepted as keyword 'context'
+    assert not _accepts_kwarg(pos_only, "context")
+    assert not base_accepts(pos_only, "context")
+    # But kw_only and pos_or_kw should accept
+    assert _accepts_kwarg(kw_only, "context")
+    assert base_accepts(kw_only, "context")
+    assert _accepts_kwarg(pos_or_kw, "context")
+    assert base_accepts(pos_or_kw, "context")
+    # **kwargs should NOT be accepted for trusted keywords (final repair)
+    assert not _accepts_kwarg(with_kwargs, "context")
+    assert not base_accepts(with_kwargs, "context")
+    assert not _accepts_kwarg(with_kwargs, "clock")
+    assert not base_accepts(with_kwargs, "clock")

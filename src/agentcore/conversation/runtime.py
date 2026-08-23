@@ -70,28 +70,31 @@ CURRENT_TURN_LABEL = "CURRENT USER MESSAGE"
 
 
 def _accepts_kwarg(func: Any, name: str) -> bool:
-    """Return True if ``func`` accepts ``name`` as a keyword argument.
+    """Return True if ``func`` explicitly accepts ``name`` as a keyword argument.
 
-    Safe capability detection for Task 42.4b P1-1: inspects the signature
-    without invoking the callable, so an internal TypeError is never
-    misclassified as a missing-argument TypeError.
+    Trusted context/clock must only cross the provider boundary when
+    explicitly declared. ``**kwargs`` is NOT treated as capability for
+    trusted keywords, because the public legacy ModelProvider Protocol is
+    ``complete(prompt, *, system=None, **options)`` and a legacy provider
+    may accept arbitrary options without semantic knowledge of
+    OperationContext or Clock. Injecting trusted objects into generic
+    ``**options`` would violate legacy compatibility and the trusted-context
+    boundary.
 
-    A ``**kwargs`` parameter is treated as accepting any name.
+    Only ``KEYWORD_ONLY`` and ``POSITIONAL_OR_KEYWORD`` with matching name
+    count. ``VAR_KEYWORD`` and ``POSITIONAL_ONLY`` do not.
     """
     try:
         sig = inspect.signature(func)
     except (ValueError, TypeError):
         return False
-    for param in sig.parameters.values():
-        if param.kind == inspect.Parameter.VAR_KEYWORD:
-            return True
-        if param.name == name and param.kind in (
-            inspect.Parameter.KEYWORD_ONLY,
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            inspect.Parameter.POSITIONAL_ONLY,
-        ):
-            return True
-    return False
+    param = sig.parameters.get(name)
+    if param is None:
+        return False
+    return param.kind in (
+        inspect.Parameter.KEYWORD_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    )
 
 
 class _NullFence:

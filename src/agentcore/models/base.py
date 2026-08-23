@@ -24,21 +24,22 @@ from agentcore.models.messages import ModelRequest, ModelResponse
 
 
 def _accepts_kwarg(func: Any, name: str) -> bool:
-    """Safe capability detection without invoking the callable."""
+    """Return True only if func explicitly declares name as keyword-capable.
+
+    Trusted keywords (context, clock) must not be inferred from **kwargs.
+    Only KEYWORD_ONLY and POSITIONAL_OR_KEYWORD with exact name count.
+    """
     try:
         sig = inspect.signature(func)
     except (ValueError, TypeError):
         return False
-    for param in sig.parameters.values():
-        if param.kind == inspect.Parameter.VAR_KEYWORD:
-            return True
-        if param.name == name and param.kind in (
-            inspect.Parameter.KEYWORD_ONLY,
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            inspect.Parameter.POSITIONAL_ONLY,
-        ):
-            return True
-    return False
+    param = sig.parameters.get(name)
+    if param is None:
+        return False
+    return param.kind in (
+        inspect.Parameter.KEYWORD_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    )
 
 
 class BaseModelProvider(ABC):

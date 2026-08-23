@@ -175,28 +175,31 @@ class HttpClient:
                         ) -> tuple[Any, float, bool]:
         """Return (deadline, remaining, expired) or (None, inf, False).
 
-        Fail-closed: if a trusted deadline object is present but its
-        methods fail, treat it as expired with zero remaining rather than
-        silently becoming unbounded. Legacy no-context path remains
-        unbounded by design.
+        Fail-closed hardening (final repair):
+        - context is None -> intentional legacy/no-context, unbounded.
+        - context is non-None but deadline missing/None/invalid -> expired
+          (do not silently disable controls).
+        - deadline method failures -> expired.
         """
         if context is None:
             return None, math.inf, False
+        # Trusted context is non-None: require explicit deadline.
+        # Use explicit presence check to distinguish missing vs None.
+        if not hasattr(context, "deadline"):
+            return None, 0.0, True
         deadline = getattr(context, "deadline", None)
         if deadline is None:
-            return None, math.inf, False
+            return None, 0.0, True
         try:
             expired = bool(deadline.expired(clock))
         except Exception:
-            # Broken trusted deadline must not become unbounded.
             return deadline, 0.0, True
         try:
             remaining = float(deadline.remaining(clock))
         except Exception:
             return deadline, 0.0, True
         if not math.isfinite(remaining):
-            # Unbounded deadline -> inf remaining, never expired by remaining.
-            # Only the explicit expired flag above can mark it expired.
+            # Unbounded deadline -> inf remaining, only explicit expired flag matters.
             remaining = math.inf
             return deadline, remaining, expired
         if remaining <= 0:
@@ -204,16 +207,17 @@ class HttpClient:
         return deadline, remaining, expired
 
     def _is_cancelled(self, context: Any) -> bool:
-        """Fail-closed: cancellation read failure is treated as cancelled."""
+        """Fail-closed: malformed trusted context is treated as cancelled."""
         if context is None:
             return False
+        if not hasattr(context, "cancellation"):
+            return True
         cancellation = getattr(context, "cancellation", None)
         if cancellation is None:
-            return False
+            return True
         try:
             return bool(getattr(cancellation, "requested", False))
         except Exception:
-            # Broken trusted cancellation must not become "not cancelled".
             return True
 
     def post_json(self, url: str, payload: Mapping[str, Any],
