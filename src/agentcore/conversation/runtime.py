@@ -91,6 +91,9 @@ class _NullFence:
     def commit(self) -> None:
         return None
 
+    def operation_context(self) -> None:
+        return None
+
     def stage_tool_message(self, session: Any, message: Message, *,
                            max_messages: int) -> None:
         session.append(message, max_messages=max_messages)
@@ -342,6 +345,16 @@ class ConversationRuntime:
             reply = self._generate(session, message, memory_context,
                                    result, fence=fence)
         except ResponseGenerationError as exc:
+            # If the fence now reports this turn is no longer current
+            # (deadline, supersession, shutdown), truthfully surface that
+            # instead of a generic model failure. This preserves 42.4a
+            # winner ordering: an already-accepted cancellation reason wins.
+            try:
+                fence.check()
+            except Exception as fence_exc:
+                from agentcore.conversation.turns import TurnSuperseded
+                if isinstance(fence_exc, TurnSuperseded):
+                    raise fence_exc
             # No fabricated assistant message, and nothing captured from a
             # turn whose outcome is unknown.
             result.error = exc.message
@@ -472,18 +485,27 @@ class ConversationRuntime:
         messages.extend(extra)
         return ModelRequest(messages=messages, tools=tools)
 
-    def _call_model(self, request: ModelRequest) -> tuple[str, list]:
+    def _call_model(self, request: ModelRequest, *,
+                  context: Any | None = None) -> tuple[str, list]:
         """One provider call. Returns ``(text, tool_calls)``.
 
         Supports both halves of the existing provider contract: ``generate``
         for full providers, ``complete`` for anything satisfying only the core
         Protocol. Only ``generate`` can carry tool calls, which is correct —
         the prompt-only Protocol has nowhere to put them.
+
+        When ``context`` is supplied (Task 42.4b), it is forwarded as a
+        trusted keyword-only argument. Legacy providers that do not accept
+        it continue to work via a compatibility fallback.
         """
         try:
             generate = getattr(self.model, "generate", None)
             if callable(generate):
-                response = generate(request)
+                try:
+                    response = generate(request, context=context)
+                except TypeError:
+                    # Legacy provider without context support.
+                    response = generate(request)
                 return response.text, list(
                     getattr(response, "tool_calls", []) or [])
             system = "\n\n".join(m.content for m in request.messages
@@ -491,8 +513,15 @@ class ConversationRuntime:
             body = "\n\n".join(
                 f"{m.role.value}: {m.content}" for m in request.messages
                 if m.role is not Role.SYSTEM)
-            return self.model.complete(body, system=system), []
+            try:
+                return self.model.complete(body, system=system,
+                                           context=context), []
+            except TypeError:
+                return self.model.complete(body, system=system), []
         except Exception as exc:  # noqa: BLE001 - normalise provider failures
+            from agentcore.conversation.turns import TurnSuperseded
+            if isinstance(exc, TurnSuperseded):
+                raise
             raise ResponseGenerationError(
                 "the model failed to produce a reply",
                 reason=getattr(exc, "message", str(exc))[:200],
@@ -530,8 +559,14 @@ class ConversationRuntime:
             offer_tools = self._tools_available() and round_index < rounds
             request = self.build_request(session, message, memory_context,
                                          extra=extra, with_tools=offer_tools)
+            # Trusted realtime context for model transport (Task 42.4b).
+            # The fence owns the exact deadline created at admission.
+            try:
+                model_context = fence.operation_context()
+            except Exception:
+                model_context = None
             fence.check()
-            text, tool_calls = self._call_model(request)
+            text, tool_calls = self._call_model(request, context=model_context)
             fence.check()
 
             if not tool_calls:

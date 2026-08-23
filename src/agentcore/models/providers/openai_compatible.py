@@ -53,11 +53,13 @@ class OpenAICompatibleProvider(BaseModelProvider):
         transport: Transport | None = None,
         client: HttpClient | None = None,
         retry: RetryPolicy | None = None,
+        clock: Any | None = None,
     ) -> None:
         super().__init__(config)
         # Honour the configured attempt budget unless a policy is injected.
         policy = retry or RetryPolicy(max_attempts=self.config.max_retries)
-        self.client = client or HttpClient(transport=transport, retry=policy)
+        self.client = client or HttpClient(
+            transport=transport, retry=policy, clock=clock)
         self._log = get_logger("models.openai_compatible")
         self._validate_config()
 
@@ -118,7 +120,9 @@ class OpenAICompatibleProvider(BaseModelProvider):
         return payload
 
     # -- execution ---------------------------------------------------------
-    def generate(self, request: ModelRequest) -> ModelResponse:
+    def generate(self, request: ModelRequest, *,
+                 context: Any | None = None,
+                 clock: Any | None = None) -> ModelResponse:
         payload = self.build_payload(request)
         headers, secrets = self._auth_headers()
         started = time.perf_counter()
@@ -132,7 +136,8 @@ class OpenAICompatibleProvider(BaseModelProvider):
         try:
             data = self.client.post_json(
                 self.endpoint, payload, headers,
-                self.config.timeout_seconds, secrets=secrets)
+                self.config.timeout_seconds, secrets=secrets,
+                context=context, clock=clock)
         except Exception as exc:
             self._log.warning(Events.MODEL_FAILED, provider=self.name,
                               model=payload["model"],

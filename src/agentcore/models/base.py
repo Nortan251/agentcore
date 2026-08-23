@@ -32,23 +32,40 @@ class BaseModelProvider(ABC):
         self.config = config or ModelConfig()
 
     @abstractmethod
-    def generate(self, request: ModelRequest) -> ModelResponse:
+    def generate(self, request: ModelRequest, *,
+                 context: Any | None = None) -> ModelResponse:
         """Execute a request and return a normalised response.
 
         Implementations must raise a :class:`agentcore.models.errors.ModelError`
         subclass on failure — never return a partial or empty response.
+
+        ``context`` is an optional trusted :class:`OperationContext`
+        carrying the turn deadline and cancellation token (Task 42.4b).
+        Providers that receive it must respect its remaining budget for
+        every transport attempt and retry. Callers without a realtime
+        context continue to work unchanged.
         """
 
     def complete(self, prompt: str, *, system: str | None = None,
+                 context: Any | None = None,
                  **options: Any) -> str:
         """Satisfy the existing ``ModelProvider`` Protocol.
 
         Deliberately returns plain ``str`` so the established core contract is
         preserved. Callers needing usage, finish reason or tool calls should
         use :meth:`generate` directly.
+
+        ``context`` is forwarded to :meth:`generate` when supplied, so a
+        realtime caller can propagate its deadline even through the legacy
+        ``complete`` seam. Non-realtime callers omit it and retain old
+        behaviour.
         """
-        return self.generate(
-            ModelRequest.from_prompt(prompt, system=system, **options)).text
+        request = ModelRequest.from_prompt(prompt, system=system, **options)
+        try:
+            return self.generate(request, context=context).text
+        except TypeError:
+            # Compatibility with providers that do not accept context.
+            return self.generate(request).text
 
     def describe(self) -> dict[str, Any]:
         """Non-sensitive provider summary, safe to log or expose via the CLI."""
