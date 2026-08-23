@@ -8,6 +8,8 @@ without a paid API.
 
 from __future__ import annotations
 
+from typing import Any
+
 from agentcore.config.schema import ModelConfig
 from agentcore.models.base import BaseModelProvider
 from agentcore.models.messages import (
@@ -31,7 +33,16 @@ class EchoProvider(BaseModelProvider):
         self.prefix = prefix
         self.calls: list[ModelRequest] = []
 
-    def generate(self, request: ModelRequest) -> ModelResponse:
+    def generate(self, request: ModelRequest, *,
+                 context: Any | None = None,
+                 clock: Any | None = None) -> ModelResponse:
+        # ``context`` and ``clock`` are accepted for API compatibility
+        # (Task 42.4b) but intentionally ignored: the echo provider performs
+        # no I/O and therefore has no transport timeout to bound. Deadline
+        # truth remains owned by the realtime fence, which will reject a late
+        # echo result if the turn has already expired.
+        _ = context
+        _ = clock
         self.calls.append(request)
         last_user = next(
             (m for m in reversed(request.messages) if m.role is Role.USER), None)

@@ -151,6 +151,27 @@ class _TurnFence:
             deadline=self._deadline,
         )
 
+    def operation_context(self) -> OperationContext | None:
+        """Trusted realtime context for model transport (Task 42.4b).
+
+        Returns ``None`` until the turn has been activated and owns an
+        operation id, so callers without a valid operation never fabricate
+        a deadline. When active, the returned context carries the exact
+        deadline object created at admission, so the ephemeral and durable
+        views never drift.
+
+        Fail-closed: if the turn is active but context creation fails,
+        the exception propagates and the turn fails truthfully rather
+        than silently becoming unbounded.
+        """
+        if self._operation_id is None:
+            return None
+        return self._context()
+
+    @property
+    def clock(self) -> Clock:
+        return self._clock
+
     def _rejection_reason(self, record: TurnRecord,
                           expected_phase: TurnPhase,
                           ) -> CancellationReason | None:

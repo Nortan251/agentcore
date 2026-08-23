@@ -18,6 +18,7 @@ network.
 from __future__ import annotations
 
 import json
+import math
 import random
 import time
 import urllib.error
@@ -35,6 +36,7 @@ from agentcore.models.errors import (
 )
 from agentcore.observability.events import Events
 from agentcore.observability.logging import get_logger
+from agentcore.util.clock import Clock, SystemClock
 
 #: Header names whose values must never be logged or included in errors.
 _SENSITIVE_HEADERS = frozenset({
@@ -151,33 +153,139 @@ class HttpClient:
 
     Providers hand it a URL, payload and headers; it returns parsed JSON or
     raises a typed, sanitised :class:`ModelError`.
+
+    Task 42.4b adds trusted deadline enforcement: when an
+    :class:`OperationContext` is supplied, every physical attempt uses
+    ``min(configured timeout, remaining deadline)`` and no attempt starts
+    after expiry. Retries share the same parent deadline and never launch
+    after it.
     """
 
     def __init__(self, transport: Transport | None = None,
                  retry: RetryPolicy | None = None,
-                 sleep: Callable[[float], None] = time.sleep) -> None:
+                 sleep: Callable[[float], None] = time.sleep,
+                 clock: Clock | None = None) -> None:
         self.transport = transport or UrllibTransport()
         self.retry = retry or RetryPolicy()
         self._sleep = sleep
+        self._clock = clock or SystemClock()
         self._log = get_logger("models.transport")
+
+    def _deadline_state(self, context: Any, clock: Clock
+                        ) -> tuple[Any, float, bool]:
+        """Return (deadline, remaining, expired) or (None, inf, False).
+
+        Fail-closed hardening (final repair):
+        - context is None -> intentional legacy/no-context, unbounded.
+        - context is non-None but deadline missing/None/invalid -> expired
+          (do not silently disable controls).
+        - deadline method failures -> expired.
+        """
+        if context is None:
+            return None, math.inf, False
+        # Trusted context is non-None: require explicit deadline.
+        # Use explicit presence check to distinguish missing vs None.
+        if not hasattr(context, "deadline"):
+            return None, 0.0, True
+        deadline = getattr(context, "deadline", None)
+        if deadline is None:
+            return None, 0.0, True
+        try:
+            expired = bool(deadline.expired(clock))
+        except Exception:
+            return deadline, 0.0, True
+        try:
+            remaining = float(deadline.remaining(clock))
+        except Exception:
+            return deadline, 0.0, True
+        if not math.isfinite(remaining):
+            # Unbounded deadline -> inf remaining, only explicit expired flag matters.
+            remaining = math.inf
+            return deadline, remaining, expired
+        if remaining <= 0:
+            expired = True
+        return deadline, remaining, expired
+
+    def _is_cancelled(self, context: Any) -> bool:
+        """Fail-closed: malformed trusted context is treated as cancelled."""
+        if context is None:
+            return False
+        if not hasattr(context, "cancellation"):
+            return True
+        cancellation = getattr(context, "cancellation", None)
+        if cancellation is None:
+            return True
+        try:
+            return bool(getattr(cancellation, "requested", False))
+        except Exception:
+            return True
 
     def post_json(self, url: str, payload: Mapping[str, Any],
                   headers: Mapping[str, str], timeout: float,
-                  *, secrets: tuple[str, ...] = ()) -> Any:
+                  *, secrets: tuple[str, ...] = (),
+                  context: Any | None = None,
+                  clock: Clock | None = None) -> Any:
         safe_headers = sanitize_headers(headers)
+        effective_clock = clock or self._clock
         last_error: Exception | None = None
 
         for attempt in range(1, self.retry.max_attempts + 1):
+            # -- trusted cancellation / deadline check before each attempt --
+            if self._is_cancelled(context):
+                raise ModelTimeoutError(
+                    "operation cancelled before attempt",
+                    timeout_seconds=timeout)
+
+            _, remaining, expired = self._deadline_state(context,
+                                                         effective_clock)
+            if expired or remaining <= 0:
+                raise ModelTimeoutError(
+                    "deadline exceeded before attempt",
+                    timeout_seconds=timeout)
+
+            if math.isfinite(remaining):
+                effective_timeout = min(timeout, remaining)
+            else:
+                effective_timeout = timeout
+
+            # Never pass zero or negative timeout to urllib.
+            if effective_timeout <= 0:
+                raise ModelTimeoutError(
+                    "deadline exceeded before attempt",
+                    timeout_seconds=timeout)
+
             try:
-                response = self.transport.post_json(url, payload, headers, timeout)
+                response = self.transport.post_json(
+                    url, payload, headers, effective_timeout)
                 return self._handle(response, url, secrets)
             except (ModelTimeoutError, ModelConnectionError,
                     ModelRateLimitError, ModelProviderError) as exc:
                 if not exc.retryable or attempt == self.retry.max_attempts:
                     raise
                 last_error = exc
+
+                # -- deadline / cancellation check before retry --
+                if self._is_cancelled(context):
+                    raise ModelTimeoutError(
+                        "operation cancelled before retry",
+                        timeout_seconds=timeout) from exc
+
+                _, remaining_after, expired_after = self._deadline_state(
+                    context, effective_clock)
+                if expired_after or remaining_after <= 0:
+                    raise ModelTimeoutError(
+                        "deadline exceeded before retry",
+                        timeout_seconds=timeout) from exc
+
                 delay = getattr(exc, "retry_after", None) or self.retry.backoff_for(
                     attempt)
+
+                # Backoff must not knowingly carry execution beyond deadline.
+                if math.isfinite(remaining_after) and delay >= remaining_after:
+                    raise ModelTimeoutError(
+                        "deadline would be exceeded by retry backoff",
+                        timeout_seconds=remaining_after) from exc
+
                 self._log.warning(
                     Events.MODEL_RETRY, url=url, attempt=attempt,
                     max_attempts=self.retry.max_attempts,
