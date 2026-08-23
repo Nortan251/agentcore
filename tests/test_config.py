@@ -4,6 +4,7 @@ import pytest
 
 from agentcore.config.loader import load_config
 from agentcore.config.schema import AgentConfig, ModelConfig, ToolConfig
+from agentcore.conversation.config import ConversationConfig
 from agentcore.errors import ConfigError
 from agentcore.permissions.levels import PermissionLevel
 
@@ -163,3 +164,54 @@ def test_invalid_recovery_settings_rejected():
         load_config(None, env={"AGENTCORE_RECOVERY__BACKOFF_FACTOR": "0.5"})
     with pytest.raises(ConfigError):
         load_config(None, env={"AGENTCORE_RECOVERY__MAX_REPLANS": "-1"})
+
+
+# -- Task 42.4a: realtime conversation turn deadline -------------------------
+def test_turn_deadline_default_is_120_seconds():
+    assert AgentConfig().validate().conversation.turn_deadline_seconds \
+        == 120.0
+
+
+def test_turn_deadline_accepts_its_exact_bounds():
+    for edge in (1.0, 3600.0):
+        config = AgentConfig(conversation=ConversationConfig(
+            turn_deadline_seconds=edge)).validate()
+        assert config.conversation.turn_deadline_seconds == edge
+
+
+@pytest.mark.parametrize("value", [
+    0.9, 3600.1, 0.0, -5.0, True, False, "120", float("nan"),
+    float("inf"), float("-inf"), None,
+])
+def test_turn_deadline_rejects_out_of_range_and_non_finite(value):
+    with pytest.raises(ConfigError):
+        ConversationConfig(turn_deadline_seconds=value).validate()
+
+
+def test_turn_deadline_loads_from_toml_and_env_in_precedence(tmp_path):
+    path = tmp_path / "agent.toml"
+    path.write_text(
+        "[conversation]\nturn_deadline_seconds = 60.0\n",
+        encoding="utf-8")
+    cfg = load_config(path)
+    assert cfg.conversation.turn_deadline_seconds == 60.0
+
+    # Environment beats the file, exactly like every other conversation key.
+    cfg = load_config(path, env={
+        "AGENTCORE_CONVERSATION__TURN_DEADLINE_SECONDS": "30.0"})
+    assert cfg.conversation.turn_deadline_seconds == 30.0
+
+    # Explicit overrides still beat the environment.
+    cfg = load_config(path, env={
+        "AGENTCORE_CONVERSATION__TURN_DEADLINE_SECONDS": "30.0"},
+        overrides={"conversation": {"turn_deadline_seconds": 90.0}})
+    assert cfg.conversation.turn_deadline_seconds == 90.0
+
+
+def test_turn_deadline_env_rejects_garbage_and_out_of_range():
+    with pytest.raises(ConfigError):
+        load_config(None, env={
+            "AGENTCORE_CONVERSATION__TURN_DEADLINE_SECONDS": "soon"})
+    with pytest.raises(ConfigError):
+        load_config(None, env={
+            "AGENTCORE_CONVERSATION__TURN_DEADLINE_SECONDS": "0.5"})

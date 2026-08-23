@@ -16,6 +16,7 @@ import pytest
 import agentcore.realtime.store as store_module
 from agentcore.realtime import (
     CancellationReason,
+    Deadline,
     InMemoryTurnStore,
     JsonFileTurnStore,
     TurnAlreadyExistsError,
@@ -814,3 +815,100 @@ def test_reconciliation_is_deterministic_after_interrupted_step():
     assert result.phase is TurnPhase.TIMED_OUT
     operations = [entry.operation_id for entry in result.transitions]
     assert len(operations) == len(set(operations))
+
+
+# -- Task 42.4a: restart reconciliation consumes durable deadline evidence --
+def _interrupted_with_deadline(store, number, *, seconds):
+    """A GENERATING record whose durable deadline expires after ``seconds``."""
+    clock = FixedClock(NOW)
+    record = store.create(new_turn(
+        f"conv_{number:012x}", 1, clock=clock, id_factory=_ids(number),
+        deadline=Deadline.after(seconds, clock=clock)))
+    controller = TurnController(store, record.turn_id, clock=clock)
+    record = _transition(controller, record, TurnPhase.QUEUED, number * 10)
+    record = _transition(controller, record, TurnPhase.GENERATING,
+                         number * 10 + 1)
+    assert record.deadline_at == NOW + timedelta(seconds=seconds)
+    return record
+
+
+def test_restart_reconciles_expired_deadline_to_timed_out():
+    store = InMemoryTurnStore()
+    record = _interrupted_with_deadline(store, 1, seconds=60)
+
+    # Reconciliation clock is past the durable deadline: the interruption
+    # evidence truthfully supports TIMED_OUT (D3), never a resume.
+    reconcile_nonterminal_turns(store, clock=FixedClock(NOW + timedelta(
+        seconds=120)))
+
+    result = store.load(record.turn_id)
+    assert result.phase is TurnPhase.TIMED_OUT
+    assert result.cancellation_reason is CancellationReason.DEADLINE_EXCEEDED
+    assert result.final_terminal is TurnPhase.TIMED_OUT
+
+    # Terminal and idempotent under a repeated reconciliation.
+    versions = {turn_id: store.load(turn_id).version
+                for turn_id in store.list_turns()}
+    reconcile_nonterminal_turns(store, clock=FixedClock(NOW + timedelta(
+        seconds=300)))
+    assert {turn_id: store.load(turn_id).version
+            for turn_id in store.list_turns()} == versions
+    assert store.load(record.turn_id).phase is TurnPhase.TIMED_OUT
+
+
+def test_restart_reconciles_future_deadline_to_failed():
+    store = InMemoryTurnStore()
+    record = _interrupted_with_deadline(store, 2, seconds=600)
+
+    # The deadline is still in the future: an interrupted turn is ordinary
+    # interrupted work, never resumed regardless of remaining budget.
+    reconcile_nonterminal_turns(store, clock=FixedClock(NOW + timedelta(
+        seconds=30)))
+
+    result = store.load(record.turn_id)
+    assert result.phase is TurnPhase.FAILED
+    assert result.cancellation_reason is CancellationReason.INTERNAL_FAILURE
+
+
+def test_restart_without_deadline_keeps_existing_failure_semantics():
+    store = InMemoryTurnStore()
+    clock = FixedClock(NOW)
+    record = store.create(new_turn(
+        "conv_000000000003", 1, clock=clock, id_factory=_ids(3)))
+    controller = TurnController(store, record.turn_id, clock=clock)
+    record = _transition(controller, record, TurnPhase.QUEUED, 30)
+    _transition(controller, record, TurnPhase.GENERATING, 31)
+    assert store.load(record.turn_id).deadline_at is None
+
+    reconcile_nonterminal_turns(store, clock=FixedClock(NOW + timedelta(
+        seconds=9999)))
+
+    result = store.load(record.turn_id)
+    assert result.phase is TurnPhase.FAILED
+    assert result.cancellation_reason is CancellationReason.INTERNAL_FAILURE
+
+
+def test_restart_never_relabels_committed_finalizing_as_timeout():
+    """D5: a committed FINALIZING(COMPLETED) stays crash-failed, not timed out.
+
+    The deadline expiring after the completion CAS — here, long before the
+    restart — must never rewrite an already-committed outcome.
+    """
+    store = InMemoryTurnStore()
+    clock = FixedClock(NOW)
+    record = store.create(new_turn(
+        "conv_000000000004", 1, clock=clock, id_factory=_ids(4),
+        deadline=Deadline.after(60, clock=clock)))
+    controller = TurnController(store, record.turn_id, clock=clock)
+    record = _transition(controller, record, TurnPhase.QUEUED, 40)
+    record = _transition(controller, record, TurnPhase.GENERATING, 41)
+    _transition(controller, record, TurnPhase.FINALIZING, 42,
+                requested_terminal=TurnPhase.COMPLETED)
+
+    reconcile_nonterminal_turns(store, clock=FixedClock(NOW + timedelta(
+        seconds=120)))
+
+    result = store.load(record.turn_id)
+    assert result.phase is TurnPhase.FAILED
+    assert result.cancellation_reason is CancellationReason.INTERNAL_FAILURE
+    assert result.requested_terminal is TurnPhase.COMPLETED

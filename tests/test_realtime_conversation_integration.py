@@ -22,7 +22,7 @@ import subprocess
 import sys
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -38,14 +38,17 @@ from agentcore.config.schema import (
 from agentcore.conversation.tool_use import ConversationToolRunner, ToolCallOutcome
 from agentcore.conversation.turns import (
     SUPERSEDED_TURN_ERROR,
+    TIMED_OUT_TURN_ERROR,
     StageLease,
     TurnBridge,
+    TurnSuperseded,
+    _TurnFence,
 )
 from agentcore.core.agent import Agent, AgentDependencies, build_agent
 from agentcore.errors import AgentError
 from agentcore.models.messages import ModelResponse, Role, ToolCall
 from agentcore.permissions.levels import Capability, PermissionLevel
-from agentcore.observability.logging import configure_logging
+from agentcore.observability.logging import configure_logging, get_logger
 from agentcore.realtime import (
     CancellationReason,
     Deadline,
@@ -58,6 +61,7 @@ from agentcore.realtime import (
     derive_session_key,
     new_operation_id,
 )
+from agentcore.realtime.cancellation import CancellationSource
 from agentcore.realtime.turn import (
     SESSION_KEY_CHARS,
     SESSION_KEY_DIGEST_CHARS,
@@ -506,7 +510,10 @@ def test_turn_phase_ledger_follows_the_approved_state_machine(tmp_path):
         TurnPhase.QUEUED, TurnPhase.GENERATING, TurnPhase.FINALIZING,
         TurnPhase.COMPLETED,
     ]
-    assert record.deadline_at is None
+    # Task 42.4a (D1/D2): every admitted turn now carries its bounded root
+    # deadline's UTC projection durably; the 42.3-era "always absent"
+    # scaffolding assertion is superseded by the frozen decisions.
+    assert record.deadline_at is not None
 
 
 def test_successive_turns_increment_the_session_generation(tmp_path):
@@ -1298,11 +1305,38 @@ def test_a_half_specified_deadline_is_rejected():
         Deadline(None, now)
 
 
-def test_owned_turns_persist_no_deadline_at_all(tmp_path):
-    model = ScriptedModel(_reply("ok"))
-    agent, runtime, store, _ = _opted_in(tmp_path, model)
-    runtime.send("hello")
-    assert _records(store)[0].deadline_at is None
+def test_owned_turns_persist_the_root_deadline_projection(tmp_path):
+    """The durable deadline is the root admission deadline's UTC projection.
+
+    Supersedes the Task 42.3 amendment's ``deadline_at stays absent``
+    scaffolding: Task 42.4a (D1/D2) makes the configured root deadline
+    durable at admission. It must equal the projection captured *before*
+    admission, stay immutable through every later transition, and give a
+    later-admitted successor its own independent, later budget.
+    """
+    from agentcore.conversation.runtime import ConversationRuntime
+
+    clock = FixedClock(datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc))
+    model = ScriptedModel(_reply("one"), _reply("two"))
+    store = InMemoryTurnStore()
+    coordinator = RecordingCoordinator(TurnCoordinator(store, clock=clock))
+    bridge = TurnBridge(coordinator, clock=clock, turn_deadline_seconds=120.0)
+    runtime = ConversationRuntime(model=model, turns=bridge)
+
+    first = runtime.send("hello")
+    first_deadline = _records(store)[0].deadline_at
+    assert first_deadline == datetime(2026, 8, 22, 12, 2,
+                                      tzinfo=timezone.utc)
+
+    clock.advance(60.0)
+    second = runtime.send("again")
+
+    by_id = {record.turn_id: record for record in _records(store)}
+    # Immutable through the whole completed lifecycle, and independent
+    # (later) for the successor admitted 60s afterwards.
+    assert by_id[first.turn_id].deadline_at == first_deadline
+    assert by_id[second.turn_id].deadline_at == first_deadline + \
+        timedelta(seconds=60)
 
 
 # ===========================================================================
@@ -1744,3 +1778,527 @@ def test_third_admission_reclassifies_a_queued_successor_that_started(tmp_path):
     assert final.reply.content == "fourth reply"
     assert final.turn_generation == 4
     assert store.load(final.turn_id).phase is TurnPhase.COMPLETED
+
+
+# ===========================================================================
+# 19. Task 42.4a — bounded realtime conversation turn deadlines
+# ===========================================================================
+#: Deterministic deadline arithmetic: every expiry advances the trusted
+#: bridge clock past a 120-second budget.
+DEADLINE_SECONDS = 120.0
+EXPIRE_BY = 121.0
+T0 = datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc)
+
+
+def _opted_in_deadline(tmp_path, model, clock, *, seconds=DEADLINE_SECONDS,
+                       tools=None, tools_enabled=False,
+                       level=PermissionLevel.AUTONOMOUS,
+                       log_level: str = "CRITICAL"):
+    """The standard opted-in composition, with a controllable bridge clock.
+
+    The bridge is rebuilt through its public constructor with the test's
+    fixed clock so deadline expiry is advanced deterministically; the
+    registry, executor, policy, session store and coordinator stay real.
+    """
+    store = InMemoryTurnStore()
+    coordinator = RecordingCoordinator(TurnCoordinator(store, clock=clock))
+    agent = _agent(_config(tmp_path, tools_enabled=tools_enabled, level=level,
+                           log_level=log_level),
+                   model, coordinator=coordinator, tools=tools)
+    agent._turns = TurnBridge(coordinator, clock=clock,
+                              turn_deadline_seconds=seconds)
+    return agent, agent.conversation(), store, coordinator
+
+
+def test_fence_reports_deadline_expiry_not_generic_staleness():
+    """The exact defect this slice must avoid: expiry degrading to ``None``.
+
+    With the token never cancelled and the durable record still current,
+    the only reason ``check()`` can fail is deadline expiry — and it must
+    say so, because a ``None`` reason terminalizes as FAILED.
+    """
+
+    def fresh_fence(token=None):
+        store = InMemoryTurnStore()
+        clock = FixedClock(T0)
+        coordinator = TurnCoordinator(store, clock=clock)
+        deadline = Deadline.after(DEADLINE_SECONDS, clock=clock)
+        key = derive_session_key("conv_deadline_probe")
+        admitted = coordinator.admit(key, deadline=deadline).admitted
+        fence = _TurnFence(
+            TurnController(store, admitted.turn_id, clock=clock),
+            turn_id=admitted.turn_id, session_key=key,
+            generation=admitted.generation,
+            operation_id=admitted.active_operation_id,
+            token=(token or CancellationSource()).token,
+            deadline=deadline, clock=clock,
+            session_lock=threading.RLock(), store=store,
+            log=get_logger("conversation.turns"))
+        return store, clock, coordinator, key, fence
+
+    # 1. Pure expiry: read-only check, token untouched, record current.
+    store, clock, coordinator, key, pure = fresh_fence()
+    pure.activate()
+    clock.advance(EXPIRE_BY)
+    with pytest.raises(TurnSuperseded) as excinfo:
+        pure.check()
+    assert excinfo.value.reason is CancellationReason.DEADLINE_EXCEEDED
+
+    # 2. Cancellation wins over expiry and keeps its own reason. The
+    #    cancelled token means the turn never even activates; its fence
+    #    must report the shutdown reason, not the concurrent expiry.
+    shutdown = CancellationSource()
+    shutdown.cancel(CancellationReason.AGENT_SHUTDOWN)
+    _, clock2, _, _, cancelled = fresh_fence(shutdown)
+    clock2.advance(EXPIRE_BY)
+    with pytest.raises(TurnSuperseded) as excinfo:
+        cancelled.check()
+    assert excinfo.value.reason is CancellationReason.AGENT_SHUTDOWN
+
+    # 3. Durable supersession wins over expiry and keeps its reason: the
+    #    successor below moves the first record to CANCELLING(SUPERSEDED),
+    #    and no later clock position may relabel it.
+    coordinator.admit(key, deadline=Deadline.after(
+        DEADLINE_SECONDS, clock=clock))
+    with pytest.raises(TurnSuperseded) as excinfo:
+        pure.check()
+    assert excinfo.value.reason is CancellationReason.SUPERSEDED
+
+
+def test_agent_threads_the_configured_deadline_into_the_bridge(tmp_path):
+    """The composition root passes conversation config to the bridge."""
+    from dataclasses import replace
+
+    from agentcore.conversation.config import ConversationConfig
+
+    base = _config(tmp_path)
+    config = replace(
+        base, conversation=replace(
+            base.conversation, turn_deadline_seconds=90.0))
+    model = ScriptedModel(_reply("ok"))
+    coordinator = RecordingCoordinator(TurnCoordinator(InMemoryTurnStore()))
+    agent = Agent(config, AgentDependencies(model=model,
+                                            turn_coordinator=coordinator))
+
+    result = agent.conversation().send("hello")
+
+    assert result.ok
+    record = coordinator.store.load(result.turn_id)
+    # The durable budget is the configured one (±µs clock granularity).
+    delta = record.deadline_at - record.created_at
+    assert timedelta(seconds=89) < delta < timedelta(seconds=91)
+
+
+def test_expired_queued_turn_never_starts_model_work(tmp_path):
+    """Expiry while waiting for the StageLease forbids all stage work.
+
+    Deterministic interleaving: T1 is gated inside its provider call while
+    T2 is admitted and queued; the clock then passes both budgets; T1's
+    late result and T2's activation are both rejected at their fences.
+    """
+    model = ScriptedModel(_reply("first reply"), _reply("second reply"))
+    release_first = model.gate(1)
+    clock = FixedClock(T0)
+    agent, runtime, store, coordinator = _opted_in_deadline(tmp_path, model,
+                                                            clock)
+    session = runtime.start()
+    results: dict[str, object] = {}
+
+    def send(name, text):
+        results[name] = runtime.send(text, session=session)
+
+    first = threading.Thread(target=send, args=("first", "one"), daemon=True)
+    first.start()
+    model.wait_entered(1)
+    second = threading.Thread(target=send, args=("second", "two"),
+                              daemon=True)
+    second.start()
+    queued = coordinator.wait_for(2)
+    assert queued.admitted.phase is TurnPhase.QUEUED
+
+    clock.advance(EXPIRE_BY)          # both budgets expire at once
+    release_first.set()
+    for thread in (first, second):
+        thread.join(WAIT)
+        assert not thread.is_alive()
+
+    # The queued successor never entered the provider; the gated turn's
+    # late reply is rejected too. Neither published anything. T1 was
+    # durably superseded by T2's admission before either budget expired,
+    # so its accepted reason survives; T2 — never started — timed out in
+    # the queue.
+    assert model.calls == 1
+    assert _texts(session) == ["one"]
+    records = sorted(_records(store), key=lambda record: record.generation)
+    assert records[0].phase is TurnPhase.CANCELLED
+    assert records[0].cancellation_reason is CancellationReason.SUPERSEDED
+    assert records[1].phase is TurnPhase.TIMED_OUT
+    assert records[1].cancellation_reason is \
+        CancellationReason.DEADLINE_EXCEEDED
+    assert not results["first"].ok and not results["second"].ok
+    assert results["first"].turn_phase == "cancelled"
+    assert results["second"].turn_phase == "timed_out"
+
+
+def test_late_provider_result_is_rejected_and_times_out(tmp_path):
+    """A provider that physically returns after expiry publishes nothing."""
+    model = ScriptedModel(_reply("late reply"))
+    release = model.gate(1)
+    clock = FixedClock(T0)
+    agent, runtime, store, _ = _opted_in_deadline(tmp_path, model, clock)
+    session = runtime.start()
+    results: list = []
+
+    thread = threading.Thread(
+        target=lambda: results.append(runtime.send("hello", session=session)),
+        daemon=True)
+    thread.start()
+    model.wait_entered(1)             # the provider call has begun
+    clock.advance(EXPIRE_BY)          # ... and the budget dies while it runs
+    release.set()
+    thread.join(WAIT)
+
+    result = results[0]
+    assert not result.ok
+    assert result.reply is None
+    assert result.turn_phase == "timed_out"
+    record = _records(store)[0]
+    assert record.phase is TurnPhase.TIMED_OUT
+    assert record.cancellation_reason is CancellationReason.DEADLINE_EXCEEDED
+    # No late assistant output, in memory or on disk: a timed-out turn
+    # never even reaches the session save.
+    assert _texts(session) == ["hello"]
+    assert not runtime.sessions.exists(session.id)
+
+
+def test_expiry_before_tool_round_prevents_execution(tmp_path):
+    """Expiry observed after the model asked for tools runs nothing."""
+    counter = CountingTool()
+    tools = list(default_tools()) + [counter]
+    call = ToolCall(id="c1", name="counter", arguments={})
+    model = ScriptedModel(_reply("", tool_calls=[call]), _reply("unused"))
+    release = model.gate(1)
+    clock = FixedClock(T0)
+    agent, runtime, store, _ = _opted_in_deadline(
+        tmp_path, model, clock, tools=tools, tools_enabled=True)
+    session = runtime.start()
+    results: list = []
+
+    thread = threading.Thread(
+        target=lambda: results.append(runtime.send("count", session=session)),
+        daemon=True)
+    thread.start()
+    model.wait_entered(1)
+    clock.advance(EXPIRE_BY)
+    release.set()
+    thread.join(WAIT)
+
+    assert counter.runs == 0                      # the fence preceded tools
+    assert [m for m in session.messages if m.role is Role.TOOL] == []
+    record = _records(store)[0]
+    assert record.phase is TurnPhase.TIMED_OUT
+    assert results[0].turn_phase == "timed_out"
+
+
+def test_expiry_after_physical_tool_return_fences_the_result(tmp_path):
+    """A tool that finished after expiry stays truthful but unpublishable."""
+    gate = GateTool()
+    tools = list(default_tools()) + [gate]
+    call = ToolCall(id="c1", name="gate", arguments={})
+    model = ScriptedModel(_reply("", tool_calls=[call]), _reply("unused"))
+    clock = FixedClock(T0)
+    agent, runtime, store, _ = _opted_in_deadline(
+        tmp_path, model, clock, tools=tools, tools_enabled=True)
+    session = runtime.start()
+    results: list = []
+
+    thread = threading.Thread(
+        target=lambda: results.append(runtime.send("run gate",
+                                                   session=session)),
+        daemon=True)
+    thread.start()
+    assert gate.entered.wait(WAIT)    # the tool is physically running
+    clock.advance(EXPIRE_BY)          # the budget dies under it
+    gate.release.set()
+    thread.join(WAIT)
+
+    assert gate.runs == 1             # truthful: it really did execute once
+    assert [m for m in session.messages if m.role is Role.TOOL] == []
+    assert "gated" not in _texts(session)
+    record = _records(store)[0]
+    assert record.phase is TurnPhase.TIMED_OUT
+    assert record.cancellation_reason is CancellationReason.DEADLINE_EXCEEDED
+
+
+def test_deadline_observed_before_supersession_times_out_first(tmp_path):
+    """Order A: expiry observed while still current wins the vocabulary."""
+    model = ScriptedModel(_reply("slow"), _reply("fresh"))
+    release = model.gate(1)
+    clock = FixedClock(T0)
+    agent, runtime, store, _ = _opted_in_deadline(tmp_path, model, clock)
+    session = runtime.start()
+    results: list = []
+
+    thread = threading.Thread(
+        target=lambda: results.append(runtime.send("hello", session=session)),
+        daemon=True)
+    thread.start()
+    model.wait_entered(1)
+    clock.advance(EXPIRE_BY)          # expiry precedes any supersession
+    release.set()
+    thread.join(WAIT)
+
+    first = _records(store)[0]
+    assert first.phase is TurnPhase.TIMED_OUT
+    assert first.cancellation_reason is CancellationReason.DEADLINE_EXCEEDED
+    # A successor admitted afterwards gets a fresh, independent budget.
+    second = runtime.send("again", session=session)
+    assert second.ok
+    assert store.load(second.turn_id).phase is TurnPhase.COMPLETED
+
+
+def test_supersession_cas_wins_over_later_expiry_without_relabel(tmp_path):
+    """Order B: an accepted supersession reason is never regressed."""
+    model = ScriptedModel(_reply("slow"), _reply("never used"))
+    release = model.gate(1)
+    clock = FixedClock(T0)
+    agent, runtime, store, coordinator = _opted_in_deadline(tmp_path, model,
+                                                            clock)
+    session = runtime.start()
+    results: dict[str, object] = {}
+
+    def send(name, text):
+        results[name] = runtime.send(text, session=session)
+
+    first = threading.Thread(target=send, args=("first", "one"), daemon=True)
+    first.start()
+    model.wait_entered(1)
+    second = threading.Thread(target=send, args=("second", "two"),
+                              daemon=True)
+    second.start()
+    coordinator.wait_for(2)           # T1 durably CANCELLING(SUPERSEDED)
+    t1_id = coordinator.admissions[0].admitted.turn_id
+    clock.advance(EXPIRE_BY)          # expiry arrives strictly afterwards
+    release.set()
+    for thread in (first, second):
+        thread.join(WAIT)
+
+    stale = store.load(t1_id)
+    assert stale.phase is TurnPhase.CANCELLED
+    assert stale.cancellation_reason is CancellationReason.SUPERSEDED
+    # The queued successor genuinely expired while waiting; that too is
+    # reported truthfully.
+    fresh = store.load(coordinator.admissions[1].admitted.turn_id)
+    assert fresh.phase is TurnPhase.TIMED_OUT
+
+
+def test_shutdown_token_reason_wins_over_expiry(tmp_path):
+    """Cancellation-first: shutdown keeps AGENT_SHUTDOWN, not TIMED_OUT."""
+    model = ScriptedModel(_reply("late"))
+    release = model.gate(1)
+    clock = FixedClock(T0)
+    agent, runtime, store, _ = _opted_in_deadline(tmp_path, model, clock)
+    session = runtime.start()
+    results: list = []
+
+    thread = threading.Thread(
+        target=lambda: results.append(runtime.send("hello", session=session)),
+        daemon=True)
+    thread.start()
+    model.wait_entered(1)
+    clock.advance(EXPIRE_BY)
+    agent.shutdown()                  # cooperative request, then release
+    release.set()
+    thread.join(WAIT)
+
+    record = _records(store)[0]
+    assert record.phase is TurnPhase.CANCELLED
+    assert record.cancellation_reason is CancellationReason.AGENT_SHUTDOWN
+    assert "late" not in _texts(session)
+
+
+class _AdvanceClockAfterCommitStore:
+    """Advance the trusted clock the instant the completion CAS lands.
+
+    Wrapping the store is the deterministic way to place clock movement
+    *after* the ``GENERATING -> FINALIZING(COMPLETED)`` CAS and *before*
+    publication continues — the exact D5 case-B window.
+    """
+
+    def __init__(self, delegate, clock, seconds):
+        self._delegate = delegate
+        self._clock = clock
+        self._seconds = seconds
+        self.committed = False
+
+    @property
+    def admission_coordination(self):
+        return self._delegate.admission_coordination
+
+    def create(self, record):
+        return self._delegate.create(record)
+
+    def load(self, turn_id):
+        return self._delegate.load(turn_id)
+
+    def compare_and_swap(self, turn_id, expected_version, next_record):
+        result = self._delegate.compare_and_swap(
+            turn_id, expected_version, next_record)
+        if not self.committed and \
+                next_record.phase is TurnPhase.FINALIZING and \
+                next_record.requested_terminal is TurnPhase.COMPLETED:
+            self.committed = True
+            self._clock.advance(self._seconds)
+        return result
+
+    def list_turns(self):
+        return self._delegate.list_turns()
+
+    def close(self):
+        return self._delegate.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+
+def test_completion_cas_beats_later_clock_advance(tmp_path):
+    """D5 case B: once committed, later expiry cannot rewrite completion."""
+    from agentcore.conversation.runtime import ConversationRuntime
+
+    clock = FixedClock(T0)
+    model = ScriptedModel(_reply("committed reply"))
+    store = _AdvanceClockAfterCommitStore(InMemoryTurnStore(), clock,
+                                          EXPIRE_BY)
+    coordinator = TurnCoordinator(store, clock=clock)
+    bridge = TurnBridge(coordinator, clock=clock,
+                        turn_deadline_seconds=DEADLINE_SECONDS)
+    runtime = ConversationRuntime(model=model, turns=bridge)
+
+    result = runtime.send("hello")
+
+    assert store.committed                  # the window really was forced
+    assert clock.monotonic() >= EXPIRE_BY   # expiry is strictly post-CAS
+    assert result.ok
+    assert result.turn_phase == "completed"
+    assert result.reply.content == "committed reply"
+    record = store.load(result.turn_id)
+    assert record.phase is TurnPhase.COMPLETED
+    assert record.cancellation_reason is None
+    assert _texts(result.session) == ["hello", "committed reply"]
+
+
+def test_outward_error_distinguishes_timeout_from_supersession(tmp_path):
+    """The TurnResult error text follows the durable terminal outcome.
+
+    A timed-out turn must not claim it was superseded; a superseded turn
+    keeps the existing message. Durable lifecycle, CAS and deadline
+    semantics are untouched — this is outward vocabulary only.
+    """
+    # Timeout: the provider physically returns after the deadline.
+    model = ScriptedModel(_reply("late"))
+    release = model.gate(1)
+    clock = FixedClock(T0)
+    agent, runtime, store, _ = _opted_in_deadline(tmp_path, model, clock)
+    session = runtime.start()
+    results: list = []
+    thread = threading.Thread(
+        target=lambda: results.append(runtime.send("hello", session=session)),
+        daemon=True)
+    thread.start()
+    model.wait_entered(1)
+    clock.advance(EXPIRE_BY)
+    release.set()
+    thread.join(WAIT)
+
+    timed_out = results[0]
+    assert not timed_out.ok
+    assert timed_out.error == TIMED_OUT_TURN_ERROR
+    assert timed_out.turn_phase == "timed_out"
+    assert _records(store)[0].phase is TurnPhase.TIMED_OUT
+
+    # Supersession: the existing outward message is unchanged.
+    supersede_model = ScriptedModel(_reply("first"), _reply("second"))
+    release_first = supersede_model.gate(1)
+    supersede_agent, supersede_runtime, supersede_store, coordinator = \
+        _opted_in_deadline(tmp_path, supersede_model, FixedClock(T0))
+    supersede_session = supersede_runtime.start()
+    outcomes: dict[str, object] = {}
+
+    def send(name, text):
+        outcomes[name] = supersede_runtime.send(
+            text, session=supersede_session)
+
+    first = threading.Thread(target=send, args=("first", "one"),
+                             daemon=True)
+    first.start()
+    supersede_model.wait_entered(1)
+    second = threading.Thread(target=send, args=("second", "two"),
+                              daemon=True)
+    second.start()
+    coordinator.wait_for(2)
+    release_first.set()
+    first.join(WAIT)
+    second.join(WAIT)
+
+    assert not outcomes["first"].ok
+    assert outcomes["first"].error == SUPERSEDED_TURN_ERROR
+    assert outcomes["first"].turn_phase == "cancelled"
+    assert outcomes["second"].ok
+
+
+def test_turn_timed_out_event_is_categorical(tmp_path):
+    """turn.timed_out carries safe identifiers only, exactly once."""
+    raw = "raw-id-sentinel with spaces"
+    model = ScriptedModel(_reply("assistant-sentinel-text"))
+    release = model.gate(1)
+    clock = FixedClock(T0)
+    agent, runtime, store, _ = _opted_in_deadline(tmp_path, model, clock,
+                                                 log_level="DEBUG")
+    session = runtime.start()
+    session.id = raw
+
+    thread = threading.Thread(target=lambda: runtime.send(
+        "user-sentinel-text", session=session), daemon=True)
+    thread.start()
+    model.wait_entered(1)
+    with capture_events() as buffer:
+        clock.advance(EXPIRE_BY)
+        release.set()
+        thread.join(WAIT)
+
+    lines = [json.loads(line) for line in
+             buffer.getvalue().splitlines() if line.strip()]
+    turn_events = [line for line in lines
+                   if str(line.get("event", "")).startswith("turn.")]
+    timed_out = [line for line in turn_events
+                 if line["event"] == "turn.timed_out"]
+    assert len(timed_out) == 1
+    for line in turn_events:
+        payload = json.dumps(line)
+        assert raw not in payload
+        assert "user-sentinel-text" not in payload
+        assert "assistant-sentinel-text" not in payload
+        assert derive_session_key(raw) in payload
+
+
+def test_legacy_path_ignores_the_deadline_configuration(tmp_path):
+    """Without a coordinator the key is inert: the turn runs to completion."""
+    from dataclasses import replace
+
+    from agentcore.conversation.config import ConversationConfig
+
+    base = _config(tmp_path)
+    config = replace(
+        base, conversation=replace(
+            base.conversation, turn_deadline_seconds=1.0))
+    agent = _agent(config, ScriptedModel(_reply("legacy reply")))
+    runtime = agent.conversation()
+
+    result = runtime.send("hello")
+
+    assert result.ok
+    assert result.reply.content == "legacy reply"
+    assert result.turn_id is None       # no realtime machinery at all

@@ -62,6 +62,11 @@ _MAX_TERMINALIZATION_STEPS = 32
 #: turn outcome, not a model failure, so no assistant message is fabricated.
 SUPERSEDED_TURN_ERROR = "this turn was superseded by a newer message"
 
+#: Outward explanation when the turn's own deadline expired instead. The
+#: durable record already says TIMED_OUT/DEADLINE_EXCEEDED; the outward
+#: error must not claim supersession.
+TIMED_OUT_TURN_ERROR = "this turn exceeded its deadline"
+
 
 class TurnSuperseded(Exception):
     """Internal signal: this turn is no longer the current one.
@@ -102,18 +107,19 @@ class StageLease:
 
 
 class _TurnFence:
-    """Stale/cancellation fence and phase authority for one owned turn.
+    """Stale/cancellation/deadline fence and phase authority for one turn.
 
-    Read-only boundaries use ``TurnController.accepts``. Mutating boundaries
-    use the transition itself as the fence: a compare-and-swap that loses to a
-    supersession is the proof that this turn may not proceed, so no tool round
-    can start, and no assistant message can be committed, after the record has
-    moved on.
+    Read-only boundaries decide through :meth:`_rejection_reason` against the
+    freshly loaded record. Mutating boundaries use the transition itself as
+    the fence: a compare-and-swap that loses to a supersession is the proof
+    that this turn may not proceed, so no tool round can start, and no
+    assistant message can be committed, after the record has moved on.
     """
 
     def __init__(self, controller: TurnController, *, turn_id: str,
                  session_key: str, generation: int,
                  operation_id: str | None, token: CancellationToken,
+                 deadline: Deadline, clock: Clock,
                  session_lock: Any, store: Any,
                  log: StructuredLogger) -> None:
         self._controller = controller
@@ -123,6 +129,11 @@ class _TurnFence:
         self._generation = generation
         self._operation_id = operation_id
         self._token = token
+        # The turn's own bounded deadline (Task 42.4a): created once by the
+        # bridge at admission and never recomputed, so the ephemeral context
+        # and the durable ``deadline_at`` projection cannot drift apart.
+        self._deadline = deadline
+        self._clock = clock
         self._session_lock = session_lock
         self._log = log
         self._phase = TurnPhase.QUEUED
@@ -137,25 +148,50 @@ class _TurnFence:
             generation=self._generation,
             operation_id=self._operation_id or "",
             cancellation=self._token,
-            # Task 42.3 enforces no timeout. The unbounded deadline is the
-            # named scaffolding the fence contract requires, nothing more.
-            deadline=Deadline.unbounded(),
+            deadline=self._deadline,
         )
+
+    def _rejection_reason(self, record: TurnRecord,
+                          expected_phase: TurnPhase,
+                          ) -> CancellationReason | None:
+        """Why this turn may not proceed against ``record``, or ``None``.
+
+        The order is deterministic and defers to durable truth:
+
+        1. an already-requested cancellation wins first and keeps its reason
+           (shutdown or any other token-cancelled cause);
+        2. the durable record is authoritative: a turn that already moved on
+           — superseded, cancelling, terminal — keeps the reason that record
+           carries and is never relabelled as a timeout;
+        3. only a still-current turn can observe its own deadline expiry,
+           and that observation is the timeout's truthful reason.
+        """
+        if self._token.requested:
+            return self._token.reason
+        if record.is_terminal or record.phase is not expected_phase or \
+                record.generation != self._generation or \
+                record.session_id != self._session_key or \
+                record.active_operation_id != self._operation_id:
+            return record.cancellation_reason
+        if self._deadline.expired(self._clock):
+            return CancellationReason.DEADLINE_EXCEEDED
+        return None
 
     def check(self) -> None:
         """Fail closed unless this turn is still the current, live one."""
-        if self._operation_id is None or \
-                not self._controller.accepts(self._context(),
-                                             expected_phase=self._phase):
+        if self._operation_id is None:
             raise TurnSuperseded(self._token.reason)
+        reason = self._rejection_reason(self._store.load(self.turn_id),
+                                        self._phase)
+        if reason is not None:
+            raise TurnSuperseded(reason)
 
     def _advance(self, expected: TurnPhase, target: TurnPhase,
                  **outcome: Any) -> None:
-        if self._token.requested:
-            raise TurnSuperseded(self._token.reason)
         record = self._store.load(self.turn_id)
-        if record.phase is not expected:
-            raise TurnSuperseded(record.cancellation_reason)
+        reason = self._rejection_reason(record, expected)
+        if reason is not None:
+            raise TurnSuperseded(reason)
         operation_id = new_operation_id()
         try:
             self._controller.transition(
@@ -231,6 +267,7 @@ class TurnBridge:
                  stage_lease: StageLease | None = None,
                  session_lock: Any = None,
                  clock: Clock | None = None,
+                 turn_deadline_seconds: float = 120.0,
                  logger: StructuredLogger | None = None) -> None:
         self._coordinator = coordinator
         # The coordinator is the admission authority; its store is the durable
@@ -239,6 +276,10 @@ class TurnBridge:
         self.stage_lease = stage_lease or StageLease()
         self.session_lock = session_lock or threading.RLock()
         self._clock = clock or SystemClock()
+        # Root budget for every admitted turn (Task 42.4a). Validated by
+        # ``Deadline.after`` at each admission; a future trusted API deadline
+        # can only shorten this through ``Deadline.child``, never lengthen it.
+        self._turn_deadline_seconds = turn_deadline_seconds
         self._root = CancellationSource()
         self._log = logger or get_logger("conversation.turns")
 
@@ -255,7 +296,13 @@ class TurnBridge:
     def run(self, runtime: Any, session: Any, message: Any) -> Any:
         """Admit, own and terminalize exactly one conversational turn."""
         session_key = derive_session_key(session.id)
-        admission = self._coordinator.admit(session_key)
+        # One bounded root deadline per admission, from the trusted bridge
+        # clock, created *before* admission: its UTC projection becomes the
+        # immutable durable ``deadline_at``, and the fence below carries this
+        # exact object so the ephemeral and durable views never drift.
+        deadline = Deadline.after(self._turn_deadline_seconds,
+                                  clock=self._clock)
+        admission = self._coordinator.admit(session_key, deadline=deadline)
         admitted = admission.admitted
         log = self._log.bind(turn_id=admitted.turn_id,
                              session_key=session_key,
@@ -272,6 +319,7 @@ class TurnBridge:
             controller, turn_id=admitted.turn_id, session_key=session_key,
             generation=admitted.generation,
             operation_id=admitted.active_operation_id, token=source.token,
+            deadline=deadline, clock=self._clock,
             session_lock=self.session_lock, store=self._store, log=log)
         try:
             # Admission is already complete and its lane released; no
@@ -325,7 +373,12 @@ class TurnBridge:
 
     def _superseded(self, runtime: Any, session: Any, fence: _TurnFence,
                     record: TurnRecord) -> Any:
-        result = runtime._superseded_result(session, SUPERSEDED_TURN_ERROR)
+        # The durable terminal record owns the truthful outward vocabulary:
+        # a turn that timed out must not claim it was superseded.
+        message = (TIMED_OUT_TURN_ERROR
+                   if record.phase is TurnPhase.TIMED_OUT
+                   else SUPERSEDED_TURN_ERROR)
+        result = runtime._superseded_result(session, message)
         _annotate(result, fence, record)
         return result
 
@@ -344,6 +397,13 @@ class TurnBridge:
         for _ in range(_MAX_TERMINALIZATION_STEPS):
             record = self._store.load(turn_id)
             if record.is_terminal:
+                if record.phase is TurnPhase.TIMED_OUT:
+                    # Categorical timeout evidence only; the finalized event
+                    # below still reports the terminal phase once.
+                    log.info(Events.TURN_TIMED_OUT,
+                             cancellation_reason=(
+                                 record.cancellation_reason.value
+                                 if record.cancellation_reason else None))
                 log.info(
                     Events.TURN_FINALIZED, phase=record.phase.value,
                     cancellation_reason=(record.cancellation_reason.value
