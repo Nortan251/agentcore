@@ -11,6 +11,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
+import inspect
+import threading
+
 from agentcore.config.schema import AgentConfig
 from agentcore.core.defaults import NoRetryStrategy, NullVerifier, PassthroughPlanner
 from agentcore.core.interfaces import (
@@ -26,7 +29,7 @@ from agentcore.core.plan_signature import (
     plan_signature,
 )
 from agentcore.core.replan import ReplanLedger, ReplanOutcome
-from agentcore.core.runner import RunReport, TaskRunner
+from agentcore.core.runner import RunControl, RunReport, TaskRunner
 from agentcore.errors import AgentError, StateError
 from agentcore.fs.guard import WorkspaceGuard
 from agentcore.fs.paths import WorkspaceMismatchError
@@ -34,6 +37,9 @@ from agentcore.observability.events import Events
 from agentcore.observability.logging import configure_logging, get_logger
 from agentcore.permissions.policy import ApprovalGate, PermissionPolicy
 from agentcore.models.messages import Message, Role
+from agentcore.realtime.cancellation import CancellationReason, CancellationSource
+from agentcore.realtime.errors import CancellationRequested, TurnValidationError
+from agentcore.realtime.turn import Deadline
 from agentcore.state.models import AgentPhase, AgentState
 from agentcore.state.store import InMemoryStateStore, StateStore
 from agentcore.tasks.models import Task, TaskStatus
@@ -41,6 +47,22 @@ from agentcore.tools.base import Tool
 from agentcore.tools.builtin import default_tools
 from agentcore.tools.executor import ToolExecutor, ToolInvocation
 from agentcore.tools.registry import ToolRegistry
+from agentcore.util.clock import Clock
+
+
+def _accepts_control_kwarg(func):
+    """Check if func accepts control kwarg explicitly (not via **kwargs)."""
+    try:
+        sig = inspect.signature(func)
+    except (ValueError, TypeError):
+        return False
+    param = sig.parameters.get("control")
+    if param is None:
+        return False
+    return param.kind in (
+        inspect.Parameter.KEYWORD_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    )
 
 
 @dataclass
@@ -141,6 +163,16 @@ class Agent:
         self._turns: Any | None = self._build_turn_bridge()
         # New runs are pinned to this workspace from the outset.
         self.state = AgentState(workspace=self.workspace.identity)
+
+        # Task 42.4c: autonomous cancellation root and active-run marker.
+        # One autonomous run per Agent is supported; concurrent runs are
+        # rejected categorically rather than sharing singular AgentState.
+        # Shutdown requests cancellation but does not concurrently persist
+        # half-mutated state while a run is active.
+        self._autonomy_root = CancellationSource()
+        self._autonomy_lock = threading.RLock()
+        self._active_run = False
+
         self.log.info(Events.AGENT_STARTED, run_id=self.state.run_id,
                       permission_level=str(self.policy.level),
                       tools=self.registry.names(),
@@ -580,62 +612,131 @@ class Agent:
         task.validate()
         self.state.set_task(task)
 
-    def run_task(self, task: Task | None = None) -> RunReport:
+
+    def run_task(self, task: Task | None = None, *,
+                 deadline: Deadline | None = None,
+                 clock: Clock | None = None) -> RunReport:
         """Execute a task, replanning when recovery asks for a new approach.
 
         The loop is ``execute -> (recovery says replan?) -> replan -> execute``,
         bounded by ``config.recovery.max_replans``. Each iteration runs the
         existing runner, so verification, permissions and recovery all apply
         unchanged on every attempt.
+
+        Task 42.4c adds optional trusted deadline/clock and cooperative
+        cancellation via autonomous root. One run per Agent is supported;
+        concurrent runs are rejected categorically. Deadline requires clock,
+        validated by RunControl. No deadline config is introduced; host/test
+        injection only.
         """
-        if task is not None:
-            self.assign(task)
-        if self.state.current_task is None:
-            raise ValueError("no task assigned; pass a task or call assign() first")
+        # Validate deadline requires clock before acquiring active-run marker
+        if deadline is not None and clock is None:
+            raise TurnValidationError("deadline requires a clock")
+        if deadline is not None and not isinstance(deadline, Deadline):
+            raise TurnValidationError("deadline is invalid")
 
-        max_replans = self.config.recovery.max_replans
-        current = self.state.current_task
-        if current.status.is_terminal:
-            raise StateError("task has already finished; assign a new task",
-                             task_id=current.id, status=current.status.value)
+        # One autonomous run per Agent — fail-loud, not shared
+        with self._autonomy_lock:
+            if self._active_run:
+                raise StateError("autonomous run already active",
+                                 run_id=self.state.run_id)
+            self._active_run = True
 
-        report = self._execute_once()
+        child = self._autonomy_root.child()
+        try:
+            control = RunControl(cancellation=child.token,
+                                 deadline=deadline,
+                                 clock=clock)
 
-        while report.replan_requested:
-            ledger = ReplanLedger.load(self.state)
-            if ledger.exhausted(max_replans):
-                self.log.info(Events.REPLAN_EXHAUSTED,
-                              replans=ledger.count, max_replans=max_replans)
-                self.state.update_resume_point(
-                    note="replan budget exhausted; awaiting human input")
-                break
+            if task is not None:
+                self.assign(task)
+            if self.state.current_task is None:
+                raise ValueError("no task assigned; pass a task or call assign() first")
 
-            outcome = self._replan(ledger, report)
-            if outcome is ReplanOutcome.ABANDON:
-                # Rejected or errored; the previous task and its history are
-                # intact and the report still reflects the failure.
-                break
-            if outcome is ReplanOutcome.RETRY:
-                # A duplicate of an already-failed strategy. The attempt is
-                # spent, but the request stands: ask again while budget remains
-                # (the guard at the top of the loop terminates it).
-                continue
+            max_replans = self.config.recovery.max_replans
+            current = self.state.current_task
+            if current.status.is_terminal:
+                raise StateError("task has already finished; assign a new task",
+                                 task_id=current.id, status=current.status.value)
 
-            report = self._execute_once(resumed=True)
+            # Checkpoint before first execution (A)
+            control.checkpoint()
 
-        self._finalise_run(report)
-        return report
+            report = self._execute_once(control=control)
+
+            while report.replan_requested:
+                # Checkpoint before entering each replan iteration
+                control.checkpoint()
+
+                ledger = ReplanLedger.load(self.state)
+                if ledger.exhausted(max_replans):
+                    self.log.info(Events.REPLAN_EXHAUSTED,
+                                  replans=ledger.count, max_replans=max_replans)
+                    self.state.update_resume_point(
+                        note="replan budget exhausted; awaiting human input")
+                    break
+
+                # Checkpoint before planner.replan (final gate before consuming attempt)
+                control.checkpoint()
+                outcome = self._replan(ledger, report, control=control)
+                if outcome is ReplanOutcome.ABANDON:
+                    break
+                if outcome is ReplanOutcome.RETRY:
+                    continue
+
+                # Before executing accepted replacement plan
+                control.checkpoint()
+                report = self._execute_once(resumed=True, control=control)
+
+            self._finalise_run(report)
+            return report
+
+        except CancellationRequested as exc:
+            # Cancellation settlement: task CANCELLED, not generic failure
+            current = self.state.current_task
+            if current is not None and not current.status.is_terminal:
+                current.transition_to(TaskStatus.CANCELLED)
+            if 'report' not in locals():
+                tid = current.id if current is not None else "unknown"
+                report = RunReport(task_id=tid, status=TaskStatus.CANCELLED)
+            report.status = TaskStatus.CANCELLED
+            reason = exc.reason if isinstance(exc.reason, CancellationReason) else CancellationReason.INTERNAL_FAILURE
+            report.cancellation_reason = reason.value
+            report.replan_requested = False
+            self.state.set_active_subtask(None)
+            self._finalise_run(report)
+            return report
+
+        finally:
+            child.close()
+            with self._autonomy_lock:
+                self._active_run = False
 
     # -- loop internals ----------------------------------------------------
-    def _execute_once(self, *, resumed: bool = False) -> RunReport:
+    def _execute_once(self, *, resumed: bool = False,
+                      control: RunControl | None = None) -> RunReport:
         """Run the current task once through the existing runner."""
+        control = control or RunControl()
         current = self.state.current_task
         assert current is not None  # guaranteed by run_task
+        # Checkpoint before entering execution
+        control.checkpoint()
         self.state.transition_phase(AgentPhase.EXECUTING, note="run_task")
         if resumed:
             self.log.info(Events.REPLAN_EXECUTION_RESUMED, task_id=current.id)
         try:
+            if _accepts_control_kwarg(self.runner.run):
+                return self.runner.run(current, self.state, control=control)
             return self.runner.run(current, self.state)
+        except CancellationRequested as exc:
+            # Expected cancellation, not generic failure
+            reason = exc.reason if isinstance(exc.reason, CancellationReason) else CancellationReason.INTERNAL_FAILURE
+            report = RunReport(task_id=current.id, status=TaskStatus.CANCELLED,
+                               cancellation_reason=reason.value)
+            if not current.status.is_terminal:
+                current.transition_to(TaskStatus.CANCELLED)
+            self.state.set_active_subtask(None)
+            return report
         except Exception as exc:  # noqa: BLE001 - state must reflect the failure
             self.state.record_error(exc)
             self.state.transition_phase(AgentPhase.ERROR, note=str(exc))
@@ -643,7 +744,8 @@ class Agent:
             raise
 
     def _replan(self, ledger: ReplanLedger,
-                report: RunReport) -> ReplanOutcome:
+                report: RunReport,
+                *, control: RunControl | None = None) -> ReplanOutcome:
         """Ask the planner for a new approach and judge the result.
 
         Budget is consumed *before* the planner runs, so a planner that raises
@@ -652,28 +754,47 @@ class Agent:
         Returns :class:`ReplanOutcome`: ``ADOPTED`` (execute the new plan),
         ``RETRY`` (duplicate strategy refused, ask again if budget remains) or
         ``ABANDON`` (unusable output; stop).
+
+        Task 42.4c: checkpoints before/after planner.replan and before adopting.
+        If planner returns after cancellation, reject new task. Ledger
+        linearization fixed: checkpoint BEFORE consuming attempt.
         """
+        control = control or RunControl()
         previous = self.state.current_task
         assert previous is not None
         reason = self._replan_reason(report)
 
-        attempt = ledger.begin(reason, previous)
-        ledger.save(self.state)
-
-        # After a duplicate rejection the loop re-enters while already in
-        # PLANNING, and PLANNING -> RECOVERING is not a legal transition. The
-        # recovery step has already happened in that case, so only pass through
-        # RECOVERING when coming from execution.
+        # Transition into required recovery/planning phase as today
         if self.state.phase is not AgentPhase.PLANNING:
             self.state.transition_phase(AgentPhase.RECOVERING,
                                         note="replan requested")
         self.state.transition_phase(AgentPhase.PLANNING, note=reason)
+        self.log.info(Events.REPLAN_STARTED, attempt=0,
+                      max_replans=self.config.recovery.max_replans,
+                      task_id=previous.id, reason=reason)
+
+        # Final cooperative gate BEFORE consuming attempt (P2-1)
+        control.checkpoint()
+
+        attempt = ledger.begin(reason, previous)
+        ledger.save(self.state)
+
         self.log.info(Events.REPLAN_STARTED, attempt=attempt,
                       max_replans=self.config.recovery.max_replans,
                       task_id=previous.id, reason=reason)
 
         try:
             new_task = self.planner.replan(previous, self.state)
+        except CancellationRequested as exc:
+            # Cancellation during planner.replan: attempt already consumed,
+            # finish ledger as cancelled, cancel current task. No error record (P2-4).
+            ledger.finish(reason=reason, outcome="cancelled",
+                          previous_task_id=previous.id,
+                          detail=f"cancelled: {exc.reason.value if isinstance(exc.reason, CancellationReason) else 'unknown'}")
+            ledger.save(self.state)
+            if not previous.status.is_terminal:
+                previous.transition_to(TaskStatus.CANCELLED)
+            raise exc
         except Exception as exc:  # noqa: BLE001 - a bad planner must not crash the run
             self.state.record_error(exc)
             ledger.finish(reason=reason, outcome="error",
@@ -685,6 +806,19 @@ class Agent:
                              message=getattr(exc, "message", str(exc)))
             self._abandon_replan(report, "planner raised during replan")
             return ReplanOutcome.ABANDON
+
+        # Checkpoint after planner returns, before adopting
+        try:
+            control.checkpoint()
+        except CancellationRequested as exc:
+            # Late plan after cancellation: attempt consumed, finish cancelled, never adopt
+            ledger.finish(reason=reason, outcome="cancelled",
+                          previous_task_id=previous.id,
+                          detail="late plan after cancellation")
+            ledger.save(self.state)
+            if not previous.status.is_terminal:
+                previous.transition_to(TaskStatus.CANCELLED)
+            raise exc
 
         rejection = self._reject_reason(new_task, previous)
         if rejection is not None:
@@ -716,6 +850,9 @@ class Agent:
 
         # Accepted: carry the objective forward and swap in the new plan. The
         # previous task is already archived in the ledger, so no history is lost.
+        # Checkpoint before adopting
+        control.checkpoint()
+
         ledger.finish(reason=reason, outcome="accepted",
                       previous_task_id=previous.id, new_task_id=new_task.id)
         ledger.save(self.state)
@@ -801,11 +938,41 @@ class Agent:
         return "recovery requested a replan"
 
     def _finalise_run(self, report: RunReport) -> None:
-        """Settle the agent phase once the loop has stopped."""
+        """Settle the agent phase once the loop has stopped.
+
+        Exact rules (final cleanup):
+        COMPLETED -> DONE (no catch, fail-loud if illegal)
+        FAILED -> ERROR (no fallback to DONE)
+        CANCELLED: only PLANNING gets IDLE bridge, else DONE directly.
+        Only PLANNING gets explicit IDLE bridge. No ERROR special-case.
+        No StateError catch/pass. Checkpoint after settlement succeeds.
+        """
         if report.status is TaskStatus.COMPLETED:
-            self.state.transition_phase(AgentPhase.DONE, note="task completed")
+            self.state.transition_phase(
+                AgentPhase.DONE,
+                note="task completed",
+            )
         elif report.status is TaskStatus.FAILED:
-            self.state.transition_phase(AgentPhase.ERROR, note="task failed")
+            self.state.transition_phase(
+                AgentPhase.ERROR,
+                note="task failed",
+            )
+        elif report.status is TaskStatus.CANCELLED:
+            reason = report.cancellation_reason or "cancelled"
+            if self.state.phase is AgentPhase.PLANNING:
+                self.state.transition_phase(
+                    AgentPhase.IDLE,
+                    note=f"reset before task cancelled: {reason}",
+                )
+                self.state.transition_phase(
+                    AgentPhase.DONE,
+                    note=f"task cancelled: {reason}",
+                )
+            else:
+                self.state.transition_phase(
+                    AgentPhase.DONE,
+                    note=f"task cancelled: {reason}",
+                )
         else:
             self.state.update_resume_point(note="task blocked")
         self.checkpoint()
@@ -869,11 +1036,18 @@ class Agent:
         return describe()
 
     def shutdown(self) -> None:
-        # Cooperative only: a live turn is asked to stop and terminalizes at
-        # its next fence. Nothing is killed and no provider call is aborted.
+        # Task 42.4c P1-1 fix: atomic idle checkpoint
+        try:
+            self._autonomy_root.cancel(CancellationReason.AGENT_SHUTDOWN)
+        except Exception:
+            pass
         if self._turns is not None:
             self._turns.shutdown()
-        self.checkpoint()
+        # Atomic idle checkpoint: hold lock across check and save so new run
+        # cannot set _active_run=True until idle checkpoint completes.
+        with self._autonomy_lock:
+            if not self._active_run:
+                self.checkpoint()
         self.log.info(Events.AGENT_STOPPED, **self.state.summary())
 
 
