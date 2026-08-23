@@ -30,6 +30,7 @@ from agentcore.core.plan_signature import (
 )
 from agentcore.core.replan import ReplanLedger, ReplanOutcome
 from agentcore.core.runner import RunControl, RunReport, TaskRunner
+from agentcore.core.correlation import RunCorrelation
 from agentcore.errors import AgentError, StateError
 from agentcore.fs.guard import WorkspaceGuard
 from agentcore.fs.paths import WorkspaceMismatchError
@@ -38,8 +39,14 @@ from agentcore.observability.logging import configure_logging, get_logger
 from agentcore.permissions.policy import ApprovalGate, PermissionPolicy
 from agentcore.models.messages import Message, Role
 from agentcore.realtime.cancellation import CancellationReason, CancellationSource
-from agentcore.realtime.errors import CancellationRequested, TurnValidationError
-from agentcore.realtime.turn import Deadline
+from agentcore.realtime.errors import (
+    CancellationRequested,
+    TurnCorrelationConflictError,
+    TurnCorrelationError,
+    TurnNotFoundError,
+    TurnValidationError,
+)
+from agentcore.realtime.turn import Deadline, TurnPhase, require_run_id, require_turn_id, TurnController
 from agentcore.state.models import AgentPhase, AgentState
 from agentcore.state.store import InMemoryStateStore, StateStore
 from agentcore.tasks.models import Task, TaskStatus
@@ -165,10 +172,6 @@ class Agent:
         self.state = AgentState(workspace=self.workspace.identity)
 
         # Task 42.4c: autonomous cancellation root and active-run marker.
-        # One autonomous run per Agent is supported; concurrent runs are
-        # rejected categorically rather than sharing singular AgentState.
-        # Shutdown requests cancellation but does not concurrently persist
-        # half-mutated state while a run is active.
         self._autonomy_root = CancellationSource()
         self._autonomy_lock = threading.RLock()
         self._active_run = False
@@ -504,7 +507,7 @@ class Agent:
             logger=get_logger("conversation.tools"))
 
     def correct_memory(self, turns: Any, *, memory_id: str | None = None) -> Any:
-        """Act on a conversational correction ("forget that", "no longer true").
+        """Act on a conversational correction (\"forget that\", \"no longer true\").
 
         Returns a ``ResolutionOutcome``. An ambiguous or unmatched target
         yields ``UNRESOLVED`` and changes nothing — never a best guess.
@@ -549,7 +552,7 @@ class Agent:
         This is the integration seam for conversational capture. It is *not*
         wired into ``run_task``/``execute``: the project has no persistent
         conversation loop yet, and inventing one purely to force automatic
-        capture would be exactly the "store everything" behaviour this layer
+        capture would be exactly the \"store everything\" behaviour this layer
         exists to avoid.
 
         Returns a ``CaptureResult`` (empty when capture is unavailable), so a
@@ -612,10 +615,155 @@ class Agent:
         task.validate()
         self.state.set_task(task)
 
+    # -- autonomous correlation (Task 42.4d) --------------------------------
+    def _require_turn_store(self):
+        """Require realtime coordinator/store for correlation."""
+        if self.turn_coordinator is None:
+            raise TurnCorrelationError("turn coordinator required for correlation")
+        store = getattr(self.turn_coordinator, "store", None)
+        if store is None:
+            raise TurnCorrelationError("turn store required for correlation")
+        return store
+
+    def _validate_origin_turn(self, turn_id: str, run_id: str):
+        """Validate that a turn can be bound to this run.
+
+        Checks:
+        - turn_id format
+        - turn exists
+        - phase == COMPLETED
+        - turn.run_id is None or == run_id
+        - state.origin_turn_id is None or == turn_id
+        Returns the loaded TurnRecord.
+        """
+        turn_id = require_turn_id(turn_id)
+        run_id = require_run_id(run_id)
+        store = self._require_turn_store()
+        try:
+            record = store.load(turn_id)
+        except TurnNotFoundError:
+            raise
+        except Exception as exc:
+            raise TurnCorrelationError("failed to load origin turn", turn_id=turn_id) from exc
+
+        if record.phase is not TurnPhase.COMPLETED:
+            raise TurnCorrelationError(
+                "only COMPLETED turns can be origin",
+                turn_id=turn_id, phase=record.phase.value)
+
+        if record.run_id is not None and record.run_id != run_id:
+            raise TurnCorrelationConflictError(
+                "turn already bound to a different run",
+                turn_id=turn_id, existing_run_id=record.run_id, new_run_id=run_id)
+
+        # State origin immutability
+        existing_origin = self.state.origin_turn_id
+        if existing_origin is not None and existing_origin != turn_id:
+            raise TurnCorrelationConflictError(
+                "run already bound to a different turn",
+                turn_id=turn_id, existing_origin=existing_origin, run_id=run_id)
+
+        return record
+
+    def bind_origin_turn(self, turn_id: str) -> RunCorrelation:
+        """Establish reciprocal durable correlation between this run and a COMPLETED turn.
+
+        Trusted host API. No planner, tool, permission decision, capability grant.
+
+        Order (state-first, safe handshake):
+        1. pre-flight validate turn COMPLETED, run_id None or this run_id, state origin None or this turn_id
+        2. set state.origin_turn_id = turn_id
+        3. checkpoint AgentState
+        4. atomically TurnController.bind_run(state.run_id)
+        5. reload/verify reciprocal
+        6. emit RUN_CORRELATED event, return RunCorrelation
+
+        No executable work may begin before step 5 succeeds.
+        """
+        turn_id = require_turn_id(turn_id)
+        run_id = require_run_id(self.state.run_id)
+
+        # 1. pre-flight
+        store = self._require_turn_store()
+        record = self._validate_origin_turn(turn_id, run_id)
+
+        # 2. set state origin (immutable once set, idempotent same id)
+        if self.state.origin_turn_id is None:
+            # Validate turn_id format already done, now set
+            # Use direct assignment; AgentState is mutable for this field, but we enforce immutability via check above
+            self.state.origin_turn_id = turn_id
+        # If already same, idempotent
+
+        # 3. checkpoint state
+        self.checkpoint()
+
+        # 4. atomically bind run on turn side
+        try:
+            controller = TurnController(store, turn_id)
+            controller.bind_run(run_id)
+        except Exception:
+            # Propagate, do not execute tool work, do not clear evidence
+            raise
+
+        # 5. reload/verify reciprocal
+        try:
+            reloaded = store.load(turn_id)
+        except Exception as exc:
+            raise TurnCorrelationError("failed to verify correlation after bind", turn_id=turn_id) from exc
+
+        if reloaded.run_id != run_id:
+            raise TurnCorrelationError(
+                "reciprocal correlation mismatch after bind",
+                turn_id=turn_id, expected_run_id=run_id, actual_run_id=reloaded.run_id)
+
+        if self.state.origin_turn_id != turn_id:
+            raise TurnCorrelationError(
+                "state origin mismatch after bind",
+                turn_id=turn_id, state_origin=self.state.origin_turn_id)
+
+        # 6. emit safe categorical event
+        self.log.info(Events.RUN_CORRELATED,
+                      run_id=run_id, origin_turn_id=turn_id, turn_phase="completed")
+
+        return RunCorrelation(run_id=run_id, origin_turn_id=turn_id)
+
+    def _heal_correlation_if_needed(self, loaded_state: AgentState) -> None:
+        """Heal crash window: state has origin X, turn X has run_id None -> bind."""
+        origin = loaded_state.origin_turn_id
+        if origin is None:
+            return
+        # Require coordinator/store
+        store = self._require_turn_store()
+        try:
+            record = store.load(origin)
+        except Exception as exc:
+            raise TurnCorrelationError("origin turn missing during heal", turn_id=origin) from exc
+
+        if record.phase is not TurnPhase.COMPLETED:
+            raise TurnCorrelationError(
+                "origin turn is not COMPLETED during heal",
+                turn_id=origin, phase=record.phase.value)
+
+        if record.run_id is None:
+            # Heal
+            try:
+                controller = TurnController(store, origin)
+                controller.bind_run(loaded_state.run_id)
+            except Exception as exc:
+                raise TurnCorrelationError("failed to heal correlation", turn_id=origin) from exc
+            # Verify after heal
+            reloaded = store.load(origin)
+            if reloaded.run_id != loaded_state.run_id:
+                raise TurnCorrelationError("heal verification failed", turn_id=origin)
+        elif record.run_id != loaded_state.run_id:
+            raise TurnCorrelationConflictError(
+                "origin turn bound to different run during heal",
+                turn_id=origin, existing_run_id=record.run_id, new_run_id=loaded_state.run_id)
 
     def run_task(self, task: Task | None = None, *,
                  deadline: Deadline | None = None,
-                 clock: Clock | None = None) -> RunReport:
+                 clock: Clock | None = None,
+                 origin_turn_id: str | None = None) -> RunReport:
         """Execute a task, replanning when recovery asks for a new approach.
 
         The loop is ``execute -> (recovery says replan?) -> replan -> execute``,
@@ -628,12 +776,19 @@ class Agent:
         concurrent runs are rejected categorically. Deadline requires clock,
         validated by RunControl. No deadline config is introduced; host/test
         injection only.
+
+        Task 42.4d adds optional origin_turn_id correlation. If supplied, or if
+        state already has origin, reciprocal durable correlation is established
+        BEFORE any executable work. Only COMPLETED turns may be origin.
         """
         # Validate deadline requires clock before acquiring active-run marker
         if deadline is not None and clock is None:
             raise TurnValidationError("deadline requires a clock")
         if deadline is not None and not isinstance(deadline, Deadline):
             raise TurnValidationError("deadline is invalid")
+        if origin_turn_id is not None:
+            # Validate format early, before work
+            require_turn_id(origin_turn_id)
 
         # One autonomous run per Agent — fail-loud, not shared
         with self._autonomy_lock:
@@ -647,6 +802,23 @@ class Agent:
             control = RunControl(cancellation=child.token,
                                  deadline=deadline,
                                  clock=clock)
+
+            # Task 42.4d: correlation handling BEFORE task assignment/execution
+            # Determine effective origin to bind/validate
+            effective_origin: str | None = None
+            if origin_turn_id is not None:
+                effective_origin = origin_turn_id
+            elif self.state.origin_turn_id is not None:
+                effective_origin = self.state.origin_turn_id
+
+            if effective_origin is not None:
+                # This will validate, checkpoint state, bind turn, verify reciprocal
+                # No tool work may begin before this succeeds
+                # If state already has origin and param omitted, validate/heal existing
+                # If param equals existing, idempotent
+                # If param differs, fail before work (handled in _validate_origin_turn)
+                # If no coordinator, _require_turn_store will raise categorical failure before work
+                self.bind_origin_turn(effective_origin)
 
             if task is not None:
                 self.assign(task)
@@ -997,7 +1169,10 @@ class Agent:
         can execute.
 
         Legacy runs recorded before pinning carry ``workspace=None`` and are
-        accepted unchanged.
+        accepted unchanged. Task 42.4d adds correlation validation: if loaded
+        state has origin_turn_id, require coordinator/store, validate origin
+        COMPLETED, heal if run_id None, else conflict, verify reciprocal, only
+        then adopt.
         """
         loaded = self.state_store.load(run_id)
         pinned = getattr(loaded, "workspace", None)
@@ -1008,9 +1183,55 @@ class Agent:
                 "run belongs to a different workspace; refusing to resume",
                 run_id=run_id, run_workspace=pinned,
                 current_workspace=self.workspace.identity)
+
+        # Task 42.4d: correlation validation before adopting
+        origin = loaded.origin_turn_id
+        if origin is not None:
+            # Require coordinator/store
+            try:
+                store = self._require_turn_store()
+            except Exception as exc:
+                # Fail closed, current state unchanged
+                raise exc
+
+            # Validate origin_turn_id format
+            try:
+                require_turn_id(origin)
+            except Exception as exc:
+                raise exc
+
+            # Load originating turn
+            try:
+                record = store.load(origin)
+            except Exception as exc:
+                raise exc
+
+            if record.phase is not TurnPhase.COMPLETED:
+                raise TurnCorrelationError(
+                    "origin turn is not COMPLETED",
+                    turn_id=origin, phase=record.phase.value)
+
+            # Heal crash window: state has origin X, turn X has run_id None -> bind
+            if record.run_id is None:
+                try:
+                    controller = TurnController(store, origin)
+                    controller.bind_run(loaded.run_id)
+                except Exception as exc:
+                    raise TurnCorrelationError("failed to heal correlation during resume", turn_id=origin) from exc
+                # Reload after heal
+                record = store.load(origin)
+
+            if record.run_id != loaded.run_id:
+                raise TurnCorrelationConflictError(
+                    "origin turn bound to different run during resume",
+                    turn_id=origin, existing_run_id=record.run_id, new_run_id=loaded.run_id)
+
+            # Verify reciprocal exact match
+            if loaded.origin_turn_id != origin or record.run_id != loaded.run_id:
+                raise TurnCorrelationError("reciprocal mismatch during resume", turn_id=origin)
+
         self.state = loaded
         if self.state.workspace is None:
-            # Adopt the current workspace so the next checkpoint is pinned.
             self.state.workspace = self.workspace.identity
         self.log.info(Events.STATE_RESUMED, **self.state.summary())
         return self.state
@@ -1043,8 +1264,7 @@ class Agent:
             pass
         if self._turns is not None:
             self._turns.shutdown()
-        # Atomic idle checkpoint: hold lock across check and save so new run
-        # cannot set _active_run=True until idle checkpoint completes.
+        # Atomic idle checkpoint: hold lock across check and save
         with self._autonomy_lock:
             if not self._active_run:
                 self.checkpoint()

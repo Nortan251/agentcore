@@ -227,6 +227,9 @@ class AgentState:
     #: workspace pinning; such legacy state still loads, and resume treats it
     #: as a match rather than refusing to continue old work.
     workspace: str | None = None
+    #: Optional originating turn id for runs that originated from a conversation (Task 42.4d).
+    #: Opaque, trusted, never model authority. None for legacy uncorrelated runs.
+    origin_turn_id: str | None = None
     phase: AgentPhase = AgentPhase.IDLE
     current_task: Task | None = None
     active_subtask_id: str | None = None
@@ -409,6 +412,7 @@ class AgentState:
         task = self.current_task
         return {
             "run_id": self.run_id,
+            "origin_turn_id": self.origin_turn_id,
             "phase": self.phase.value,
             "version": self.version,
             "task_id": task.id if task else None,
@@ -430,6 +434,7 @@ class AgentState:
         return {
             "run_id": self.run_id,
             "workspace": self.workspace,
+            "origin_turn_id": self.origin_turn_id,
             "phase": self.phase.value,
             "current_task": self.current_task.to_dict() if self.current_task else None,
             "active_subtask_id": self.active_subtask_id,
@@ -451,6 +456,7 @@ class AgentState:
             run_id=data.get("run_id") or new_id("run"),
             # Absent in legacy state: stays None, never invented.
             workspace=data.get("workspace"),
+            origin_turn_id=data.get("origin_turn_id"),
             phase=AgentPhase(data.get("phase", "idle")),
             current_task=Task.from_dict(data["current_task"])
             if data.get("current_task") else None,
