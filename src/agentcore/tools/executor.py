@@ -6,13 +6,15 @@ Pipeline per invocation:
 
 Centralising this means permission gating cannot be bypassed by a new tool, and
 every invocation produces the same structured log events.
+
+Task 42.4c adds optional trusted checkpoint callback around permission waits.
 """
 
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from agentcore.errors import (
     AgentError,
@@ -23,6 +25,7 @@ from agentcore.fs.sensitive import DEFAULT_SENSITIVE_POLICY
 from agentcore.observability.events import Events
 from agentcore.observability.logging import StructuredLogger, get_logger
 from agentcore.permissions.policy import Decision, PermissionPolicy
+from agentcore.realtime.errors import CancellationRequested
 from agentcore.tools.base import ToolContext, ToolResult
 from agentcore.tools.registry import ToolRegistry
 
@@ -93,9 +96,6 @@ class ToolExecutor:
     ) -> None:
         self.registry = registry
         self.policy = policy
-        # A guard, when supplied, is authoritative for the workspace root: it
-        # has already canonicalised it. This keeps one definition of "the
-        # workspace" rather than letting the executor hold a second opinion.
         self.workspace = workspace
         self.workspace_dir = (str(workspace.root) if workspace is not None
                               else workspace_dir)
@@ -111,17 +111,26 @@ class ToolExecutor:
         )
 
     def invoke(self, tool_name: str, args: Mapping[str, Any] | None = None,
+               *, checkpoint: Callable[[], None] | None = None,
                **context_meta: Any) -> ToolInvocation:
         """Run a tool and always return a record — never raises for tool failure.
 
-        Raises only :class:`ToolNotFoundError` (programmer error) so that a
-        mistyped tool name is loud, while runtime failures stay data.
+        Raises only :class:`ToolNotFoundError` (programmer error) and
+        :class:`CancellationRequested` (trusted control) so that a
+        mistyped tool name is loud and cancellation propagates.
+
+        ``checkpoint`` is an optional trusted cooperative cancellation callback
+        (Task 42.4c). It is a named keyword-only parameter and is NOT swallowed
+        into ``context_meta`` or logs. Called:
+        1. after argument validation, immediately before PermissionPolicy.check
+        2. if permission ALLOWED, immediately after permission and before Tool.run,
+           OUTSIDE the try/except that catches AgentError, so CancellationRequested
+           propagates and Tool.run does not start after already-requested cancellation.
         """
         args = dict(args or {})
+        # checkpoint is NOT part of context_meta logging
         log = self._log.bind(tool=tool_name, **context_meta)
-        tool = self.registry.get(tool_name)  # raises ToolNotFoundError
-        # Raw args are logged, but a sensitive filesystem path supplied as an
-        # argument (e.g. ``{"path": ".env"}``) must not reach the log.
+        tool = self.registry.get(tool_name)
         log.info(Events.TOOL_INVOKED, args=_safe_args_for_log(args))
         started = time.perf_counter()
 
@@ -140,6 +149,10 @@ class ToolExecutor:
                                                      **exc.details),
                                   elapsed())
 
+        # Checkpoint 1: after validation, before permission
+        if checkpoint is not None:
+            checkpoint()
+
         # 2. permission gate
         decision = self.policy.check(tool.capabilities,
                                      description=tool.spec.description)
@@ -156,17 +169,24 @@ class ToolExecutor:
                                                      **denial.details),
                                   elapsed(), decision)
 
+        # Checkpoint 2: after permission ALLOWED, before Tool.run, OUTSIDE try/except
+        if checkpoint is not None:
+            checkpoint()
+
         # 3. execution
         try:
             result = tool.run(cleaned, self._context(tool_name))
             if not isinstance(result, ToolResult):
                 result = ToolResult.success(result)
+        except CancellationRequested:
+            # Must propagate, not converted into tool failure
+            raise
         except AgentError as exc:
             log.warning(Events.TOOL_FAILED, reason="agent_error",
                         error=exc.message, details=exc.details)
             result = ToolResult.failure(exc.message, kind=type(exc).__name__,
                                         retryable=exc.retryable, **exc.details)
-        except Exception as exc:  # noqa: BLE001 - a tool must not kill the agent
+        except Exception as exc:  # noqa: BLE001
             log.exception(Events.TOOL_FAILED, reason="unhandled_exception",
                           error=str(exc))
             result = ToolResult.failure(f"{type(exc).__name__}: {exc}",
@@ -176,10 +196,6 @@ class ToolExecutor:
         if result.ok:
             log.info(Events.TOOL_SUCCEEDED, duration_ms=round(duration, 3))
         else:
-            # A sensitive rejection's error message names the protected file;
-            # log only the categorical reason so the filename never reaches
-            # the structured log (Task 39 F-03). Everything else keeps the
-            # full message for debugging.
             reason = result.metadata.get("reason") if result.metadata else None
             if reason in _SENSITIVE_FAILURE_REASONS:
                 log.warning(Events.TOOL_FAILED, reason=reason,
