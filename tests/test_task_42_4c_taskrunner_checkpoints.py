@@ -1,7 +1,7 @@
 """Task 42.4c — autonomous cooperative cancellation + deadline checkpoints.
 
 Deterministic tests using Events, Conditions, FixedClock, injected sleep,
-gated fakes. No time.sleep() race proofs.
+gated fakes. No sleep-based race proofs.
 """
 
 from __future__ import annotations
