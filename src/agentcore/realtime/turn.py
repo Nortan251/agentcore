@@ -772,6 +772,23 @@ class TurnController:
             return latest.snapshot_after(replay)
         return accepted.snapshot()
 
+    def bind_run(self, run_id: str) -> TurnSnapshot:
+        """Atomically bind a COMPLETED turn to a run_id (Task 42.4d).
+
+        Delegates to the store's narrow ``bind_run`` operation.
+        - same run -> idempotent, no lifecycle change
+        - different run -> TurnCorrelationConflictError
+        - only COMPLETED unbound turn can gain first run_id
+        - lifecycle phase/version/transitions unchanged
+        """
+        run_id = _require_run_id(run_id)
+        # Store is expected to expose bind_run; if not, raise validation
+        bind = getattr(self._store, "bind_run", None)
+        if not callable(bind):
+            raise TurnValidationError("turn store does not support bind_run")
+        record = bind(self._turn_id, run_id)
+        return record.snapshot()
+
     def accepts(self, context: OperationContext, *,
                 expected_phase: TurnPhase) -> bool:
         """Truthfully fence stale, cancelled, or expired logical callbacks."""
@@ -858,6 +875,16 @@ def new_operation_id(*,
 def require_session_id(value: Any) -> str:
     """Validate one conversation-session correlation identifier."""
     return _require_link_id(value, "session_id")
+
+
+def require_turn_id(value: Any) -> str:
+    """Public validator for turn ids (Task 42.4d)."""
+    return _require_turn_id(value)
+
+
+def require_run_id(value: Any) -> str:
+    """Public validator for run ids (Task 42.4d)."""
+    return _require_run_id(value)
 
 
 def derive_session_key(raw_session_id: str) -> str:
