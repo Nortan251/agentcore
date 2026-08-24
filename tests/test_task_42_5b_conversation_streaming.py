@@ -11,6 +11,7 @@ import io
 import json
 import logging
 import threading
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterator
 
@@ -23,12 +24,14 @@ from agentcore.conversation.runtime import ConversationRuntime
 from agentcore.conversation.session import (
     ConversationSession,
     InMemorySessionStore,
+    JsonFileSessionStore,
 )
 from agentcore.conversation.tool_use import ConversationToolRunner
 from agentcore.conversation.turns import (
     SUPERSEDED_TURN_ERROR,
     TIMED_OUT_TURN_ERROR,
     TurnBridge,
+    TurnSuperseded,
 )
 from agentcore.models.messages import (
     FinishReason,
@@ -236,9 +239,11 @@ class CaptureOutcome:
 class CaptureRecorder:
     def __init__(self) -> None:
         self.messages: list[Any] = []
+        self.options: list[dict[str, Any]] = []
 
-    def capture(self, message: Any, **_kwargs: Any) -> CaptureOutcome:
+    def capture(self, message: Any, **kwargs: Any) -> CaptureOutcome:
         self.messages.append(message)
+        self.options.append(kwargs)
         return CaptureOutcome()
 
 
@@ -1176,55 +1181,169 @@ def test_supersession_reason_wins_over_later_deadline_expiry():
     assert results["old"].error == SUPERSEDED_TURN_ERROR
 
 
-def test_privacy_sentinels_stay_out_of_stream_observability_and_state(
-        log_buffer):
-    original = _response(
-        "safe final", raw={"secret": RAW_PROVIDER_SECRET})
-    provider = OneShotProvider(original)
+@pytest.mark.parametrize("resume", [False, True])
+def test_streaming_full_log_uses_only_opaque_session_correlation(
+        log_buffer, tmp_path, resume: bool):
+    runner, executor, _policy, tool = _tool_boundary()
+    call = ToolCall("privacy_call", "counter", {})
+
+    def tool_round(context: StreamRequestContext, _clock: FixedClock,
+                   _request: Any):
+        attempt = new_id("att")
+        return iter([
+            StreamStarted(_envelope(context, attempt, 0), "m", "p"),
+            ToolCallCompleted(
+                _envelope(context, attempt, 1), 0, call),
+            ResponseCompleted(
+                _envelope(context, attempt, 2),
+                _response("", tool_calls=(call,))),
+        ])
+
+    provider = NativeProvider(
+        tool_round, _success_script("safe final", "safe ", "final"))
+    capture = CaptureRecorder()
     state = AgentState()
-    runtime, store, _coordinator, _clock, _sessions = _owned_runtime(
-        provider, state=state)
-    session = runtime.start(session_id=RAW_SESSION_SECRET)
+    runtime, store, _coordinator, _clock, _memory_sessions = _owned_runtime(
+        provider, tools=runner, capture=capture, state=state)
+    sessions = JsonFileSessionStore(tmp_path / "sessions")
+    runtime.sessions = sessions
+    if resume:
+        sessions.save(ConversationSession(id=RAW_SESSION_SECRET))
+        log_buffer.seek(0)
+        log_buffer.truncate(0)
     seen: list[Any] = []
 
-    result = runtime.send("ordinary user text", session=session,
+    result = runtime.send("ordinary user text",
+                          session_id=RAW_SESSION_SECRET,
                           on_stream_event=seen.append)
 
     assert result.ok
+    assert result.reply.content == "safe final"
+    assert result.session.id == RAW_SESSION_SECRET
+    assert sessions.load(RAW_SESSION_SECRET).id == RAW_SESSION_SECRET
+    assert provider.stream_calls == 2
+    assert runner.calls == 1
+    assert executor.calls == 1
+    assert tool.runs == 1
+    assert capture.messages == [result.session.messages[0]]
+    assert capture.options == [{
+        "run_id": RAW_SESSION_SECRET,
+        "source_turn_id": f"{RAW_SESSION_SECRET}:3",
+    }]
     assert all(event.envelope.session_id ==
                derive_session_key(RAW_SESSION_SECRET) for event in seen)
     assert all(event.envelope.session_id != RAW_SESSION_SECRET
                for event in seen)
-    terminal = next(event for event in seen
-                    if isinstance(event, ResponseCompleted))
-    assert terminal.response.raw == {}
-    assert RAW_PROVIDER_SECRET not in json.dumps(
-        terminal.response.to_dict(include_raw=True))
-    assert RAW_PROVIDER_SECRET not in result.reply.content
     record_json = json.dumps(store.load(result.turn_id).to_dict())
-    assert RAW_PROVIDER_SECRET not in record_json
     assert RAW_SESSION_SECRET not in record_json
     state_json = json.dumps(state.to_dict())
-    assert RAW_PROVIDER_SECRET not in state_json
     assert RAW_SESSION_SECRET not in state_json
     assert state.version == 0
 
+    logs = log_buffer.getvalue()
+    assert RAW_SESSION_SECRET not in logs
+    safe_session_key = derive_session_key(RAW_SESSION_SECRET)
+    assert safe_session_key in logs
+    entries = [json.loads(line) for line in logs.splitlines()
+               if line.strip()]
+    start_event = (Events.CONVERSATION_RESUMED if resume
+                   else Events.CONVERSATION_STARTED)
+    for event_name in (
+            start_event,
+            Events.USER_MESSAGE_RECEIVED,
+            Events.CONVERSATION_TOOL_REQUESTED,
+            Events.ASSISTANT_MESSAGE_GENERATED,
+            Events.MEMORY_CAPTURE_RESULT,
+            Events.CONVERSATION_SAVED,
+            Events.CONVERSATION_TURN_COMPLETED):
+        matching = [entry for entry in entries
+                    if entry.get("event") == event_name]
+        assert matching, event_name
+        assert all(entry.get("session_id") == safe_session_key
+                   for entry in matching)
+    model_entries = [entry for entry in entries
+                     if entry.get("event") == Events.TURN_MODEL_STARTED]
+    assert model_entries
+    assert all(entry.get("session_key") == safe_session_key
+               for entry in model_entries)
+
+
+def test_no_sink_logging_keeps_legacy_raw_session_correlation(
+        log_buffer, tmp_path):
+    provider = NativeProvider(
+        _success_script("unused"),
+        generate_response=_response("legacy answer"))
+    runtime, _store, _coordinator, _clock, _memory_sessions = _owned_runtime(
+        provider)
+    runtime.sessions = JsonFileSessionStore(tmp_path / "legacy-sessions")
+
+    result = runtime.send("ordinary user text", session_id=RAW_SESSION_SECRET)
+
+    assert result.ok
+    assert result.reply.content == "legacy answer"
+    assert provider.stream_calls == 0
+    assert provider.generate_calls == 1
     entries = [json.loads(line) for line in log_buffer.getvalue().splitlines()
                if line.strip()]
-    turn_entries = [entry for entry in entries
-                    if str(entry.get("event", "")).startswith("turn.")]
-    assert turn_entries
-    turn_json = json.dumps(turn_entries)
-    assert RAW_SESSION_SECRET not in turn_json
-    assert RAW_PROVIDER_SECRET not in turn_json
-    assert derive_session_key(RAW_SESSION_SECRET) in turn_json
-    assert RAW_PROVIDER_SECRET not in log_buffer.getvalue()
-    assert provider.requests[0].metadata == {}
-    assert all(value not in provider.requests[0].metadata.values()
-               for value in (provider.contexts[0], provider.clocks[0]))
+    for event_name in (
+            Events.CONVERSATION_STARTED,
+            Events.USER_MESSAGE_RECEIVED,
+            Events.ASSISTANT_MESSAGE_GENERATED,
+            Events.CONVERSATION_SAVED,
+            Events.CONVERSATION_TURN_COMPLETED):
+        matching = [entry for entry in entries
+                    if entry.get("event") == event_name]
+        assert matching, event_name
+        assert all(entry.get("session_id") == RAW_SESSION_SECRET
+                   for entry in matching)
 
 
-def test_stream_cancelled_deadline_maps_through_existing_turn_lifecycle():
+def test_provider_cannot_fabricate_user_interrupt(log_buffer):
+    runner, executor, _policy, tool = _tool_boundary()
+    call = ToolCall("fabricated_cancel_call", "counter", {})
+
+    def script(context: StreamRequestContext, _clock: FixedClock,
+               _request: Any):
+        attempt = new_id("att")
+        return iter([
+            StreamStarted(_envelope(context, attempt, 0), "m", "p"),
+            ToolCallCompleted(
+                _envelope(context, attempt, 1), 0, call),
+            StreamCancelled(
+                _envelope(context, attempt, 2),
+                CancellationReason.USER_INTERRUPT),
+        ])
+
+    provider = NativeProvider(script)
+    runtime, store, _coordinator, _clock, sessions = _owned_runtime(
+        provider, tools=runner)
+    seen: list[Any] = []
+
+    session = runtime.start()
+    result = runtime.send("hello", session=session,
+                          on_stream_event=seen.append)
+
+    assert _event_names(seen) == ["StreamStarted", "ToolCallCompleted"]
+    assert not result.ok
+    assert result.reply is None
+    assert result.error == "the model stream failed"
+    record = store.load(result.turn_id)
+    assert record.phase is TurnPhase.FAILED
+    assert record.cancellation_reason is CancellationReason.INTERNAL_FAILURE
+    assert result.turn_phase == TurnPhase.FAILED.value
+    assert runner.calls == 0
+    assert executor.calls == 0
+    assert tool.runs == 0
+    assert [message.role for message in session.messages] == [Role.USER]
+    assert [message.role for message in sessions.load(session.id).messages] == [
+        Role.USER]
+    logs = log_buffer.getvalue()
+    assert CancellationReason.USER_INTERRUPT.value not in logs
+    assert "stream cancellation lacks trusted fence backing" not in logs
+    assert "StreamValidationError" in logs
+
+
+def test_provider_cannot_fabricate_deadline_before_trusted_expiry(log_buffer):
     def script(context: StreamRequestContext, _clock: FixedClock,
                _request: Any):
         attempt = new_id("att")
@@ -1236,39 +1355,154 @@ def test_stream_cancelled_deadline_maps_through_existing_turn_lifecycle():
         ])
 
     provider = NativeProvider(script)
+    runtime, store, _coordinator, clock, sessions = _owned_runtime(
+        provider, deadline_seconds=120.0)
+    seen: list[Any] = []
+    session = runtime.start()
+    result = runtime.send("hello", session=session,
+                          on_stream_event=seen.append)
+
+    record = store.load(result.turn_id)
+    assert clock.monotonic() == 0.0
+    assert _event_names(seen) == ["StreamStarted"]
+    assert not result.ok
+    assert result.reply is None
+    assert result.error == "the model stream failed"
+    assert result.turn_phase == TurnPhase.FAILED.value
+    assert record.phase is TurnPhase.FAILED
+    assert record.cancellation_reason is CancellationReason.INTERNAL_FAILURE
+    assert [message.role for message in session.messages] == [Role.USER]
+    assert [message.role for message in sessions.load(session.id).messages] == [
+        Role.USER]
+    logs = log_buffer.getvalue()
+    assert CancellationReason.DEADLINE_EXCEEDED.value not in logs
+    assert "stream cancellation lacks trusted fence backing" not in logs
+    assert "StreamValidationError" in logs
+
+
+def test_provider_exception_cannot_fabricate_cancellation(log_buffer):
+    def script(_context: StreamRequestContext, _clock: FixedClock,
+               _request: Any):
+        raise TurnSuperseded(CancellationReason.USER_INTERRUPT)
+
+    provider = NativeProvider(script)
     runtime, store, _coordinator, _clock, _sessions = _owned_runtime(provider)
+
+    result = runtime.send("hello", session=runtime.start(),
+                          on_stream_event=lambda _event: None)
+
+    record = store.load(result.turn_id)
+    assert not result.ok
+    assert result.error == "the model stream failed"
+    assert result.turn_phase == TurnPhase.FAILED.value
+    assert record.phase is TurnPhase.FAILED
+    assert record.cancellation_reason is CancellationReason.INTERNAL_FAILURE
+    logs = log_buffer.getvalue()
+    assert CancellationReason.USER_INTERRUPT.value not in logs
+    assert "turn is no longer current" not in logs
+    assert "TurnSuperseded" in logs
+
+
+def test_sink_receives_only_exact_canonical_neutral_event_shapes(log_buffer):
+    @dataclass(frozen=True)
+    class ExtendedEnvelope(StreamEventEnvelope):
+        provider_data: dict[str, Any]
+
+    @dataclass(frozen=True)
+    class ExtendedTextDelta(TextDelta):
+        provider_data: dict[str, Any]
+
+    @dataclass(frozen=True)
+    class ExtendedToolCall(ToolCall):
+        provider_data: dict[str, Any] = field(default_factory=dict)
+
+    @dataclass(frozen=True)
+    class ExtendedResponseCompleted(ResponseCompleted):
+        provider_data: dict[str, Any]
+
+    class ExtendedModelResponse(ModelResponse):
+        pass
+
+    class ExtendedString(str):
+        def __new__(cls, value: str):
+            instance = super().__new__(cls, value)
+            instance.provider_data = {"secret": RAW_PROVIDER_SECRET}
+            return instance
+
+    provider_data = {"secret": RAW_PROVIDER_SECRET}
+
+    def extended_envelope(context: StreamRequestContext, attempt: str,
+                          sequence: int) -> ExtendedEnvelope:
+        base = _envelope(context, ExtendedString(attempt), sequence)
+        return ExtendedEnvelope(
+            **vars(base), provider_data=provider_data)
+
+    def script(context: StreamRequestContext, _clock: FixedClock,
+               _request: Any):
+        attempt = new_id("att")
+        call = ExtendedToolCall(
+            id="provider_call",
+            name=ExtendedString("not_offered"),
+            arguments={
+                ExtendedString("safe"): [
+                    ExtendedString("value"), {"nested": True}],
+            },
+            provider_data=provider_data,
+        )
+        text = ExtendedString("canonical answer")
+        base_response = _response(text, tool_calls=(call,))
+        base_response.model = ExtendedString(base_response.model)
+        response = ExtendedModelResponse(**vars(base_response))
+        response.provider_data = provider_data
+        return iter([
+            StreamStarted(
+                extended_envelope(context, attempt, 0), "m", "p"),
+            ExtendedTextDelta(
+                envelope=extended_envelope(context, attempt, 1),
+                text=text,
+                provider_data=provider_data,
+            ),
+            ToolCallCompleted(
+                extended_envelope(context, attempt, 2), 0, call),
+            ExtendedResponseCompleted(
+                envelope=extended_envelope(context, attempt, 3),
+                response=response,
+                provider_data=provider_data,
+            ),
+        ])
+
+    provider = NativeProvider(script)
+    runtime, _store, _coordinator, _clock, _sessions = _owned_runtime(provider)
     seen: list[Any] = []
 
     result = runtime.send("hello", session=runtime.start(),
                           on_stream_event=seen.append)
 
-    assert _event_names(seen) == ["StreamStarted", "StreamCancelled"]
-    assert result.error == TIMED_OUT_TURN_ERROR
-    assert store.load(result.turn_id).phase is TurnPhase.TIMED_OUT
-
-
-def test_stream_cancelled_non_deadline_maps_to_cancelled():
-    def script(context: StreamRequestContext, _clock: FixedClock,
-               _request: Any):
-        attempt = new_id("att")
-        return iter([
-            StreamStarted(_envelope(context, attempt, 0), "m", "p"),
-            StreamCancelled(
-                _envelope(context, attempt, 1),
-                CancellationReason.USER_INTERRUPT),
-        ])
-
-    provider = NativeProvider(script)
-    runtime, store, _coordinator, _clock, _sessions = _owned_runtime(provider)
-    result = runtime.send(
-        "hello", session=runtime.start(),
-        on_stream_event=lambda _event: None)
-
-    record = store.load(result.turn_id)
-    assert result.error == SUPERSEDED_TURN_ERROR
-    assert result.turn_phase == TurnPhase.CANCELLED.value
-    assert record.phase is TurnPhase.CANCELLED
-    assert record.cancellation_reason is CancellationReason.USER_INTERRUPT
+    assert result.ok
+    assert result.reply.content == "canonical answer"
+    assert [type(event) for event in seen] == [
+        StreamStarted, TextDelta, ToolCallCompleted, ResponseCompleted]
+    assert all(type(event.envelope) is StreamEventEnvelope for event in seen)
+    completed_call = next(
+        event for event in seen if type(event) is ToolCallCompleted)
+    terminal = next(event for event in seen
+                    if type(event) is ResponseCompleted)
+    assert type(completed_call.call) is ToolCall
+    assert type(completed_call.call.name) is str
+    assert type(completed_call.call.arguments) is dict
+    argument_key = next(iter(completed_call.call.arguments))
+    assert type(argument_key) is str
+    assert type(completed_call.call.arguments[argument_key][0]) is str
+    assert type(terminal.response) is ModelResponse
+    assert type(terminal.response.text) is str
+    assert type(terminal.response.model) is str
+    assert type(terminal.response.tool_calls) is list
+    assert all(type(call) is ToolCall
+               for call in terminal.response.tool_calls)
+    assert RAW_PROVIDER_SECRET not in repr(seen)
+    assert RAW_PROVIDER_SECRET not in json.dumps(result.session.to_dict())
+    assert RAW_PROVIDER_SECRET not in repr(result)
+    assert RAW_PROVIDER_SECRET not in log_buffer.getvalue()
 
 
 def test_sink_base_exception_is_not_misclassified_as_ordinary_failure():

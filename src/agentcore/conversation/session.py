@@ -232,7 +232,8 @@ class InMemorySessionStore:
     def __init__(self) -> None:
         self._data: dict[str, dict[str, Any]] = {}
 
-    def save(self, session: ConversationSession) -> None:
+    def save(self, session: ConversationSession, *,
+             log_session_id: str | None = None) -> None:
         # A serialised copy, so later mutation cannot alter the snapshot.
         self._data[session.id] = session.to_dict()
 
@@ -276,7 +277,8 @@ class JsonFileSessionStore:
                                               session_id=raw)
         return self.directory / f"{raw}.json"
 
-    def save(self, session: ConversationSession) -> None:
+    def save(self, session: ConversationSession, *,
+             log_session_id: str | None = None) -> None:
         path = self._path(session.id)
         payload = json.dumps(session.to_dict(), indent=2, default=str)
         fd, tmp = tempfile.mkstemp(dir=self.directory, suffix=".tmp")
@@ -287,7 +289,10 @@ class JsonFileSessionStore:
         except BaseException:
             Path(tmp).unlink(missing_ok=True)
             raise
-        self._log.debug(Events.CONVERSATION_SAVED, **session.describe())
+        fields = session.describe()
+        if log_session_id is not None:
+            fields["session_id"] = log_session_id
+        self._log.debug(Events.CONVERSATION_SAVED, **fields)
 
     def load(self, session_id: str) -> ConversationSession:
         path = self._path(session_id)

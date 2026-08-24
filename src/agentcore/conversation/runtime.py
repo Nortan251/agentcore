@@ -205,10 +205,11 @@ class TurnResult:
         """True only when something durable was actually written."""
         return bool(self.memories_created or self.memories_updated)
 
-    def describe(self) -> dict[str, Any]:
+    def describe(self, *, session_id: str | None = None) -> dict[str, Any]:
         """Log-safe: counts and outcomes, never content."""
         payload: dict[str, Any] = {
-            "session_id": self.session.id,
+            "session_id": (self.session.id
+                           if session_id is None else session_id),
             "ok": self.ok,
             "reply_chars": len(self.reply.content) if self.reply else 0,
             "memories_used": self.memories_used,
@@ -273,12 +274,24 @@ class ConversationRuntime:
     def start(self, *, session_id: str | None = None,
               scope_key: str | None = None) -> ConversationSession:
         """Begin a conversation, resuming a persisted one when it exists."""
+        return self._start(
+            session_id=session_id,
+            scope_key=scope_key,
+            safe_log_session=False,
+        )
+
+    def _start(self, *, session_id: str | None,
+               scope_key: str | None,
+               safe_log_session: bool) -> ConversationSession:
+        """Start internally with optional opaque streaming log correlation."""
         if session_id and self.sessions is not None:
             try:
                 if self.sessions.exists(session_id):
                     session = self.sessions.load(session_id)
                     self._log.info(Events.CONVERSATION_RESUMED,
-                                   **session.describe())
+                                   **self._session_log_fields(
+                                       session,
+                                       safe_log_session=safe_log_session))
                     return session
             except Exception as exc:  # noqa: BLE001 - a bad file starts fresh
                 self._log.warning(Events.CONVERSATION_FAILED,
@@ -286,15 +299,38 @@ class ConversationRuntime:
         session = ConversationSession(scope_key=scope_key)
         if session_id:
             session.id = session_id
-        self._log.info(Events.CONVERSATION_STARTED, **session.describe())
+        self._log.info(
+            Events.CONVERSATION_STARTED,
+            **self._session_log_fields(
+                session, safe_log_session=safe_log_session),
+        )
         return session
 
-    def save(self, session: ConversationSession) -> bool:
+    @staticmethod
+    def _session_log_fields(session: ConversationSession, *,
+                            safe_log_session: bool) -> dict[str, Any]:
+        payload = session.describe()
+        if safe_log_session:
+            # Lazy import preserves the exact no-sink import graph.  Deriving
+            # before admission is safe: this is log correlation only and does
+            # not fabricate turn/generation/operation ownership.
+            from agentcore.realtime.turn import derive_session_key
+
+            payload["session_id"] = derive_session_key(session.id)
+        return payload
+
+    def save(self, session: ConversationSession, *,
+             log_session_id: str | None = None) -> bool:
         """Persist a session. Never raises: storage is not the conversation."""
         if self.sessions is None:
             return False
         try:
-            self.sessions.save(session)
+            save = self.sessions.save
+            if log_session_id is not None and _accepts_kwarg(
+                    save, "log_session_id"):
+                save(session, log_session_id=log_session_id)
+            else:
+                save(session)
             return True
         except Exception as exc:  # noqa: BLE001
             self._log.warning(Events.CONVERSATION_FAILED, stage="save",
@@ -345,7 +381,11 @@ class ConversationRuntime:
         # a brand-new empty session is falsy and `session or ...` would
         # silently discard it and start a different conversation every turn.
         if session is None:
-            session = self.start(session_id=session_id)
+            session = self._start(
+                session_id=session_id,
+                scope_key=None,
+                safe_log_session=on_stream_event is not None,
+            )
         message = text if isinstance(text, Message) else Message.user(str(text))
         if self.turns is None:
             return self._run_turn(session, message)
@@ -376,12 +416,17 @@ class ConversationRuntime:
         result = TurnResult(session=session)
 
         stream_state = None
+        log_session_id: str | None = None
         if on_stream_event is not None:
             # Lazy import preserves the legacy no-realtime import graph.
             from agentcore.conversation.streaming import TurnStreamState
 
             stream_state = TurnStreamState.for_owned_turn(
                 on_stream_event, fence=fence, logger=self._log)
+            log_session_id = stream_state.session_key
+
+        session_log_id = (session.id if log_session_id is None
+                          else log_session_id)
 
         try:
             with fence.session_lock():
@@ -395,7 +440,8 @@ class ConversationRuntime:
                               error=type(exc).__name__)
             return result
 
-        self._log.info(Events.USER_MESSAGE_RECEIVED, session_id=session.id,
+        self._log.info(Events.USER_MESSAGE_RECEIVED,
+                       session_id=session_log_id,
                        role=message.role.value,
                        chars=len(message.content))
 
@@ -411,7 +457,8 @@ class ConversationRuntime:
         try:
             reply = self._generate(session, message, memory_context,
                                    result, fence=fence,
-                                   stream_state=stream_state)
+                                   stream_state=stream_state,
+                                   log_session_id=log_session_id)
         except ResponseGenerationError as exc:
             # If the fence now reports this turn is no longer current
             # (deadline, supersession, shutdown), truthfully surface that
@@ -431,10 +478,10 @@ class ConversationRuntime:
             # turn whose outcome is unknown.
             result.error = exc.message
             self._log.warning(Events.CONVERSATION_FAILED, stage="generate",
-                              session_id=session.id,
+                              session_id=session_log_id,
                               error=exc.details.get("error_type", "unknown"))
             with fence.session_lock():
-                self.save(session)
+                self.save(session, log_session_id=log_session_id)
             return result
 
         # Fix this turn's terminal outcome before any generated transcript is
@@ -449,17 +496,25 @@ class ConversationRuntime:
             session.append(reply, max_messages=self.config.max_session_messages)
         result.reply = reply
         self._log.info(Events.ASSISTANT_MESSAGE_GENERATED,
-                       session_id=session.id, chars=len(reply.content))
+                       session_id=session_log_id, chars=len(reply.content))
 
         # Capture runs on the *user* turn only. The assistant's own words are
         # never mined: the agent must not remember what it said as if the user
         # had said it.
         if correction is None:
-            self._capture(message, session, result)
+            self._capture(
+                message,
+                session,
+                result,
+                log_session_id=log_session_id,
+            )
 
         with fence.session_lock():
-            self.save(session)
-        self._log.info(Events.CONVERSATION_TURN_COMPLETED, **result.describe())
+            self.save(session, log_session_id=log_session_id)
+        self._log.info(
+            Events.CONVERSATION_TURN_COMPLETED,
+            **result.describe(session_id=log_session_id),
+        )
         return result
 
     # -- stages ------------------------------------------------------------
@@ -620,7 +675,8 @@ class ConversationRuntime:
                   memory_context: dict[str, Any] | None,
                   result: TurnResult | None = None,
                   *, fence: Any = None,
-                  stream_state: Any = None) -> Message:
+                  stream_state: Any = None,
+                  log_session_id: str | None = None) -> Message:
         """Produce the assistant reply, running tools when the model asks.
 
         The loop is ``model -> tool calls? -> execute -> model``, bounded by
@@ -636,6 +692,8 @@ class ConversationRuntime:
         turn owns this call; on the legacy path every hook is a no-op.
         """
         fence = fence if fence is not None else _NO_FENCE
+        session_log_id = (session.id if log_session_id is None
+                          else log_session_id)
         if self.model is None:
             raise ResponseGenerationError(
                 "no model provider is configured for this conversation",
@@ -687,14 +745,14 @@ class ConversationRuntime:
             if not offer_tools:
                 # Budget spent but the model still wants tools: stop asking.
                 self._log.warning(Events.CONVERSATION_TOOL_ROUNDS_EXHAUSTED,
-                                  session_id=session.id, rounds=rounds)
+                                  session_id=session_log_id, rounds=rounds)
                 break
 
             # A superseded turn stops here, before any tool is asked to run,
             # so supersession can never cause a duplicate tool execution.
             fence.enter_tool_round()
             round_result = self.tools.run_calls(tool_calls,
-                                                session_id=session.id)
+                                                session_id=session_log_id)
             # A result that arrives after supersession stays truthful
             # invocation evidence, but it may not re-enter the conversation.
             fence.leave_tool_round()
@@ -751,7 +809,8 @@ class ConversationRuntime:
                               error=type(exc).__name__)
 
     def _capture(self, message: Message, session: ConversationSession,
-                 result: TurnResult) -> None:
+                 result: TurnResult, *,
+                 log_session_id: str | None = None) -> None:
         """Consider the user turn for durable memory, and apply decisions.
 
         The capture engine already decides *what* is durable and already
@@ -763,14 +822,23 @@ class ConversationRuntime:
             return
         from agentcore.memory.capture import CaptureAction
 
+        session_log_id = (session.id if log_session_id is None
+                          else log_session_id)
+
         try:
             outcome = self.capture.capture(
                 message, run_id=session.id,
                 source_turn_id=f"{session.id}:{len(session.messages)}")
         except Exception as exc:  # noqa: BLE001 - memory must not break chat
             result.memory_error = f"memory capture failed: {type(exc).__name__}"
-            self._log.warning(Events.MEMORY_CAPTURE_FAILED, stage="runtime",
-                              error=type(exc).__name__)
+            fields = ({"session_id": session_log_id}
+                      if log_session_id is not None else {})
+            self._log.warning(
+                Events.MEMORY_CAPTURE_FAILED,
+                stage="runtime",
+                error=type(exc).__name__,
+                **fields,
+            )
             return
 
         result.memories_created.extend(outcome.stored)
@@ -790,7 +858,8 @@ class ConversationRuntime:
 
         if outcome.conflicts_recorded:
             self._log.info(Events.MEMORY_CONFLICT_DETECTED,
-                           session_id=session.id,
+                           session_id=session_log_id,
                            conflicts=len(outcome.conflicts_recorded))
-        self._log.info(Events.MEMORY_CAPTURE_RESULT, session_id=session.id,
+        self._log.info(Events.MEMORY_CAPTURE_RESULT,
+                       session_id=session_log_id,
                        **outcome.describe())

@@ -17,7 +17,6 @@ from __future__ import annotations
 import inspect
 import math
 import re
-from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -25,7 +24,6 @@ from agentcore.conversation.errors import (
     ConversationValidationError,
     ResponseGenerationError,
 )
-from agentcore.conversation.turns import TurnSuperseded
 from agentcore.models.base import _accepts_kwarg
 from agentcore.models.messages import ModelRequest, ModelResponse
 from agentcore.models.stream_context import StreamRequestContext
@@ -60,6 +58,14 @@ def _type_kind(value: Any) -> str:
     return kind if _SAFE_CATEGORY.fullmatch(kind) else "StreamError"
 
 
+def _stream_failure(exc: BaseException) -> ResponseGenerationError:
+    """Normalize an untrusted stream exception without retaining its text."""
+    return ResponseGenerationError(
+        "the model stream failed",
+        error_type=_exception_kind(exc),
+    )
+
+
 def _trusted_native_stream(provider: Any) -> Callable[..., Any] | None:
     """Return a native stream only when both trusted keywords are explicit.
 
@@ -89,6 +95,7 @@ class TurnStreamState:
     sink: StreamEventSink
     logger: StructuredLogger
     started_at: float
+    session_key: str
     enabled: bool = True
     first_token_emitted: bool = False
     sink_calls: int = 0
@@ -116,7 +123,12 @@ class TurnStreamState:
         if not math.isfinite(started_at):
             raise ConversationValidationError(
                 "streaming requires a valid monotonic clock")
-        return cls(sink=sink, logger=logger, started_at=started_at)
+        return cls(
+            sink=sink,
+            logger=logger,
+            started_at=started_at,
+            session_key=context.session_id,
+        )
 
     def present(self, event: ModelStreamEvent, *, clock: Clock) -> None:
         """Observe first-token shape, then synchronously call the sink.
@@ -215,31 +227,53 @@ def consume_stream_response(
                 request_id=request_id,
                 attempt_id=attempt_id,
             )
+        iterator = iter(events)
+    except Exception as exc:
+        # A provider cannot gain turn-cancellation authority by raising the
+        # conversation layer's internal TurnSuperseded signal itself.
+        raise _stream_failure(exc) from None
 
-        # Do not prefetch or pull event N+1 until validation, currentness and
-        # synchronous presentation of event N have all completed.
-        for event in events:
-            accumulator.accept(event)
-            fence.check()
-            # The accumulator already detached its canonical state.  Give the
-            # zero-authority sink its own detached event as well, so mutation
-            # cannot reach accumulator state or provider-owned objects reused
-            # by a later event in the same iterator.
-            state.present(deepcopy(event), clock=clock)
+    # Do not prefetch or pull event N+1 until validation, currentness and
+    # synchronous presentation of event N have all completed.
+    while True:
+        try:
+            event = next(iterator)
+        except StopIteration:
+            break
+        except Exception as exc:
+            raise _stream_failure(exc) from None
 
-        accumulator.finish()
-        # The iterator may have exhausted after a terminal while a successor
-        # was admitted.  Revalidate before interpreting terminal authority.
+        try:
+            canonical_event = accumulator.accept(event)
+        except Exception as exc:
+            raise _stream_failure(exc) from None
+
+        # This call is deliberately outside every untrusted/provider exception
+        # normalization scope.  Only this trusted fence may surface
+        # TurnSuperseded as durable cancellation/deadline truth.
         fence.check()
-    except TurnSuperseded:
-        raise
-    except ResponseGenerationError:
-        raise
-    except Exception as exc:  # fail closed without retaining provider text
-        raise ResponseGenerationError(
-            "the model stream failed",
-            error_type=_exception_kind(exc),
-        ) from None
+        if isinstance(canonical_event, StreamCancelled):
+            # The fence just proved that trusted turn state established no
+            # cancellation at this boundary.  Provider output cannot
+            # manufacture cancellation truth or reach presentation.
+            raise ResponseGenerationError(
+                "the model stream failed",
+                error_type="StreamValidationError",
+            )
+        # ``accept`` returns an exact base neutral event detached from both the
+        # provider and accumulator-owned state.
+        try:
+            state.present(canonical_event, clock=clock)
+        except Exception as exc:
+            raise _stream_failure(exc) from None
+
+    try:
+        accumulator.finish()
+    except Exception as exc:
+        raise _stream_failure(exc) from None
+    # The iterator may have exhausted after a terminal while a successor was
+    # admitted.  Revalidate before interpreting terminal authority.
+    fence.check()
 
     terminal = accumulator.terminal_event
     if isinstance(terminal, ResponseCompleted):
@@ -250,7 +284,10 @@ def consume_stream_response(
                 error_type="MissingCanonicalResponse")
         return response
     if isinstance(terminal, StreamCancelled):
-        raise TurnSuperseded(terminal.reason)
+        raise ResponseGenerationError(
+            "the model stream failed",
+            error_type="StreamValidationError",
+        )
     if isinstance(terminal, StreamFailed):
         raise ResponseGenerationError(
             "the model stream failed",
