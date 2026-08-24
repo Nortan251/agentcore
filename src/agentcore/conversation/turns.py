@@ -314,7 +314,8 @@ class TurnBridge:
         self._root.cancel(CancellationReason.AGENT_SHUTDOWN)
 
     # -- one turn ----------------------------------------------------------
-    def run(self, runtime: Any, session: Any, message: Any) -> Any:
+    def run(self, runtime: Any, session: Any, message: Any, *,
+            on_stream_event: Any = None) -> Any:
         """Admit, own and terminalize exactly one conversational turn."""
         session_key = derive_session_key(session.id)
         # One bounded root deadline per admission, from the trusted bridge
@@ -346,14 +347,19 @@ class TurnBridge:
             # Admission is already complete and its lane released; no
             # coordinator mutex and no session lock is held while waiting here.
             with self.stage_lease:
-                return self._run_owned(runtime, session, message,
-                                       controller, fence, log)
+                if on_stream_event is None:
+                    return self._run_owned(runtime, session, message,
+                                           controller, fence, log)
+                return self._run_owned(
+                    runtime, session, message, controller, fence, log,
+                    on_stream_event=on_stream_event)
         finally:
             source.close()
 
     def _run_owned(self, runtime: Any, session: Any, message: Any,
                    controller: TurnController, fence: _TurnFence,
-                   log: StructuredLogger) -> Any:
+                   log: StructuredLogger, *,
+                   on_stream_event: Any = None) -> Any:
         try:
             # Re-check eligibility now that the lease is held: the turn may
             # have been superseded while it waited.
@@ -366,7 +372,12 @@ class TurnBridge:
             return self._superseded(runtime, session, fence, record)
 
         try:
-            result = runtime._run_turn(session, message, fence=fence)
+            if on_stream_event is None:
+                result = runtime._run_turn(session, message, fence=fence)
+            else:
+                result = runtime._run_turn(
+                    session, message, fence=fence,
+                    on_stream_event=on_stream_event)
         except TurnSuperseded as exc:
             log.info(Events.TURN_STALE_RESULT_REJECTED, stage="generate")
             record = self._terminalize(controller, fence.turn_id,

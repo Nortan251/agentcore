@@ -29,10 +29,13 @@ from __future__ import annotations
 import inspect
 from dataclasses import dataclass, field
 from contextlib import nullcontext
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from agentcore.conversation.config import ConversationConfig
-from agentcore.conversation.errors import ResponseGenerationError
+from agentcore.conversation.errors import (
+    ConversationValidationError,
+    ResponseGenerationError,
+)
 from agentcore.conversation.session import ConversationSession
 from agentcore.models.messages import Message, ModelRequest, Role
 from agentcore.observability.events import Events
@@ -301,7 +304,9 @@ class ConversationRuntime:
     # -- the turn ----------------------------------------------------------
     def send(self, text: str | Message, *,
              session: ConversationSession | None = None,
-             session_id: str | None = None) -> TurnResult:
+             session_id: str | None = None,
+             on_stream_event: Callable[[Any], None] | None = None,
+             ) -> TurnResult:
         """Process one user turn and return the assistant reply.
 
         Ordering is deliberate:
@@ -320,6 +325,22 @@ class ConversationRuntime:
         turn can neither persist a late assistant message nor report success.
         Without one, the path below is exactly the pre-Task-42.3 path.
         """
+        # Streaming is explicit and requires real turn ownership.  Check this
+        # before starting or mutating a session: no unowned call may fabricate
+        # realtime identity or appear to be fenced.
+        if on_stream_event is not None:
+            if self.turns is None:
+                raise ConversationValidationError(
+                    "streaming requires an owned realtime turn")
+            if not callable(on_stream_event):
+                raise ConversationValidationError(
+                    "on_stream_event must be callable")
+            sink_call = getattr(on_stream_event, "__call__", None)
+            if inspect.iscoroutinefunction(on_stream_event) or \
+                    inspect.iscoroutinefunction(sink_call):
+                raise ConversationValidationError(
+                    "on_stream_event must be synchronous")
+
         # `is None`, never truthiness: ConversationSession defines __len__, so
         # a brand-new empty session is falsy and `session or ...` would
         # silently discard it and start a different conversation every turn.
@@ -328,7 +349,10 @@ class ConversationRuntime:
         message = text if isinstance(text, Message) else Message.user(str(text))
         if self.turns is None:
             return self._run_turn(session, message)
-        return self.turns.run(self, session, message)
+        if on_stream_event is None:
+            return self.turns.run(self, session, message)
+        return self.turns.run(
+            self, session, message, on_stream_event=on_stream_event)
 
     def _superseded_result(self, session: ConversationSession,
                            reason: str) -> TurnResult:
@@ -340,7 +364,9 @@ class ConversationRuntime:
         return TurnResult(session=session, error=reason)
 
     def _run_turn(self, session: ConversationSession, message: Message,
-                  *, fence: Any = None) -> TurnResult:
+                  *, fence: Any = None,
+                  on_stream_event: Callable[[Any], None] | None = None,
+                  ) -> TurnResult:
         """The turn itself. ``fence`` is a no-op unless a turn owns this call.
 
         Every hook below is a no-op on the legacy path, so behavior with no
@@ -348,6 +374,14 @@ class ConversationRuntime:
         """
         fence = fence if fence is not None else _NO_FENCE
         result = TurnResult(session=session)
+
+        stream_state = None
+        if on_stream_event is not None:
+            # Lazy import preserves the legacy no-realtime import graph.
+            from agentcore.conversation.streaming import TurnStreamState
+
+            stream_state = TurnStreamState.for_owned_turn(
+                on_stream_event, fence=fence, logger=self._log)
 
         try:
             with fence.session_lock():
@@ -376,7 +410,8 @@ class ConversationRuntime:
 
         try:
             reply = self._generate(session, message, memory_context,
-                                   result, fence=fence)
+                                   result, fence=fence,
+                                   stream_state=stream_state)
         except ResponseGenerationError as exc:
             # If the fence now reports this turn is no longer current
             # (deadline, supersession, shutdown), truthfully surface that
@@ -584,7 +619,8 @@ class ConversationRuntime:
     def _generate(self, session: ConversationSession, message: Message,
                   memory_context: dict[str, Any] | None,
                   result: TurnResult | None = None,
-                  *, fence: Any = None) -> Message:
+                  *, fence: Any = None,
+                  stream_state: Any = None) -> Message:
         """Produce the assistant reply, running tools when the model asks.
 
         The loop is ``model -> tool calls? -> execute -> model``, bounded by
@@ -620,7 +656,29 @@ class ConversationRuntime:
             model_context = fence.operation_context()
             model_clock = fence.clock
             fence.check()
-            text, tool_calls = self._call_model(request, context=model_context, clock=model_clock)
+            if stream_state is None:
+                text, tool_calls = self._call_model(
+                    request, context=model_context, clock=model_clock)
+            else:
+                # Imported only for explicit opt-in streaming.  The helper
+                # returns the accumulator's detached canonical response; no
+                # provisional event is ever reconstructed into conversation
+                # state or tool authority.
+                from agentcore.conversation.streaming import (
+                    consume_stream_response,
+                )
+
+                response = consume_stream_response(
+                    self.model,
+                    request,
+                    context=model_context,
+                    clock=model_clock,
+                    fence=fence,
+                    state=stream_state,
+                    max_text_chars=self.config.max_message_chars,
+                )
+                text = response.text
+                tool_calls = list(response.tool_calls)
             fence.check()
 
             if not tool_calls:
