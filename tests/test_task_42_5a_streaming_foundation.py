@@ -6,6 +6,7 @@ time.sleep(), no threads, no network, no real provider.
 
 from __future__ import annotations
 
+import math
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
 from typing import Any
@@ -1138,6 +1139,112 @@ def test_one_shot_malformed_model_response_becomes_stream_failed(
     assert terminal.will_retry is False
     assert RAW_SECRET not in repr(terminal)
     assert RUNTIME_SECRET not in repr(terminal)
+
+
+def test_one_shot_usage_secret_field_becomes_stream_failed():
+    clock = FixedClock(T0)
+    ctx, _ = make_context(clock)
+    provider = RecordingProvider(response=ModelResponse(
+        text="ok",
+        usage=Usage(
+            prompt_tokens={"secret": RAW_SECRET},
+            completion_tokens=0,
+            total_tokens=0,
+        ),
+    ))
+
+    events = list(iter_one_shot_events(
+        provider, basic_request(), context=ctx, clock=clock,
+        request_id=new_id("req"), attempt_id=new_id("att")))
+
+    assert len(provider.calls) == 1
+    assert isinstance(events[0], StreamStarted)
+    terminal = events[1]
+    assert isinstance(terminal, StreamFailed)
+    assert terminal.error_kind == "StreamValidationError"
+    assert terminal.retryable is False
+    assert terminal.will_retry is False
+    assert RAW_SECRET not in repr(events)
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        Usage(prompt_tokens=-1, completion_tokens=0, total_tokens=0),
+        Usage(prompt_tokens=True, completion_tokens=0, total_tokens=0),
+    ],
+)
+def test_one_shot_invalid_usage_fields_become_stream_failed(usage: Usage):
+    clock = FixedClock(T0)
+    ctx, _ = make_context(clock)
+    provider = RecordingProvider(response=ModelResponse(text="ok", usage=usage))
+
+    events = list(iter_one_shot_events(
+        provider, basic_request(), context=ctx, clock=clock,
+        request_id=new_id("req"), attempt_id=new_id("att")))
+
+    assert len(provider.calls) == 1
+    assert isinstance(events[0], StreamStarted)
+    terminal = events[1]
+    assert isinstance(terminal, StreamFailed)
+    assert terminal.error_kind == "StreamValidationError"
+    assert terminal.retryable is False
+    assert terminal.will_retry is False
+
+
+@pytest.mark.parametrize(
+    "latency_ms",
+    [
+        {"secret": RAW_SECRET},
+        True,
+        -1,
+        math.nan,
+        math.inf,
+    ],
+)
+def test_one_shot_invalid_latency_becomes_stream_failed(latency_ms: Any):
+    clock = FixedClock(T0)
+    ctx, _ = make_context(clock)
+    provider = RecordingProvider(response=ModelResponse(
+        text="ok",
+        latency_ms=latency_ms,
+    ))
+
+    events = list(iter_one_shot_events(
+        provider, basic_request(), context=ctx, clock=clock,
+        request_id=new_id("req"), attempt_id=new_id("att")))
+
+    assert len(provider.calls) == 1
+    assert isinstance(events[0], StreamStarted)
+    terminal = events[1]
+    assert isinstance(terminal, StreamFailed)
+    assert terminal.error_kind == "StreamValidationError"
+    assert terminal.retryable is False
+    assert terminal.will_retry is False
+    assert RAW_SECRET not in repr(events)
+
+
+def test_cyclic_tool_arguments_become_stream_failed():
+    clock = FixedClock(T0)
+    ctx, _ = make_context(clock)
+    args: list[Any] = []
+    args.append(args)
+    provider = RecordingProvider(response=ModelResponse(
+        text="ok",
+        tool_calls=[ToolCall(id="call_a", name="tool", arguments={"loop": args})],
+    ))
+
+    events = list(iter_one_shot_events(
+        provider, basic_request(), context=ctx, clock=clock,
+        request_id=new_id("req"), attempt_id=new_id("att")))
+
+    assert len(provider.calls) == 1
+    assert isinstance(events[0], StreamStarted)
+    terminal = events[1]
+    assert isinstance(terminal, StreamFailed)
+    assert terminal.error_kind == "StreamValidationError"
+    assert terminal.retryable is False
+    assert terminal.will_retry is False
 
 
 def test_keyboard_interrupt_propagates_from_one_shot_adapter():

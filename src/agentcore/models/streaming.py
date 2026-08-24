@@ -27,6 +27,7 @@ output. Provider events never establish trusted turn identity by being first.
 from __future__ import annotations
 
 import re
+import math
 from dataclasses import dataclass
 from typing import Any, Iterator
 
@@ -133,30 +134,56 @@ def _require_str(value: Any, field_name: str) -> str:
 
 
 def _detach_json_like(value: Any) -> Any:
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, list):
-        return [_detach_json_like(item) for item in value]
-    if isinstance(value, dict):
-        copied: dict[str, Any] = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise StreamValidationError(
-                    "tool call arguments must have string keys")
-            copied[key] = _detach_json_like(item)
-        return copied
-    raise StreamValidationError(
-        "tool call arguments must contain only JSON-like values")
+    try:
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        if isinstance(value, list):
+            return [_detach_json_like(item) for item in value]
+        if isinstance(value, dict):
+            copied: dict[str, Any] = {}
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise StreamValidationError(
+                        "tool call arguments must have string keys")
+                copied[key] = _detach_json_like(item)
+            return copied
+        raise StreamValidationError(
+            "tool call arguments must contain only JSON-like values")
+    except RecursionError as exc:
+        raise StreamValidationError(
+            "tool call arguments must be acyclic JSON-like values") from exc
+
+
+def _detach_usage_field(value: Any, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise StreamValidationError(
+            f"response.usage.{field_name} must be a non-negative integer")
+    return value
 
 
 def _detach_usage(usage: Any) -> Usage:
     if not isinstance(usage, Usage):
         raise StreamValidationError("response.usage must be a Usage")
+    prompt_tokens = _detach_usage_field(usage.prompt_tokens, "prompt_tokens")
+    completion_tokens = _detach_usage_field(
+        usage.completion_tokens, "completion_tokens")
+    total_tokens = _detach_usage_field(usage.total_tokens, "total_tokens")
     return Usage(
-        prompt_tokens=usage.prompt_tokens,
-        completion_tokens=usage.completion_tokens,
-        total_tokens=usage.total_tokens,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
     )
+
+
+def _detach_latency_ms(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise StreamValidationError(
+            "response.latency_ms must be a non-negative finite number")
+    numeric = float(value)
+    if not math.isfinite(numeric) or numeric < 0:
+        raise StreamValidationError(
+            "response.latency_ms must be a non-negative finite number")
+    return numeric
 
 
 def _detach_tool_call(call: Any) -> ToolCall:
@@ -210,7 +237,7 @@ def _detach_model_response(response: Any, *, max_text_chars: int | None,
         usage=_detach_usage(response.usage),
         tool_calls=[_detach_tool_call(call) for call in response.tool_calls],
         raw={},
-        latency_ms=response.latency_ms,
+        latency_ms=_detach_latency_ms(response.latency_ms),
     )
 
 
