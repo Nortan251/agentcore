@@ -933,11 +933,20 @@ class StreamEventEnvelope:
   fence for this model round.
 - `request_id` is a new opaque ID for one logical model request, meaning one
   model round in the bounded conversation loop.
-- `attempt_id` is a new opaque ID for one physical streaming attempt.
+- For native streaming, `attempt_id` is a new opaque ID for exactly one
+  observable physical streaming transport attempt. For one-shot compatibility,
+  it identifies one compatibility-adapter attempt around exactly one selected
+  legacy provider invocation.
 - `sequence` is zero-based and exactly contiguous within an attempt.
 
-A retry retains `request_id`, creates a new `attempt_id`, and resets `sequence`
-to zero. A later model/tool/model round creates a new `request_id` under the
+A native retry retains `request_id`, creates a new `attempt_id`, and resets
+`sequence` to zero. One-shot compatibility has one `request_id`, one adapter
+`attempt_id`, and one selected legacy provider invocation. Retries performed
+inside that legacy invocation are intentionally opaque: the adapter neither
+fabricates attempt IDs nor emits `StreamStarted` / `StreamFailed` events for
+internal retries it cannot observe. This is the sole compatibility exception
+to the phrase "physical attempt" and does not weaken native-stream attempt
+truth. A later model/tool/model round creates a new `request_id` under the
 then-current `GENERATING` operation. All envelope values come from trusted
 runtime identity factories and context. They are never model- or
 provider-generated. An envelope contains no raw session identifier, secret,
@@ -951,7 +960,8 @@ header, tool argument, user/model text, or other payload content.
   value, function-name fragment, and argument-string fragment;
 - `ToolCallCompleted`: a validated neutral `ToolCall`;
 - `UsageUpdated`: neutral `Usage`;
-- `ResponseCompleted`: the canonical `ModelResponse`;
+- `ResponseCompleted`: the stream-safe canonical `ModelResponse`, always with
+  `raw={}`;
 - `StreamFailed`: categorical, sanitized failure information including
   `retryable: bool` and `will_retry: bool`;
 - `StreamCancelled`: the winning trusted `CancellationReason`.
@@ -961,7 +971,8 @@ exception text, raw SSE frames, or unsanitized provider error text.
 
 ### Attempt state machine, semantic output, and retry truth
 
-Each physical attempt has this lifecycle:
+Each observable attempt—one native physical streaming attempt or one one-shot
+compatibility-adapter attempt—has this lifecycle:
 
 ```text
 StreamStarted(sequence=0)
@@ -986,10 +997,10 @@ An index by itself is not a tool fragment. `StreamStarted` and `UsageUpdated`
 alone are nonsemantic. Empty text or fragment fields do not make an event
 semantic. This definition controls whether replay is safe.
 
-Transparent retry is allowed only before semantic output has been exposed. A
-transient connection, timeout, 429, or eligible 5xx after `StreamStarted` and
-possibly `UsageUpdated`, but before semantic output, may produce
-`StreamFailed(retryable=True, will_retry=True)` and a new attempt if the
+For native streaming, transparent retry is allowed only before semantic output
+has been exposed. A transient connection, timeout, 429, or eligible 5xx after
+`StreamStarted` and possibly `UsageUpdated`, but before semantic output, may
+produce `StreamFailed(retryable=True, will_retry=True)` and a new attempt if the
 existing `RetryPolicy`, cancellation state, and remaining deadline all allow
 it. Once any semantic event is accepted, automatic replay is forbidden:
 `will_retry` must be false and failure terminates the logical request. This
@@ -1026,6 +1037,18 @@ neutral calls must exactly match `response.tool_calls`. Incomplete tool
 fragments, duplicate completion, mismatched calls, or text mismatch fail the
 model operation. Nothing is committed and no tool executes. The accumulator
 never prefers deltas over the final response or vice versa.
+
+Every `ResponseCompleted` exposed through the neutral stream boundary contains
+a **stream-safe** canonical `ModelResponse` whose `raw` field is exactly `{}`.
+No provider-shaped dictionary crosses that boundary. For one-shot
+compatibility, if `generate()` returns a `ModelResponse` with provider data in
+`raw`, construct a new normalized `ModelResponse` preserving only `text`,
+`model`, `provider`, `finish_reason`, `usage`, `tool_calls`, and `latency_ms`,
+and set `raw={}`. Do not mutate the provider-returned object. Native streaming
+uses the same `raw={}` rule and never reconstructs raw chunks into the final
+response. This boundary rule does not alter legacy no-stream `generate()`:
+direct callers continue to receive its existing `ModelResponse.raw` behavior.
+The accumulator's public result must use the same stream-safe response.
 
 The existing conversation behavior still rejects a blank final reply and
 creates its assistant `Message` using the existing final-text normalization.
@@ -1081,13 +1104,35 @@ details.
 
 The compatibility adapter invokes exactly one entry point selected by the
 current one-shot rules: one `generate(request, ...)` call when available, or
-one `complete(...)` call otherwise. It emits one adapter attempt:
-`StreamStarted(sequence=0)` followed by
-`ResponseCompleted(sequence=1)`. It does not split completed text, synthesize
-`TextDelta`, tokenize text, or invoke a provider once to probe and again to
-fall back. Existing retry behavior encapsulated by that one legacy provider
-invocation is not rewritten by 42.5a, and the adapter does not fabricate
-attempt events for internals it cannot observe.
+one `complete(...)` call otherwise. It first emits
+`StreamStarted(sequence=0)`, then invokes that selected entry point exactly
+once. After the invocation returns or raises, it selects exactly one
+`sequence=1` terminal without reinvoking the provider:
+
+1. If `context.cancellation.requested`, emit `StreamCancelled` with
+   `context.cancellation.reason`.
+2. Otherwise, if `context.deadline.expired(clock)`, emit `StreamCancelled` with
+   `CancellationReason.DEADLINE_EXCEEDED`.
+3. Otherwise, on success, emit `ResponseCompleted` with the new stream-safe
+   canonical response described above.
+4. Otherwise, emit `StreamFailed` using only a safe categorical framework error
+   kind. For a `ModelError`, `retryable` preserves that error type's existing
+   retryability. For an unexpected non-`ModelError`, `retryable=False`.
+   `will_retry=False` in every compatibility-adapter `StreamFailed`.
+
+`StreamCancelled` is the neutral attempt terminal for trusted logical
+cancellation, including deadline expiry. The adapter itself never performs an
+outer retry. Existing retries encapsulated inside its one legacy
+`generate()`/`complete()` invocation remain unchanged and opaque, preserving
+provider entry-point invocation count one. There is no speculative fallback
+call and no fabricated event for an internal retry. The adapter never exposes
+an exception message, traceback, provider body, headers, credentials, raw
+response, or unsanitized provider exception text.
+
+On success it does not split completed text, synthesize `TextDelta`, or tokenize
+text. Its event sequence is exactly `StreamStarted` then
+`ResponseCompleted`; on failure or trusted cancellation it is exactly
+`StreamStarted` then the selected `StreamFailed` or `StreamCancelled` terminal.
 
 ### Conversation consumption, presentation sink, and event fencing
 
@@ -1248,8 +1293,9 @@ OpenAI-compatible normalization remains provider-local:
 - explicit `[DONE]` finalizes canonical calls and emits `ResponseCompleted`.
 
 No provider dictionaries escape above this adapter. The final result uses the
-existing `ModelResponse`, `ToolCall`, `Usage`, and `FinishReason` types.
-`ModelResponse.raw` does not retain all streamed chunks.
+existing `ModelResponse`, `ToolCall`, `Usage`, and `FinishReason` types, and the
+`ResponseCompleted.response.raw` field is exactly `{}`. Raw chunks are neither
+retained nor reconstructed into `ModelResponse.raw`.
 
 ### Cancellation, owned resource closure, and deadline truth
 
@@ -1275,11 +1321,16 @@ classify the attempt as `StreamCancelled` with the winning trusted
 instant physical interruption where the platform or provider does not
 guarantee it.
 
-Winner truth is unchanged. Deadline wins as `TIMED_OUT` /
-`DEADLINE_EXCEEDED` only when it is the accepted reason. An earlier
-supersession, shutdown, user, or operator cancellation remains `CANCELLED` with
-its original winning reason. Cancellation is not retryable. Stage 4 adds no
-thread killing, timer thread, tool preemption, or new retry budget.
+Winner truth is unchanged: an already-requested trusted cancellation is
+checked first, then deadline expiry. An earlier `SUPERSEDED`, `AGENT_SHUTDOWN`,
+`USER_INTERRUPT`, or `OPERATOR_CANCEL` is never relabelled
+`DEADLINE_EXCEEDED` merely because the deadline also expired. At the neutral
+stream layer all of these conditions, including `DEADLINE_EXCEEDED`, terminate
+the attempt as `StreamCancelled` with the winning reason. The durable turn
+mapping remains distinct: `DEADLINE_EXCEEDED` maps to `TurnPhase.TIMED_OUT`;
+other accepted cancellation reasons map to `TurnPhase.CANCELLED`. Cancellation
+is not retryable. Stage 4 adds no thread killing, timer thread, tool preemption,
+or new retry budget.
 
 ### First-token observability and privacy
 
@@ -1304,9 +1355,13 @@ latencies, categorical retry/failure state, and terminal outcome.
 Security tests use distinctive sentinels and independently prove that logs and
 errors omit `RAW_SESSION_SECRET`, API secrets, Authorization values, tool
 argument fragments, workspace paths, full user messages, and full model
-deltas. Trusted context and clock must be absent from `ModelRequest.metadata`,
-wire JSON, generic options, logs, and errors. Assertions may not use `or True`
-or unrelated weak alternatives.
+deltas. They also place `RAW_PROVIDER_SECRET_42_5` inside a fake provider's
+`ModelResponse.raw` and prove it is absent from the `ResponseCompleted` exposed
+to the sink, stream logs, error details, and accumulator public result, while
+normalized text, model, provider, usage, and tool calls remain intact. Trusted
+context and clock must be absent from `ModelRequest.metadata`, wire JSON,
+generic options, logs, and errors. Assertions may not use `or True` or unrelated
+weak alternatives.
 
 ### Required deterministic acceptance tests for later slices
 
@@ -1325,6 +1380,38 @@ cover:
 | Retry delay greater than or equal to remaining | no retry |
 | Trusted cancellation before retry | no retry |
 | Retried attempt identity | same request ID; new attempt ID; sequence reset |
+
+42.5a additionally requires these one-shot compatibility tests:
+
+1. **Success raw scrub.** A fake `generate()` returns
+   `ModelResponse(text="ok", raw={"secret":
+   "RAW_PROVIDER_SECRET_42_5"}, ...)`. Assert exactly one provider call and the
+   events `StreamStarted`, `ResponseCompleted`; the exposed response has
+   `raw={}`; the sentinel is absent from serialized/public event and
+   accumulator result; and normalized text, model, provider, usage, and tool
+   calls are preserved.
+2. **Retryable model failure.** `ModelConnectionError` yields exactly
+   `StreamStarted`, `StreamFailed` with `retryable=True` and
+   `will_retry=False`; provider call count is one and there is no adapter-level
+   second call.
+3. **Nonretryable model failure.** `ModelAuthError` and `ModelResponseError`
+   each yield `StreamFailed(retryable=False, will_retry=False)` after exactly
+   one invocation.
+4. **Trusted cancellation.** When the provider returns or raises after trusted
+   cancellation has already won, the terminal is `StreamCancelled` with the
+   original reason, never `StreamFailed`.
+5. **Deadline expiry.** When no cancellation won earlier and the deadline
+   expires during the invocation, the terminal is
+   `StreamCancelled(DEADLINE_EXCEEDED)`; the conversation layer later maps it
+   to `TIMED_OUT`.
+6. **Cancellation versus deadline.** If `SUPERSEDED` wins before deadline
+   expiry and the provider returns or raises after both conditions hold, the
+   terminal remains `StreamCancelled(SUPERSEDED)`, never
+   `DEADLINE_EXCEEDED`.
+7. **Compatibility attempt identity.** A legacy provider simulates or reports
+   multiple internal HTTP retries. The adapter still exposes one `request_id`,
+   one `attempt_id`, one `StreamStarted`, and one final terminal, with no events
+   or fabricated attempt identities for those opaque retries.
 
 Backpressure is proven with a fake iterator that records every pull. A sink
 blocks after event N on an `Event`/`Barrier`; event N+1 is not pulled until the
@@ -1350,10 +1437,11 @@ Additional mandatory cases are:
 - A successful streamed tool round follows the existing runner/executor and
   staging path, then a later model round may stream; final assistant and tool
   messages publish only after final commit.
-- A provider without a valid trusted `stream()` uses the one-shot adapter,
-  invokes `generate`/`complete` exactly once, emits only `StreamStarted` and
-  `ResponseCompleted`, and returns a result equivalent to existing one-shot
-  behavior. No-sink send remains unchanged.
+- A provider without a valid trusted `stream()` uses the one-shot adapter and
+  invokes `generate`/`complete` exactly once. On success it emits only
+  `StreamStarted` and stream-safe `ResponseCompleted` and returns a result
+  equivalent to existing one-shot behavior; failure/cancellation follows the
+  explicit terminal state machine above. No-sink send remains unchanged.
 - A sink that raises on its first text delta is disabled; provider consumption
   continues synchronously; the canonical reply may commit; authority is
   unchanged; only categorical exception type is logged; raw delta is absent.
