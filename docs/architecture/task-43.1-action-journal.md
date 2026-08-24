@@ -6,10 +6,12 @@ Date: **2026-08-24**
 
 Baseline: `784ab048cb9d68a0635d6beace3972f6e14de960`
 
-This document freezes the contract for durable mutating actions before
-AgentCore gains email send, calendar mutation, browser submission, desktop
-control, scheduled actions, or other mutation-heavy capabilities. It is an
-architecture contract only; Task 43.1 adds no production implementation.
+This document freezes the contract for durable, external, privileged, or
+meaningfully ambiguous actions before AgentCore gains email send, calendar
+mutation, browser submission, desktop control, scheduled actions, or other
+mutation-heavy capabilities. Reversible session-local UI/media control remains
+on a low-latency non-journaled path. This is an architecture contract only;
+Task 43.1 adds no production implementation.
 
 This document supersedes only the *proposed, not implemented* side-effect
 state names and `ActionBoundary` sketch in section F of
@@ -19,9 +21,10 @@ Stage 4 streaming contracts remain unchanged.
 ## 1. Scope, authority, and guarantee
 
 The ActionJournal is a separate durable domain that records what AgentCore was
-authorized to try, which effect attempts may have run, what external truth is
-known, and what must be reconciled. It is not conversation history, run state,
-memory, or a `TurnRecord` extension.
+authorized to try, which meaningful effect attempts may have run, what
+durable/external truth is known, and what must be reconciled. It is not a log
+of every visible control, conversation history, run state, memory, or a
+`TurnRecord` extension.
 
 The target is deliberately narrower than distributed exactly-once delivery:
 
@@ -39,7 +42,8 @@ Authority remains exactly:
 ToolRegistry.get
   -> Tool.validate_args
   -> PermissionPolicy.check / required user approval
-  -> ToolExecutor-controlled action journal boundary, for mutations
+  -> ToolExecutor-controlled action journal boundary, when the trusted
+     semantic action kind is journal-eligible
   -> Tool.run
   -> normalization/logging
   -> ToolInvocation
@@ -74,8 +78,10 @@ The baseline establishes these facts:
    lexical `act_` prefix, but it is not an ActionJournal record and grants no
    authority.
 5. `ToolSpec.read_only` currently provides only a read/mutation split. It does
-   not describe idempotency, commit boundaries, external identifiers, or
-   reconciliation.
+   not distinguish ephemeral control from durable mutation and does not
+   describe idempotency, commit boundaries, external identifiers, or
+   reconciliation. A future trusted action-kind registration supplies that
+   semantic classification; model arguments never do.
 6. `TurnRecord.action_refs` is bounded and immutable under current CAS rules.
    Most conversation actions are discovered after turn admission, so the
    ActionJournal's `turn_id` link is authoritative. Task 43.1 does not change
@@ -97,15 +103,21 @@ with the architecture. There is no unavoidable Stage 4 contradiction.
 one particular message or moving one particular file. The durable `action_id`
 names it across retries and restarts.
 
+**Ephemeral control** is a reversible, session-local UI or media operation
+whose loss/repetition after restart does not create meaningful durable,
+external, account, security, privilege, or reconciliation truth. It remains a
+normal tool invocation but is not an ActionJournal logical action.
+
 **Invocation** is one caller's entrance to `ToolExecutor`. Duplicate callers
 may have distinct invocation IDs while attaching to the same logical action.
 
 **Attempt claim** is a durably reserved opportunity to call the mutation seam
 once. Its `attempt_id` is written before the seam can be invoked.
 
-**Mutation seam** is the trusted boundary after which the tool may cause the
-user-visible or external mutation. In the first safe integration, the entire
-`Tool.run` call for a mutating tool is treated as that seam. Capability-specific
+**Mutation seam** is the trusted boundary after which a journal-eligible tool
+may cause a durable, external, privileged, long-running, or meaningfully
+ambiguous mutation. In the first safe integration, the entire `Tool.run` call
+for a journal-eligible tool is treated as that seam. Capability-specific
 adapters may later narrow the boundary, but may never move it ahead of durable
 attempt persistence.
 
@@ -160,8 +172,10 @@ identity.
 
 Every record has a stable, versioned `action_kind`, such as conceptual
 `filesystem.move.v1` or `calendar.create.v1`, plus the registered tool name,
-tool version, and exact declared capability set. Core code keys reconciliation
-adapters by `action_kind` and compatible tool version, never by model text.
+tool version, exact mutation capability set, and trusted journal-eligibility
+class. A reconciler separately declares its minimal read/probe capability set.
+Core code keys classification and reconciliation adapters by `action_kind` and
+compatible tool version, never by model text or a model-selected argument.
 
 The durable intent contains:
 
@@ -285,8 +299,10 @@ must establish the verdict.
 
 ## C. Intent before effect
 
-No mutating external or user-visible effect may occur before an `AUTHORIZED`
-record and an `IN_FLIGHT` attempt claim are durably readable.
+No journal-eligible durable, external, privileged, long-running, or
+meaningfully ambiguous effect may occur before an `AUTHORIZED` record and an
+`IN_FLIGHT` attempt claim are durably readable. Ephemeral controls use the
+separate fast path frozen in section N and do not create these records.
 
 The future `ToolExecutor` flow is frozen as:
 
@@ -491,7 +507,9 @@ The execution route is:
 ```text
 ActionRecoveryCoordinator selects a claimed record
   -> ToolExecutor reconciliation entry point
-  -> current registry/version and PermissionPolicy checks
+  -> current registry/version lookup
+  -> PermissionPolicy checks the reconciler's minimal current read/probe
+     capabilities
   -> registered capability reconciler performs read-only probe
   -> ActionJournal CAS accepts the result for the same claim epoch
 ```
@@ -504,11 +522,31 @@ Because the probe is read-only, it does not need a second ActionRecord; its
 invocation and accepted evidence are audit-linked to the action being
 reconciled.
 
+Reconciliation authority and mutation authority are deliberately separate:
+
+- the historical mutation allow is evidence that the old attempt was
+  authorized; it grants nothing now;
+- every probe must pass current `PermissionPolicy` using only the minimal
+  read/probe capabilities registered for that reconciler;
+- a revoked mutation capability immediately forbids a retry but does not by
+  itself forbid a separately allowed read-only probe;
+- any retry or new physical attempt separately passes the current mutation
+  capabilities and all current approval requirements;
+- if probe permission is denied, credentials are unavailable, or the probe
+  cannot be safely authorized, it does not run and the action remains
+  `RECONCILE_REQUIRED`.
+
+For example, after an ambiguous email send, current `SEND_EMAIL=DENY` and
+`READ_EMAIL=ALLOW` may permit the registered reconciler to inspect Sent mail
+and settle existing truth. It permits no resend. If current read permission is
+also denied, the probe does not execute and ambiguity remains. There is no
+special recovery bypass around `PermissionPolicy`.
+
 Reconciliation results are accepted only for the exact `action_id`, record
 version, and reconciliation claim epoch. A late probe from a stale worker is
 discarded. Missing adapters, incompatible tool versions, inaccessible
-credentials, permission denial, or exhausted bounded probes leave the action
-blocked; they never authorize a retry.
+credentials, probe-permission denial, or exhausted bounded probes leave the
+action blocked; they never authorize a retry.
 
 The generic layer does not treat “not found” as proof of absence. The adapter
 must account for provider consistency, retention, and search semantics.
@@ -594,9 +632,13 @@ Until a future implementation adds that receipt through the existing policy
 authority, an approved action may not automatically reuse approval after
 restart; it must be checked or requested again.
 
-Retries, reconciliation, and recovery re-evaluate current policy. A historical
-allow decision is evidence that the old attempt was authorized, not permission
-for a new attempt after access was revoked.
+Recovery never inherits historical authority. A historical allow decision is
+evidence that the old attempt was authorized, not permission for either a
+probe or a new attempt. Reconciliation evaluates only the registered minimal
+current read/probe capabilities. A retry evaluates the full current mutation
+capability set and all current approval requirements. Revoking mutation
+authority therefore prevents retries immediately without automatically
+preventing an independently allowed read-only probe.
 
 Model text, provider output, journal state, an idempotency key, external
 success, and a recovery classification never grant authority.
@@ -612,7 +654,7 @@ nonterminal record.
 | `AUTHORIZED` with no prior attempt | No effect may have occurred. Leave waiting until its durable owner resumes and current permission/approval is rechecked; do not execute merely because it exists. |
 | `AUTHORIZED` after a checked safe retry decision | Preserve the retry proof, but still require current owner, authority, deadline, and attempt budget before a new claim. |
 | `IN_FLIGHT` from a prior process epoch | Atomically move to `RECONCILE_REQUIRED`. Never mark failed, cancelled, or automatically repeat solely because the process died. |
-| `RECONCILE_REQUIRED` | Claim a bounded read-only probe when an adapter and policy allow it; otherwise remain human-required/unresolved. |
+| `RECONCILE_REQUIRED` | Claim a bounded read-only probe only when its minimal current read/probe capabilities pass policy; otherwise remain human-required/unresolved. Mutation permission is neither inherited nor required merely to inspect existing truth. |
 | Terminal | Validate and leave unchanged. |
 
 Externally idempotent actions may become `AUTHORIZED` for same-action retry
@@ -677,14 +719,17 @@ Target similarity alone never joins them.
 No current production API changes in Task 43.1. A later implementation must add
 typed contracts under `ToolExecutor`, conceptually:
 
+- `EffectEligibility`: trusted, versioned action-kind metadata selecting the
+  pure-read, ephemeral-control, or journal-required path;
 - `MutationDescriptor`: pure canonical intent, `action_kind`, effect class,
   target category/ref, deduplication identity, and optional idempotency key;
 - `ActionExecutionPermit`: executor-created, single-use, bound to exact
   action/attempt/tool/version and absent from model arguments;
 - `MutationOutcome`: fixed effect verdict, normalized bounded result, safe
   evidence refs, and categorical error;
-- `ActionReconciler`: read-only capability probe invoked only through the
-  executor's reconciliation entry point.
+- `ActionReconciler`: read-only capability probe with an explicit minimal
+  read/probe capability set, invoked only through the executor's
+  reconciliation entry point.
 
 The first implementation may conservatively treat entry to mutating
 `Tool.run` as permit consumption. A future narrower adapter may consume the
@@ -700,10 +745,13 @@ permit immediately before its transport/file/UI seam. In both forms:
 - an exception after permit consumption defaults to `OUTCOME_UNKNOWN` unless
   a trusted adapter supplies stronger evidence.
 
-When journal enforcement is enabled, a tool with `read_only=False` but no
-registered mutation descriptor/outcome/reconciler policy fails closed before
-`Tool.run`. Legacy `ToolResult`, arbitrary metadata, and exception types are
-not enough to infer effect truth.
+When journal enforcement is enabled, each non-read action kind must have a
+trusted eligibility registration. An action kind classified as journal-required
+but missing its mutation descriptor/outcome/reconciler policy fails closed
+before `Tool.run`. A generic desktop/browser action that cannot prove it is
+ephemeral also fails closed; `read_only=False`, legacy `ToolResult`, arbitrary
+metadata, model arguments, and exception types are not enough to infer or
+downgrade effect truth.
 
 `ToolInvocation` should later gain `invocation_id`, optional `action_id`,
 `attempt_id`, and a safe action-outcome summary. It remains invocation history,
@@ -712,23 +760,67 @@ to the journal but must not copy protected payloads.
 
 ## N. Which operations require journaling
 
-| Operation class | Journal rule |
-|---|---|
-| Pure read | Bypass ActionJournal; keep current ToolExecutor validation, permission, cancellation, and logging. |
-| Incidental process-local scratch with no user/external durable effect | No action record, provided cleanup/loss cannot change user-visible truth. |
-| Local user-visible mutation | Required, including create/write/move/rename/delete and durable configuration changes. |
-| External mutation | Required regardless of HTTP method. |
-| Irreversible or ambiguous mutation | Required, with reconciliation or human-required policy before registration. |
-| Long-running effect | Required before it starts; action survives the initiating turn/process. |
-| Compensation/rollback | A separate required action, never hidden cleanup of the old record. |
+Journal eligibility is semantic action-kind metadata registered by trusted
+code. A model, provider, tool argument, UI label, HTTP method, click, or key
+sequence cannot select or downgrade it. The closed classification is:
 
-“Read” is semantic. Fetching a page is read-only; marking an email read,
-acknowledging a notification, or visiting an endpoint that submits a form is a
-mutation. A tool falsely marked `read_only` is an authority defect and must be
-rejected by registration/review, not papered over by retry logic.
+| Semantic class | Meaning | Journal rule |
+|---|---|---|
+| `PURE_READ` | Reads existing state without changing durable, external, account, security, or meaningful user reality. | Fast path; no ActionRecord. |
+| `EPHEMERAL_CONTROL` | Reversible/session-local UI or media control with no durable user-data mutation, durable external/account mutation, security/privilege mutation, meaningful restart ambiguity, or recovery requirement. | Fast path; no ActionRecord. |
+| `DURABLE_LOCAL_MUTATION` | File create/write/move/rename/delete, repository/ref/config mutation, or meaningful durable application/user setting. | ActionJournal required. |
+| `EXTERNAL_ACCOUNT_MUTATION` | Email/message send, calendar mutation, upload/post/publish, form submission, or remote repository/account mutation. | ActionJournal required. |
+| `SECURITY_PRIVILEGE_SYSTEM_MUTATION` | Installation, privilege change, credential/security setting, or durable system configuration when later supported. | ActionJournal required and may require stronger approval. |
+| `LONG_RUNNING_OR_AMBIGUOUS_EFFECT` | An effect whose restart/retry uncertainty could duplicate or lose meaningful user-visible reality, even if another label looks superficially local. | ActionJournal required; this class is an escalation override. |
 
-Read-only tools remain lightweight. They are not journaled merely for uniform
-observability.
+Incidental process-local scratch with no durable or meaningful external/user
+effect is not an action and creates no journal record.
+
+The `EPHEMERAL_CONTROL` fast path includes, when the registered semantic action
+kind meets every criterion above:
+
+- open/focus/switch an application or window;
+- switch a browser tab or open a normal browser page;
+- play, pause, seek, or select next/previous media;
+- adjust session/device volume.
+
+These operations still follow the complete authority path:
+
+```text
+ToolRegistry.get
+  -> Tool.validate_args
+  -> trusted cancellation/currentness checkpoint
+  -> PermissionPolicy.check / required approval
+  -> trusted cancellation/currentness checkpoint
+  -> Tool.run
+  -> normalization/logging
+  -> ToolInvocation
+```
+
+They may emit normal bounded tool observability, but no `ActionRecord`, attempt
+claim, restart scan, or reconciliation item. The absence of journal I/O must
+not remove or reorder validation, permission, approval, checkpoints, or stale
+result fencing. Simple JARVIS controls therefore retain the low-latency path
+without weakening authority.
+
+Classification follows the effect's semantics, not its physical input
+mechanism. “Click browser tab” may be `EPHEMERAL_CONTROL`; “click Send”,
+“submit form”, “upload video”, “delete cloud file”, and “install application”
+cross journal-required boundaries. Marking an email read or acknowledging a
+remote notification is also an account mutation even if reversible.
+
+A generic browser/desktop-control tool may not hide an arbitrary click or
+keystroke behind one tool-wide `EPHEMERAL_CONTROL` label. Each allowed semantic
+action kind must be registered and validated independently. If the trusted
+adapter cannot determine before execution whether an invocation can cross a
+durable/external/security boundary, registration or execution fails closed or
+uses the journal-required class. The model cannot assert that a coordinate,
+selector, shortcut, or button is harmless.
+
+Pure reads and ephemeral controls remain lightweight. They are not journaled
+merely for uniform observability. Compensation/rollback remains a separate
+journal-required action whenever it mutates meaningful durable or external
+reality.
 
 ## O. User-facing truth
 
@@ -747,6 +839,11 @@ The runtime maps durable truth to plain language:
 Low-level state names need not be shown. An initiating turn may be cancelled
 while its action later becomes `SUCCEEDED`; the UI must present both facts
 rather than forcing one to overwrite the other.
+
+An ephemeral control returns through the ordinary tool result path and does
+not surface “possibly switched tab” or “verifying media pause” recovery states.
+If its semantic classification cannot be proven, it fails closed rather than
+silently taking the fast path.
 
 ## P. Long-running workflows, schedulers, and zero-cost mode
 
@@ -804,6 +901,8 @@ log write. Metrics and logs are observability, never lifecycle authority.
 Safe metrics include authorization-to-attempt latency, physical duration,
 time-to-durable-result, reconciliation latency/count, terminal counts,
 ambiguous-action age, duplicate attachments, and corruption/quarantine counts.
+Ephemeral controls use existing bounded tool latency/outcome observability and
+emit no `action.*` lifecycle events.
 
 ## R. Storage, representation, and versioning
 
@@ -816,7 +915,9 @@ the `TurnRecord`, `AgentState`, `ConversationSession`, or `MemoryRecord` schema.
 An `ActionRecord` has fixed, strictly validated fields:
 
 - schema version, action ID, state, monotonic record version;
-- action kind, tool name/version, capabilities, effect class;
+- action kind, tool name/version, trusted journal-eligibility class, mutation
+  capabilities, reconciler's minimal read/probe capabilities, and effect
+  class;
 - canonical intent digest and protected intent reference;
 - target category and optional safe fingerprint;
 - deduplication scope/key and optional external idempotency key/contract;
@@ -957,6 +1058,8 @@ Task 43.1 does not implement or authorize:
   retry semantics, `TurnBridge`, `StageLease`, or conversation streaming;
 - a second permission system, direct `Tool.run`, or a shadow executor;
 - journaling every pure read;
+- journaling proven ephemeral UI/media controls solely because they are
+  user-visible;
 - automatic rollback/compensation;
 - any financial action authority.
 
@@ -1044,6 +1147,26 @@ subprocess crash points, and `FixedClock`. No correctness assertion uses
 20. **Stage 4 regression.** The existing 42.5a/b/c suites remain unchanged and
     prove no stream event, accumulator, retry, StageLease, or TurnBridge
     contract moved.
+21. **Ephemeral fast control.** Register a trusted `EPHEMERAL_CONTROL` fake and
+    invoke it through the real `ToolExecutor`. Gates/counters prove argument
+    validation, both trusted checkpoints, and current policy/approval occur in
+    order; exactly one fake control operation runs and zero ActionRecords or
+    action attempts exist.
+22. **Desktop/browser semantic boundary.** Attempt to register or execute a
+    generic desktop/browser “send/submit” action as `EPHEMERAL_CONTROL`.
+    Trusted semantic registration rejects it or execution fails closed before
+    `Tool.run`; zero send/submit effects occur. A model-supplied “ephemeral”
+    flag, coordinate, selector, or button label cannot change the result.
+23. **Reconciliation after mutation permission revocation.** Seed an ambiguous
+    action, then deny its current mutation capability while allowing the
+    reconciler's independent minimal read/probe capability. The real
+    `ToolExecutor` permits exactly one gated read-only probe, authoritative
+    evidence may settle the original action, and the physical mutation attempt
+    count never increases.
+24. **Reconciliation read permission revocation.** Seed the same ambiguous
+    action but deny the registered read/probe capability. The probe body is
+    never entered, the action remains `RECONCILE_REQUIRED`, and zero new
+    mutation attempts occur.
 
 ## 5. Architecture self-audit
 
@@ -1086,11 +1209,22 @@ subprocess crash points, and `FixedClock`. No correctness assertion uses
 14. **Is Stage 4 untouched?** Yes. Neutral events, `StreamAccumulator`, model
     attempt identity, retry semantics, `TurnBridge`, `StageLease`, streaming
     consumption, and `TURN_SCHEMA_VERSION == 1` are unchanged.
+15. **Do reversible session/UI controls require journal I/O merely because
+    they are visible?** No. Trusted `EPHEMERAL_CONTROL` action kinds retain the
+    full executor/policy/checkpoint path and create no ActionRecord.
+16. **Can a generic click/keystroke hide a durable effect behind the ephemeral
+    path?** No. Semantic action-kind registration is trusted and fail-closed;
+    models and physical input mechanisms cannot choose eligibility.
+17. **Does reconciliation inherit mutation authority or require it merely to
+    inspect truth?** No. The probe passes its minimal current read/probe
+    capabilities; any retry separately passes current mutation capability and
+    approval.
 
 ## 6. Frozen conclusion
 
 ActionJournal is durable evidence and reconciliation control around the one
 existing tool authority. It provides no arbitrary exactly-once promise and no
 new product capability. Its core rule is simple: persist authorized intent and
-an exclusive attempt claim before mutation; after ambiguity, establish truth
-or stop.
+an exclusive attempt claim before every journal-eligible effect; after
+ambiguity, establish truth or stop. Pure reads and proven ephemeral controls
+stay on the normal low-latency ToolExecutor path without weakening authority.
