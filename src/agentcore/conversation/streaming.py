@@ -240,11 +240,24 @@ def consume_stream_response(
     # accumulator or fence failure on other Python runtimes.
     try:
         while True:
+            # Do not advance a provider after this logical turn has lost
+            # authority while the consumer held synchronous backpressure.
+            # This trusted check is additive to the mandatory post-accept
+            # fence below and deliberately sits outside provider exception
+            # normalization.
+            fence.check()
             try:
                 event = next(iterator)
             except StopIteration:
+                # Exhaustion may race with trusted cancellation/deadline.  Let
+                # turn truth win before normal completion validation can call
+                # ``finish`` (including its pending-retry invariant).
+                fence.check()
                 break
             except Exception as exc:
+                # Provider exceptions cannot establish or replace trusted
+                # cancellation truth.  Recheck before categorizing the error.
+                fence.check()
                 raise _stream_failure(exc) from None
 
             try:

@@ -672,7 +672,10 @@ def test_valid_text_stream_is_incremental_canonical_and_raw_free():
 
     started = next(iterator)
     assert isinstance(started, StreamStarted)
-    assert transport.stream_calls == []
+    # The first observable event is returned only after the physical seam was
+    # invoked and its owned-handle cancellation registration was installed.
+    assert len(transport.stream_calls) == 1
+    assert _active_cancellation_callbacks(source) == 1
     assert body.read_calls == 0
     first = next(iterator)
     assert isinstance(first, TextDelta) and first.text == "hel"
@@ -781,6 +784,137 @@ def test_native_openai_text_stream_integrates_through_conversation_runtime():
     assert all(message.content not in {"hel", "lo"}
                for message in persisted.messages)
     assert len(transport.stream_calls) == 1
+
+
+def test_real_pre_cancelled_first_pull_has_no_provider_attempt_or_event():
+    class GateBeforeIteratorProvider:
+        def __init__(self, inner: OpenAICompatibleProvider) -> None:
+            self.inner = inner
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.context: StreamRequestContext | None = None
+
+        def stream(self, request: ModelRequest, *, context: OperationContext,
+                   clock: Any):
+            self.context = context
+            self.entered.set()
+            assert self.release.wait(10.0)
+            return self.inner.stream(request, context=context, clock=clock)
+
+    transport = ScriptedTransport([(200, {}, _success_body("must-not-open"))])
+    provider = GateBeforeIteratorProvider(_provider(transport))
+    clock = FixedClock(T0)
+    store = InMemoryTurnStore()
+    bridge = TurnBridge(
+        TurnCoordinator(store, clock=clock),
+        clock=clock,
+        turn_deadline_seconds=120.0,
+    )
+    runtime = ConversationRuntime(
+        model=provider,
+        sessions=InMemorySessionStore(),
+        turns=bridge,
+        config=ConversationConfig(turn_deadline_seconds=120.0),
+    )
+    session = runtime.start()
+    seen: list[Any] = []
+    results: list[Any] = []
+    errors: list[BaseException] = []
+
+    def send() -> None:
+        try:
+            results.append(runtime.send(
+                "cancel before advance", session=session,
+                on_stream_event=seen.append,
+            ))
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=send, daemon=True)
+    thread.start()
+    assert provider.entered.wait(10.0)
+    bridge.shutdown()
+    assert provider.context is not None
+    assert provider.context.cancellation.requested is True
+    assert provider.context.cancellation.reason is \
+        CancellationReason.AGENT_SHUTDOWN
+    provider.release.set()
+    thread.join(10.0)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert len(results) == 1
+    result = results[0]
+    assert result.ok is False
+    assert result.turn_phase == TurnPhase.CANCELLED.value
+    record = store.load(result.turn_id)
+    assert record.phase is TurnPhase.CANCELLED
+    assert record.cancellation_reason is CancellationReason.AGENT_SHUTDOWN
+    assert seen == []
+    assert transport.stream_calls == []
+
+
+def test_real_pre_expired_first_pull_has_no_provider_attempt_or_event():
+    class ExpireBeforeIteratorProvider:
+        def __init__(self, inner: OpenAICompatibleProvider) -> None:
+            self.inner = inner
+
+        def stream(self, request: ModelRequest, *, context: OperationContext,
+                   clock: FixedClock):
+            clock.advance(121.0)
+            return self.inner.stream(request, context=context, clock=clock)
+
+    transport = ScriptedTransport([(200, {}, _success_body("must-not-open"))])
+    clock = FixedClock(T0)
+    store = InMemoryTurnStore()
+    bridge = TurnBridge(
+        TurnCoordinator(store, clock=clock),
+        clock=clock,
+        turn_deadline_seconds=120.0,
+    )
+    runtime = ConversationRuntime(
+        model=ExpireBeforeIteratorProvider(_provider(transport)),
+        sessions=InMemorySessionStore(),
+        turns=bridge,
+        config=ConversationConfig(turn_deadline_seconds=120.0),
+    )
+    seen: list[Any] = []
+
+    result = runtime.send(
+        "expire before advance", session=runtime.start(),
+        on_stream_event=seen.append,
+    )
+
+    assert result.ok is False
+    assert result.turn_phase == TurnPhase.TIMED_OUT.value
+    record = store.load(result.turn_id)
+    assert record.phase is TurnPhase.TIMED_OUT
+    assert record.cancellation_reason is \
+        CancellationReason.DEADLINE_EXCEEDED
+    assert seen == []
+    assert transport.stream_calls == []
+
+
+def test_normal_retry_continuation_satisfies_conversation_accumulator():
+    transport = ScriptedTransport([
+        ModelConnectionError("first physical attempt failed"),
+        (200, {}, _success_body("retry success")),
+    ])
+    runtime, _sessions, _store, _clock = _owned_runtime(
+        _provider(transport, max_retries=2))
+    seen: list[Any] = []
+
+    result = runtime.send(
+        "retry", session=runtime.start(), on_stream_event=seen.append)
+
+    assert result.ok is True
+    assert result.reply.content == "retry success"
+    assert [type(event) for event in seen] == [
+        StreamStarted, StreamFailed, StreamStarted,
+        TextDelta, ResponseCompleted,
+    ]
+    assert seen[1].will_retry is True
+    assert len(transport.stream_calls) == 2
 
 
 def test_real_successor_admission_cancels_blocked_native_stream_and_then_runs():
@@ -897,6 +1031,131 @@ def test_real_successor_admission_cancels_blocked_native_stream_and_then_runs():
     assert executor.calls == 0
     assert policy.check_calls == 0
     assert tool.runs == 0
+
+
+def test_real_supersession_during_retry_terminal_backpressure_opens_no_retry():
+    transport = ScriptedTransport([
+        ModelConnectionError("first physical attempt failed"),
+        (200, {}, _success_body("successor owns second physical call")),
+    ])
+    provider = _ContextRecordingProvider(
+        _provider(transport, max_retries=2))
+    clock = FixedClock(T0)
+    store = InMemoryTurnStore()
+    coordinator = _RecordingCoordinator(TurnCoordinator(store, clock=clock))
+    bridge = TurnBridge(
+        coordinator, clock=clock, turn_deadline_seconds=120.0)
+    runtime = ConversationRuntime(
+        model=provider,
+        sessions=InMemorySessionStore(),
+        turns=bridge,
+        config=ConversationConfig(turn_deadline_seconds=120.0),
+    )
+    session = runtime.start()
+    retry_terminal_entered = threading.Event()
+    release_retry_terminal = threading.Event()
+    old_events: list[Any] = []
+    successor_events: list[Any] = []
+    results: dict[str, Any] = {}
+    errors: dict[str, BaseException] = {}
+
+    def old_sink(event: Any) -> None:
+        old_events.append(event)
+        if isinstance(event, StreamFailed) and event.will_retry:
+            retry_terminal_entered.set()
+            assert release_retry_terminal.wait(10.0)
+
+    def send_old() -> None:
+        try:
+            results["old"] = runtime.send(
+                "old", session=session, on_stream_event=old_sink)
+        except BaseException as exc:
+            errors["old"] = exc
+
+    def send_successor() -> None:
+        try:
+            results["successor"] = runtime.send(
+                "successor", session=session,
+                on_stream_event=successor_events.append,
+            )
+        except BaseException as exc:
+            errors["successor"] = exc
+
+    old_thread = threading.Thread(target=send_old, daemon=True)
+    old_thread.start()
+    old_admission = coordinator.wait_for(1)
+    assert retry_terminal_entered.wait(10.0)
+    assert len(transport.stream_calls) == 1
+    assert [type(event) for event in old_events] == [
+        StreamStarted, StreamFailed]
+    assert old_events[-1].will_retry is True
+
+    successor_thread = threading.Thread(target=send_successor, daemon=True)
+    successor_thread.start()
+    successor_admission = coordinator.wait_for(2)
+    assert len(provider.contexts) == 1
+    assert provider.contexts[0].cancellation.requested is True
+    assert provider.contexts[0].cancellation.reason is \
+        CancellationReason.SUPERSEDED
+    # The successor is admitted but remains behind the StageLease, while the
+    # old consumer is still synchronously presenting its retry terminal.
+    assert len(transport.stream_calls) == 1
+
+    release_retry_terminal.set()
+    for thread in (old_thread, successor_thread):
+        thread.join(10.0)
+        assert not thread.is_alive()
+
+    assert errors == {}
+    assert results["old"].turn_phase == TurnPhase.CANCELLED.value
+    assert results["old"].error == \
+        "this turn was superseded by a newer message"
+    assert results["successor"].ok is True
+    assert results["successor"].reply.content == \
+        "successor owns second physical call"
+    old_record = store.load(old_admission.admitted.turn_id)
+    successor_record = store.load(successor_admission.admitted.turn_id)
+    assert old_record.phase is TurnPhase.CANCELLED
+    assert old_record.cancellation_reason is CancellationReason.SUPERSEDED
+    assert successor_record.phase is TurnPhase.COMPLETED
+    # Only the successor may account for call two. No old retry Started/ID was
+    # exposed and pending-retry finish validation did not replace cancellation.
+    assert [type(event) for event in old_events] == [
+        StreamStarted, StreamFailed]
+    assert len(transport.stream_calls) == 2
+    assert [type(event) for event in successor_events] == [
+        StreamStarted, TextDelta, ResponseCompleted]
+
+
+def test_deadline_during_retry_terminal_backpressure_opens_no_retry():
+    transport = ScriptedTransport([
+        ModelConnectionError("first physical attempt failed"),
+        (200, {}, _success_body("must-not-open")),
+    ])
+    runtime, _sessions, store, clock = _owned_runtime(
+        _provider(transport, max_retries=2))
+    seen: list[Any] = []
+
+    def expire_at_retry_terminal(event: Any) -> None:
+        seen.append(event)
+        if isinstance(event, StreamFailed) and event.will_retry:
+            clock.advance(121.0)
+
+    result = runtime.send(
+        "deadline", session=runtime.start(),
+        on_stream_event=expire_at_retry_terminal,
+    )
+
+    assert result.ok is False
+    assert result.turn_phase == TurnPhase.TIMED_OUT.value
+    assert result.error == "this turn exceeded its deadline"
+    record = store.load(result.turn_id)
+    assert record.phase is TurnPhase.TIMED_OUT
+    assert record.cancellation_reason is \
+        CancellationReason.DEADLINE_EXCEEDED
+    assert [type(event) for event in seen] == [StreamStarted, StreamFailed]
+    assert seen[-1].will_retry is True
+    assert len(transport.stream_calls) == 1
 
 
 def test_live_queued_turn_receives_superseded_before_start_from_third_admission():
@@ -1142,24 +1401,76 @@ def test_conflicting_finish_reason_transition_fails_closed(
 def test_connection_failure_before_semantic_retries_with_fresh_attempt():
     clock = FixedClock(T0)
     slept: list[float] = []
+    order: list[str] = []
+
+    def fail_first_open() -> Any:
+        order.append("physical_failure")
+        raise ModelConnectionError("RAW_SSE_SECRET_42_5C")
+
+    def consume_retry_delay(delay: float) -> None:
+        slept.append(delay)
+        order.append("retry_delay_consumed")
+
     transport = ScriptedTransport([
-        ModelConnectionError("RAW_SSE_SECRET_42_5C"),
+        fail_first_open,
         (200, {}, _success_body("ok")),
     ])
     context, _ = _stream_context(clock)
-    events = _collect(_provider(
-        transport, max_retries=2, sleep=slept.append), context, clock)
+    iterator = _provider(
+        transport, max_retries=2, sleep=consume_retry_delay).stream(
+            _request(), context=context, clock=clock)
+
+    first_started = next(iterator)
+    assert isinstance(first_started, StreamStarted)
+    assert len(transport.stream_calls) == 1
+    first_failed = next(iterator)
+    order.append("retry_promise_observed")
+    assert isinstance(first_failed, StreamFailed)
+    # Backoff belongs to the failed attempt's eligibility decision. It has
+    # completed before the retry promise crosses the neutral boundary.
+    assert order == [
+        "physical_failure", "retry_delay_consumed",
+        "retry_promise_observed",
+    ]
+    assert len(transport.stream_calls) == 1  # no retry prefetch
+
+    second_started = next(iterator)
+    assert isinstance(second_started, StreamStarted)
+    assert len(transport.stream_calls) == 2
+    events = [first_started, first_failed, second_started, *list(iterator)]
     assert [type(event) for event in events] == [
         StreamStarted, StreamFailed, StreamStarted,
         TextDelta, ResponseCompleted]
-    first_failed = events[1]
     assert (first_failed.retryable, first_failed.will_retry) == (True, True)
-    assert events[0].envelope.request_id == events[2].envelope.request_id
-    assert events[0].envelope.attempt_id != events[2].envelope.attempt_id
-    assert events[2].envelope.sequence == 0
-    assert len(transport.stream_calls) == 2
+    assert first_started.envelope.request_id == \
+        second_started.envelope.request_id
+    assert first_started.envelope.attempt_id != \
+        second_started.envelope.attempt_id
+    assert first_started.envelope.sequence == 0
+    assert second_started.envelope.sequence == 0
     assert slept == [0.5]
     assert RAW_SSE_SECRET not in repr(events)
+
+
+def test_immediate_physical_open_failure_has_truthful_attempt_lifecycle():
+    clock = FixedClock(T0)
+    transport = ScriptedTransport([
+        ModelConnectionError("categorical open failure"),
+    ])
+    context, _ = _stream_context(clock)
+    iterator = _provider(transport).stream(
+        _request(), context=context, clock=clock)
+
+    started = next(iterator)
+    assert isinstance(started, StreamStarted)
+    assert started.envelope.sequence == 0
+    assert len(transport.stream_calls) == 1
+    failed = next(iterator)
+    assert isinstance(failed, StreamFailed)
+    assert failed.envelope.attempt_id == started.envelope.attempt_id
+    assert failed.will_retry is False
+    with pytest.raises(StopIteration):
+        next(iterator)
 
 
 @pytest.mark.parametrize("status,headers,error_kind", [
@@ -1372,6 +1683,53 @@ def test_retry_delay_equal_or_greater_than_remaining_forbids_retry(
     assert slept == []
 
 
+def test_retry_delay_that_stops_fitting_before_promise_is_not_consumed():
+    clock = FixedClock(T0)
+    slept: list[float] = []
+    transport = ScriptedTransport([
+        ModelConnectionError("transient"),
+        (200, {}, _success_body("must-not-open")),
+    ])
+    context, _ = _stream_context(clock, remaining=2.0)
+    provider = _provider(
+        transport, max_retries=2, backoff=1.0, sleep=slept.append)
+
+    class AdvanceClockLogger:
+        def warning(self, _event: str, **_fields: Any) -> None:
+            clock.advance(1.5)
+
+    provider._log = AdvanceClockLogger()
+    events = _collect(provider, context, clock)
+
+    assert [type(event) for event in events] == [
+        StreamStarted, StreamFailed]
+    assert events[-1].retryable is True
+    assert events[-1].will_retry is False
+    assert slept == []
+    assert len(transport.stream_calls) == 1
+
+
+def test_retry_sleeper_failure_finalizes_real_attempt_without_fake_retry():
+    def fail_sleep(_delay: float) -> None:
+        raise ValueError("local sleeper failure")
+
+    clock = FixedClock(T0)
+    transport = ScriptedTransport([
+        ModelConnectionError("transient"),
+        (200, {}, _success_body("must-not-open")),
+    ])
+    context, _ = _stream_context(clock)
+    events = _collect(_provider(
+        transport, max_retries=2, sleep=fail_sleep), context, clock)
+
+    assert [type(event) for event in events] == [
+        StreamStarted, StreamFailed]
+    assert events[-1].envelope.attempt_id == events[0].envelope.attempt_id
+    assert events[-1].error_kind == "ValueError"
+    assert events[-1].will_retry is False
+    assert len(transport.stream_calls) == 1
+
+
 def test_all_attempt_timeouts_share_original_deadline_and_are_clamped():
     clock = FixedClock(T0)
     slept: list[float] = []
@@ -1411,7 +1769,9 @@ def test_deadline_winning_during_failed_open_cancels_without_retry():
     assert len(transport.stream_calls) == 1
 
 
-def test_retry_promise_cancellation_gets_new_started_then_cancelled_no_wire():
+def test_cancellation_between_retry_attempts_exposes_no_fake_attempt():
+    import agentcore.models.providers.openai_compatible as module
+
     clock = FixedClock(T0)
     transport = ScriptedTransport([
         ModelConnectionError("transient"),
@@ -1423,20 +1783,20 @@ def test_retry_promise_cancellation_gets_new_started_then_cancelled_no_wire():
     started = next(iterator)
     failed = next(iterator)
     assert isinstance(failed, StreamFailed) and failed.will_retry
+    assert len(transport.stream_calls) == 1
     source.cancel(CancellationReason.OPERATOR_CANCEL)
-    retried_started = next(iterator)
-    cancelled = next(iterator)
-    with pytest.raises(StopIteration):
+
+    with pytest.raises(module._TrustedStreamCancellation) as caught:
         next(iterator)
-    assert isinstance(retried_started, StreamStarted)
-    assert retried_started.envelope.sequence == 0
-    assert retried_started.envelope.attempt_id != started.envelope.attempt_id
-    assert isinstance(cancelled, StreamCancelled)
-    assert cancelled.reason is CancellationReason.OPERATOR_CANCEL
+
+    assert caught.value.reason is CancellationReason.OPERATOR_CANCEL
+    assert started.envelope.attempt_id == failed.envelope.attempt_id
     assert len(transport.stream_calls) == 1
 
 
-def test_retry_promise_shrunk_backoff_budget_never_opens_without_backoff():
+def test_deadline_between_retry_attempts_exposes_no_fake_attempt():
+    import agentcore.models.providers.openai_compatible as module
+
     clock = FixedClock(T0)
     transport = ScriptedTransport([
         ModelConnectionError("transient"),
@@ -1449,18 +1809,18 @@ def test_retry_promise_shrunk_backoff_budget_never_opens_without_backoff():
     first = next(iterator)
     failed = next(iterator)
     assert isinstance(failed, StreamFailed) and failed.will_retry
-    clock.advance(1.5)
-    second = next(iterator)
-    terminal = next(iterator)
-    assert isinstance(second, StreamStarted)
-    assert second.envelope.attempt_id != first.envelope.attempt_id
-    assert isinstance(terminal, StreamFailed)
-    assert terminal.error_kind == "ModelTimeoutError"
-    assert terminal.will_retry is False
+    assert first.envelope.attempt_id == failed.envelope.attempt_id
+    assert len(transport.stream_calls) == 1
+    clock.advance(2.0)
+
+    with pytest.raises(module._TrustedStreamCancellation) as caught:
+        next(iterator)
+
+    assert caught.value.reason is CancellationReason.DEADLINE_EXCEEDED
     assert len(transport.stream_calls) == 1
 
 
-def test_cancellation_during_retry_log_prevents_promised_backoff_and_wire():
+def test_cancellation_during_retry_log_prevents_promise_backoff_and_wire():
     clock = FixedClock(T0)
     slept: list[float] = []
     transport = ScriptedTransport([
@@ -1481,12 +1841,17 @@ def test_cancellation_during_retry_log_prevents_promised_backoff_and_wire():
     provider._log = GateLogger()
     iterator = provider.stream(_request(), context=context, clock=clock)
     first = next(iterator)
-    failed = next(iterator)
     assert isinstance(first, StreamStarted)
-    assert isinstance(failed, StreamFailed) and failed.will_retry
     observed: list[Any] = []
+    errors: list[BaseException] = []
 
-    thread = threading.Thread(target=lambda: observed.append(next(iterator)))
+    def pull_terminal() -> None:
+        try:
+            observed.append(next(iterator))
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=pull_terminal)
     thread.start()
     assert log_entered.wait(10.0)
     source.cancel(CancellationReason.SUPERSEDED)
@@ -1494,10 +1859,9 @@ def test_cancellation_during_retry_log_prevents_promised_backoff_and_wire():
     thread.join(10.0)
 
     assert not thread.is_alive()
-    assert len(observed) == 1 and isinstance(observed[0], StreamStarted)
-    cancelled = next(iterator)
-    assert isinstance(cancelled, StreamCancelled)
-    assert cancelled.reason is CancellationReason.SUPERSEDED
+    assert errors == []
+    assert len(observed) == 1 and isinstance(observed[0], StreamCancelled)
+    assert observed[0].reason is CancellationReason.SUPERSEDED
     assert slept == []
     assert len(transport.stream_calls) == 1
 
@@ -1507,47 +1871,67 @@ def test_cancellation_during_retry_log_prevents_promised_backoff_and_wire():
 # ---------------------------------------------------------------------------
 
 
-def test_cancellation_before_open_emits_trusted_terminal_and_zero_http():
+def test_pre_cancelled_provider_advance_has_no_attempt_or_http():
+    import agentcore.models.providers.openai_compatible as module
+
     clock = FixedClock(T0)
     transport = ScriptedTransport([(200, {}, _success_body("no"))])
     context, source = _stream_context(clock)
     source.cancel(CancellationReason.USER_INTERRUPT)
-    events = _collect(_provider(transport), context, clock)
-    assert [type(event) for event in events] == [
-        StreamStarted, StreamCancelled]
-    assert events[-1].reason is CancellationReason.USER_INTERRUPT
+
+    with pytest.raises(module._TrustedStreamCancellation) as caught:
+        _collect(_provider(transport), context, clock)
+
+    assert caught.value.reason is CancellationReason.USER_INTERRUPT
     assert transport.stream_calls == []
 
 
 def test_pre_cancelled_stream_wins_before_missing_credential_setup(
         monkeypatch: pytest.MonkeyPatch):
+    import agentcore.models.providers.openai_compatible as module
+
     monkeypatch.delenv(API_KEY_ENV)
     clock = FixedClock(T0)
     transport = ScriptedTransport([(200, {}, _success_body("no"))])
     context, source = _stream_context(clock)
     source.cancel(CancellationReason.USER_INTERRUPT)
 
-    events = _collect(_provider(transport), context, clock)
+    with pytest.raises(module._TrustedStreamCancellation) as caught:
+        _collect(_provider(transport), context, clock)
 
-    assert [type(event) for event in events] == [
-        StreamStarted, StreamCancelled]
-    assert events[-1].reason is CancellationReason.USER_INTERRUPT
+    assert caught.value.reason is CancellationReason.USER_INTERRUPT
     assert transport.stream_calls == []
 
 
-def test_missing_stream_credential_is_categorical_attempt_failure(
+def test_missing_stream_credential_is_no_wire_categorical_turn_failure(
         monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv(API_KEY_ENV)
-    clock = FixedClock(T0)
     transport = ScriptedTransport([(200, {}, _success_body("no"))])
-    context, _ = _stream_context(clock)
+    provider = _provider(transport)
+    direct_clock = FixedClock(T0)
+    direct_context, _ = _stream_context(direct_clock)
 
-    events = _collect(_provider(transport), context, clock)
+    with pytest.raises(ModelAuthError) as caught:
+        _collect(provider, direct_context, direct_clock)
 
-    assert [type(event) for event in events] == [StreamStarted, StreamFailed]
-    assert events[-1].error_kind == "ModelAuthError"
-    assert (events[-1].retryable, events[-1].will_retry) == (False, False)
+    assert AUTHORIZATION_SECRET not in repr(caught.value)
     assert transport.stream_calls == []
+    runtime, _sessions, turn_store, _clock = _owned_runtime(provider)
+    seen: list[Any] = []
+
+    result = runtime.send(
+        "missing auth", session=runtime.start(),
+        on_stream_event=seen.append,
+    )
+
+    assert result.ok is False
+    assert result.turn_phase == TurnPhase.FAILED.value
+    assert seen == []
+    assert transport.stream_calls == []
+    assert AUTHORIZATION_SECRET not in repr(result)
+    record = turn_store.load(result.turn_id)
+    assert record.phase is TurnPhase.FAILED
+    assert record.cancellation_reason is CancellationReason.INTERNAL_FAILURE
 
 
 def test_cancellation_immediately_after_open_closes_owned_handle_once():
@@ -1611,17 +1995,22 @@ def test_cancellation_while_blocked_read_closes_handle_and_reason_wins():
 
 
 def test_earlier_cancellation_beats_later_deadline():
+    import agentcore.models.providers.openai_compatible as module
+
     clock = FixedClock(T0)
     context, source = _stream_context(clock, remaining=1.0)
     source.cancel(CancellationReason.SUPERSEDED)
     clock.advance(2.0)
     transport = ScriptedTransport([(200, {}, _success_body("no"))])
-    events = _collect(_provider(transport), context, clock)
-    assert events[-1].reason is CancellationReason.SUPERSEDED
+    with pytest.raises(module._TrustedStreamCancellation) as caught:
+        _collect(_provider(transport), context, clock)
+    assert caught.value.reason is CancellationReason.SUPERSEDED
     assert transport.stream_calls == []
 
 
 def test_cancellation_linearizing_during_deadline_read_wins_trusted_race():
+    import agentcore.models.providers.openai_compatible as module
+
     base_clock = FixedClock(T0)
     entered_deadline_read = threading.Event()
     release_deadline_read = threading.Event()
@@ -1645,10 +2034,16 @@ def test_cancellation_linearizing_during_deadline_read_wins_trusted_race():
     transport = ScriptedTransport([(200, {}, _success_body("no"))])
     iterator = _provider(transport).stream(
         _request(), context=context, clock=gated_clock)
-    assert isinstance(next(iterator), StreamStarted)
     observed: list[Any] = []
+    errors: list[BaseException] = []
 
-    thread = threading.Thread(target=lambda: observed.append(next(iterator)))
+    def pull_first() -> None:
+        try:
+            observed.append(next(iterator))
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=pull_first)
     thread.start()
     assert entered_deadline_read.wait(10.0)
     source.cancel(CancellationReason.SUPERSEDED)
@@ -1657,9 +2052,10 @@ def test_cancellation_linearizing_during_deadline_read_wins_trusted_race():
     thread.join(10.0)
 
     assert not thread.is_alive()
-    assert len(observed) == 1
-    assert isinstance(observed[0], StreamCancelled)
-    assert observed[0].reason is CancellationReason.SUPERSEDED
+    assert observed == []
+    assert len(errors) == 1
+    assert isinstance(errors[0], module._TrustedStreamCancellation)
+    assert errors[0].reason is CancellationReason.SUPERSEDED
     assert transport.stream_calls == []
 
 
@@ -1717,92 +2113,112 @@ def test_cancellation_during_unexpired_pre_yield_clock_read_blocks_delta():
     assert raw.close_calls == 1
 
 
-def test_cancellation_linearizing_during_remaining_read_opens_no_wire():
-    base_clock = FixedClock(T0)
-    entered_remaining_read = threading.Event()
-    release_remaining_read = threading.Event()
+def test_real_cancellation_after_pre_pull_before_physical_open_has_no_attempt():
+    class GatedOpenProvider(OpenAICompatibleProvider):
+        def __init__(self, inner: OpenAICompatibleProvider) -> None:
+            super().__init__(inner.config, client=inner.client)
+            self.guard_entered = threading.Event()
+            self.release_guard = threading.Event()
 
-    class GatedClock:
-        def __init__(self) -> None:
-            self.monotonic_calls = 0
+        def _guard_stream_transport_invocation(
+            self,
+            context: StreamRequestContext,
+            clock: Any,
+        ) -> None:
+            self.guard_entered.set()
+            assert self.release_guard.wait(10.0)
+            super()._guard_stream_transport_invocation(context, clock)
 
-        def now(self):
-            return base_clock.now()
-
-        def monotonic(self) -> float:
-            self.monotonic_calls += 1
-            # logical start, preflight expiry, effective-timeout expiry, and
-            # remaining-helper expiry precede Deadline.remaining's own read.
-            if self.monotonic_calls == 5:
-                entered_remaining_read.set()
-                assert release_remaining_read.wait(10.0)
-            return base_clock.monotonic()
-
-    gated_clock = GatedClock()
-    context, source = _stream_context(base_clock, remaining=30.0)
     transport = ScriptedTransport([(200, {}, _success_body("no"))])
-    iterator = _provider(transport).stream(
-        _request(), context=context, clock=gated_clock)
-    assert isinstance(next(iterator), StreamStarted)
-    observed: list[Any] = []
+    provider = GatedOpenProvider(_provider(transport))
+    clock = FixedClock(T0)
+    store = InMemoryTurnStore()
+    bridge = TurnBridge(
+        TurnCoordinator(store, clock=clock),
+        clock=clock,
+        turn_deadline_seconds=120.0,
+    )
+    runtime = ConversationRuntime(
+        model=provider,
+        sessions=InMemorySessionStore(),
+        turns=bridge,
+        config=ConversationConfig(turn_deadline_seconds=120.0),
+    )
+    seen: list[Any] = []
+    results: list[Any] = []
+    errors: list[BaseException] = []
 
-    thread = threading.Thread(target=lambda: observed.append(next(iterator)))
+    def send() -> None:
+        try:
+            results.append(runtime.send(
+                "cancel before physical open",
+                session=runtime.start(),
+                on_stream_event=seen.append,
+            ))
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=send, daemon=True)
     thread.start()
-    assert entered_remaining_read.wait(10.0)
-    source.cancel(CancellationReason.SUPERSEDED)
-    release_remaining_read.set()
+    assert provider.guard_entered.wait(10.0)
+    # The conversation pre-pull fence has passed, but the provider's final
+    # trusted guard still precedes the physical transport seam.
+    bridge.shutdown()
+    provider.release_guard.set()
     thread.join(10.0)
 
     assert not thread.is_alive()
-    assert len(observed) == 1
-    assert isinstance(observed[0], StreamCancelled)
-    assert observed[0].reason is CancellationReason.SUPERSEDED
+    assert errors == []
+    assert len(results) == 1
+    assert results[0].turn_phase == TurnPhase.CANCELLED.value
+    record = store.load(results[0].turn_id)
+    assert record.phase is TurnPhase.CANCELLED
+    assert record.cancellation_reason is CancellationReason.AGENT_SHUTDOWN
+    assert seen == []
     assert transport.stream_calls == []
 
 
-def test_cancellation_during_failure_retry_budget_read_becomes_cancelled():
-    base_clock = FixedClock(T0)
-    entered_retry_remaining = threading.Event()
-    release_retry_remaining = threading.Event()
+def test_cancellation_during_retry_backoff_exposes_no_promise_or_attempt():
+    clock = FixedClock(T0)
+    context, source = _stream_context(clock, remaining=30.0)
+    sleep_entered = threading.Event()
+    release_sleep = threading.Event()
 
-    class GatedClock:
-        def __init__(self) -> None:
-            self.monotonic_calls = 0
+    def gated_sleep(_delay: float) -> None:
+        sleep_entered.set()
+        assert release_sleep.wait(10.0)
 
-        def now(self):
-            return base_clock.now()
-
-        def monotonic(self) -> float:
-            self.monotonic_calls += 1
-            # The ninth read is Deadline.remaining in the failed-attempt retry
-            # decision, after attempt-timeout preflight and winner checks.
-            if self.monotonic_calls == 9:
-                entered_retry_remaining.set()
-                assert release_retry_remaining.wait(10.0)
-            return base_clock.monotonic()
-
-    gated_clock = GatedClock()
-    context, source = _stream_context(base_clock, remaining=30.0)
     transport = ScriptedTransport([
         ModelConnectionError("failed open"),
         (200, {}, _success_body("must-not-open")),
     ])
-    iterator = _provider(transport, max_retries=2).stream(
-        _request(), context=context, clock=gated_clock)
-    assert isinstance(next(iterator), StreamStarted)
+    iterator = _provider(
+        transport, max_retries=2, sleep=gated_sleep).stream(
+            _request(), context=context, clock=clock)
+    started = next(iterator)
+    assert isinstance(started, StreamStarted)
     observed: list[Any] = []
+    errors: list[BaseException] = []
 
-    thread = threading.Thread(target=lambda: observed.append(next(iterator)))
+    def pull_terminal() -> None:
+        try:
+            observed.append(next(iterator))
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=pull_terminal)
     thread.start()
-    assert entered_retry_remaining.wait(10.0)
+    assert sleep_entered.wait(10.0)
     source.cancel(CancellationReason.SUPERSEDED)
-    release_retry_remaining.set()
+    release_sleep.set()
     thread.join(10.0)
 
     assert not thread.is_alive()
+    assert errors == []
     assert len(observed) == 1
     assert isinstance(observed[0], StreamCancelled)
     assert observed[0].reason is CancellationReason.SUPERSEDED
+    assert observed[0].envelope.attempt_id == started.envelope.attempt_id
     assert len(transport.stream_calls) == 1
 
 
@@ -1824,12 +2240,15 @@ def test_transport_cannot_fabricate_private_cancellation_signal():
 
 
 def test_deadline_without_earlier_cancellation_is_deadline_exceeded():
+    import agentcore.models.providers.openai_compatible as module
+
     clock = FixedClock(T0)
     context, _ = _stream_context(clock, remaining=1.0)
     clock.advance(1.0)
     transport = ScriptedTransport([(200, {}, _success_body("no"))])
-    events = _collect(_provider(transport), context, clock)
-    assert events[-1].reason is CancellationReason.DEADLINE_EXCEEDED
+    with pytest.raises(module._TrustedStreamCancellation) as caught:
+        _collect(_provider(transport), context, clock)
+    assert caught.value.reason is CancellationReason.DEADLINE_EXCEEDED
     assert transport.stream_calls == []
 
 

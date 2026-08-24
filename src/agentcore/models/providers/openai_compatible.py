@@ -628,9 +628,10 @@ class OpenAICompatibleProvider(BaseModelProvider):
             raise ModelResponseError(
                 "native model streaming clock was invalid")
 
-        # Keep setup lazy until after the first attempt lifecycle and trusted
-        # cancellation check.  A pre-existing cancellation must outrank even
-        # local credential/configuration failure and must perform no wire I/O.
+        # Keep setup lazy until trusted cancellation has had the first say. A
+        # no-wire preflight failure is not a native attempt and therefore must
+        # not expose an attempt ID or neutral event.
+        self._raise_for_trusted_cancellation(context, clock)
         model_hint = request.model or self.config.name
         payload: dict[str, Any] | None = None
         headers: dict[str, str] | None = None
@@ -646,8 +647,21 @@ class OpenAICompatibleProvider(BaseModelProvider):
 
         semantic_output_emitted = False
         attempt_number = 0
-        preflight_failure: tuple[str, bool] | None = None
         while attempt_number < max_attempts:
+            # Everything through the final trusted guard is preflight.  Any
+            # exception here crosses no native event boundary because no
+            # physical transport seam has been invoked.
+            self._raise_for_trusted_cancellation(context, clock)
+            if payload is None:
+                payload = self.build_payload(request)
+                payload["stream"] = True
+            if headers is None:
+                headers, secrets = self._auth_headers()
+            timeout = self._effective_stream_timeout(context, clock)
+            self._guard_stream_transport_invocation(context, clock)
+
+            # Allocate immediately before the physical seam.  It remains
+            # unobservable until that seam has actually been invoked.
             attempt_number += 1
             attempt_id = new_id("att")
             sequence = 0
@@ -666,151 +680,230 @@ class OpenAICompatibleProvider(BaseModelProvider):
                 sequence += 1
                 return value
 
-            yield StreamStarted(
-                envelope=envelope(),
-                model=model_hint,
-                provider=self.name,
-            )
-
-            # A pre-cancelled/pre-expired request still needs a valid neutral
-            # attempt lifecycle, but it must make zero HTTP calls.
-            reason = self._trusted_cancellation_reason(context, clock)
-            if reason is not None:
-                yield StreamCancelled(envelope=envelope(), reason=reason)
-                return
-            if preflight_failure is not None:
-                error_kind, retryable = preflight_failure
-                yield StreamFailed(
-                    envelope=envelope(),
-                    error_kind=error_kind,
-                    retryable=retryable,
-                    will_retry=False,
-                )
-                return
-
+            handle = None
+            registration = None
+            attempt_error: Exception | None = None
+            cleanup_error: Exception | None = None
+            success: _AttemptSuccess | None = None
             try:
-                if payload is None:
-                    payload = self.build_payload(request)
-                    payload["stream"] = True
-                if headers is None:
-                    headers, secrets = self._auth_headers()
-                timeout = self._effective_stream_timeout(context, clock)
-                attempt = self._iter_stream_attempt(
-                    payload=payload,
-                    headers=headers,
-                    secrets=secrets,
-                    timeout=timeout,
-                    context=context,
-                    clock=clock,
-                    logical_started=logical_started,
-                    model_hint=model_hint,
-                    envelope=envelope,
-                )
                 try:
-                    while True:
+                    handle = self.client.open_stream(
+                        self.endpoint,
+                        payload,
+                        headers,
+                        timeout,
+                        secrets=secrets,
+                    )
+                except Exception as exc:
+                    # Invocation itself is the physical-attempt boundary, so
+                    # even an immediate ordinary failure owns this attempt ID.
+                    attempt_error = exc
+
+                if attempt_error is None:
+                    try:
+                        assert handle is not None
+                        registration = context.cancellation.register(
+                            lambda _reason, owned=handle: owned.close())
+                        # Registration closes an already-cancelled handle
+                        # synchronously. Recheck before Started is observable.
+                        self._raise_for_trusted_cancellation(context, clock)
+                    except Exception as exc:
+                        attempt_error = exc
+                        # A failed registration or post-registration trusted
+                        # check must not leave an unowned live response while
+                        # the consumer holds backpressure on Started.
+                        if handle is not None:
+                            handle.close()
+
+                # The physical invocation is now established.  This is the
+                # first observable neutral event even when open/registration
+                # immediately failed.
+                yield StreamStarted(
+                    envelope=envelope(),
+                    model=model_hint,
+                    provider=self.name,
+                )
+
+                if attempt_error is None:
+                    assert handle is not None
+                    attempt = self._iter_stream_attempt(
+                        handle=handle,
+                        context=context,
+                        clock=clock,
+                        logical_started=logical_started,
+                        model_hint=model_hint,
+                        envelope=envelope,
+                    )
+                    try:
+                        while True:
+                            try:
+                                event = next(attempt)
+                            except StopIteration as stopped:
+                                success = stopped.value
+                                break
+                            if self._is_semantic_event(event):
+                                semantic_output_emitted = True
+                            yield event
+                    except Exception as exc:
+                        attempt_error = exc
+                    finally:
                         try:
-                            event = next(attempt)
-                        except StopIteration as stopped:
-                            success = stopped.value
-                            break
-                        if self._is_semantic_event(event):
-                            semantic_output_emitted = True
-                        yield event
+                            attempt.close()
+                        except Exception as close_error:
+                            if attempt_error is None:
+                                attempt_error = close_error
+            finally:
+                try:
+                    if registration is not None:
+                        try:
+                            registration.close()
+                        except Exception as exc:
+                            cleanup_error = exc
                 finally:
-                    # GeneratorExit and every control-flow BaseException reach
-                    # the attempt's finally without being normalized.
-                    attempt.close()
-            except Exception as exc:
-                # Resource cleanup has completed before this terminal is made
-                # observable.  Trusted winner truth outranks I/O/parser shape.
+                    # Registration cleanup is not trusted to succeed. The
+                    # physical handle must still close for ordinary failures
+                    # and control-flow BaseExceptions alike.
+                    if handle is not None:
+                        handle.close()
+
+            if attempt_error is None and cleanup_error is not None:
+                attempt_error = cleanup_error
+
+            if attempt_error is not None:
+                # Cleanup has completed before any terminal becomes visible.
+                # Trusted winner truth outranks I/O/parser/orchestration shape.
                 reason = self._trusted_cancellation_reason(context, clock)
                 if reason is not None:
                     yield StreamCancelled(
                         envelope=envelope(), reason=reason)
                     return
-                if isinstance(exc, _TrustedStreamCancellation):
-                    # Even this module-private signal is not authority when an
-                    # injected transport fabricates it. Only the trusted token
-                    # and deadline check above can establish cancellation.
-                    exc = ModelResponseError(
+                if isinstance(attempt_error, _TrustedStreamCancellation):
+                    # A transport may import and fabricate the private signal;
+                    # only the trusted state check above grants authority.
+                    attempt_error = ModelResponseError(
                         "native stream cancellation lacked a trusted winner")
 
-                retryable = isinstance(exc, ModelError) and bool(exc.retryable)
-                delay = self._stream_retry_delay(exc, attempt_number) \
-                    if retryable else None
+                retryable = isinstance(attempt_error, ModelError) and \
+                    bool(attempt_error.retryable)
+                delay = self._stream_retry_delay(
+                    attempt_error, attempt_number) if retryable else None
+                reason = self._trusted_cancellation_reason(context, clock)
+                if reason is not None:
+                    yield StreamCancelled(
+                        envelope=envelope(), reason=reason)
+                    return
                 remaining = self._remaining_stream_deadline(context, clock)
                 reason = self._trusted_cancellation_reason(context, clock)
                 if reason is not None:
                     yield StreamCancelled(
                         envelope=envelope(), reason=reason)
                     return
-                will_retry = (
+
+                retry_eligible = (
                     retryable
                     and not semantic_output_emitted
                     and attempt_number < max_attempts
                     and delay is not None
                     and delay < remaining
                 )
-                error_kind = self._safe_error_kind(exc)
+                error_kind = self._safe_error_kind(attempt_error)
+                if not retry_eligible:
+                    yield StreamFailed(
+                        envelope=envelope(),
+                        error_kind=error_kind,
+                        retryable=retryable,
+                        will_retry=False,
+                    )
+                    return
+
+                assert delay is not None
+                try:
+                    self._log.warning(
+                        Events.MODEL_RETRY,
+                        provider=self.name,
+                        model=model_hint,
+                        attempt=attempt_number,
+                        max_attempts=max_attempts,
+                        error=error_kind,
+                        delay_seconds=round(delay, 3),
+                    )
+                except Exception:
+                    # Categorical best-effort observability cannot alter retry
+                    # eligibility or expose provider content.
+                    pass
+
+                # Logging may synchronously block. Revalidate both authority
+                # and the still-unpaid delay immediately before sleeping.
+                reason = self._trusted_cancellation_reason(context, clock)
+                if reason is not None:
+                    yield StreamCancelled(
+                        envelope=envelope(), reason=reason)
+                    return
+                remaining = self._remaining_stream_deadline(context, clock)
+                reason = self._trusted_cancellation_reason(context, clock)
+                if reason is not None:
+                    yield StreamCancelled(
+                        envelope=envelope(), reason=reason)
+                    return
+                if delay >= remaining:
+                    yield StreamFailed(
+                        envelope=envelope(),
+                        error_kind=error_kind,
+                        retryable=retryable,
+                        will_retry=False,
+                    )
+                    return
+
+                try:
+                    self.client.sleep(delay)
+                except Exception as sleep_error:
+                    reason = self._trusted_cancellation_reason(context, clock)
+                    if reason is not None:
+                        yield StreamCancelled(
+                            envelope=envelope(), reason=reason)
+                        return
+                    if isinstance(sleep_error, _TrustedStreamCancellation):
+                        sleep_error = ModelResponseError(
+                            "native stream cancellation lacked a trusted "
+                            "winner")
+                    yield StreamFailed(
+                        envelope=envelope(),
+                        error_kind=self._safe_error_kind(sleep_error),
+                        retryable=(
+                            isinstance(sleep_error, ModelError)
+                            and bool(sleep_error.retryable)
+                        ),
+                        will_retry=False,
+                    )
+                    return
+
+                # The retry promise crosses the event boundary only after its
+                # mandatory delay has been consumed and authority revalidated.
+                reason = self._trusted_cancellation_reason(context, clock)
+                if reason is not None:
+                    yield StreamCancelled(
+                        envelope=envelope(), reason=reason)
+                    return
                 yield StreamFailed(
                     envelope=envelope(),
                     error_kind=error_kind,
                     retryable=retryable,
-                    will_retry=will_retry,
+                    will_retry=True,
                 )
-                if not will_retry:
-                    return
-
-                # A retry terminal is a promise.  If cancellation/deadline wins
-                # while the consumer owns that terminal, the next loop still
-                # emits a fresh StreamStarted followed by StreamCancelled, but
-                # opens no wire attempt and performs no backoff.
-                reason = self._trusted_cancellation_reason(context, clock)
-                if reason is None:
-                    remaining = self._remaining_stream_deadline(context, clock)
-                    if delay < remaining:
-                        try:
-                            self._log.warning(
-                                Events.MODEL_RETRY,
-                                provider=self.name,
-                                model=model_hint,
-                                attempt=attempt_number,
-                                max_attempts=max_attempts,
-                                error=error_kind,
-                                delay_seconds=round(delay, 3),
-                            )
-                        except Exception:
-                            # Observability is content-free and best-effort; a
-                            # broken handler cannot violate a retry promise.
-                            pass
-                        # Logging may block in an injected/slow handler. Check
-                        # trusted state again at the actual backoff boundary.
-                        reason = self._trusted_cancellation_reason(
-                            context, clock)
-                        remaining = self._remaining_stream_deadline(
-                            context, clock)
-                        if reason is None and delay < remaining:
-                            try:
-                                self.client.sleep(delay)
-                            except Exception as sleep_error:
-                                preflight_failure = (
-                                    self._safe_error_kind(sleep_error),
-                                    isinstance(sleep_error, ModelError) and
-                                    bool(sleep_error.retryable),
-                                )
-                        elif reason is None:
-                            preflight_failure = ("ModelTimeoutError", True)
-                    else:
-                        # The retry was valid when announced, but consumer time
-                        # consumed its backoff budget. Fulfil the attempt promise
-                        # with a new no-wire attempt and a categorical terminal;
-                        # never skip policy backoff and open anyway.
-                        preflight_failure = ("ModelTimeoutError", True)
+                # Backpressure is preserved here: loop preflight and physical
+                # retry invocation occur only on the next consumer pull.
                 continue
 
             if not isinstance(success, _AttemptSuccess):
-                raise ModelResponseError(
-                    "provider stream attempt ended without a canonical result")
+                # This is still a failure of the real physical attempt whose
+                # Started event was exposed above.
+                yield StreamFailed(
+                    envelope=envelope(),
+                    error_kind="ModelResponseError",
+                    retryable=False,
+                    will_retry=False,
+                )
+                return
 
             # The successful HTTP resource and cancellation registration are
             # already closed.  Final tool completions and ResponseCompleted are
@@ -834,70 +927,51 @@ class OpenAICompatibleProvider(BaseModelProvider):
                 envelope=envelope(), response=success.response)
             return
 
+    def _guard_stream_transport_invocation(
+        self,
+        context: StreamRequestContext,
+        clock: Clock,
+    ) -> None:
+        """Perform the final trusted check immediately before physical open."""
+        self._raise_for_trusted_cancellation(context, clock)
+
     def _iter_stream_attempt(
         self,
         *,
-        payload: dict[str, Any],
-        headers: dict[str, str],
-        secrets: tuple[str, ...],
-        timeout: float,
+        handle: Any,
         context: StreamRequestContext,
         clock: Clock,
         logical_started: float,
         model_hint: str,
         envelope: Any,
     ) -> Generator[ModelStreamEvent, None, _AttemptSuccess]:
-        """Drive one physical HTTP/SSE attempt with rigorous ownership."""
-        handle = None
-        registration = None
-        try:
-            handle = self.client.open_stream(
-                self.endpoint,
-                payload,
-                headers,
-                timeout,
-                secrets=secrets,
-            )
-            registration = context.cancellation.register(
-                lambda _reason: handle.close())
+        """Normalize one already-opened physical HTTP/SSE attempt."""
+        normalizer = _OpenAIStreamNormalizer(model_hint=model_hint)
+        parser = iter(iter_sse_data(handle))
+        while True:
+            self._raise_for_trusted_cancellation(context, clock)
+            try:
+                data = next(parser)
+            except StopIteration:
+                raise ModelResponseError(
+                    "provider stream ended before explicit [DONE]") from None
             self._raise_for_trusted_cancellation(context, clock)
 
-            normalizer = _OpenAIStreamNormalizer(model_hint=model_hint)
-            parser = iter(iter_sse_data(handle))
-            while True:
+            if data == "[DONE]":
                 self._raise_for_trusted_cancellation(context, clock)
-                try:
-                    data = next(parser)
-                except StopIteration:
-                    raise ModelResponseError(
-                        "provider stream ended before explicit [DONE]") from None
+                latency_ms = self._stream_latency_ms(
+                    logical_started, clock)
+                pending, response = normalizer.finalize(
+                    latency_ms=latency_ms)
                 self._raise_for_trusted_cancellation(context, clock)
+                return _AttemptSuccess(
+                    pending=tuple(pending), response=response)
 
-                if data == "[DONE]":
-                    self._raise_for_trusted_cancellation(context, clock)
-                    latency_ms = self._stream_latency_ms(
-                        logical_started, clock)
-                    pending, response = normalizer.finalize(
-                        latency_ms=latency_ms)
-                    self._raise_for_trusted_cancellation(context, clock)
-                    return _AttemptSuccess(
-                        pending=tuple(pending), response=response)
-
-                specs = normalizer.accept_data(data)
+            specs = normalizer.accept_data(data)
+            self._raise_for_trusted_cancellation(context, clock)
+            for spec in specs:
                 self._raise_for_trusted_cancellation(context, clock)
-                for spec in specs:
-                    self._raise_for_trusted_cancellation(context, clock)
-                    yield self._event_from_spec(spec, envelope())
-        finally:
-            try:
-                if registration is not None:
-                    registration.close()
-            finally:
-                # Registration cleanup is not trusted to succeed.  The owned
-                # HTTP resource must still be closed for ordinary exceptions
-                # and control-flow BaseExceptions alike.
-                if handle is not None:
-                    handle.close()
+                yield self._event_from_spec(spec, envelope())
 
     @staticmethod
     def _event_from_spec(spec: _EventSpec,
