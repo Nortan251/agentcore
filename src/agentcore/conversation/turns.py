@@ -19,9 +19,11 @@ foundation that knows nothing about conversation, and the conversation layer
 opts into it. With no coordinator injected this module is never imported and
 the pre-Task-42.3 path runs untouched.
 
-Cancellation is cooperative only. A provider or tool that ignores cancellation
-keeps the successor waiting until it physically returns; nothing here claims
-barge-in latency, forced interruption, or preemption.
+Cancellation remains cooperative.  The bridge signals live per-turn tokens
+from durable admission evidence, allowing an owner such as the native HTTP
+stream to close only its own resource.  A provider or tool that ignores the
+token still keeps the successor waiting until it physically returns; nothing
+here kills threads, rolls back effects, or weakens the stage lease.
 """
 
 from __future__ import annotations
@@ -302,6 +304,13 @@ class TurnBridge:
         # can only shorten this through ``Deadline.child``, never lengthen it.
         self._turn_deadline_seconds = turn_deadline_seconds
         self._root = CancellationSource()
+        # Ephemeral signal routing only.  TurnCoordinator remains the durable
+        # admission/supersession authority, while this bridge owns the live
+        # CancellationSource objects that must never enter durable state.  The
+        # lock protects the mapping only; source.cancel() runs after release
+        # because an owned-resource close callback may execute synchronously.
+        self._live_sources_lock = threading.Lock()
+        self._live_sources: dict[str, CancellationSource] = {}
         self._log = logger or get_logger("conversation.turns")
 
     # -- host lifecycle ----------------------------------------------------
@@ -312,6 +321,61 @@ class TurnBridge:
     def shutdown(self) -> None:
         """Request cooperative cancellation of every live turn."""
         self._root.cancel(CancellationReason.AGENT_SHUTDOWN)
+
+    # -- live cancellation routing -----------------------------------------
+    def _register_live_source(self, turn_id: str,
+                              source: CancellationSource) -> None:
+        with self._live_sources_lock:
+            if turn_id in self._live_sources:
+                raise TurnCoordinatorError(
+                    "turn already has a live cancellation source",
+                    turn_id=turn_id)
+            self._live_sources[turn_id] = source
+
+    def _unregister_live_source(self, turn_id: str,
+                                source: CancellationSource) -> None:
+        with self._live_sources_lock:
+            if self._live_sources.get(turn_id) is source:
+                self._live_sources.pop(turn_id, None)
+
+    def _cancel_live_source(self, turn_id: str,
+                            reason: CancellationReason) -> None:
+        # Keep a strong reference across the race with unregister/close, but
+        # never invoke callbacks while holding the registry lock.
+        with self._live_sources_lock:
+            source = self._live_sources.get(turn_id)
+        if source is not None:
+            source.cancel(reason)
+
+    def _signal_admission_supersessions(self, admission: Any) -> None:
+        """Route only authoritative supersession evidence to live owners.
+
+        ``TurnCoordinator.admit`` has returned before this method runs, so its
+        admission lane and every store lock are released.  Missing sources are
+        expected for already-finished or foreign-host turns; durable fencing
+        remains authoritative and no ephemeral source is fabricated.
+        """
+        evidence = (
+            (admission.superseded_active, CancellationReason.SUPERSEDED),
+            (admission.superseded_before_start,
+             CancellationReason.SUPERSEDED_BEFORE_START),
+        )
+        for snapshot, expected_reason in evidence:
+            if snapshot is None or \
+                    snapshot.cancellation_reason is not expected_reason:
+                continue
+            self._cancel_live_source(snapshot.turn_id, expected_reason)
+
+    def _synchronize_live_source(self, turn_id: str,
+                                 source: CancellationSource) -> None:
+        """Close the admit-return/register race using current durable truth."""
+        record = self._store.load(turn_id)
+        reason = record.cancellation_reason
+        if reason in {
+            CancellationReason.SUPERSEDED,
+            CancellationReason.SUPERSEDED_BEFORE_START,
+        }:
+            source.cancel(reason)
 
     # -- one turn ----------------------------------------------------------
     def run(self, runtime: Any, session: Any, message: Any, *,
@@ -326,24 +390,36 @@ class TurnBridge:
                                   clock=self._clock)
         admission = self._coordinator.admit(session_key, deadline=deadline)
         admitted = admission.admitted
-        log = self._log.bind(turn_id=admitted.turn_id,
-                             session_key=session_key,
-                             generation=admitted.generation)
-        log.info(Events.TURN_ADMITTED,
-                 superseded_active=admission.superseded_active is not None,
-                 superseded_before_start=(
-                     admission.superseded_before_start is not None))
-
-        controller = TurnController(self._store, admitted.turn_id,
-                                    clock=self._clock)
         source = self._root.child()
-        fence = _TurnFence(
-            controller, turn_id=admitted.turn_id, session_key=session_key,
-            generation=admitted.generation,
-            operation_id=admitted.active_operation_id, token=source.token,
-            deadline=deadline, clock=self._clock,
-            session_lock=self.session_lock, store=self._store, log=log)
+        registered = False
         try:
+            # Register the newly admitted turn before signalling predecessors.
+            # A still-newer admission can now find it.  The durable reload then
+            # catches the complementary race where that newer admission already
+            # completed before this insertion and therefore found no source.
+            self._register_live_source(admitted.turn_id, source)
+            registered = True
+            self._signal_admission_supersessions(admission)
+            self._synchronize_live_source(admitted.turn_id, source)
+
+            log = self._log.bind(turn_id=admitted.turn_id,
+                                 session_key=session_key,
+                                 generation=admitted.generation)
+            log.info(Events.TURN_ADMITTED,
+                     superseded_active=(
+                         admission.superseded_active is not None),
+                     superseded_before_start=(
+                         admission.superseded_before_start is not None))
+
+            controller = TurnController(self._store, admitted.turn_id,
+                                        clock=self._clock)
+            fence = _TurnFence(
+                controller, turn_id=admitted.turn_id,
+                session_key=session_key,
+                generation=admitted.generation,
+                operation_id=admitted.active_operation_id, token=source.token,
+                deadline=deadline, clock=self._clock,
+                session_lock=self.session_lock, store=self._store, log=log)
             # Admission is already complete and its lane released; no
             # coordinator mutex and no session lock is held while waiting here.
             with self.stage_lease:
@@ -354,6 +430,8 @@ class TurnBridge:
                     runtime, session, message, controller, fence, log,
                     on_stream_event=on_stream_event)
         finally:
+            if registered:
+                self._unregister_live_source(admitted.turn_id, source)
             source.close()
 
     def _run_owned(self, runtime: Any, session: Any, message: Any,

@@ -68,7 +68,7 @@ from agentcore.permissions.levels import Capability, PermissionLevel
 from agentcore.permissions.policy import PermissionPolicy
 from agentcore.realtime import InMemoryTurnStore, TurnCoordinator
 from agentcore.realtime.cancellation import CancellationReason, CancellationSource
-from agentcore.realtime.turn import Deadline, OperationContext
+from agentcore.realtime.turn import Deadline, OperationContext, TurnPhase
 from agentcore.tools.base import Tool, ToolResult, tool_spec
 from agentcore.tools.executor import ToolExecutor
 from agentcore.tools.registry import ToolRegistry
@@ -158,6 +158,81 @@ class ScriptedTransport:
         if isinstance(item, BaseException):
             raise item
         return item
+
+
+class _RecordingCoordinator:
+    """Observe completed real admissions without replacing their authority."""
+
+    def __init__(self, inner: TurnCoordinator) -> None:
+        self.inner = inner
+        self.admissions: list[Any] = []
+        self._condition = threading.Condition()
+
+    @property
+    def store(self) -> InMemoryTurnStore:
+        return self.inner.store
+
+    def admit(self, *args: Any, **kwargs: Any) -> Any:
+        admission = self.inner.admit(*args, **kwargs)
+        with self._condition:
+            self.admissions.append(admission)
+            self._condition.notify_all()
+        return admission
+
+    def wait_for(self, count: int) -> Any:
+        with self._condition:
+            assert self._condition.wait_for(
+                lambda: len(self.admissions) >= count, timeout=10.0)
+            return self.admissions[count - 1]
+
+
+class _ContextRecordingProvider:
+    """Keep the real provider path while exposing its trusted contexts."""
+
+    def __init__(self, inner: OpenAICompatibleProvider) -> None:
+        self.inner = inner
+        self.contexts: list[StreamRequestContext] = []
+        self._lock = threading.Lock()
+
+    def stream(self, request: ModelRequest, *, context: OperationContext,
+               clock: Any):
+        with self._lock:
+            self.contexts.append(context)
+        return self.inner.stream(request, context=context, clock=clock)
+
+
+class _BlockingReadBody:
+    """Return one frame, then block until the owned response is closed."""
+
+    def __init__(self, first: bytes, *, close_gate: threading.Event | None = None
+                 ) -> None:
+        self._first = first
+        self._close_gate = close_gate
+        self._lock = threading.Lock()
+        self.read_entered = threading.Event()
+        self.close_entered = threading.Event()
+        self.closed = threading.Event()
+        self.read_calls = 0
+        self.close_calls = 0
+
+    def read(self, size: int) -> bytes:
+        with self._lock:
+            self.read_calls += 1
+            first = self._first
+            if first:
+                result = first[:size]
+                self._first = first[size:]
+                return result
+        self.read_entered.set()
+        assert self.closed.wait(10.0), "owned stream was never closed"
+        raise OSError("deterministic closed stream")
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self.close_entered.set()
+        if self._close_gate is not None:
+            assert self._close_gate.wait(10.0), "close gate was never released"
+        self.closed.set()
 
 
 def _sse(value: Any, *, ending: bytes = b"\n\n") -> bytes:
@@ -706,6 +781,218 @@ def test_native_openai_text_stream_integrates_through_conversation_runtime():
     assert all(message.content not in {"hel", "lo"}
                for message in persisted.messages)
     assert len(transport.stream_calls) == 1
+
+
+def test_real_successor_admission_cancels_blocked_native_stream_and_then_runs():
+    old_body = _BlockingReadBody(_sse(_chunk(
+        content="old-partial",
+        tools=[{
+            "index": 0,
+            "id": "call_old_partial",
+            "type": "function",
+            "function": {"name": "counter", "arguments": "{}"},
+        }],
+    )))
+    successor_opened = threading.Event()
+    old_turn_id: list[str] = []
+    clock = FixedClock(T0)
+    store = InMemoryTurnStore()
+
+    def successor_stream() -> tuple[int, dict[str, str], RawBody]:
+        # The StageLease may admit and queue a successor immediately, but it
+        # must not permit successor model work until the old owner terminalizes.
+        old = store.load(old_turn_id[0])
+        assert old.phase is TurnPhase.CANCELLED
+        assert old.cancellation_reason is CancellationReason.SUPERSEDED
+        successor_opened.set()
+        return 200, {}, _success_body("successor")
+
+    transport = ScriptedTransport([
+        (200, {}, old_body),
+        successor_stream,
+    ])
+    provider = _ContextRecordingProvider(_provider(transport))
+    coordinator = _RecordingCoordinator(TurnCoordinator(store, clock=clock))
+    bridge = TurnBridge(
+        coordinator, clock=clock, turn_deadline_seconds=120.0)
+    sessions = InMemorySessionStore()
+    runner, executor, policy, tool = _tool_boundary()
+    runtime = ConversationRuntime(
+        model=provider,
+        tools=runner,
+        sessions=sessions,
+        turns=bridge,
+        config=ConversationConfig(turn_deadline_seconds=120.0),
+    )
+    session = runtime.start()
+    results: dict[str, Any] = {}
+    errors: dict[str, BaseException] = {}
+    old_events: list[Any] = []
+    successor_events: list[Any] = []
+
+    def send(name: str, text: str, sink: list[Any]) -> None:
+        try:
+            results[name] = runtime.send(
+                text, session=session, on_stream_event=sink.append)
+        except BaseException as exc:  # surfaced below without losing the thread
+            errors[name] = exc
+
+    old_thread = threading.Thread(
+        target=send, args=("old", "old input", old_events), daemon=True)
+    old_thread.start()
+    first_admission = coordinator.wait_for(1)
+    old_turn_id.append(first_admission.admitted.turn_id)
+    assert old_body.read_entered.wait(10.0)
+    assert any(isinstance(event, TextDelta) and event.text == "old-partial"
+               for event in old_events)
+    assert any(isinstance(event, ToolCallDelta) for event in old_events)
+    assert len(provider.contexts) == 1
+    old_context = provider.contexts[0]
+    assert old_context.cancellation.requested is False
+
+    successor_thread = threading.Thread(
+        target=send,
+        args=("successor", "new input", successor_events),
+        daemon=True,
+    )
+    successor_thread.start()
+    second_admission = coordinator.wait_for(2)
+
+    # The old read cannot wake itself: this is direct proof that the real
+    # successor admission routed durable supersession to the old context token,
+    # whose native provider callback closed the owned HTTP response.
+    assert old_body.close_entered.wait(10.0)
+    assert old_context.cancellation.requested is True
+    assert old_context.cancellation.reason is CancellationReason.SUPERSEDED
+    assert old_body.closed.wait(10.0)
+
+    for thread in (old_thread, successor_thread):
+        thread.join(10.0)
+        assert not thread.is_alive()
+
+    assert errors == {}
+    assert results["old"].ok is False
+    assert results["old"].turn_phase == TurnPhase.CANCELLED.value
+    assert results["successor"].ok is True
+    assert results["successor"].reply.content == "successor"
+    assert successor_opened.is_set()
+    old_record = store.load(first_admission.admitted.turn_id)
+    successor_record = store.load(second_admission.admitted.turn_id)
+    assert old_record.phase is TurnPhase.CANCELLED
+    assert old_record.cancellation_reason is CancellationReason.SUPERSEDED
+    assert successor_record.phase is TurnPhase.COMPLETED
+    assert old_body.close_calls == 1
+    assert len(transport.stream_calls) == 2
+
+    # Provisional text/tool fragments were observable only at the sink.  They
+    # never became transcript state or executable ToolExecutor authority.
+    persisted = sessions.load(session.id)
+    assert persisted is not None
+    assert all("old-partial" not in message.content
+               for message in persisted.messages)
+    assert all(message.role is not Role.TOOL for message in persisted.messages)
+    assert [message.content for message in persisted.messages
+            if message.role is Role.ASSISTANT] == ["successor"]
+    assert runner.calls == 0
+    assert executor.calls == 0
+    assert policy.check_calls == 0
+    assert tool.runs == 0
+
+
+def test_live_queued_turn_receives_superseded_before_start_from_third_admission():
+    release_old_close = threading.Event()
+    old_body = _BlockingReadBody(
+        _sse(_chunk(content="old-provisional")),
+        close_gate=release_old_close,
+    )
+    transport = ScriptedTransport([
+        (200, {}, old_body),
+        (200, {}, _success_body("third wins")),
+    ])
+    provider = _ContextRecordingProvider(_provider(transport))
+    clock = FixedClock(T0)
+    store = InMemoryTurnStore()
+    coordinator = _RecordingCoordinator(TurnCoordinator(store, clock=clock))
+    bridge = TurnBridge(
+        coordinator, clock=clock, turn_deadline_seconds=120.0)
+    runtime = ConversationRuntime(
+        model=provider,
+        sessions=InMemorySessionStore(),
+        turns=bridge,
+        config=ConversationConfig(turn_deadline_seconds=120.0),
+    )
+    session = runtime.start()
+    results: dict[str, Any] = {}
+    errors: dict[str, BaseException] = {}
+
+    def send(name: str) -> None:
+        try:
+            results[name] = runtime.send(
+                name, session=session, on_stream_event=lambda _event: None)
+        except BaseException as exc:
+            errors[name] = exc
+
+    first = threading.Thread(target=send, args=("first",), daemon=True)
+    second = threading.Thread(target=send, args=("second",), daemon=True)
+    third: threading.Thread | None = None
+    queued_registration = None
+    threads = [first, second]
+    first.start()
+    coordinator.wait_for(1)
+    assert old_body.read_entered.wait(10.0)
+    second.start()
+    second_admission = coordinator.wait_for(2)
+
+    # The second admission registered its own source before signalling the old
+    # stream. Gate that close so the second stays live and queued while a third
+    # real admission replaces it.
+    assert old_body.close_entered.wait(10.0)
+    with bridge._live_sources_lock:
+        queued_source = bridge._live_sources.get(
+            second_admission.admitted.turn_id)
+    assert queued_source is not None
+    queued_cancelled = threading.Event()
+    queued_reasons: list[CancellationReason] = []
+
+    def record_queued_reason(reason: CancellationReason) -> None:
+        queued_reasons.append(reason)
+        queued_cancelled.set()
+
+    queued_registration = queued_source.token.register(record_queued_reason)
+    try:
+        third = threading.Thread(target=send, args=("third",), daemon=True)
+        threads.append(third)
+        third.start()
+        third_admission = coordinator.wait_for(3)
+        assert queued_cancelled.wait(10.0)
+        assert queued_reasons == [CancellationReason.SUPERSEDED_BEFORE_START]
+        assert queued_source.token.reason is \
+            CancellationReason.SUPERSEDED_BEFORE_START
+    finally:
+        release_old_close.set()
+        if queued_registration is not None:
+            queued_registration.close()
+        for thread in threads:
+            thread.join(10.0)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == {}
+    assert results["first"].ok is False
+    assert results["second"].ok is False
+    assert results["third"].ok is True
+    assert results["third"].reply.content == "third wins"
+    second_record = store.load(second_admission.admitted.turn_id)
+    third_record = store.load(third_admission.admitted.turn_id)
+    assert second_record.phase is TurnPhase.CANCELLED
+    assert second_record.cancellation_reason is \
+        CancellationReason.SUPERSEDED_BEFORE_START
+    assert third_record.phase is TurnPhase.COMPLETED
+    assert len(provider.contexts) == 2  # first + third; queued second never ran
+    assert len(transport.stream_calls) == 2
+    assert old_body.close_calls == 1
+    assert queued_source.closed is True
+    with bridge._live_sources_lock:
+        assert bridge._live_sources == {}
 
 
 def test_stream_requires_trusted_request_context_before_http():
