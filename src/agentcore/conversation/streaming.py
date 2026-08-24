@@ -234,38 +234,64 @@ def consume_stream_response(
         raise _stream_failure(exc) from None
 
     # Do not prefetch or pull event N+1 until validation, currentness and
-    # synchronous presentation of event N have all completed.
-    while True:
-        try:
-            event = next(iterator)
-        except StopIteration:
-            break
-        except Exception as exc:
-            raise _stream_failure(exc) from None
+    # synchronous presentation of event N have all completed.  The consumer
+    # explicitly owns iterator abandonment: relying on refcount-driven
+    # generator destruction can leave a provider HTTP handle registered after
+    # accumulator or fence failure on other Python runtimes.
+    try:
+        while True:
+            # Do not advance a provider after this logical turn has lost
+            # authority while the consumer held synchronous backpressure.
+            # This trusted check is additive to the mandatory post-accept
+            # fence below and deliberately sits outside provider exception
+            # normalization.
+            fence.check()
+            try:
+                event = next(iterator)
+            except StopIteration:
+                # Exhaustion may race with trusted cancellation/deadline.  Let
+                # turn truth win before normal completion validation can call
+                # ``finish`` (including its pending-retry invariant).
+                fence.check()
+                break
+            except Exception as exc:
+                # Provider exceptions cannot establish or replace trusted
+                # cancellation truth.  Recheck before categorizing the error.
+                fence.check()
+                raise _stream_failure(exc) from None
 
-        try:
-            canonical_event = accumulator.accept(event)
-        except Exception as exc:
-            raise _stream_failure(exc) from None
+            try:
+                canonical_event = accumulator.accept(event)
+            except Exception as exc:
+                raise _stream_failure(exc) from None
 
-        # This call is deliberately outside every untrusted/provider exception
-        # normalization scope.  Only this trusted fence may surface
-        # TurnSuperseded as durable cancellation/deadline truth.
-        fence.check()
-        if isinstance(canonical_event, StreamCancelled):
-            # The fence just proved that trusted turn state established no
-            # cancellation at this boundary.  Provider output cannot
-            # manufacture cancellation truth or reach presentation.
-            raise ResponseGenerationError(
-                "the model stream failed",
-                error_type="StreamValidationError",
-            )
-        # ``accept`` returns an exact base neutral event detached from both the
-        # provider and accumulator-owned state.
-        try:
-            state.present(canonical_event, clock=clock)
-        except Exception as exc:
-            raise _stream_failure(exc) from None
+            # This call is deliberately outside every untrusted/provider
+            # exception normalization scope. Only this trusted fence may
+            # surface TurnSuperseded as durable cancellation/deadline truth.
+            fence.check()
+            if isinstance(canonical_event, StreamCancelled):
+                # The fence just proved that trusted turn state established no
+                # cancellation at this boundary. Provider output cannot
+                # manufacture cancellation truth or reach presentation.
+                raise ResponseGenerationError(
+                    "the model stream failed",
+                    error_type="StreamValidationError",
+                )
+            # ``accept`` returns an exact base neutral event detached from both
+            # the provider and accumulator-owned state.
+            try:
+                state.present(canonical_event, clock=clock)
+            except Exception as exc:
+                raise _stream_failure(exc) from None
+    finally:
+        close_iterator = getattr(iterator, "close", None)
+        if callable(close_iterator):
+            try:
+                close_iterator()
+            except Exception:
+                # Resource cleanup must not replace the already-truthful stream
+                # or fence outcome, and arbitrary provider text is discarded.
+                pass
 
     try:
         accumulator.finish()
