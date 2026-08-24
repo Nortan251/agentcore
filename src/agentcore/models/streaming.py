@@ -135,8 +135,16 @@ def _require_str(value: Any, field_name: str) -> str:
 
 def _detach_json_like(value: Any) -> Any:
     try:
-        if value is None or isinstance(value, (bool, int, float, str)):
-            return value
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return bool(value)
+        if isinstance(value, int):
+            return int(value)
+        if isinstance(value, float):
+            return float(value)
+        if isinstance(value, str):
+            return str(value)
         if isinstance(value, list):
             return [_detach_json_like(item) for item in value]
         if isinstance(value, dict):
@@ -145,7 +153,7 @@ def _detach_json_like(value: Any) -> Any:
                 if not isinstance(key, str):
                     raise StreamValidationError(
                         "tool call arguments must have string keys")
-                copied[key] = _detach_json_like(item)
+                copied[str(key)] = _detach_json_like(item)
             return copied
         raise StreamValidationError(
             "tool call arguments must contain only JSON-like values")
@@ -158,7 +166,7 @@ def _detach_usage_field(value: Any, field_name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise StreamValidationError(
             f"response.usage.{field_name} must be a non-negative integer")
-    return value
+    return int(value)
 
 
 def _detach_usage(usage: Any) -> Usage:
@@ -203,8 +211,8 @@ def _detach_tool_call(call: Any) -> ToolCall:
     if type(call.arguments) is not dict:
         raise StreamValidationError("tool call arguments must be a dict")
     return ToolCall(
-        id=call.id,
-        name=call.name,
+        id=str(call.id),
+        name=str(call.name),
         arguments=_detach_json_like(call.arguments),
     )
 
@@ -234,9 +242,9 @@ def _detach_model_response(response: Any, *, max_text_chars: int | None,
         raise StreamValidationError(
             "stream-safe response.raw must be exactly {}")
     return ModelResponse(
-        text=response.text,
-        model=response.model,
-        provider=response.provider,
+        text=str(response.text),
+        model=str(response.model),
+        provider=str(response.provider),
         finish_reason=response.finish_reason,
         usage=_detach_usage(response.usage),
         tool_calls=[_detach_tool_call(call) for call in response.tool_calls],
@@ -287,6 +295,22 @@ class StreamEventEnvelope:
 def _require_envelope(value: Any) -> None:
     if not isinstance(value, StreamEventEnvelope):
         raise StreamValidationError("envelope must be a StreamEventEnvelope")
+
+
+def _detach_envelope(value: Any) -> StreamEventEnvelope:
+    """Rebuild only the declared trusted-envelope fields on the base type."""
+    _require_envelope(value)
+    return StreamEventEnvelope(
+        turn_id=str(_require_safe_id(value.turn_id, "turn_id")),
+        session_id=str(_require_safe_id(value.session_id, "session_id")),
+        generation=int(_require_positive_int(
+            value.generation, "generation")),
+        operation_id=str(_require_safe_id(
+            value.operation_id, "operation_id")),
+        request_id=str(_require_safe_id(value.request_id, "request_id")),
+        attempt_id=str(_require_safe_id(value.attempt_id, "attempt_id")),
+        sequence=int(_require_nonnegative_int(value.sequence, "sequence")),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +477,73 @@ _EVENT_TYPES = (
 _TERMINAL_TYPES = (ResponseCompleted, StreamFailed, StreamCancelled)
 
 
+def _detach_stream_event(event: ModelStreamEvent, *,
+                         max_text_chars: int) -> ModelStreamEvent:
+    """Return one exact canonical neutral event detached from provider shape.
+
+    The accumulator uses this one operation at its validation and presentation
+    detachment boundaries.  Reconstructing from declared fields strips
+    subclass-only provider data from the event, envelope and nested neutral
+    payloads without introducing a second independent validator.
+    """
+    envelope = _detach_envelope(event.envelope)
+    if isinstance(event, StreamStarted):
+        return StreamStarted(
+            envelope=envelope,
+            model=str(_require_str(event.model, "model")),
+            provider=str(_require_str(event.provider, "provider")),
+        )
+    if isinstance(event, TextDelta):
+        return TextDelta(
+            envelope=envelope,
+            text=str(_require_str(event.text, "text")),
+        )
+    if isinstance(event, ToolCallDelta):
+        return ToolCallDelta(
+            envelope=envelope,
+            index=int(_require_nonnegative_int(event.index, "index")),
+            call_id=(None if event.call_id is None else str(
+                _require_str(event.call_id, "call_id"))),
+            name_fragment=str(_require_str(
+                event.name_fragment, "name_fragment")),
+            arguments_fragment=str(_require_str(
+                event.arguments_fragment, "arguments_fragment")),
+        )
+    if isinstance(event, ToolCallCompleted):
+        return ToolCallCompleted(
+            envelope=envelope,
+            index=int(_require_nonnegative_int(event.index, "index")),
+            call=_detach_tool_call(event.call),
+        )
+    if isinstance(event, UsageUpdated):
+        return UsageUpdated(
+            envelope=envelope, usage=_detach_usage(event.usage))
+    if isinstance(event, ResponseCompleted):
+        return ResponseCompleted(
+            envelope=envelope,
+            response=_detach_model_response(
+                event.response,
+                max_text_chars=max_text_chars,
+                require_empty_raw=True,
+            ),
+        )
+    if isinstance(event, StreamFailed):
+        if not isinstance(event.error_kind, str) or \
+                not _SAFE_ERROR_KIND.fullmatch(event.error_kind):
+            raise StreamValidationError(
+                "error_kind must be a bounded safe categorical string")
+        return StreamFailed(
+            envelope=envelope,
+            error_kind=str(event.error_kind),
+            retryable=event.retryable,
+            will_retry=event.will_retry,
+        )
+    if isinstance(event, StreamCancelled):
+        return StreamCancelled(envelope=envelope, reason=event.reason)
+    raise StreamValidationError(
+        "event is not a recognised neutral stream event")
+
+
 # ---------------------------------------------------------------------------
 # Stream-safe ModelResponse normalisation
 # ---------------------------------------------------------------------------
@@ -534,11 +625,12 @@ class StreamAccumulator:
 
     # -- public API ---------------------------------------------------
 
-    def accept(self, event: ModelStreamEvent) -> None:
-        """Validate and accept one event, or raise without mutating state.
+    def accept(self, event: ModelStreamEvent) -> ModelStreamEvent:
+        """Validate, accept and return one detached canonical neutral event.
 
         A failed call leaves no partially accepted state: every check runs
-        before any commit.
+        before any commit.  The returned event contains only declared base
+        neutral fields and does not alias provider-owned nested payloads.
         """
         if self._finished:
             raise StreamValidationError(
@@ -547,11 +639,15 @@ class StreamAccumulator:
             raise StreamValidationError(
                 "event is not a recognised neutral stream event")
 
+        event = _detach_stream_event(
+            event, max_text_chars=self._max_text_chars)
+
         self._check_identity(event.envelope)
 
         if isinstance(event, StreamStarted):
             self._accept_started(event)
-            return
+            return _detach_stream_event(
+                event, max_text_chars=self._max_text_chars)
 
         if not self._started or self._attempt_terminal is not None:
             raise StreamValidationError(
@@ -583,6 +679,11 @@ class StreamAccumulator:
             raise StreamValidationError("unhandled neutral stream event type")
 
         self._expected_sequence += 1
+        # Presentation receives a second canonical detachment, so even a sink
+        # that bypasses frozen dataclasses with ``object.__setattr__`` cannot
+        # mutate an envelope or nested object retained by the accumulator.
+        return _detach_stream_event(
+            event, max_text_chars=self._max_text_chars)
 
     def finish(self) -> None:
         """Finalise iteration. Raises unless a valid logical terminal state

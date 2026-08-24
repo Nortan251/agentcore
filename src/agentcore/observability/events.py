@@ -133,6 +133,7 @@ class Events:
     TURN_BRIDGE_CONFIGURED: Final = "turn.bridge_configured"
     TURN_ADMITTED: Final = "turn.admitted"
     TURN_MODEL_STARTED: Final = "turn.model_started"
+    TURN_FIRST_TOKEN: Final = "turn.first_token"
     TURN_TOOL_STARTED: Final = "turn.tool_started"
     TURN_TOOL_FINISHED: Final = "turn.tool_finished"
     TURN_STALE_RESULT_REJECTED: Final = "turn.stale_result_rejected"
