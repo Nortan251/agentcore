@@ -795,3 +795,699 @@ capability, no new configuration key, no dependency change, and no durable
 schema change. It does not alter `AgentState` phases, `ToolExecutor`,
 permissions, filesystem rules, verification, recovery, or existing persistence
 behavior.
+
+## Task 42.5 streaming implementation amendment — 2026-08-24
+
+Status: **project-lead implementation contract; architecture only.** This
+amendment implements no stream event, transport, provider, conversation, test,
+configuration, or workflow code.
+
+Baseline: the merged runtime at
+`c151643346d2275d24ee60e1ef4d9892d19390a8` (Task 42.4d). Tasks 42.2, 42.3,
+42.4a, 42.4b, 42.4c, and 42.4d are complete and are not reopened here. Older
+passages in this document that say a turn coordinator, cancellation,
+deadlines, stale fencing, or related mechanisms are "proposed, not
+implemented" remain historical context. They do not describe the baseline for
+Stage 4. The merged code and tests at the baseline commit are authoritative
+where those historical passages describe an earlier repository state.
+
+No frozen rule below contradicts that baseline. The baseline has no streaming
+API or stream event types yet; that absence is the work assigned to Stage 4,
+not a contradiction. In particular, the merged implementation already
+provides the authority and finalization boundaries that streaming must retain:
+
+```text
+ConversationRuntime.send
+  -> TurnBridge.run
+  -> per-Agent StageLease
+  -> _TurnFence.activate
+  -> ConversationRuntime._run_turn
+  -> _generate
+  -> _call_model
+  -> provider.generate / complete
+  -> HttpClient
+  -> ModelResponse
+  -> optional ConversationToolRunner
+  -> ToolExecutor
+  -> fence.commit
+  -> staged tool-message publication
+  -> final assistant session append
+  -> memory capture from the USER turn only
+  -> session save
+  -> turn terminalization
+```
+
+The current `_TurnFence` carries the admitted turn's trusted
+`OperationContext` and exact clock domain, checks durable currentness, stages
+owned tool messages, and fixes successful outcome at `fence.commit()` before
+publishing generated transcript. `TurnRecord.session_id` is already the
+opaque, domain-separated derived session key. `CancellationToken` already
+supports synchronous callback registration. The current OpenAI-compatible
+provider and `HttpClient.post_json` are one-shot APIs with bounded retries and
+deadline clamping. `TURN_SCHEMA_VERSION` is `1`. Stage 4 extends these facts;
+it does not replace them.
+
+### Purpose and frozen implementation slices
+
+Stage 4 makes model generation incrementally observable without weakening turn
+authority, stale-result fencing, deadline truth, cancellation truth, tool
+authority, transcript durability, memory boundaries, privacy, or retry truth.
+Every partial result is **provisional**. Presentation is never persistence, and
+presentation is never permission.
+
+Stage 4 is split into three separately reviewed changes:
+
+1. **42.5a — provider-neutral stream foundation.** Add immutable neutral event
+   schemas, the trusted envelope and validation, the accumulator/state machine,
+   the one-shot `generate`/`complete` compatibility adapter, and attempt/retry
+   invariants. It adds no network streaming and changes no
+   `ConversationRuntime` behavior.
+2. **42.5b — conversation stream integration.** Add synchronous iterator
+   consumption, per-event stale fencing, an opt-in presentation sink,
+   first-token observability, provisional delivery, final-only persistence,
+   and streamed-tool-call execution fencing. Tests use fake streaming
+   providers and deterministic synchronization. It adds no real SSE provider.
+3. **42.5c — OpenAI-compatible real streaming.** Add a narrow owned HTTP stream
+   seam, bounded SSE and tool-fragment parsing, retry-before-semantic-output,
+   cancellation of the owned stream, deadline propagation, and canonical final
+   `ModelResponse` normalization. Existing one-shot APIs remain supported and
+   behavior-compatible.
+
+Stage 4 is complete only after 42.5a, 42.5b, and 42.5c have each been audited,
+tested, CI-green, and merged. This amendment does not implement any of them.
+
+### Synchronous pull model and opt-in conversation API
+
+The core consumes `Iterator[ModelStreamEvent]` synchronously. There is no
+`asyncio`, producer or worker thread, background prefetch, queue, websocket
+framework, or third-party streaming dependency. Pull-based iteration is the
+backpressure mechanism: event N+1 is not requested until event N has been
+parsed, validated, fenced, and, when enabled, synchronously delivered.
+
+The public conversation direction is explicitly opt-in:
+
+```python
+ConversationRuntime.send(
+    ...,
+    on_stream_event=None,
+) -> TurnResult
+```
+
+The exact identifier may follow established project naming style, but these
+semantics may not change:
+
+- `on_stream_event is None` uses the existing one-shot conversation path. A
+  provider's streaming capability never silently selects streaming.
+- Supplying a sink requests streaming and requires a currently owned realtime
+  turn admitted through `TurnBridge`. This applies even when the selected
+  provider ultimately uses the one-shot compatibility adapter.
+- If no realtime turn exists, fail before model execution and before any
+  streaming-specific session mutation. Never mint a fake `turn_id`,
+  `session_id`, `generation`, or `operation_id` to make an unowned call look
+  owned.
+- Opt-in streaming does not alter the return type or authority of `TurnResult`.
+  Only successful canonical completion can create its reply.
+
+### Trusted event envelope and immutable neutral events
+
+Every stream event exposed outside the provider adapter carries an immutable
+`StreamEventEnvelope` with exactly these trusted correlation fields:
+
+```python
+@dataclass(frozen=True)
+class StreamEventEnvelope:
+    turn_id: str
+    session_id: str
+    generation: int
+    operation_id: str
+    request_id: str
+    attempt_id: str
+    sequence: int
+```
+
+- `turn_id` is the current admitted turn ID.
+- `session_id` is the existing derived opaque correlation key, never the raw
+  `ConversationSession.id`.
+- `generation` is the admitted turn generation.
+- `operation_id` is the current `GENERATING` operation identity held by the
+  fence for this model round.
+- `request_id` is a new opaque ID for one logical model request, meaning one
+  model round in the bounded conversation loop.
+- For native streaming, `attempt_id` is a new opaque ID for exactly one
+  observable physical streaming transport attempt. For one-shot compatibility,
+  it identifies one compatibility-adapter attempt around exactly one selected
+  legacy provider invocation.
+- `sequence` is zero-based and exactly contiguous within an attempt.
+
+A native retry retains `request_id`, creates a new `attempt_id`, and resets
+`sequence` to zero. One-shot compatibility has one `request_id`, one adapter
+`attempt_id`, and one selected legacy provider invocation. Retries performed
+inside that legacy invocation are intentionally opaque: the adapter neither
+fabricates attempt IDs nor emits `StreamStarted` / `StreamFailed` events for
+internal retries it cannot observe. This is the sole compatibility exception
+to the phrase "physical attempt" and does not weaken native-stream attempt
+truth. A later model/tool/model round creates a new `request_id` under the
+then-current `GENERATING` operation. All envelope values come from trusted
+runtime identity factories and context. They are never model- or
+provider-generated. An envelope contains no raw session identifier, secret,
+header, tool argument, user/model text, or other payload content.
+
+42.5a freezes immutable/frozen neutral variants:
+
+- `StreamStarted`: safe provider/model metadata only;
+- `TextDelta`: provisional text;
+- `ToolCallDelta`: bounded nonnegative `index`, optional call-ID fragment or
+  value, function-name fragment, and argument-string fragment;
+- `ToolCallCompleted`: a validated neutral `ToolCall`;
+- `UsageUpdated`: neutral `Usage`;
+- `ResponseCompleted`: the stream-safe canonical `ModelResponse`, always with
+  `raw={}`;
+- `StreamFailed`: categorical, sanitized failure information including
+  `retryable: bool` and `will_retry: bool`;
+- `StreamCancelled`: the winning trusted `CancellationReason`.
+
+No neutral event carries provider dictionaries, raw headers, raw HTTP
+exception text, raw SSE frames, or unsanitized provider error text.
+
+### Attempt state machine, semantic output, and retry truth
+
+Each observable attempt—one native physical streaming attempt or one one-shot
+compatibility-adapter attempt—has this lifecycle:
+
+```text
+StreamStarted(sequence=0)
+  -> zero or more nonterminal events
+  -> exactly one attempt-terminal event
+```
+
+The attempt-terminal variants are `StreamFailed`, `StreamCancelled`, and
+`ResponseCompleted`. No event follows a terminal event for the same
+`attempt_id`. `StreamStarted` occurs exactly once and first. One logical request
+may contain several failed attempts but has exactly one final logical terminal
+outcome. A retrying `StreamFailed(will_retry=True)` must be followed by the new
+attempt it announces; a final failure has `will_retry=False`.
+
+Accepted **semantic output** is exactly any of:
+
+- a nonempty `TextDelta`;
+- a `ToolCallDelta` containing a real call-ID, name, or argument fragment;
+- a `ToolCallCompleted`.
+
+An index by itself is not a tool fragment. `StreamStarted` and `UsageUpdated`
+alone are nonsemantic. Empty text or fragment fields do not make an event
+semantic. This definition controls whether replay is safe.
+
+For native streaming, transparent retry is allowed only before semantic output
+has been exposed. A transient connection, timeout, 429, or eligible 5xx after
+`StreamStarted` and possibly `UsageUpdated`, but before semantic output, may
+produce `StreamFailed(retryable=True, will_retry=True)` and a new attempt if the
+existing `RetryPolicy`, cancellation state, and remaining deadline all allow
+it. Once any semantic event is accepted, automatic replay is forbidden:
+`will_retry` must be false and failure terminates the logical request. This
+prevents duplicate visible text and replacement or duplication of a visible
+tool instruction. Stage 4 introduces no new retry count, retry deadline, or
+retry budget.
+
+### Provider-neutral accumulator and canonical completion
+
+42.5a adds one fail-closed accumulator/state machine between provider output
+and presentation. It validates an event completely before the presentation
+sink can observe it. Its responsibilities include:
+
+- trusted envelope identity and request consistency;
+- stable turn/session/generation/operation/request identity;
+- attempt lifecycle and retry transitions;
+- exact contiguous sequence values;
+- exactly one first `StreamStarted` and one terminal per attempt;
+- no post-terminal event;
+- retry only before semantic output;
+- exactly one final logical outcome;
+- bounded text, tool count, function names, argument fragments, and totals;
+- completed tool-call validity and ordering;
+- canonical final `ModelResponse` consistency.
+
+It does not repair events, renumber sequences, infer missing transitions,
+forgive malformed duplicates, guess fragments, or silently choose one of two
+inconsistent representations.
+
+`ResponseCompleted.response` is canonical. If accepted `TextDelta` events
+occurred in the successful attempt, their exact concatenation must equal
+`response.text`. If accepted `ToolCallCompleted` events occurred, their ordered
+neutral calls must exactly match `response.tool_calls`. Incomplete tool
+fragments, duplicate completion, mismatched calls, or text mismatch fail the
+model operation. Nothing is committed and no tool executes. The accumulator
+never prefers deltas over the final response or vice versa.
+
+Every `ResponseCompleted` exposed through the neutral stream boundary contains
+a **stream-safe** canonical `ModelResponse` whose `raw` field is exactly `{}`.
+No provider-shaped dictionary crosses that boundary. For one-shot
+compatibility, if `generate()` returns a `ModelResponse` with provider data in
+`raw`, construct a new normalized `ModelResponse` preserving only `text`,
+`model`, `provider`, `finish_reason`, `usage`, `tool_calls`, and `latency_ms`,
+and set `raw={}`. Do not mutate the provider-returned object. Native streaming
+uses the same `raw={}` rule and never reconstructs raw chunks into the final
+response. This boundary rule does not alter legacy no-stream `generate()`:
+direct callers continue to receive its existing `ModelResponse.raw` behavior.
+The accumulator's public result must use the same stream-safe response.
+
+The existing conversation behavior still rejects a blank final reply and
+creates its assistant `Message` using the existing final-text normalization.
+That compatibility step occurs only from the validated canonical response; it
+never reconstructs a reply from presentation events. A one-shot adapter may
+validly emit only `StreamStarted` and `ResponseCompleted`.
+
+### Initial internal bounds
+
+Stage 4 adds no user configuration. Implement these as named internal
+constants and check them before accepting or forwarding the event that would
+cross a limit:
+
+| Accumulation | Initial ceiling |
+|---|---:|
+| Streamed tool calls per model response | 32 |
+| Accumulated function name per call | 256 characters |
+| Accumulated argument string per call | 65,536 characters |
+| Total argument-fragment characters per model response | 262,144 characters |
+| Raw SSE frame | 262,144 bytes |
+| Provisional and final assistant text | existing `conversation.max_message_chars` |
+
+There is no currently merged stricter compatible stream-specific bound. The
+existing conversation message ceiling is therefore authoritative for streamed
+assistant text. Provider-specific parsing may use a stricter compatible limit,
+but may never weaken one of these ceilings. Raw chunks, complete raw SSE
+history, and unbounded fragment lists are never retained.
+
+### Provider contract and one-shot compatibility
+
+A true realtime provider method explicitly accepts both trusted values:
+
+```python
+stream(
+    request: ModelRequest,
+    *,
+    context: OperationContext,
+    clock: Clock,
+) -> Iterator[ModelStreamEvent]
+```
+
+Capability detection follows the merged 42.4b rule: inspect the signature
+without speculative invocation. Exact `KEYWORD_ONLY` or
+`POSITIONAL_OR_KEYWORD` parameters named `context` and `clock` count.
+`POSITIONAL_ONLY` and `**kwargs` do not. If either trusted parameter is absent,
+the method is not a trusted realtime stream method and must not be called for
+realtime streaming; use the one-shot compatibility adapter instead.
+
+`OperationContext` and `Clock` are passed only through explicit named
+parameters. They never enter `**kwargs`, generic options,
+`ModelRequest.metadata`, prompt text, provider JSON, headers, logs, or error
+details.
+
+The compatibility adapter invokes exactly one entry point selected by the
+current one-shot rules: one `generate(request, ...)` call when available, or
+one `complete(...)` call otherwise. It first emits
+`StreamStarted(sequence=0)`, then invokes that selected entry point exactly
+once. After the invocation returns or raises, it selects exactly one
+`sequence=1` terminal without reinvoking the provider:
+
+1. If `context.cancellation.requested`, emit `StreamCancelled` with
+   `context.cancellation.reason`.
+2. Otherwise, if `context.deadline.expired(clock)`, emit `StreamCancelled` with
+   `CancellationReason.DEADLINE_EXCEEDED`.
+3. Otherwise, on success, emit `ResponseCompleted` with the new stream-safe
+   canonical response described above.
+4. Otherwise, emit `StreamFailed` using only a safe categorical framework error
+   kind. For a `ModelError`, `retryable` preserves that error type's existing
+   retryability. For an unexpected non-`ModelError`, `retryable=False`.
+   `will_retry=False` in every compatibility-adapter `StreamFailed`.
+
+`StreamCancelled` is the neutral attempt terminal for trusted logical
+cancellation, including deadline expiry. The adapter itself never performs an
+outer retry. Existing retries encapsulated inside its one legacy
+`generate()`/`complete()` invocation remain unchanged and opaque, preserving
+provider entry-point invocation count one. There is no speculative fallback
+call and no fabricated event for an internal retry. The adapter never exposes
+an exception message, traceback, provider body, headers, credentials, raw
+response, or unsanitized provider exception text.
+
+On success it does not split completed text, synthesize `TextDelta`, or tokenize
+text. Its event sequence is exactly `StreamStarted` then
+`ResponseCompleted`; on failure or trusted cancellation it is exactly
+`StreamStarted` then the selected `StreamFailed` or `StreamCancelled` terminal.
+
+### Conversation consumption, presentation sink, and event fencing
+
+42.5b consumes each event in this order:
+
+```text
+provider iterator yields
+  -> accumulator validates and accepts
+  -> current turn fence.check()
+  -> presentation sink receives the event, if still enabled
+```
+
+The fence check precedes every sink delivery, including terminal events. If the
+turn is superseded, cancelled, timed out, shut down, stale, or otherwise no
+longer owns the `GENERATING` operation, the event is not delivered. A late
+event cannot update a successor, alter a terminal outcome, enter transcript or
+memory, or authorize a tool. Provisional output already displayed before the
+turn lost authority cannot be physically unshown, but it never becomes durable
+unless the turn ultimately completes and commits.
+
+The sink is a synchronous presentation-only callback with zero authority. It
+cannot grant permission, execute tools, modify `TurnRecord`, mutate
+`AgentState`, choose a cancellation reason, extend a deadline, rewrite the
+canonical response, or make provisional output durable. A slow sink simply
+applies natural iterator backpressure.
+
+If the sink raises, catch the exception, log only its categorical exception
+type with safe IDs/counts, disable the sink for the rest of the entire current
+turn (including later model rounds), and continue synchronous provider
+consumption and normal finalization. Do not use traceback logging or retain the
+exception message. Sink failure is not model failure and does not change turn
+authority. Trusted cancellation remains available only through cancellation
+APIs; throwing from the presentation callback is not cancellation.
+
+### Final-only transcript and memory persistence
+
+Streaming preserves the merged finalization order:
+
+```text
+model stream completes canonically
+  -> currentness validated
+  -> fence.commit()
+  -> staged tool messages published
+  -> canonical final assistant Message appended
+  -> USER message considered for memory capture
+  -> session saved
+```
+
+`TextDelta`, `ToolCallDelta`, and `ToolCallCompleted` never enter
+`ConversationSession`. No partial text, failed-stream output, stale output,
+fragment, or stream-event array enters durable memory. Only a successful
+canonical `ResponseCompleted` can produce the final assistant `Message`, and
+that message is appended only after successful `fence.commit()`.
+
+The existing memory boundary remains unchanged: capture inspects the user
+message only, after successful final response publication. It never captures
+assistant text, provisional text, tool fragments, failed output, or stale
+output. Stage 4 changes no memory schema. The existing user-message behavior on
+failure remains separate from generated-output durability; no failed partial
+assistant reply is saved.
+
+### Streamed tool-call authority and fragment normalization
+
+Neither `ToolCallDelta` nor `ToolCallCompleted` is executable. A streamed tool
+call becomes eligible only after all of these hold:
+
+1. provider-specific fragments are complete and bounded;
+2. the neutral `ToolCall` validates;
+3. its attempt succeeds with canonical `ResponseCompleted`;
+4. the turn still owns the current fence;
+5. canonical `response.tool_calls` are passed to the existing
+   `ConversationToolRunner`.
+
+The sole execution path remains:
+
+```text
+ConversationToolRunner
+  -> ToolExecutor.invoke
+  -> ToolRegistry.get
+  -> Tool.validate_args
+  -> cancellation checkpoint
+  -> PermissionPolicy
+  -> cancellation checkpoint
+  -> Tool.run
+  -> ToolInvocation
+```
+
+Streaming code never calls `Tool.run`, never pre-approves a call, and never
+bypasses `ToolExecutor`. A stream that fails after a valid-looking
+`ToolCallCompleted` but before `ResponseCompleted` executes zero tools and
+enters no permission execution path.
+
+The OpenAI-compatible provider adapter owns fragment assembly by bounded tool
+index. It accumulates provider call ID, function-name fragments, and argument
+fragments. Indices are nonnegative integers below the tool-count ceiling.
+Repeated IDs must be consistent. Function names and argument strings obey the
+bounds above. Arguments are decoded only at call completion using
+`json.loads`, and the decoded value must be a JSON object. There is no `eval`,
+`ast.literal_eval`, JSON/bracket repair, guessing, or model-assisted
+correction.
+
+When the provider omits a usable call ID, final normalization may mint a fresh
+trusted `call_<id>` using the existing one-shot OpenAI-compatible convention.
+It does so only at final call normalization, never from a function name or
+arguments. The conversation runner's later normalization is not a fragment
+assembler.
+
+A successful streamed tool round is:
+
+```text
+stream
+  -> canonical completed tool calls
+  -> ResponseCompleted
+  -> turn-current fence
+  -> ConversationToolRunner
+  -> ToolExecutor
+  -> staged tool result messages
+  -> next model round (which may also stream)
+```
+
+The bounded existing model/tool loop remains. The final assistant response is
+committed once, and all tool messages are published only behind the existing
+overall turn finalization boundary.
+
+### Narrow HTTP streaming seam and OpenAI-compatible SSE
+
+42.5c extends transport narrowly. It does not casually refactor or change the
+behavior of mature `HttpClient.post_json`, `Transport.post_json`, or
+`OpenAICompatibleProvider.generate`. The new owned-stream transport operation
+represents one physical streaming attempt. Generic HTTP transport does not own
+semantic retry because it cannot know whether semantic output was exposed;
+native-stream retry orchestration belongs in the provider/streaming layer
+above it.
+
+Reuse existing authentication, secret sanitization, timeout clamping, retry
+policy, deadline, and cancellation concepts without changing one-shot
+behavior. The OpenAI-compatible streaming path uses the existing
+`POST /chat/completions` endpoint and adds `"stream": true` only to its own
+payload. The ordinary `generate` payload is unchanged. Do not automatically
+add vendor-specific `stream_options`.
+
+Parse bounded standard SSE `data:` events with blank-line framing and safely
+ignore comments. `data: <JSON>` carries chunks; `data: [DONE]` is the required
+explicit successful stream terminator. Decode UTF-8 and JSON strictly. Invalid
+UTF-8, oversized frames, malformed JSON, invalid chunk structure, or raw data
+outside the accepted framing fails categorically without including frame
+content in logs or exceptions. EOF before explicit successful completion is a
+failure, even if a finish reason was observed. No raw frame or complete raw
+chunk list is retained.
+
+OpenAI-compatible normalization remains provider-local:
+
+- `choices[0].delta.content` becomes `TextDelta`;
+- `choices[0].delta.tool_calls[index]` feeds bounded assembly and neutral
+  `ToolCallDelta` / `ToolCallCompleted`;
+- usable `usage` becomes `UsageUpdated`;
+- `finish_reason` supplies the accumulated neutral `FinishReason`;
+- explicit `[DONE]` finalizes canonical calls and emits `ResponseCompleted`.
+
+No provider dictionaries escape above this adapter. The final result uses the
+existing `ModelResponse`, `ToolCall`, `Usage`, and `FinishReason` types, and the
+`ResponseCompleted.response.raw` field is exactly `{}`. Raw chunks are neither
+retained nor reconstructed into `ModelResponse.raw`.
+
+### Cancellation, owned resource closure, and deadline truth
+
+Before each physical stream attempt, before and after each parsed frame, and
+before retry or backoff, check the trusted cancellation token and the same turn
+deadline/clock domain carried by the fence. Each attempt timeout is:
+
+```text
+min(model configured timeout, remaining turn deadline)
+```
+
+All attempts and backoffs share that original deadline. There is no fresh retry
+deadline. A delay greater than or equal to remaining time forbids retry; no
+attempt starts after expiry. A physically late frame or return cannot become
+accepted semantic output.
+
+`CancellationToken.register()` may be used to close an HTTP stream handle that
+AgentCore owns. The registration closes only that resource, is removed in
+`finally`, and neither kills a thread nor claims rollback. If closing the
+handle causes a blocked read to fail while trusted cancellation is requested,
+classify the attempt as `StreamCancelled` with the winning trusted
+`CancellationReason`, not as a generic connection failure. Do not promise
+instant physical interruption where the platform or provider does not
+guarantee it.
+
+Winner truth is unchanged: an already-requested trusted cancellation is
+checked first, then deadline expiry. An earlier `SUPERSEDED`, `AGENT_SHUTDOWN`,
+`USER_INTERRUPT`, or `OPERATOR_CANCEL` is never relabelled
+`DEADLINE_EXCEEDED` merely because the deadline also expired. At the neutral
+stream layer all of these conditions, including `DEADLINE_EXCEEDED`, terminate
+the attempt as `StreamCancelled` with the winning reason. The durable turn
+mapping remains distinct: `DEADLINE_EXCEEDED` maps to `TurnPhase.TIMED_OUT`;
+other accepted cancellation reasons map to `TurnPhase.CANCELLED`. Cancellation
+is not retryable. Stage 4 adds no thread killing, timer thread, tool preemption,
+or new retry budget.
+
+### First-token observability and privacy
+
+42.5b reserves:
+
+```python
+Events.TURN_FIRST_TOKEN = "turn.first_token"
+```
+
+Emit it exactly once for the first accepted nonempty `TextDelta` in the turn,
+according to final implementation semantics. `ToolCallDelta` is not a first
+text token. Use monotonic latency and safe identifiers plus length/count fields
+only; never log delta text. No audio metric is emitted.
+
+The presentation sink may receive payload text because that is its sole
+purpose. Stream payload is not automatically copied into logs, metrics,
+`TurnRecord`, `AgentState`, exception details, session state before final
+commit, or memory. Tool argument fragments are never logged. Stream
+observability is limited to safe IDs, sequence, event type, lengths, counts,
+latencies, categorical retry/failure state, and terminal outcome.
+
+Security tests use distinctive sentinels and independently prove that logs and
+errors omit `RAW_SESSION_SECRET`, API secrets, Authorization values, tool
+argument fragments, workspace paths, full user messages, and full model
+deltas. They also place `RAW_PROVIDER_SECRET_42_5` inside a fake provider's
+`ModelResponse.raw` and prove it is absent from the `ResponseCompleted` exposed
+to the sink, stream logs, error details, and accumulator public result, while
+normalized text, model, provider, usage, and tool calls remain intact. Trusted
+context and clock must be absent from `ModelRequest.metadata`, wire JSON,
+generic options, logs, and errors. Assertions may not use `or True` or unrelated
+weak alternatives.
+
+### Required deterministic acceptance tests for later slices
+
+42.5a/b/c must add tests appropriate to their slice. At minimum, retry tests
+cover:
+
+| Case | Required outcome |
+|---|---|
+| Connection failure before semantic output | retry permitted |
+| Eligible 429/5xx before semantic output | retry permitted within policy/deadline |
+| `StreamStarted` only, then transient failure | retry permitted |
+| Accepted `TextDelta`, then failure | no retry |
+| Meaningful `ToolCallDelta`, then failure | no retry |
+| `ToolCallCompleted`, then failure before completion | no retry; zero tool runs |
+| Deadline before retry | no retry |
+| Retry delay greater than or equal to remaining | no retry |
+| Trusted cancellation before retry | no retry |
+| Retried attempt identity | same request ID; new attempt ID; sequence reset |
+
+42.5a additionally requires these one-shot compatibility tests:
+
+1. **Success raw scrub.** A fake `generate()` returns
+   `ModelResponse(text="ok", raw={"secret":
+   "RAW_PROVIDER_SECRET_42_5"}, ...)`. Assert exactly one provider call and the
+   events `StreamStarted`, `ResponseCompleted`; the exposed response has
+   `raw={}`; the sentinel is absent from serialized/public event and
+   accumulator result; and normalized text, model, provider, usage, and tool
+   calls are preserved.
+2. **Retryable model failure.** `ModelConnectionError` yields exactly
+   `StreamStarted`, `StreamFailed` with `retryable=True` and
+   `will_retry=False`; provider call count is one and there is no adapter-level
+   second call.
+3. **Nonretryable model failure.** `ModelAuthError` and `ModelResponseError`
+   each yield `StreamFailed(retryable=False, will_retry=False)` after exactly
+   one invocation.
+4. **Trusted cancellation.** When the provider returns or raises after trusted
+   cancellation has already won, the terminal is `StreamCancelled` with the
+   original reason, never `StreamFailed`.
+5. **Deadline expiry.** When no cancellation won earlier and the deadline
+   expires during the invocation, the terminal is
+   `StreamCancelled(DEADLINE_EXCEEDED)`; the conversation layer later maps it
+   to `TIMED_OUT`.
+6. **Cancellation versus deadline.** If `SUPERSEDED` wins before deadline
+   expiry and the provider returns or raises after both conditions hold, the
+   terminal remains `StreamCancelled(SUPERSEDED)`, never
+   `DEADLINE_EXCEEDED`.
+7. **Compatibility attempt identity.** A legacy provider simulates or reports
+   multiple internal HTTP retries. The adapter still exposes one `request_id`,
+   one `attempt_id`, one `StreamStarted`, and one final terminal, with no events
+   or fabricated attempt identities for those opaque retries.
+
+Backpressure is proven with a fake iterator that records every pull. A sink
+blocks after event N on an `Event`/`Barrier`; event N+1 is not pulled until the
+sink is released. The proof uses no sleep, queue, producer thread, or timing
+assumption.
+
+The supersession race is also deterministic: an old turn emits its first text
+delta, the test gates that stream, admits a successor, observes durable
+supersession, and releases the old stream. The old provider's next delta is not
+delivered; no old partial assistant message persists; no old streamed tool
+executes; the old turn ends `CANCELLED`; and the successor acquires the
+`StageLease` and may complete. Use `Event`/`Barrier`, never `time.sleep`.
+
+Additional mandatory cases are:
+
+- `TextDelta("hel")`, `TextDelta("lo")`, then final `StreamFailed`: the UI may
+  have seen `hello`, but no assistant `hello` is durable or captured and no
+  retry occurs.
+- `ToolCallDelta`, `ToolCallCompleted`, then failure before
+  `ResponseCompleted`: `ConversationToolRunner`, `ToolExecutor`, permission
+  execution, and `Tool.run` are never entered; no fragment is persisted or
+  logged.
+- A successful streamed tool round follows the existing runner/executor and
+  staging path, then a later model round may stream; final assistant and tool
+  messages publish only after final commit.
+- A provider without a valid trusted `stream()` uses the one-shot adapter and
+  invokes `generate`/`complete` exactly once. On success it emits only
+  `StreamStarted` and stream-safe `ResponseCompleted` and returns a result
+  equivalent to existing one-shot behavior; failure/cancellation follows the
+  explicit terminal state machine above. No-sink send remains unchanged.
+- A sink that raises on its first text delta is disabled; provider consumption
+  continues synchronously; the canonical reply may commit; authority is
+  unchanged; only categorical exception type is logged; raw delta is absent.
+- Bounds fail before forwarding the exceeding event, and malformed envelopes,
+  sequences, retries, final text, or final calls fail closed.
+- Unexpected SSE EOF, malformed UTF-8/JSON/chunks, oversized frames, and
+  inconsistent tool fragments fail without raw frame disclosure.
+- Closing an owned stream on cancellation classifies the winning trusted
+  reason and always removes callback registration.
+
+### Frozen authority, schema, and non-goals
+
+Streaming changes zero tool authority. No stream event, provider, model, or
+presentation sink grants permission. The existing registry, validation,
+checkpoints, policy, executor, and invocation evidence remain authoritative.
+
+`TURN_SCHEMA_VERSION` remains `1`. Stage 4 does not persist partial text, raw
+stream event arrays, tool argument fragments, stream accumulators, or SSE
+frames, and therefore does not require a turn-schema bump.
+
+Stage 4 introduces no `ActionJournal`, `EffectClass`, mutation ambiguity,
+reconciliation workflow, browser/desktop/computer control, Gmail/calendar,
+scheduler, shell/process/network tool, physical tool preemption, audio,
+microphone, speech recognition, TTS, WebRTC, VAD, voice barge-in, or other
+Stage 5+ capability. It does not kill threads or claim cancellation rolls back
+an effect. Existing one-shot model APIs, permission semantics, filesystem
+rules, transcript ownership, memory ownership, and autonomous execution remain
+compatible.
+
+The implementation self-review for every Stage 4 slice must preserve these
+answers:
+
+1. Can a partial `TextDelta` become durable? **No.**
+2. Can a complete-looking tool call execute before `ResponseCompleted`?
+   **No.**
+3. Can an automatic retry occur after semantic output? **No.**
+4. Can a superseded turn deliver a later accepted delta? **No.**
+5. Can streaming bypass `ToolExecutor`? **No.**
+6. Does presentation-sink failure fail generation? **No.**
+7. Is a raw session ID present in the envelope? **No.**
+8. Can context or clock travel through generic `**kwargs`? **No.**
+9. Are raw chunks or fragments accumulated without bounds? **No.**
+10. Is no-sink `send` behavior compatible? **Yes.**
+11. Does one-shot fallback invoke its provider entry point exactly once?
+    **Yes.**
+12. Is a background producer required? **No.**
+13. Does the durable turn schema remain version 1? **Yes.**
+14. Are action journaling, physical preemption, and voice still deferred?
+    **Yes.**
