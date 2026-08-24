@@ -17,9 +17,12 @@ network.
 
 from __future__ import annotations
 
+import http.client
 import json
 import math
 import random
+import socket
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -28,7 +31,9 @@ from typing import Any, Callable, Mapping, Protocol
 
 from agentcore.models.errors import (
     ModelAuthError,
+    ModelConfigError,
     ModelConnectionError,
+    ModelError,
     ModelProviderError,
     ModelRateLimitError,
     ModelResponseError,
@@ -85,11 +90,130 @@ class HttpResponse:
                 status_code=self.status, reason=str(exc)) from exc
 
 
+class HttpStreamResponse:
+    """Owned, bounded-read HTTP response for one physical stream attempt.
+
+    The wrapper deliberately exposes only status, normalised headers,
+    ``read(size)`` and idempotent ``close()``.  It never buffers the successful
+    body.  Its close gate is also the cancellation race boundary: a callback
+    and a generator ``finally`` may both request closure, but the underlying
+    resource is closed at most once.
+    """
+
+    def __init__(self, *, status: int, headers: Mapping[str, str],
+                 stream: Any) -> None:
+        if isinstance(status, bool) or not isinstance(status, int) or \
+                status < 100 or status > 599:
+            raise ModelResponseError(
+                "stream transport returned an invalid HTTP status")
+        if not callable(getattr(stream, "read", None)) or \
+                not callable(getattr(stream, "close", None)):
+            raise ModelResponseError(
+                "stream transport returned an invalid response handle")
+        try:
+            self.headers = {
+                str(key).lower(): str(value)
+                for key, value in headers.items()
+            }
+        except Exception:
+            raise ModelResponseError(
+                "stream transport returned invalid HTTP headers") from None
+        self.status = status
+        self._stream = stream
+        self._close_lock = threading.Lock()
+        self._close_done = threading.Event()
+        self._closed = False
+        self._closing_thread_id: int | None = None
+
+    @property
+    def closed(self) -> bool:
+        with self._close_lock:
+            return self._closed
+
+    def read(self, size: int) -> bytes:
+        """Read at most ``size`` bytes without exposing raw I/O failures."""
+        if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+            raise ModelResponseError(
+                "stream read size must be a positive integer")
+        with self._close_lock:
+            if self._closed:
+                raise ModelConnectionError("provider stream was closed")
+            stream = self._stream
+        try:
+            # ``HTTPResponse.read(n)`` may wait to fill n bytes. ``read1``
+            # returns currently available buffered data and therefore keeps
+            # token-level SSE delivery responsive when the server flushes a
+            # small frame.
+            read1 = getattr(stream, "read1", None)
+            chunk = read1(size) if callable(read1) else stream.read(size)
+        except ModelError:
+            raise
+        except (TimeoutError, socket.timeout):
+            raise ModelTimeoutError(
+                "provider stream read timed out") from None
+        except (OSError, urllib.error.URLError,
+                http.client.HTTPException):
+            # Raw socket/TLS/HTTP exception text is intentionally discarded.
+            raise ModelConnectionError(
+                "provider stream read failed") from None
+        if not isinstance(chunk, bytes) or len(chunk) > size:
+            raise ModelResponseError(
+                "stream transport returned an invalid byte chunk")
+        return chunk
+
+    def close(self) -> None:
+        """Close once and wait for a concurrent owner to finish closing.
+
+        A cancellation callback and generator ``finally`` can race here.  The
+        loser must not merely observe a boolean: it waits until the underlying
+        resource's close call has completed, so no terminal event can be
+        emitted while AgentCore still owns a half-closed handle.
+        """
+        current_thread_id = threading.get_ident()
+        with self._close_lock:
+            if self._closed:
+                if self._closing_thread_id == current_thread_id:
+                    return
+                wait_for_close = True
+                stream = None
+            else:
+                self._closed = True
+                self._closing_thread_id = current_thread_id
+                wait_for_close = False
+                stream = self._stream
+        if wait_for_close:
+            self._close_done.wait()
+            return
+        try:
+            assert stream is not None
+            stream.close()
+        except Exception:
+            # Cleanup is best-effort and content-free.  It must not replace the
+            # truthful success/failure/cancellation already being finalized.
+            pass
+        finally:
+            with self._close_lock:
+                self._closing_thread_id = None
+            self._close_done.set()
+
+
 class Transport(Protocol):
     """Minimal HTTP seam so providers can be tested without a network."""
 
     def post_json(self, url: str, payload: Mapping[str, Any],
                   headers: Mapping[str, str], timeout: float) -> HttpResponse: ...
+
+    def open_stream(self, url: str, payload: Mapping[str, Any],
+                    headers: Mapping[str, str],
+                    timeout: float) -> HttpStreamResponse: ...
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Treat redirects as status responses instead of hidden wire attempts."""
+
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str,
+                         headers: Any, newurl: str) -> None:
+        return None
 
 
 class UrllibTransport:
@@ -129,6 +253,57 @@ class UrllibTransport:
         except TimeoutError as exc:
             raise ModelTimeoutError("request to provider timed out",
                                     timeout_seconds=timeout) from exc
+
+    def open_stream(self, url: str, payload: Mapping[str, Any],
+                    headers: Mapping[str, str],
+                    timeout: float) -> HttpStreamResponse:
+        """Open exactly one POST response without reading its successful body."""
+        data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(url, data=data, method="POST")
+        for key, value in headers.items():
+            request.add_header(key, value)
+        try:
+            # Disable automatic redirect replay for this seam: one call must
+            # correspond to one physical streaming request.
+            opener = urllib.request.build_opener(_NoRedirectHandler())
+            response = opener.open(request, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            # HTTPError is itself a readable/closable response.  The client
+            # classifies status/headers and closes it without reading an
+            # arbitrary provider error body.
+            response = exc
+        except urllib.error.URLError as exc:
+            reason = str(exc.reason)
+            if "timed out" in reason.lower():
+                raise ModelTimeoutError(
+                    "request to provider timed out",
+                    timeout_seconds=timeout) from None
+            raise ModelConnectionError(
+                "could not reach the model provider") from None
+        except TimeoutError:
+            raise ModelTimeoutError(
+                "request to provider timed out",
+                timeout_seconds=timeout) from None
+        except (OSError, http.client.HTTPException):
+            raise ModelConnectionError(
+                "could not reach the model provider") from None
+
+        status = getattr(response, "status", None)
+        if not isinstance(status, int):
+            status = getattr(response, "code", None)
+        response_headers = getattr(response, "headers", {}) or {}
+        try:
+            return HttpStreamResponse(
+                status=status,
+                headers=response_headers,
+                stream=response,
+            )
+        except Exception:
+            try:
+                response.close()
+            except Exception:
+                pass
+            raise
 
 
 @dataclass
@@ -296,6 +471,71 @@ class HttpClient:
 
         assert last_error is not None  # pragma: no cover - loop always raises
         raise last_error
+
+    def open_stream(self, url: str, payload: Mapping[str, Any],
+                    headers: Mapping[str, str], timeout: float,
+                    *, secrets: tuple[str, ...] = ()) -> HttpStreamResponse:
+        """Open exactly one owned streaming response, with no hidden retry.
+
+        Semantic retry cannot live here because this layer does not know which
+        neutral events have reached a consumer.  Each call invokes the
+        transport's ``open_stream`` exactly once. Non-success HTTP responses
+        are closed without reading arbitrary bodies, then classified through
+        the mature one-shot status taxonomy.
+        """
+        open_stream = getattr(self.transport, "open_stream", None)
+        if not callable(open_stream):
+            raise ModelConfigError(
+                "configured model transport does not support streaming")
+        try:
+            response = open_stream(url, payload, headers, timeout)
+        except ModelError:
+            raise
+        except (TimeoutError, socket.timeout):
+            raise ModelTimeoutError(
+                "request to provider timed out",
+                timeout_seconds=timeout) from None
+        except (OSError, urllib.error.URLError,
+                http.client.HTTPException):
+            raise ModelConnectionError(
+                "could not reach the model provider") from None
+
+        if not isinstance(response, HttpStreamResponse):
+            try:
+                response = HttpStreamResponse(
+                    status=getattr(response, "status"),
+                    headers=getattr(response, "headers", {}),
+                    stream=response,
+                )
+            except Exception as exc:
+                close = getattr(response, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+                if isinstance(exc, ModelError):
+                    raise
+                raise ModelResponseError(
+                    "stream transport returned an invalid response") from None
+
+        if 200 <= response.status < 300:
+            return response
+
+        # Streaming error bodies are unnecessary for truthful status
+        # classification and could block before cancellation registration or
+        # retain arbitrary provider content.  Classify from status/headers only.
+        response.close()
+        self._handle(HttpResponse(
+            status=response.status,
+            body=b"",
+            headers=dict(response.headers),
+        ), url, secrets)
+        raise AssertionError("non-success stream response was not classified")
+
+    def sleep(self, delay: float) -> None:
+        """Use the injected sleeper after an owner has approved a retry."""
+        self._sleep(delay)
 
     # -- classification ----------------------------------------------------
     def _handle(self, response: HttpResponse, url: str,
