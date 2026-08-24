@@ -1491,3 +1491,143 @@ answers:
 13. Does the durable turn schema remain version 1? **Yes.**
 14. Are action journaling, physical preemption, and voice still deferred?
     **Yes.**
+
+## Task 42.5c native-attempt truth amendment — 2026-08-24
+
+This amendment supersedes only conflicting Stage 4 language about the timing
+of native `StreamStarted`, retry promises, and cancellation between physical
+attempts. The one-shot compatibility adapter remains its explicitly frozen
+exception and is unchanged.
+
+### Native attempt provenance
+
+For native streaming, one `attempt_id` corresponds to exactly one invocation
+of the one-physical-attempt streaming transport seam. A physical attempt begins
+when that seam is actually invoked. The provider may allocate an `attempt_id`
+immediately before invoking the seam, but the identifier must not cross the
+neutral event boundary unless the invocation actually occurred:
+
+```text
+no physical transport invocation
+  => no native StreamStarted
+  => no observable native attempt_id
+```
+
+`StreamStarted` remains sequence zero, exactly once, and the first neutral
+event belonging to that physical attempt. It is the first *observable* neutral
+event, not authorization to create the attempt later, and therefore need not
+precede the transport invocation in wall-clock execution. If the invocation
+immediately raises, it still counts as a physical attempt and truthfully has:
+
+```text
+physical invocation
+  -> StreamStarted(sequence=0)
+  -> StreamFailed(...)
+```
+
+### No-wire preflight is not an attempt
+
+Trusted cancellation/deadline or local provider/configuration failure before
+physical transport invocation creates no native attempt. This includes an
+already-requested cancellation, an already-expired deadline, a missing
+credential, invalid preflight configuration, and a retry that is no longer
+authorized before its next invocation.
+
+Such a condition must not fabricate an `attempt_id`, `StreamStarted`, or a
+`StreamCancelled`/`StreamFailed` terminal attached to a nonexistent attempt. It
+may surface through the existing provider-exception or trusted outer-turn fence
+path. Conversation runtime and its durable turn remain the cancellation and
+timeout authority; provider output or exceptions cannot establish that truth.
+
+### Retry delay precedes the visible retry promise
+
+For a native pre-semantic retry, the provider must not expose
+`StreamFailed(will_retry=True)` until all of the following have completed:
+
+1. the physical failure is retryable;
+2. no semantic output has been exposed for the logical request;
+3. physical attempt budget remains;
+4. trusted cancellation has not won;
+5. the deadline has not expired;
+6. the retry delay is computed and is strictly less than remaining deadline;
+7. the required `Retry-After`/backoff delay has actually been consumed; and
+8. trusted cancellation/deadline is rechecked after that delay.
+
+When `StreamFailed(will_retry=True)` crosses the neutral boundary, the old
+physical attempt is terminal, its retry delay has been paid, no mandatory
+backoff remains, and a new physical attempt is armed for the next consumer
+pull. If cancellation/deadline wins while delay is consumed, the provider does
+not expose `will_retry=True`; trusted turn truth wins. If retry orchestration
+itself fails before the promise becomes visible, the old physical attempt ends
+with an appropriate safe `StreamFailed(will_retry=False)`.
+
+### Conditional meaning of `will_retry=True`
+
+A native `StreamFailed(will_retry=True)` means:
+
+> A retry is armed and will begin on the next provider pull if the trusted
+> logical turn remains current.
+
+It does not authorize transport after cancellation, supersession, shutdown,
+operator/user cancellation, or deadline expiry. Earlier language that a
+retrying failure must be followed by the attempt it announces is refined to:
+if consumption remains owned/current and requests another provider event, the
+failure is followed by a new physical attempt with the same `request_id`, a
+fresh `attempt_id`, sequence reset to zero, and `StreamStarted` as that
+attempt's first neutral event. Trusted outer-turn termination is the only way
+to discharge this conditional promise without another native attempt.
+
+### Additive pre-pull fence
+
+The required per-event order remains unchanged:
+
+```text
+provider yields event
+  -> accumulator.accept(event)
+  -> fence.check()
+  -> sink delivery
+```
+
+An additional currentness check occurs at every consumer pull boundary:
+
+```text
+fence.check()
+  -> request next provider event
+```
+
+It is additive and never replaces the post-accept fence. If trusted
+cancellation/deadline wins after an accepted retrying `StreamFailed` but before
+the next pull, the pre-pull fence terminates the turn, the provider is not
+advanced, no retry opens or obtains an observable identity, the iterator is
+closed in `finally`, and `StreamAccumulator.finish()` is not called because
+consumption ended through a trusted outer-turn abort rather than normal
+provider exhaustion.
+
+### Race between pre-pull fence and physical open
+
+The provider rechecks trusted cancellation/deadline immediately before invoking
+the one-attempt transport seam. If trusted state wins after the conversation's
+pre-pull fence but before invocation, transport is not invoked and no native
+attempt event or identity is exposed. The provider may stop or raise only a
+categorical, content-free internal signal. Conversation rechecks its trusted
+fence before treating iterator exhaustion or an ordinary exception as a
+provider failure; when trusted state won, TurnBridge cancellation/timeout truth
+wins. Provider output and provider exceptions remain non-authoritative.
+
+### Backpressure preserved
+
+No retry transport invocation occurs before the consumer requests the event
+after processing the retrying `StreamFailed`. In particular, attempt N+1 is not
+opened before attempt N's terminal is yielded, prefetched, produced on a
+background thread, queued, or run through asyncio. Retry delay may occur while
+producing attempt N's terminal because it belongs to the retry-eligibility
+decision for that pull; the physical retry begins only on the later pull.
+
+### Accumulator unchanged
+
+This amendment adds no neutral event, no `RetryAborted` event, and no
+provider-controlled cancellation event without a physical attempt. It neither
+weakens physical-attempt identity nor changes the `StreamAccumulator` API or
+state machine. Pending-retry state remains authoritative for normal stream
+continuation. When the trusted outer fence aborts consumption, the accumulator
+is abandoned with the iterator and is not finished.
