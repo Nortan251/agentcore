@@ -179,7 +179,11 @@ def _detach_latency_ms(value: Any) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise StreamValidationError(
             "response.latency_ms must be a non-negative finite number")
-    numeric = float(value)
+    try:
+        numeric = float(value)
+    except OverflowError as exc:
+        raise StreamValidationError(
+            "response.latency_ms must be a non-negative finite number") from exc
     if not math.isfinite(numeric) or numeric < 0:
         raise StreamValidationError(
             "response.latency_ms must be a non-negative finite number")
@@ -363,8 +367,7 @@ class UsageUpdated:
 
     def __post_init__(self) -> None:
         _require_envelope(self.envelope)
-        if not isinstance(self.usage, Usage):
-            raise StreamValidationError("usage must be a Usage")
+        object.__setattr__(self, "usage", _detach_usage(self.usage))
 
 
 @dataclass(frozen=True)

@@ -155,6 +155,41 @@ def test_every_event_type_is_frozen():
             event.envelope = env  # type: ignore[misc]
 
 
+def test_usage_updated_normalizes_detached_usage():
+    clock = FixedClock(T0)
+    ctx, _ = make_context(clock)
+    usage = Usage(1, 2, 3)
+    event = UsageUpdated(
+        envelope=envelope(ctx, request_id=new_id("req"),
+                          attempt_id=new_id("att"), sequence=1),
+        usage=usage,
+    )
+
+    assert event.usage == Usage(1, 2, 3)
+    assert event.usage is not usage
+    assert RAW_SECRET not in repr(event)
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        Usage(prompt_tokens={"secret": RAW_SECRET}, completion_tokens=0,
+              total_tokens=0),
+        Usage(prompt_tokens=-1, completion_tokens=0, total_tokens=0),
+        Usage(prompt_tokens=True, completion_tokens=0, total_tokens=0),
+    ],
+)
+def test_usage_updated_rejects_non_neutral_usage(usage: Usage):
+    clock = FixedClock(T0)
+    ctx, _ = make_context(clock)
+    with pytest.raises(StreamValidationError):
+        UsageUpdated(
+            envelope=envelope(ctx, request_id=new_id("req"),
+                              attempt_id=new_id("att"), sequence=1),
+            usage=usage,
+        )
+
+
 def test_invalid_generation_rejected():
     clock = FixedClock(T0)
     ctx, _ = make_context(clock)
@@ -1200,6 +1235,7 @@ def test_one_shot_invalid_usage_fields_become_stream_failed(usage: Usage):
         -1,
         math.nan,
         math.inf,
+        10 ** 1000,
     ],
 )
 def test_one_shot_invalid_latency_becomes_stream_failed(latency_ms: Any):
