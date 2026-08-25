@@ -31,10 +31,12 @@ from agentcore.action_journal import (
     ActionStore,
     ActionStoreError,
     ActionStoreOwnershipError,
+    ActionTransition,
     ActionTransitionProof,
     ActionValidationError,
     ActionVersionConflictError,
     AuthorityReceipt,
+    DuplicateRiskAcknowledgement,
     EffectVerdict,
     IdempotencyContract,
     InMemoryActionStore,
@@ -43,6 +45,7 @@ from agentcore.action_journal import (
     ReconciliationMetadata,
     new_action,
     new_action_attempt_id,
+    new_duplicate_risk_acknowledgement_id,
 )
 from agentcore.realtime import TURN_SCHEMA_VERSION
 from agentcore.util.clock import FixedClock
@@ -72,6 +75,19 @@ def _authority(number: int = 1) -> AuthorityReceipt:
     )
 
 
+def _duplicate_risk_acknowledgement(
+    predecessor_number: int = 1,
+    number: int = 2,
+) -> DuplicateRiskAcknowledgement:
+    return DuplicateRiskAcknowledgement(
+        acknowledgement_id=_id("dra", number),
+        predecessor_action_id=_id("act", predecessor_number),
+        approval_request_id=f"approval:duplicate-risk:{number}",
+        binding_digest=f"{number + 30:064x}",
+        acknowledged_at=NOW,
+    )
+
+
 def _provenance(number: int = 1) -> ActionProvenance:
     return ActionProvenance(
         invocation_id=_id("inv", number),
@@ -94,6 +110,10 @@ def _new_record(
         ActionEffectClass.LOCALLY_VERIFIABLE_OR_REVERSIBLE
     ),
     idempotency: IdempotencyContract | None = None,
+    predecessor_action_id: str | None = None,
+    duplicate_risk_acknowledgement: (
+        DuplicateRiskAcknowledgement | None
+    ) = None,
 ) -> ActionRecord:
     return new_action(
         action_kind="filesystem.move.v1",
@@ -111,6 +131,8 @@ def _new_record(
         deduplication_key=deduplication_key,
         idempotency=idempotency,
         provenance=_provenance(number),
+        predecessor_action_id=predecessor_action_id,
+        duplicate_risk_acknowledgement=duplicate_risk_acknowledgement,
         authority=_authority(number),
         clock=FixedClock(NOW),
         id_factory=_ids(number),
@@ -168,6 +190,39 @@ def _to_reconcile(record: ActionRecord, number: int = 2) -> ActionRecord:
     )
 
 
+def _unknown_then_claimed_idempotent_retry(
+    *,
+    valid_until: datetime | None = None,
+) -> ActionRecord:
+    contract = IdempotencyContract(
+        key="provider-key-1",
+        contract="provider-contract.v1",
+        scope="mailbox:primary",
+        valid_until=(valid_until if valid_until is not None
+                     else NOW + timedelta(minutes=10)),
+    )
+    first = _claim(_new_record(
+        effect_class=ActionEffectClass.EXTERNALLY_IDEMPOTENT,
+        idempotency=contract,
+    ))
+    reauthorized = first.transition(
+        ActionState.AUTHORIZED,
+        transition_id=_id("atx", 2),
+        at=NOW,
+        attempt_status=ActionAttemptStatus.POSSIBLY_INVOKED,
+        effect_verdict=EffectVerdict.OUTCOME_UNKNOWN,
+        proof=ActionTransitionProof.EXTERNAL_IDEMPOTENCY_GUARANTEE,
+    )
+    return reauthorized.claim_attempt(
+        attempt_id=_id("aat", 2),
+        invocation_id=_id("inv", 2),
+        owner_id="process:two",
+        owner_epoch=2,
+        transition_id=_id("atx", 3),
+        at=NOW,
+    )
+
+
 @pytest.fixture(params=["memory", "json"])
 def action_store(request, tmp_path):
     store = (InMemoryActionStore(clock=FixedClock(NOW))
@@ -193,6 +248,75 @@ def test_action_record_round_trip_is_strict_and_deeply_immutable():
     with pytest.raises(FrozenInstanceError):
         restored.attempts[0].status = (  # type: ignore[misc]
             ActionAttemptStatus.INVOKED
+        )
+
+
+def test_duplicate_risk_acknowledgement_round_trip_is_strict_and_bounded():
+    acknowledgement = _duplicate_risk_acknowledgement()
+    payload = acknowledgement.to_dict()
+    record = _new_record(
+        2,
+        predecessor_action_id=acknowledgement.predecessor_action_id,
+        duplicate_risk_acknowledgement=acknowledgement,
+    )
+
+    assert DuplicateRiskAcknowledgement.from_dict(payload) == acknowledgement
+    assert ActionRecord.from_dict(record.to_dict()) == record
+    assert set(payload) == {
+        "acknowledgement_id",
+        "predecessor_action_id",
+        "approval_request_id",
+        "binding_digest",
+        "acknowledged_at",
+    }
+    assert new_duplicate_risk_acknowledgement_id(
+        id_factory=_ids(8)) == _id("dra", 8)
+
+    for invalid in (
+        {key: value for key, value in payload.items()
+         if key != "approval_request_id"},
+        {**payload, "unexpected": "field"},
+        {**payload, "approval_request_id": "x" * 129},
+    ):
+        with pytest.raises(ActionValidationError):
+            DuplicateRiskAcknowledgement.from_dict(invalid)
+
+
+def test_duplicate_risk_acknowledgement_rejects_malformed_identity_and_digest():
+    acknowledgement = _duplicate_risk_acknowledgement()
+    with pytest.raises(ActionValidationError):
+        replace(
+            acknowledgement,
+            acknowledgement_id=_id("ack", 2),
+        ).validate()
+    with pytest.raises(ActionValidationError):
+        replace(acknowledgement, binding_digest="not-a-digest").validate()
+
+
+def test_duplicate_risk_schema_has_no_raw_human_text_field():
+    secret = "RAW_HUMAN_ACKNOWLEDGEMENT_SENTINEL"
+    payload = _duplicate_risk_acknowledgement().to_dict()
+    payload["human_acknowledgement_text"] = secret
+
+    with pytest.raises(ActionValidationError) as captured:
+        DuplicateRiskAcknowledgement.from_dict(payload)
+    assert secret not in str(captured.value.details)
+    assert secret not in json.dumps(
+        _duplicate_risk_acknowledgement().to_dict())
+
+
+def test_duplicate_risk_acknowledgement_requires_exact_predecessor_binding():
+    acknowledgement = _duplicate_risk_acknowledgement()
+    with pytest.raises(ActionValidationError):
+        _new_record(
+            2,
+            duplicate_risk_acknowledgement=acknowledgement,
+        )
+    with pytest.raises(ActionValidationError):
+        _new_record(
+            2,
+            predecessor_action_id=_id("act", 3),
+            duplicate_risk_acknowledgement=acknowledgement,
         )
 
 
@@ -453,6 +577,142 @@ def test_local_failure_after_unknown_idempotent_attempt_cannot_erase_truth():
         )
 
 
+@pytest.mark.parametrize(
+    ("second_status", "second_verdict"),
+    [
+        (ActionAttemptStatus.NOT_INVOKED,
+         EffectVerdict.CONFIRMED_NOT_APPLIED),
+        (ActionAttemptStatus.INVOKED,
+         EffectVerdict.CONFIRMED_NOT_APPLIED),
+        (ActionAttemptStatus.INVOKED,
+         EffectVerdict.CONFIRMED_PARTIAL),
+    ],
+    ids=[
+        "second-not-invoked",
+        "second-invoked-not-applied",
+        "second-confirmed-partial",
+    ],
+)
+def test_failed_cannot_erase_an_older_unknown_attempt(
+    second_status,
+    second_verdict,
+):
+    second = _unknown_then_claimed_idempotent_retry()
+
+    with pytest.raises(ActionValidationError):
+        second.transition(
+            ActionState.FAILED,
+            transition_id=_id("atx", 4),
+            at=NOW,
+            attempt_status=second_status,
+            effect_verdict=second_verdict,
+            terminal_outcome=_outcome(second_verdict),
+        )
+
+
+def test_definitive_no_effect_cannot_launder_an_older_unknown_attempt():
+    second = _unknown_then_claimed_idempotent_retry()
+
+    with pytest.raises(ActionValidationError):
+        second.transition(
+            ActionState.AUTHORIZED,
+            transition_id=_id("atx", 4),
+            at=NOW,
+            attempt_status=ActionAttemptStatus.INVOKED,
+            effect_verdict=EffectVerdict.CONFIRMED_NOT_APPLIED,
+            proof=ActionTransitionProof.DEFINITIVE_NO_EFFECT,
+        )
+
+
+def test_older_unknown_remains_retryable_only_under_live_external_guarantee():
+    second = _unknown_then_claimed_idempotent_retry()
+    reauthorized = second.transition(
+        ActionState.AUTHORIZED,
+        transition_id=_id("atx", 4),
+        at=NOW,
+        attempt_status=ActionAttemptStatus.INVOKED,
+        effect_verdict=EffectVerdict.CONFIRMED_NOT_APPLIED,
+        proof=ActionTransitionProof.EXTERNAL_IDEMPOTENCY_GUARANTEE,
+    )
+
+    third = reauthorized.claim_attempt(
+        attempt_id=_id("aat", 3),
+        invocation_id=_id("inv", 3),
+        owner_id="process:three",
+        owner_epoch=3,
+        transition_id=_id("atx", 5),
+        at=NOW + timedelta(minutes=1),
+    )
+    assert third.state is ActionState.IN_FLIGHT
+    assert third.attempts[0].effect_verdict is EffectVerdict.OUTCOME_UNKNOWN
+
+
+def test_expired_external_guarantee_blocks_claim_without_proof_laundering():
+    second = _unknown_then_claimed_idempotent_retry(
+        valid_until=NOW + timedelta(minutes=2))
+
+    with pytest.raises(ActionValidationError):
+        second.transition(
+            ActionState.AUTHORIZED,
+            transition_id=_id("atx", 4),
+            at=NOW + timedelta(minutes=1),
+            attempt_status=ActionAttemptStatus.INVOKED,
+            effect_verdict=EffectVerdict.CONFIRMED_NOT_APPLIED,
+            proof=ActionTransitionProof.DEFINITIVE_NO_EFFECT,
+        )
+
+    reauthorized = second.transition(
+        ActionState.AUTHORIZED,
+        transition_id=_id("atx", 4),
+        at=NOW + timedelta(minutes=1),
+        attempt_status=ActionAttemptStatus.INVOKED,
+        effect_verdict=EffectVerdict.CONFIRMED_NOT_APPLIED,
+        proof=ActionTransitionProof.EXTERNAL_IDEMPOTENCY_GUARANTEE,
+    )
+    with pytest.raises(ActionValidationError):
+        reauthorized.claim_attempt(
+            attempt_id=_id("aat", 3),
+            invocation_id=_id("inv", 3),
+            owner_id="process:three",
+            owner_epoch=3,
+            transition_id=_id("atx", 5),
+            at=NOW + timedelta(minutes=2),
+        )
+
+
+def test_one_current_unknown_attempt_can_be_definitively_reauthorized():
+    ambiguous = _to_reconcile(_claim(_new_record()))
+
+    reauthorized = ambiguous.transition(
+        ActionState.AUTHORIZED,
+        transition_id=_id("atx", 3),
+        at=NOW,
+        attempt_status=ActionAttemptStatus.POSSIBLY_INVOKED,
+        effect_verdict=EffectVerdict.CONFIRMED_NOT_APPLIED,
+        proof=ActionTransitionProof.DEFINITIVE_NO_EFFECT,
+    )
+
+    assert reauthorized.state is ActionState.AUTHORIZED
+    assert reauthorized.attempts[0].effect_verdict is (
+        EffectVerdict.CONFIRMED_NOT_APPLIED)
+
+
+def test_confirmed_complete_effect_can_succeed_despite_older_unknown_attempt():
+    second = _unknown_then_claimed_idempotent_retry()
+
+    succeeded = second.transition(
+        ActionState.SUCCEEDED,
+        transition_id=_id("atx", 4),
+        at=NOW,
+        attempt_status=ActionAttemptStatus.INVOKED,
+        effect_verdict=EffectVerdict.CONFIRMED_APPLIED,
+        terminal_outcome=_outcome(EffectVerdict.CONFIRMED_APPLIED),
+    )
+
+    assert succeeded.state is ActionState.SUCCEEDED
+    assert succeeded.attempts[0].effect_verdict is EffectVerdict.OUTCOME_UNKNOWN
+
+
 def test_cancellation_after_claim_requires_live_not_invoked_proof():
     inflight = _claim(_new_record())
     with pytest.raises(ActionValidationError):
@@ -702,6 +962,94 @@ def test_predecessor_links_must_resolve_inside_the_action_domain(action_store):
     assert linked.predecessor_action_id == predecessor.action_id
 
 
+def test_duplicate_risk_acknowledgement_is_immutable_through_cas(action_store):
+    predecessor = action_store.create(_new_record(1))
+    acknowledgement = _duplicate_risk_acknowledgement()
+
+    linked_without = action_store.create(_new_record(
+        2,
+        predecessor_action_id=predecessor.action_id,
+    ))
+    cancelled_without = linked_without.transition(
+        ActionState.CANCELLED,
+        transition_id=_id("atx", 20),
+        at=NOW,
+    )
+    with pytest.raises(ActionValidationError):
+        action_store.compare_and_swap(
+            linked_without.action_id,
+            linked_without.version,
+            replace(
+                cancelled_without,
+                duplicate_risk_acknowledgement=acknowledgement,
+            ),
+        )
+
+    linked_with = action_store.create(_new_record(
+        3,
+        predecessor_action_id=predecessor.action_id,
+        duplicate_risk_acknowledgement=replace(
+            acknowledgement,
+            acknowledgement_id=_id("dra", 3),
+        ),
+    ))
+    cancelled_with = linked_with.transition(
+        ActionState.CANCELLED,
+        transition_id=_id("atx", 30),
+        at=NOW,
+    )
+    for rewritten in (
+        None,
+        replace(
+            linked_with.duplicate_risk_acknowledgement,
+            binding_digest="f" * 64,
+        ),
+    ):
+        with pytest.raises(ActionValidationError):
+            action_store.compare_and_swap(
+                linked_with.action_id,
+                linked_with.version,
+                replace(
+                    cancelled_with,
+                    duplicate_risk_acknowledgement=rewritten,
+                ),
+            )
+
+
+def test_acknowledged_repeat_does_not_resolve_or_execute_predecessor(
+    action_store,
+):
+    predecessor = action_store.create(_new_record(1))
+    predecessor = action_store.claim_attempt(
+        predecessor.action_id,
+        predecessor.version,
+        attempt_id=_id("aat", 1),
+        invocation_id=_id("inv", 1),
+        owner_id="process:one",
+        owner_epoch=1,
+        transition_id=_id("atx", 1),
+    )
+    predecessor = action_store.compare_and_swap(
+        predecessor.action_id,
+        predecessor.version,
+        _to_reconcile(predecessor),
+    )
+
+    successor = action_store.create(_new_record(
+        2,
+        predecessor_action_id=predecessor.action_id,
+        duplicate_risk_acknowledgement=(
+            _duplicate_risk_acknowledgement()),
+    ))
+
+    assert action_store.load(predecessor.action_id).state is (
+        ActionState.RECONCILE_REQUIRED)
+    assert action_store.load(predecessor.action_id).attempts == (
+        predecessor.attempts)
+    assert successor.state is ActionState.AUTHORIZED
+    assert successor.attempts == ()
+
+
 def test_external_idempotency_identity_has_one_logical_owner(action_store):
     contract = IdempotencyContract(
         key="provider-key-1",
@@ -916,6 +1264,51 @@ def test_strict_schema_rejects_unknown_missing_and_raw_metadata():
     payload.pop("action_kind")
     with pytest.raises(ActionValidationError):
         ActionRecord.from_dict(payload)
+
+    payload = _new_record().to_dict()
+    payload.pop("duplicate_risk_acknowledgement")
+    with pytest.raises(ActionValidationError):
+        ActionRecord.from_dict(payload)
+
+
+def test_manual_json_cannot_reload_failed_record_with_older_unknown_attempt(
+    tmp_path,
+):
+    second = _unknown_then_claimed_idempotent_retry()
+    outcome = _outcome(EffectVerdict.CONFIRMED_NOT_APPLIED)
+    terminal = ActionTransition(
+        transition_id=_id("atx", 4),
+        from_state=ActionState.IN_FLIGHT,
+        to_state=ActionState.FAILED,
+        from_version=second.version,
+        to_version=second.version + 1,
+        at=NOW,
+        attempt_id=second.attempts[-1].attempt_id,
+        attempt_status=ActionAttemptStatus.INVOKED,
+        effect_verdict=EffectVerdict.CONFIRMED_NOT_APPLIED,
+        terminal_outcome=outcome,
+    )
+    payload = second.to_dict()
+    payload["state"] = ActionState.FAILED.value
+    payload["version"] = second.version + 1
+    payload["attempts"][-1] = replace(
+        second.attempts[-1],
+        status=ActionAttemptStatus.INVOKED,
+        effect_verdict=EffectVerdict.CONFIRMED_NOT_APPLIED,
+        updated_at=NOW,
+    ).to_dict()
+    payload["transitions"].append(terminal.to_dict())
+    payload["terminal_outcome"] = outcome.to_dict()
+    payload["updated_at"] = terminal.to_dict()["at"]
+    path = tmp_path / f"{second.action_id}.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    store = JsonFileActionStore(tmp_path, clock=FixedClock(NOW))
+    try:
+        with pytest.raises(ActionValidationError):
+            store.load(second.action_id)
+    finally:
+        store.close()
 
 
 def test_unknown_schema_and_illegal_history_fail_closed_on_reload(tmp_path):

@@ -44,6 +44,8 @@ MAX_IDEMPOTENCY_SCOPE_CHARS = 128
 MAX_PROVENANCE_REF_CHARS = 128
 AUTHORITY_DIGEST_HEX_CHARS = 64
 MAX_AUTHORITY_SCOPE_CHARS = 128
+MAX_DUPLICATE_RISK_APPROVAL_REQUEST_ID_CHARS = 128
+DUPLICATE_RISK_BINDING_DIGEST_HEX_CHARS = 64
 MAX_ACTION_ATTEMPTS = 32
 MAX_ACTION_TRANSITIONS = 256
 MAX_EVIDENCE_REFS = 64
@@ -62,6 +64,7 @@ _INVOCATION_ID = re.compile(r"^inv_[0-9a-f]{12}$")
 _ACTION_ATTEMPT_ID = re.compile(r"^aat_[0-9a-f]{12}$")
 _ACTION_TRANSITION_ID = re.compile(r"^atx_[0-9a-f]{12}$")
 _AUTHORITY_RECEIPT_ID = re.compile(r"^auth_[0-9a-f]{12}$")
+_DUPLICATE_RISK_ACKNOWLEDGEMENT_ID = re.compile(r"^dra_[0-9a-f]{12}$")
 _TURN_ID = re.compile(r"^turn_[0-9a-f]{12}$")
 _OPERATION_ID = re.compile(r"^op_[0-9a-f]{12}$")
 _RUN_ID = re.compile(r"^run_[0-9a-f]{12}$")
@@ -273,6 +276,98 @@ class AuthorityReceipt:
                                    MAX_PROVENANCE_REF_CHARS,
                                    "approval request id")
                 if data["approval_request_id"] is not None else None
+            ),
+        ).validate()
+
+
+@dataclass(frozen=True)
+class DuplicateRiskAcknowledgement:
+    """Bounded trusted receipt for deliberately repeating an ambiguous action.
+
+    This receipt records upstream acknowledgement; it neither grants authority
+    nor resolves the predecessor.  It deliberately has no field for user or
+    model text.
+    """
+
+    acknowledgement_id: str
+    predecessor_action_id: str
+    approval_request_id: str
+    binding_digest: str
+    acknowledged_at: datetime
+
+    def validate(self) -> DuplicateRiskAcknowledgement:
+        _require_pattern(
+            self.acknowledgement_id,
+            _DUPLICATE_RISK_ACKNOWLEDGEMENT_ID,
+            "duplicate-risk acknowledgement id",
+        )
+        _require_pattern(
+            self.predecessor_action_id,
+            _ACTION_ID,
+            "duplicate-risk predecessor action id",
+        )
+        _require_reference(
+            self.approval_request_id,
+            MAX_DUPLICATE_RISK_APPROVAL_REQUEST_ID_CHARS,
+            "duplicate-risk approval request id",
+        )
+        _require_digest(
+            self.binding_digest,
+            "duplicate-risk acknowledgement binding digest",
+        )
+        _ensure_utc(self.acknowledged_at, "duplicate-risk acknowledged_at")
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "acknowledgement_id": self.acknowledgement_id,
+            "predecessor_action_id": self.predecessor_action_id,
+            "approval_request_id": self.approval_request_id,
+            "binding_digest": self.binding_digest,
+            "acknowledged_at": _format_utc(
+                self.acknowledged_at, "duplicate-risk acknowledged_at"),
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: Mapping[str, Any],
+    ) -> DuplicateRiskAcknowledgement:
+        _require_exact_keys(
+            data,
+            {
+                "acknowledgement_id",
+                "predecessor_action_id",
+                "approval_request_id",
+                "binding_digest",
+                "acknowledged_at",
+            },
+            "duplicate-risk acknowledgement",
+        )
+        return cls(
+            acknowledgement_id=_require_pattern(
+                data["acknowledgement_id"],
+                _DUPLICATE_RISK_ACKNOWLEDGEMENT_ID,
+                "duplicate-risk acknowledgement id",
+            ),
+            predecessor_action_id=_require_pattern(
+                data["predecessor_action_id"],
+                _ACTION_ID,
+                "duplicate-risk predecessor action id",
+            ),
+            approval_request_id=_require_reference(
+                data["approval_request_id"],
+                MAX_DUPLICATE_RISK_APPROVAL_REQUEST_ID_CHARS,
+                "duplicate-risk approval request id",
+            ),
+            binding_digest=_require_digest(
+                data["binding_digest"],
+                "duplicate-risk acknowledgement binding digest",
+            ),
+            acknowledged_at=_parse_utc(
+                data["acknowledged_at"],
+                "duplicate-risk acknowledged_at",
             ),
         ).validate()
 
@@ -838,6 +933,7 @@ class ActionRecord:
     idempotency: IdempotencyContract | None
     provenance: ActionProvenance
     predecessor_action_id: str | None
+    duplicate_risk_acknowledgement: DuplicateRiskAcknowledgement | None
     authority: AuthorityReceipt
     attempts: tuple[ActionAttempt, ...]
     transitions: tuple[ActionTransition, ...]
@@ -932,6 +1028,20 @@ class ActionRecord:
             if self.predecessor_action_id == self.action_id:
                 raise ActionValidationError(
                     "an action cannot be its own predecessor")
+        if self.duplicate_risk_acknowledgement is not None:
+            acknowledgement = self.duplicate_risk_acknowledgement
+            if not isinstance(
+                    acknowledgement, DuplicateRiskAcknowledgement):
+                raise ActionValidationError(
+                    "duplicate-risk acknowledgement is invalid")
+            acknowledgement.validate()
+            if self.predecessor_action_id is None:
+                raise ActionValidationError(
+                    "duplicate-risk acknowledgement requires a predecessor")
+            if acknowledgement.predecessor_action_id != (
+                    self.predecessor_action_id):
+                raise ActionValidationError(
+                    "duplicate-risk acknowledgement predecessor mismatch")
         if not isinstance(self.authority, AuthorityReceipt):
             raise ActionValidationError("authority receipt is invalid")
         self.authority.validate()
@@ -942,6 +1052,10 @@ class ActionRecord:
         if self.authority.authorized_at > created:
             raise ActionValidationError(
                 "action predates its authority receipt")
+        if self.duplicate_risk_acknowledgement is not None and \
+                self.duplicate_risk_acknowledgement.acknowledged_at > created:
+            raise ActionValidationError(
+                "action predates its duplicate-risk acknowledgement")
         if self.authority.expires_at is not None and \
                 self.authority.expires_at <= created:
             raise ActionValidationError(
@@ -1071,6 +1185,10 @@ class ActionRecord:
                 prior_action_has_unknown=any(
                     values[1] is EffectVerdict.OUTCOME_UNKNOWN
                     for values in replay.values()),
+                earlier_attempt_has_unknown=any(
+                    attempt_id != transition.attempt_id and
+                    values[1] is EffectVerdict.OUTCOME_UNKNOWN
+                    for attempt_id, values in replay.items()),
             )
             _validate_reconciliation_progress(
                 reconciliation, transition.reconciliation,
@@ -1110,6 +1228,11 @@ class ActionRecord:
         if claimed_attempts != len(self.attempts):
             raise ActionValidationError(
                 "action attempt ledger contains an unclaimed attempt")
+        if state is ActionState.FAILED and any(
+                values[1] is EffectVerdict.OUTCOME_UNKNOWN
+                for values in replay.values()):
+            raise ActionValidationError(
+                "failed action cannot retain an unknown attempt")
         for attempt in self.attempts:
             expected_status, expected_verdict, expected_refs, expected_at = (
                 replay[attempt.attempt_id]
@@ -1344,6 +1467,9 @@ class ActionRecord:
             prior_action_has_unknown=any(
                 attempt.effect_verdict is EffectVerdict.OUTCOME_UNKNOWN
                 for attempt in self.attempts),
+            earlier_attempt_has_unknown=any(
+                attempt.effect_verdict is EffectVerdict.OUTCOME_UNKNOWN
+                for attempt in self.attempts[:-1]),
         )
         return replace(
             self,
@@ -1381,6 +1507,10 @@ class ActionRecord:
                             if self.idempotency is not None else None),
             "provenance": self.provenance.to_dict(),
             "predecessor_action_id": self.predecessor_action_id,
+            "duplicate_risk_acknowledgement": (
+                self.duplicate_risk_acknowledgement.to_dict()
+                if self.duplicate_risk_acknowledgement is not None else None
+            ),
             "authority": self.authority.to_dict(),
             "attempts": [attempt.to_dict() for attempt in self.attempts],
             "transitions": [item.to_dict() for item in self.transitions],
@@ -1401,7 +1531,8 @@ class ActionRecord:
             "reconciliation_capabilities", "effect_class", "intent_digest",
             "intent_ref", "target_category", "target_fingerprint",
             "deduplication_scope", "deduplication_key", "idempotency",
-            "provenance", "predecessor_action_id", "authority", "attempts",
+            "provenance", "predecessor_action_id",
+            "duplicate_risk_acknowledgement", "authority", "attempts",
             "transitions", "reconciliation", "terminal_outcome",
             "evidence_refs", "created_at", "updated_at", "schema_version",
         }
@@ -1427,6 +1558,7 @@ class ActionRecord:
             raise ActionValidationError("action transitions must be a list")
         raw_idempotency = data["idempotency"]
         raw_provenance = data["provenance"]
+        raw_duplicate_risk = data["duplicate_risk_acknowledgement"]
         raw_authority = data["authority"]
         raw_reconciliation = data["reconciliation"]
         raw_terminal = data["terminal_outcome"]
@@ -1441,6 +1573,10 @@ class ActionRecord:
                 raw_idempotency, Mapping):
             raise ActionValidationError(
                 "idempotency metadata must be a mapping")
+        if raw_duplicate_risk is not None and not isinstance(
+                raw_duplicate_risk, Mapping):
+            raise ActionValidationError(
+                "duplicate-risk acknowledgement must be a mapping")
         if raw_terminal is not None and not isinstance(raw_terminal, Mapping):
             raise ActionValidationError(
                 "terminal outcome must be a mapping")
@@ -1490,6 +1626,10 @@ class ActionRecord:
                 data["predecessor_action_id"], _ACTION_ID,
                 "predecessor action id")
                 if data["predecessor_action_id"] is not None else None),
+            duplicate_risk_acknowledgement=(
+                DuplicateRiskAcknowledgement.from_dict(raw_duplicate_risk)
+                if raw_duplicate_risk is not None else None
+            ),
             authority=AuthorityReceipt.from_dict(raw_authority),
             attempts=tuple(ActionAttempt.from_dict(item)
                            if isinstance(item, Mapping) else
@@ -1531,6 +1671,9 @@ def new_action(
     deduplication_key: str | None = None,
     idempotency: IdempotencyContract | None = None,
     predecessor_action_id: str | None = None,
+    duplicate_risk_acknowledgement: (
+        DuplicateRiskAcknowledgement | None
+    ) = None,
     clock: Clock | None = None,
     id_factory: Callable[[str], str] = new_id,
 ) -> ActionRecord:
@@ -1557,6 +1700,7 @@ def new_action(
         idempotency=idempotency,
         provenance=provenance,
         predecessor_action_id=predecessor_action_id,
+        duplicate_risk_acknowledgement=duplicate_risk_acknowledgement,
         authority=authority,
         attempts=(),
         transitions=(),
@@ -1582,6 +1726,17 @@ def new_action_transition_id(
 ) -> str:
     return _require_pattern(id_factory("atx"), _ACTION_TRANSITION_ID,
                             "action transition id")
+
+
+def new_duplicate_risk_acknowledgement_id(
+    *, id_factory: Callable[[str], str] = new_id,
+) -> str:
+    """Mint a receipt ID in the stable ``dra_`` namespace."""
+    return _require_pattern(
+        id_factory("dra"),
+        _DUPLICATE_RISK_ACKNOWLEDGEMENT_ID,
+        "duplicate-risk acknowledgement id",
+    )
 
 
 def require_action_id(value: Any) -> str:
@@ -1614,6 +1769,7 @@ def validate_action_successor(current: ActionRecord,
         current.idempotency,
         current.provenance,
         current.predecessor_action_id,
+        current.duplicate_risk_acknowledgement,
         current.authority,
         current.created_at,
         current.schema_version,
@@ -1636,6 +1792,7 @@ def validate_action_successor(current: ActionRecord,
         candidate.idempotency,
         candidate.provenance,
         candidate.predecessor_action_id,
+        candidate.duplicate_risk_acknowledgement,
         candidate.authority,
         candidate.created_at,
         candidate.schema_version,
@@ -1726,6 +1883,7 @@ def deduplication_compatible(first: ActionRecord,
         first.deduplication_identity,
         first.idempotency,
         first.predecessor_action_id,
+        first.duplicate_risk_acknowledgement,
     ) == (
         second.action_kind,
         second.tool_name,
@@ -1741,6 +1899,7 @@ def deduplication_compatible(first: ActionRecord,
         second.deduplication_identity,
         second.idempotency,
         second.predecessor_action_id,
+        second.duplicate_risk_acknowledgement,
     )
 
 
@@ -1784,6 +1943,7 @@ def _validate_transition_semantics(
     idempotency: IdempotencyContract | None,
     prior_attempt_status: ActionAttemptStatus | None,
     prior_action_has_unknown: bool,
+    earlier_attempt_has_unknown: bool,
 ) -> None:
     transition.validate()
     source = transition.from_state
@@ -1823,6 +1983,10 @@ def _validate_transition_semantics(
             if verdict is not EffectVerdict.CONFIRMED_NOT_APPLIED:
                 raise ActionValidationError(
                     "definitive retry proof requires confirmed no effect")
+            if earlier_attempt_has_unknown:
+                raise ActionValidationError(
+                    "definitive no-effect proof cannot erase an earlier "
+                    "unknown attempt")
         else:
             if effect_class is not ActionEffectClass.EXTERNALLY_IDEMPOTENT or \
                     idempotency is None:

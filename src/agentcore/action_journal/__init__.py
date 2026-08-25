@@ -14,6 +14,7 @@ from agentcore.action_journal.errors import (
 from agentcore.action_journal.models import (
     ACTION_JOURNAL_SCHEMA_VERSION,
     AUTHORITY_DIGEST_HEX_CHARS,
+    DUPLICATE_RISK_BINDING_DIGEST_HEX_CHARS,
     INTENT_DIGEST_HEX_CHARS,
     LEGAL_ACTION_TRANSITIONS,
     MAX_ACTION_ATTEMPTS,
@@ -24,6 +25,7 @@ from agentcore.action_journal.models import (
     MAX_CAPABILITY_NAME_CHARS,
     MAX_DEDUPLICATION_KEY_CHARS,
     MAX_DEDUPLICATION_SCOPE_CHARS,
+    MAX_DUPLICATE_RISK_APPROVAL_REQUEST_ID_CHARS,
     MAX_EVIDENCE_REFS,
     MAX_EVIDENCE_REF_CHARS,
     MAX_IDEMPOTENCY_CONTRACT_CHARS,
@@ -52,6 +54,7 @@ from agentcore.action_journal.models import (
     ActionTransition,
     ActionTransitionProof,
     AuthorityReceipt,
+    DuplicateRiskAcknowledgement,
     EffectVerdict,
     IdempotencyContract,
     ReconciliationDisposition,
@@ -60,6 +63,7 @@ from agentcore.action_journal.models import (
     new_action,
     new_action_attempt_id,
     new_action_transition_id,
+    new_duplicate_risk_acknowledgement_id,
     require_action_id,
 )
 from agentcore.action_journal.store import (
@@ -72,6 +76,7 @@ from agentcore.action_journal.store import (
 __all__ = [
     "ACTION_JOURNAL_SCHEMA_VERSION",
     "AUTHORITY_DIGEST_HEX_CHARS",
+    "DUPLICATE_RISK_BINDING_DIGEST_HEX_CHARS",
     "INTENT_DIGEST_HEX_CHARS",
     "LEGAL_ACTION_TRANSITIONS",
     "MAX_ACTION_ATTEMPTS",
@@ -83,6 +88,7 @@ __all__ = [
     "MAX_CAPABILITY_NAME_CHARS",
     "MAX_DEDUPLICATION_KEY_CHARS",
     "MAX_DEDUPLICATION_SCOPE_CHARS",
+    "MAX_DUPLICATE_RISK_APPROVAL_REQUEST_ID_CHARS",
     "MAX_EVIDENCE_REFS",
     "MAX_EVIDENCE_REF_CHARS",
     "MAX_IDEMPOTENCY_CONTRACT_CHARS",
@@ -121,6 +127,7 @@ __all__ = [
     "ActionValidationError",
     "ActionVersionConflictError",
     "AuthorityReceipt",
+    "DuplicateRiskAcknowledgement",
     "EffectVerdict",
     "IdempotencyContract",
     "InMemoryActionStore",
@@ -131,5 +138,6 @@ __all__ = [
     "new_action",
     "new_action_attempt_id",
     "new_action_transition_id",
+    "new_duplicate_risk_acknowledgement_id",
     "require_action_id",
 ]
