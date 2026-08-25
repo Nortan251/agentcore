@@ -1110,6 +1110,7 @@ class ActionRecord:
             datetime,
         ]] = {}
         claimed_attempts = 0
+        unresolved_action_ambiguity = False
 
         for index, transition in enumerate(self.transitions, start=1):
             if not isinstance(transition, ActionTransition):
@@ -1182,13 +1183,8 @@ class ActionRecord:
                 effect_class=self.effect_class,
                 idempotency=self.idempotency,
                 prior_attempt_status=prior_status,
-                prior_action_has_unknown=any(
-                    values[1] is EffectVerdict.OUTCOME_UNKNOWN
-                    for values in replay.values()),
-                earlier_attempt_has_unknown=any(
-                    attempt_id != transition.attempt_id and
-                    values[1] is EffectVerdict.OUTCOME_UNKNOWN
-                    for attempt_id, values in replay.items()),
+                unresolved_attempt_ambiguity=(
+                    unresolved_action_ambiguity),
             )
             _validate_reconciliation_progress(
                 reconciliation, transition.reconciliation,
@@ -1212,6 +1208,13 @@ class ActionRecord:
                     refs + list(transition.evidence_refs),
                     transition.at,
                 )
+                if verdict is EffectVerdict.OUTCOME_UNKNOWN:
+                    unresolved_action_ambiguity = True
+
+            if transition.from_state is ActionState.RECONCILE_REQUIRED and \
+                    transition.effect_verdict is (
+                        EffectVerdict.CONFIRMED_NOT_APPLIED):
+                unresolved_action_ambiguity = False
 
             for ref in transition.evidence_refs:
                 if ref in aggregate_seen:
@@ -1228,11 +1231,6 @@ class ActionRecord:
         if claimed_attempts != len(self.attempts):
             raise ActionValidationError(
                 "action attempt ledger contains an unclaimed attempt")
-        if state is ActionState.FAILED and any(
-                values[1] is EffectVerdict.OUTCOME_UNKNOWN
-                for values in replay.values()):
-            raise ActionValidationError(
-                "failed action cannot retain an unknown attempt")
         for attempt in self.attempts:
             expected_status, expected_verdict, expected_refs, expected_at = (
                 replay[attempt.attempt_id]
@@ -1412,22 +1410,17 @@ class ActionRecord:
         attempt_id: str | None = None
         next_attempts = self.attempts
         prior_status: ActionAttemptStatus | None = None
-        if self.state in {
-            ActionState.IN_FLIGHT,
-            ActionState.RECONCILE_REQUIRED,
-        }:
+        if self.state is ActionState.IN_FLIGHT:
             if not self.attempts:
                 raise ActionValidationError(
                     "effect transition lacks an action attempt")
             current_attempt = self.attempts[-1]
             prior_status = current_attempt.status
-            if self.state is ActionState.IN_FLIGHT and attempt_status is None:
+            if attempt_status is None:
                 raise ActionValidationError(
                     "in-flight transition requires an attempt status")
-            next_status = (attempt_status if attempt_status is not None
-                           else current_attempt.status)
-            next_status = _require_enum(next_status, ActionAttemptStatus,
-                                        "attempt status")
+            next_status = _require_enum(
+                attempt_status, ActionAttemptStatus, "attempt status")
             attempt_id = current_attempt.attempt_id
             evolved = _evolve_attempt(
                 current_attempt,
@@ -1438,6 +1431,11 @@ class ActionRecord:
             )
             next_attempts = self.attempts[:-1] + (evolved,)
             attempt_status = next_status
+        elif self.state is ActionState.RECONCILE_REQUIRED:
+            if attempt_status is not None:
+                raise ActionValidationError(
+                    "reconciliation cannot attribute action truth to an "
+                    "attempt")
         elif attempt_status is not None:
             raise ActionValidationError(
                 "transition without an active attempt carries attempt status")
@@ -1464,12 +1462,8 @@ class ActionRecord:
             effect_class=self.effect_class,
             idempotency=self.idempotency,
             prior_attempt_status=prior_status,
-            prior_action_has_unknown=any(
-                attempt.effect_verdict is EffectVerdict.OUTCOME_UNKNOWN
-                for attempt in self.attempts),
-            earlier_attempt_has_unknown=any(
-                attempt.effect_verdict is EffectVerdict.OUTCOME_UNKNOWN
-                for attempt in self.attempts[:-1]),
+            unresolved_attempt_ambiguity=(
+                _has_unresolved_action_ambiguity(self.transitions)),
         )
         return replace(
             self,
@@ -1903,6 +1897,22 @@ def deduplication_compatible(first: ActionRecord,
     )
 
 
+def _has_unresolved_action_ambiguity(
+    transitions: tuple[ActionTransition, ...],
+) -> bool:
+    """Derive logical ambiguity without rewriting physical attempt verdicts."""
+    unresolved = False
+    for transition in transitions:
+        if transition.attempt_id is not None and \
+                transition.effect_verdict is EffectVerdict.OUTCOME_UNKNOWN:
+            unresolved = True
+        if transition.from_state is ActionState.RECONCILE_REQUIRED and \
+                transition.effect_verdict is (
+                    EffectVerdict.CONFIRMED_NOT_APPLIED):
+            unresolved = False
+    return unresolved
+
+
 def _validate_state_outcome_shape(transition: ActionTransition) -> None:
     target = transition.to_state
     verdict = transition.effect_verdict
@@ -1942,8 +1952,7 @@ def _validate_transition_semantics(
     effect_class: ActionEffectClass,
     idempotency: IdempotencyContract | None,
     prior_attempt_status: ActionAttemptStatus | None,
-    prior_action_has_unknown: bool,
-    earlier_attempt_has_unknown: bool,
+    unresolved_attempt_ambiguity: bool,
 ) -> None:
     transition.validate()
     source = transition.from_state
@@ -1965,12 +1974,21 @@ def _validate_transition_semantics(
                 EffectVerdict.CONFIRMED_NOT_APPLIED):
             raise ActionValidationError(
                 "pre-invocation failure must confirm no effect")
-        if target is ActionState.FAILED and prior_action_has_unknown:
+        if target is ActionState.FAILED and unresolved_attempt_ambiguity:
             raise ActionValidationError(
                 "local failure cannot erase an earlier unknown attempt")
-    elif transition.attempt_id is None or status is None:
+    elif source is ActionState.IN_FLIGHT:
+        if transition.attempt_id is None or status is None:
+            raise ActionValidationError(
+                "in-flight outcome must correlate the current attempt")
+        if target is ActionState.FAILED and unresolved_attempt_ambiguity:
+            raise ActionValidationError(
+                "attempt-local failure cannot erase an earlier unknown "
+                "attempt")
+    elif source is ActionState.RECONCILE_REQUIRED and (
+            transition.attempt_id is not None or status is not None):
         raise ActionValidationError(
-            "effect transition must correlate the current attempt")
+            "reconciliation cannot rewrite physical attempt truth")
 
     if target is ActionState.AUTHORIZED:
         if proof not in {
@@ -1983,7 +2001,8 @@ def _validate_transition_semantics(
             if verdict is not EffectVerdict.CONFIRMED_NOT_APPLIED:
                 raise ActionValidationError(
                     "definitive retry proof requires confirmed no effect")
-            if earlier_attempt_has_unknown:
+            if source is ActionState.IN_FLIGHT and \
+                    unresolved_attempt_ambiguity:
                 raise ActionValidationError(
                     "definitive no-effect proof cannot erase an earlier "
                     "unknown attempt")
@@ -2020,13 +2039,14 @@ def _validate_transition_semantics(
         if status is ActionAttemptStatus.CLAIMED:
             raise ActionValidationError(
                 "an attempt outcome cannot remain merely claimed")
-    if target is ActionState.RECONCILE_REQUIRED and status not in {
+    if source is ActionState.IN_FLIGHT and \
+            target is ActionState.RECONCILE_REQUIRED and status not in {
         ActionAttemptStatus.INVOKED,
         ActionAttemptStatus.POSSIBLY_INVOKED,
     }:
         raise ActionValidationError(
             "unknown outcome requires invoked-or-possible attempt truth")
-    if verdict in {
+    if source is ActionState.IN_FLIGHT and verdict in {
         EffectVerdict.CONFIRMED_APPLIED,
         EffectVerdict.CONFIRMED_PARTIAL,
     } and status is not ActionAttemptStatus.INVOKED:

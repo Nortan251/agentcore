@@ -223,6 +223,19 @@ def _unknown_then_claimed_idempotent_retry(
     )
 
 
+def _multi_attempt_reconciliation_required() -> ActionRecord:
+    second = _unknown_then_claimed_idempotent_retry()
+    return second.transition(
+        ActionState.RECONCILE_REQUIRED,
+        transition_id=_id("atx", 4),
+        at=NOW,
+        attempt_status=ActionAttemptStatus.POSSIBLY_INVOKED,
+        effect_verdict=EffectVerdict.OUTCOME_UNKNOWN,
+        reconciliation=_reconciliation(),
+        evidence_refs=("evidence:timeout:second-attempt",),
+    )
+
+
 @pytest.fixture(params=["memory", "json"])
 def action_store(request, tmp_path):
     store = (InMemoryActionStore(clock=FixedClock(NOW))
@@ -402,7 +415,6 @@ def test_every_legal_transition_has_a_valid_typed_form():
 
     assert reconcile.transition(
         ActionState.SUCCEEDED, transition_id=_id("atx", 9), at=NOW,
-        attempt_status=ActionAttemptStatus.INVOKED,
         effect_verdict=EffectVerdict.CONFIRMED_APPLIED,
         terminal_outcome=_outcome(EffectVerdict.CONFIRMED_APPLIED),
     ).state is ActionState.SUCCEEDED
@@ -682,19 +694,172 @@ def test_expired_external_guarantee_blocks_claim_without_proof_laundering():
 
 def test_one_current_unknown_attempt_can_be_definitively_reauthorized():
     ambiguous = _to_reconcile(_claim(_new_record()))
+    attempt_history = ambiguous.attempts
 
     reauthorized = ambiguous.transition(
         ActionState.AUTHORIZED,
         transition_id=_id("atx", 3),
         at=NOW,
-        attempt_status=ActionAttemptStatus.POSSIBLY_INVOKED,
         effect_verdict=EffectVerdict.CONFIRMED_NOT_APPLIED,
         proof=ActionTransitionProof.DEFINITIVE_NO_EFFECT,
+        evidence_refs=("reconciliation:logical-effect-absent",),
     )
 
     assert reauthorized.state is ActionState.AUTHORIZED
+    assert reauthorized.attempts == attempt_history
     assert reauthorized.attempts[0].effect_verdict is (
+        EffectVerdict.OUTCOME_UNKNOWN)
+    assert reauthorized.transitions[-1].attempt_id is None
+    assert reauthorized.transitions[-1].attempt_status is None
+    assert "reconciliation:logical-effect-absent" in (
+        reauthorized.evidence_refs)
+    assert "reconciliation:logical-effect-absent" not in (
+        reauthorized.attempts[0].evidence_refs)
+
+
+@pytest.mark.parametrize(
+    ("target", "verdict"),
+    [
+        (ActionState.FAILED, EffectVerdict.CONFIRMED_NOT_APPLIED),
+        (ActionState.SUCCEEDED, EffectVerdict.CONFIRMED_APPLIED),
+        (ActionState.FAILED, EffectVerdict.CONFIRMED_PARTIAL),
+    ],
+    ids=["no-effect", "complete-effect", "exact-partial-effect"],
+)
+def test_multi_attempt_reconciliation_settles_only_logical_action_truth(
+    target,
+    verdict,
+):
+    ambiguous = _multi_attempt_reconciliation_required()
+    attempt_history = ambiguous.attempts
+    evidence_ref = f"reconciliation:logical:{verdict.value}"
+
+    settled = ambiguous.transition(
+        target,
+        transition_id=_id("atx", 5),
+        at=NOW,
+        effect_verdict=verdict,
+        terminal_outcome=_outcome(verdict),
+        evidence_refs=(evidence_ref,),
+    )
+
+    assert settled.attempts == attempt_history
+    assert all(attempt.effect_verdict is EffectVerdict.OUTCOME_UNKNOWN
+               for attempt in settled.attempts)
+    assert settled.terminal_outcome is not None
+    assert settled.terminal_outcome.verdict is verdict
+    if verdict is EffectVerdict.CONFIRMED_PARTIAL:
+        assert settled.terminal_outcome.partial_categories == (
+            "destination_written",)
+    transition = settled.transitions[-1]
+    assert transition.attempt_id is None
+    assert transition.attempt_status is None
+    assert transition.evidence_refs == (evidence_ref,)
+    assert evidence_ref in settled.evidence_refs
+    assert all(evidence_ref not in attempt.evidence_refs
+               for attempt in settled.attempts)
+    assert ActionRecord.from_dict(settled.to_dict()) == settled
+
+
+def test_action_wide_reconciliation_allows_safe_retry_without_rewriting():
+    ambiguous = _multi_attempt_reconciliation_required()
+    attempt_history = ambiguous.attempts
+
+    reauthorized = ambiguous.transition(
+        ActionState.AUTHORIZED,
+        transition_id=_id("atx", 5),
+        at=NOW,
+        effect_verdict=EffectVerdict.CONFIRMED_NOT_APPLIED,
+        proof=ActionTransitionProof.DEFINITIVE_NO_EFFECT,
+        evidence_refs=("reconciliation:logical-effect-absent",),
+    )
+
+    assert reauthorized.attempts == attempt_history
+    assert all(attempt.effect_verdict is EffectVerdict.OUTCOME_UNKNOWN
+               for attempt in reauthorized.attempts)
+    third = reauthorized.claim_attempt(
+        attempt_id=_id("aat", 3),
+        invocation_id=_id("inv", 3),
+        owner_id="process:three",
+        owner_epoch=3,
+        transition_id=_id("atx", 6),
+        at=NOW,
+    )
+    assert third.state is ActionState.IN_FLIGHT
+    assert third.attempts[:-1] == attempt_history
+    assert third.attempts[-1].status is ActionAttemptStatus.CLAIMED
+
+    failed = third.transition(
+        ActionState.FAILED,
+        transition_id=_id("atx", 7),
+        at=NOW,
+        attempt_status=ActionAttemptStatus.INVOKED,
+        effect_verdict=EffectVerdict.CONFIRMED_NOT_APPLIED,
+        terminal_outcome=_outcome(EffectVerdict.CONFIRMED_NOT_APPLIED),
+    )
+    assert failed.state is ActionState.FAILED
+    assert failed.attempts[:2] == attempt_history
+    assert all(attempt.effect_verdict is EffectVerdict.OUTCOME_UNKNOWN
+               for attempt in failed.attempts[:2])
+    assert failed.attempts[-1].effect_verdict is (
         EffectVerdict.CONFIRMED_NOT_APPLIED)
+
+
+def test_reconciliation_external_retry_remains_live_contract_dependent():
+    ambiguous = _multi_attempt_reconciliation_required()
+    attempt_history = ambiguous.attempts
+    reauthorized = ambiguous.transition(
+        ActionState.AUTHORIZED,
+        transition_id=_id("atx", 5),
+        at=NOW,
+        effect_verdict=EffectVerdict.OUTCOME_UNKNOWN,
+        proof=ActionTransitionProof.EXTERNAL_IDEMPOTENCY_GUARANTEE,
+    )
+
+    assert reauthorized.attempts == attempt_history
+    with pytest.raises(ActionValidationError):
+        reauthorized.claim_attempt(
+            attempt_id=_id("aat", 3),
+            invocation_id=_id("inv", 3),
+            owner_id="process:three",
+            owner_epoch=3,
+            transition_id=_id("atx", 6),
+            at=NOW + timedelta(minutes=10),
+        )
+
+    third = reauthorized.claim_attempt(
+        attempt_id=_id("aat", 3),
+        invocation_id=_id("inv", 3),
+        owner_id="process:three",
+        owner_epoch=3,
+        transition_id=_id("atx", 6),
+        at=NOW + timedelta(minutes=1),
+    )
+    with pytest.raises(ActionValidationError):
+        third.transition(
+            ActionState.FAILED,
+            transition_id=_id("atx", 7),
+            at=NOW + timedelta(minutes=1),
+            attempt_status=ActionAttemptStatus.INVOKED,
+            effect_verdict=EffectVerdict.CONFIRMED_NOT_APPLIED,
+            terminal_outcome=_outcome(
+                EffectVerdict.CONFIRMED_NOT_APPLIED),
+        )
+
+
+def test_reconciliation_transition_rejects_attempt_attribution():
+    ambiguous = _to_reconcile(_claim(_new_record()))
+
+    with pytest.raises(ActionValidationError):
+        ambiguous.transition(
+            ActionState.SUCCEEDED,
+            transition_id=_id("atx", 3),
+            at=NOW,
+            attempt_status=ActionAttemptStatus.INVOKED,
+            effect_verdict=EffectVerdict.CONFIRMED_APPLIED,
+            terminal_outcome=_outcome(EffectVerdict.CONFIRMED_APPLIED),
+            evidence_refs=("reconciliation:logical-effect-present",),
+        )
 
 
 def test_confirmed_complete_effect_can_succeed_despite_older_unknown_attempt():
@@ -1309,6 +1474,45 @@ def test_manual_json_cannot_reload_failed_record_with_older_unknown_attempt(
             store.load(second.action_id)
     finally:
         store.close()
+
+
+def test_manual_json_cannot_rewrite_attempt_through_reconciliation():
+    ambiguous = _multi_attempt_reconciliation_required()
+    outcome = _outcome(EffectVerdict.CONFIRMED_APPLIED)
+    evidence_ref = "reconciliation:logical-effect-present"
+    terminal = ActionTransition(
+        transition_id=_id("atx", 5),
+        from_state=ActionState.RECONCILE_REQUIRED,
+        to_state=ActionState.SUCCEEDED,
+        from_version=ambiguous.version,
+        to_version=ambiguous.version + 1,
+        at=NOW,
+        attempt_id=ambiguous.attempts[-1].attempt_id,
+        attempt_status=ActionAttemptStatus.INVOKED,
+        effect_verdict=EffectVerdict.CONFIRMED_APPLIED,
+        evidence_refs=(evidence_ref,),
+        terminal_outcome=outcome,
+    )
+    payload = ambiguous.to_dict()
+    payload["state"] = ActionState.SUCCEEDED.value
+    payload["version"] = ambiguous.version + 1
+    payload["attempts"][-1] = replace(
+        ambiguous.attempts[-1],
+        status=ActionAttemptStatus.INVOKED,
+        effect_verdict=EffectVerdict.CONFIRMED_APPLIED,
+        evidence_refs=(
+            ambiguous.attempts[-1].evidence_refs + (evidence_ref,)
+        ),
+        updated_at=NOW,
+    ).to_dict()
+    payload["transitions"].append(terminal.to_dict())
+    payload["reconciliation"] = ReconciliationMetadata().to_dict()
+    payload["terminal_outcome"] = outcome.to_dict()
+    payload["evidence_refs"].append(evidence_ref)
+    payload["updated_at"] = terminal.to_dict()["at"]
+
+    with pytest.raises(ActionValidationError):
+        ActionRecord.from_dict(payload)
 
 
 def test_unknown_schema_and_illegal_history_fail_closed_on_reload(tmp_path):
