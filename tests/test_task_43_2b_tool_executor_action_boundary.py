@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import select
+import signal
 import threading
 from contextlib import contextmanager
 from dataclasses import replace
@@ -580,6 +583,220 @@ def test_wrong_tool_version_and_duplicate_adapter_registration_fail_closed():
     assert not invocation.ok
     assert invocation.result.metadata["kind"] == "action_adapter_version_mismatch"
     assert replacement.runs == 0
+
+
+def test_registered_adapter_resolves_and_executes_for_exact_tool_object():
+    tool = EffectTool()
+    executor, store, adapters, _ = _build_executor(tool)
+
+    assert adapters.resolve(tool) is not None
+    invocation = _invoke(executor, context=_context())
+
+    assert invocation.ok
+    assert tool.runs == 1
+    assert store.list_actions() == [invocation.action_id]
+
+
+@pytest.mark.parametrize("replacement_path", ["replace", "reregister"])
+def test_same_shape_distinct_tool_cannot_inherit_registered_adapter(
+        replacement_path):
+    original = EffectTool()
+    policy = RecordingPolicy()
+    executor, store, adapters, adapter = _build_executor(
+        original, policy=policy,
+    )
+    replacement = EffectTool()
+    assert replacement is not original
+    assert replacement.spec == original.spec
+    if replacement_path == "replace":
+        executor.registry.register(replacement, replace=True)
+    else:
+        executor.registry.unregister(original.spec.name)
+        executor.registry.register(replacement)
+
+    with pytest.raises(ActionAdapterRegistrationError) as caught:
+        adapters.resolve(replacement)
+    assert caught.value.details["reason"] == "tool_identity_mismatch"
+
+    invocation = _invoke(executor, context=_context())
+
+    assert not invocation.ok
+    assert invocation.result.metadata["kind"] == "action_adapter_invalid"
+    assert original.runs == 0
+    assert replacement.runs == 0
+    assert adapter.preflight_calls == 0
+    assert policy.calls == 0
+    assert store.list_actions() == []
+
+
+def test_same_shape_replacement_cannot_inherit_ephemeral_control_bypass():
+    original = EffectTool(capabilities=(Capability.APP_CONTROL,))
+    adapter = FakeAdapter(
+        original,
+        eligibility=ActionJournalEligibility.EPHEMERAL_CONTROL,
+        reconciliation_capabilities=frozenset(),
+    )
+    policy = RecordingPolicy()
+    executor, store, adapters, _ = _build_executor(
+        original, adapter=adapter, policy=policy,
+    )
+    replacement = EffectTool(capabilities=(Capability.APP_CONTROL,))
+    assert replacement is not original
+    assert replacement.spec == original.spec
+    executor.registry.register(replacement, replace=True)
+
+    with pytest.raises(ActionAdapterRegistrationError) as caught:
+        adapters.resolve(replacement)
+    assert caught.value.details["reason"] == "tool_identity_mismatch"
+
+    invocation = _invoke(executor)
+
+    assert not invocation.ok
+    assert invocation.result.metadata["kind"] == "action_adapter_invalid"
+    assert original.runs == 0
+    assert replacement.runs == 0
+    assert policy.calls == 0
+    assert store.list_actions() == []
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_forked_child_rejects_inherited_registry_and_fresh_registry_works():
+    tool = EffectTool()
+    adapter = FakeAdapter(tool)
+    registry = ActionAdapterRegistry()
+    registry.register(tool, adapter)
+    result_read, result_write = os.pipe()
+    child_pid = None
+    child_reaped = False
+    try:
+        child_pid = os.fork()
+        if child_pid == 0:  # pragma: no cover - assertions run in child
+            status = 1
+            try:
+                os.close(result_read)
+                inherited_calls = (
+                    lambda: registry.resolve(tool),
+                    lambda: len(registry),
+                    lambda: registry.register(tool, adapter),
+                )
+                for exit_code, inherited_call in enumerate(
+                        inherited_calls, start=2):
+                    try:
+                        inherited_call()
+                    except ActionAdapterRegistrationError as exc:
+                        if exc.details.get("reason") != "ownership_mismatch":
+                            os._exit(exit_code + 10)
+                    else:
+                        os._exit(exit_code)
+                fresh = ActionAdapterRegistry()
+                fresh.register(tool, adapter)
+                if len(fresh) != 1 or fresh.resolve(tool) is None:
+                    os._exit(6)
+                os.write(result_write, b"1")
+                status = 0
+            finally:
+                os._exit(status)
+        os.close(result_write)
+        readable, _, _ = select.select([result_read], [], [], WAIT)
+        assert result_read in readable
+        assert os.read(result_read, 1) == b"1"
+        exited, _, _ = select.select([result_read], [], [], WAIT)
+        assert result_read in exited
+        assert os.read(result_read, 1) == b""
+        waited_pid, status = os.waitpid(child_pid, os.WNOHANG)
+        assert waited_pid == child_pid
+        child_reaped = True
+        assert os.waitstatus_to_exitcode(status) == 0
+    finally:
+        if child_pid not in (None, 0) and not child_reaped:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(child_pid, 0)
+            except ChildProcessError:
+                pass
+        for descriptor in (result_read, result_write):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_forked_child_executor_rejects_before_contended_registry_lock():
+    tool = EffectTool()
+    executor, store, adapters, _ = _build_executor(tool)
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+    thread_errors: list[BaseException] = []
+
+    def hold_registry_lock():
+        try:
+            with adapters._lock:
+                lock_held.set()
+                if not release_lock.wait(WAIT):
+                    raise AssertionError("registry lock release was not signalled")
+        except BaseException as exc:
+            thread_errors.append(exc)
+
+    holder = threading.Thread(target=hold_registry_lock)
+    holder.start()
+    assert lock_held.wait(WAIT)
+    result_read, result_write = os.pipe()
+    child_pid = None
+    child_reaped = False
+    try:
+        child_pid = os.fork()
+        if child_pid == 0:  # pragma: no cover - assertions run in child
+            status = 1
+            try:
+                os.close(result_read)
+                invocation = _invoke(executor, context=_context())
+                if invocation.result.metadata.get("kind") != (
+                        "action_adapter_invalid"):
+                    os._exit(2)
+                if tool.runs != 0:
+                    os._exit(3)
+                os.write(result_write, b"1")
+                status = 0
+            finally:
+                os._exit(status)
+        os.close(result_write)
+        release_lock.set()
+        holder.join(timeout=WAIT)
+        assert not holder.is_alive()
+        assert thread_errors == []
+        readable, _, _ = select.select([result_read], [], [], WAIT)
+        assert result_read in readable
+        assert os.read(result_read, 1) == b"1"
+        exited, _, _ = select.select([result_read], [], [], WAIT)
+        assert result_read in exited
+        assert os.read(result_read, 1) == b""
+        waited_pid, status = os.waitpid(child_pid, os.WNOHANG)
+        assert waited_pid == child_pid
+        child_reaped = True
+        assert os.waitstatus_to_exitcode(status) == 0
+        assert tool.runs == 0
+        assert store.list_actions() == []
+    finally:
+        release_lock.set()
+        holder.join(timeout=WAIT)
+        if child_pid not in (None, 0) and not child_reaped:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(child_pid, 0)
+            except ChildProcessError:
+                pass
+        for descriptor in (result_read, result_write):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def test_registered_classification_is_an_immutable_snapshot():

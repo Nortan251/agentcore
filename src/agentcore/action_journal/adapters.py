@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import threading
 from collections.abc import Mapping
@@ -272,6 +273,7 @@ class ToolActionAdapter(Protocol):
 class _RegisteredAdapter:
     adapter: ToolActionAdapter
     spec: ActionAdapterSpec
+    tool: Any
     tool_name: str
     tool_version: str
     read_only: bool
@@ -289,14 +291,23 @@ class _RegisteredAdapter:
 
 
 class ActionAdapterRegistry:
-    """Thread-safe, no-replacement trusted semantic registration."""
+    """Process-owned, thread-safe trusted semantic registrations."""
 
     def __init__(self) -> None:
+        self._owner_pid = os.getpid()
         self._lock = threading.RLock()
         self._by_tool: dict[tuple[str, str], _RegisteredAdapter] = {}
         self._by_kind: dict[str, tuple[str, str]] = {}
 
+    def _require_owner_process(self) -> None:
+        if self._owner_pid != os.getpid():
+            raise ActionAdapterRegistrationError(
+                "action adapter registry belongs to another process",
+                reason="ownership_mismatch",
+            )
+
     def register(self, tool: Any, adapter: ToolActionAdapter) -> None:
+        self._require_owner_process()
         tool_spec = getattr(tool, "spec", None)
         adapter_spec = getattr(adapter, "spec", None)
         if tool_spec is None or not isinstance(adapter_spec, ActionAdapterSpec):
@@ -345,6 +356,7 @@ class ActionAdapterRegistry:
         binding = _RegisteredAdapter(
             adapter=adapter,
             spec=adapter_spec,
+            tool=tool,
             tool_name=adapter_spec.tool_name,
             tool_version=adapter_spec.tool_version,
             read_only=read_only,
@@ -367,6 +379,7 @@ class ActionAdapterRegistry:
         *,
         tool_spec: Any | None = None,
     ) -> ToolActionAdapter | None:
+        self._require_owner_process()
         tool_spec = tool_spec if tool_spec is not None else getattr(tool, "spec", None)
         name = getattr(tool_spec, "name", None)
         version = getattr(tool_spec, "version", None)
@@ -380,6 +393,11 @@ class ActionAdapterRegistry:
                     reason="version_mismatch",
                 )
             return None
+        if binding.tool is not tool:
+            raise ActionAdapterRegistrationError(
+                "registered action adapter belongs to a different tool object",
+                reason="tool_identity_mismatch",
+            )
         current = tuple(sorted(str(capability)
                                for capability in tool_spec.capabilities))
         if binding.read_only is not tool_spec.read_only or \
@@ -394,6 +412,7 @@ class ActionAdapterRegistry:
         return binding
 
     def __len__(self) -> int:
+        self._require_owner_process()
         with self._lock:
             return len(self._by_tool)
 
