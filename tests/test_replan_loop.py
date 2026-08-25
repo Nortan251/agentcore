@@ -13,6 +13,7 @@ import json
 from typing import Any
 
 import pytest
+from conftest import journal_for_tools
 
 from agentcore.config.schema import (
     AgentConfig,
@@ -213,7 +214,8 @@ def build(tmp_path, planner, *, verifier=None, tools=None, max_replans=1,
     tools = tools if tools is not None else [MutatingTool()]
     agent = Agent(cfg(tmp_path, max_replans=max_replans, **kw),
                   AgentDependencies(tools=tools, planner=planner,
-                                    verifier=verifier or AlwaysFailVerifier()))
+                                    verifier=verifier or AlwaysFailVerifier(),
+                                    **journal_for_tools(tools)))
     return agent
 
 
@@ -595,7 +597,8 @@ def test_replan_state_survives_resume_via_store(tmp_path):
     agent = Agent(cfg(tmp_path, max_replans=1),
                   AgentDependencies(tools=[tool], planner=planner,
                                     verifier=AlwaysFailVerifier(),
-                                    state_store=store))
+                                    state_store=store,
+                                    **journal_for_tools([tool])))
     agent.execute("do the thing")
     run_id = agent.state.run_id
     agent.shutdown()
@@ -615,17 +618,20 @@ def test_resumed_run_respects_spent_budget(tmp_path):
     agent = Agent(cfg(tmp_path, max_replans=1),
                   AgentDependencies(tools=[tool], planner=planner,
                                     verifier=AlwaysFailVerifier(),
-                                    state_store=store))
+                                    state_store=store,
+                                    **journal_for_tools([tool])))
     agent.execute("do the thing")
     run_id = agent.state.run_id
     agent.shutdown()
 
     planner2 = CountingPlanner()
+    resumed_tool = MutatingTool()
     resumed_agent = Agent(cfg(tmp_path, max_replans=1),
-                          AgentDependencies(tools=[MutatingTool()],
+                          AgentDependencies(tools=[resumed_tool],
                                             planner=planner2,
                                             verifier=AlwaysFailVerifier(),
-                                            state_store=store))
+                                            state_store=store,
+                                            **journal_for_tools([resumed_tool])))
     resumed_agent.resume(run_id)
     resumed_agent.run_task()
     assert planner2.replans == 0, "spent budget must carry across resume"

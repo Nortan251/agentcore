@@ -11,6 +11,7 @@ import json
 import time
 
 import pytest
+from conftest import journal_for_tools
 
 from agentcore.cli import main
 from agentcore.config.schema import (
@@ -114,7 +115,7 @@ def seed(tmp_path, objective, *, planner, tool=None,
     tool = tool if tool is not None else WriteTool()
     agent = Agent(config_for(tmp_path, level=level), AgentDependencies(
         tools=[tool], planner=planner, verifier=PassVerifier(),
-        state_store=store))
+        state_store=store, **journal_for_tools([tool])))
     agent.execute(objective)
     agent.shutdown()
     time.sleep(0.004)
@@ -289,7 +290,8 @@ def test_engine_also_refuses_a_rejected_run(tmp_path, capsys):
                   AgentDependencies(tools=[tool], planner=WritePlanner(),
                                     verifier=PassVerifier(),
                                     state_store=JsonFileStateStore(
-                                        tmp_path / "runs")))
+                                        tmp_path / "runs"),
+                                    **journal_for_tools([tool])))
     agent.resume(run_id)
     with pytest.raises(StateError):
         agent.run_task()

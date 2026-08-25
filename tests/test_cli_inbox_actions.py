@@ -15,6 +15,7 @@ import re
 import time
 
 import pytest
+from conftest import journal_for_tools
 
 from agentcore.cli import (
     MAX_ACTION_TEXT,
@@ -110,9 +111,11 @@ def config_for(tmp_path, *, level=PermissionLevel.AUTONOMOUS) -> AgentConfig:
 
 
 def seed(tmp_path, objective, *, planner, level=PermissionLevel.AUTONOMOUS):
+    tool = WriteTool()
     agent = Agent(config_for(tmp_path, level=level), AgentDependencies(
-        tools=[WriteTool()], planner=planner, verifier=PassVerifier(),
-        state_store=JsonFileStateStore(tmp_path / "runs")))
+        tools=[tool], planner=planner, verifier=PassVerifier(),
+        state_store=JsonFileStateStore(tmp_path / "runs"),
+        **journal_for_tools([tool])))
     agent.execute(objective)
     agent.shutdown()
     time.sleep(0.005)

@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 import pytest
+from conftest import journal_for_tools
 
 from agentcore.cli import main
 from agentcore.config.schema import (
@@ -132,7 +133,8 @@ def config_for(tmp_path, *, level=PermissionLevel.AUTONOMOUS,
 def build_agent(tmp_path, planner, tool, verifier, **kw) -> Agent:
     store = JsonFileStateStore(tmp_path / "runs")
     return Agent(config_for(tmp_path, **kw), AgentDependencies(
-        tools=[tool], planner=planner, verifier=verifier, state_store=store))
+        tools=[tool], planner=planner, verifier=verifier, state_store=store,
+        **journal_for_tools([tool])))
 
 
 def seed(tmp_path, objective, planner, tool, verifier, **kw) -> str:

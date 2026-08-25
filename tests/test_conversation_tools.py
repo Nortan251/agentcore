@@ -13,6 +13,7 @@ import json
 import logging
 
 import pytest
+from conftest import journal_for_tools
 
 from agentcore.config.schema import (
     AgentConfig,
@@ -163,10 +164,11 @@ def wants(name, arguments=None, call_id="c1", text=""):
 
 
 def build_runner(tools, level=PermissionLevel.AUTONOMOUS, **kwargs):
+    tools = list(tools)
     registry = ToolRegistry()
-    registry.register_all(list(tools))
+    registry.register_all(tools)
     policy = PermissionPolicy(PermConfig(level=level))
-    executor = ToolExecutor(registry, policy)
+    executor = ToolExecutor(registry, policy, **journal_for_tools(tools))
     runner = ConversationToolRunner(executor, registry, policy=policy,
                                     **kwargs)
     return runner, registry, executor, policy

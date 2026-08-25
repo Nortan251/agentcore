@@ -10,6 +10,7 @@ import json
 from typing import Any
 
 import pytest
+from conftest import journal_for_tools
 
 from agentcore.config.schema import (
     AgentConfig,
@@ -204,7 +205,8 @@ def test_planner_cannot_bypass_permissions(tmp_path):
     model = FakeModel(plan_payload(
         {"id": "s1", "description": "write something", "tool_name": "mutate"}))
     agent = Agent(cfg(tmp_path, level=PermissionLevel.OBSERVE),
-                  AgentDependencies(tools=[tool]))
+                  AgentDependencies(
+                      tools=[tool], **journal_for_tools([tool])))
     agent.planner = LLMPlanner(model, agent.registry)
 
     report = agent.execute("write something")
@@ -221,7 +223,8 @@ def test_same_plan_succeeds_at_autonomous_level(tmp_path):
     model = FakeModel(plan_payload(
         {"id": "s1", "description": "write something", "tool_name": "mutate"}))
     agent = Agent(cfg(tmp_path, level=PermissionLevel.AUTONOMOUS),
-                  AgentDependencies(tools=[tool]))
+                  AgentDependencies(
+                      tools=[tool], **journal_for_tools([tool])))
     agent.planner = LLMPlanner(model, agent.registry)
     assert agent.execute("write something").status is TaskStatus.COMPLETED
     assert tool.runs == 1

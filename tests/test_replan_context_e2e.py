@@ -10,6 +10,7 @@ import json
 from typing import Any
 
 import pytest
+from conftest import journal_for_tools
 
 from agentcore.config.schema import (
     AgentConfig,
@@ -58,7 +59,7 @@ class WriteTool(Tool):
             parameters=[ToolParameter("text", ParamType.STRING),
                         ToolParameter("api_key", ParamType.STRING,
                                       required=False, default="")],
-            read_only=False)
+            capabilities=[Capability.FS_WRITE], read_only=False)
 
     def run(self, args, context):
         self.calls.append(dict(args))
@@ -113,7 +114,8 @@ def build(tmp_path, model, tool, *, max_replans=2,
     from agentcore.verification.verifier import Verifier
 
     agent = Agent(cfg, AgentDependencies(
-        tools=[tool], model=model, verifier=Verifier(model=None)))
+        tools=[tool], model=model, verifier=Verifier(model=None),
+        **journal_for_tools([tool], expose_bounded_text_result=True)))
     agent.planner = LLMPlanner(model, agent.registry, max_replans=max_replans)
     return agent
 
@@ -283,9 +285,12 @@ def test_history_context_survives_resume(tmp_path):
         plan_json("approach A", "A output", EXPECTED, objective=OBJECTIVE),
         plan_json("approach B", "B output", EXPECTED, objective=OBJECTIVE),
     )
+    tool = WriteTool()
     agent = Agent(config(tmp_path, max_replans=1),
-                  AgentDependencies(tools=[WriteTool()], model=model,
-                                    state_store=store))
+                  AgentDependencies(
+                      tools=[tool], model=model, state_store=store,
+                      **journal_for_tools(
+                          [tool], expose_bounded_text_result=True)))
     agent.planner = LLMPlanner(model, agent.registry, max_replans=1)
     agent.execute(OBJECTIVE)
     run_id = agent.state.run_id

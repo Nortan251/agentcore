@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 import pytest
+from conftest import journal_for_tools
 
 from agentcore.cli import (
     DEFAULT_RUN_LIMIT,
@@ -95,11 +96,12 @@ def make_run(tmp_path, objective, *, fail=False,
         recovery=RecoveryConfig(max_replans=0, base_delay_seconds=0.0),
         features=FeatureFlags(recovery=recovery),
     ).validate()
+    tool = ActTool(fail=fail)
     agent = Agent(config, AgentDependencies(
-        tools=[ActTool(fail=fail)],
+        tools=[tool],
         planner=planner or SeqPlanner("A"),
         verifier=verifier or Verifier(VerificationStatus.PASSED),
-        state_store=store))
+        state_store=store, **journal_for_tools([tool])))
     agent.execute(objective)
     agent.shutdown()
     time.sleep(0.004)          # distinct persisted timestamps

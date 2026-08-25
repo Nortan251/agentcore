@@ -14,6 +14,7 @@ import json
 from typing import Any
 
 import pytest
+from conftest import journal_for_tools
 
 from agentcore.config.schema import (
     AgentConfig,
@@ -24,7 +25,7 @@ from agentcore.config.schema import (
 )
 from agentcore.core.agent import Agent, AgentDependencies
 from agentcore.core.replan import ReplanLedger
-from agentcore.permissions.levels import PermissionLevel
+from agentcore.permissions.levels import Capability, PermissionLevel
 from agentcore.planning.planner import LLMPlanner
 from agentcore.recovery.config import RecoveryConfig
 from agentcore.recovery.history import RecoveryHistory
@@ -60,8 +61,7 @@ class WriteTool(Tool):
             "write_note", "Write a note and return what was written.",
             parameters=[ToolParameter("text", ParamType.STRING,
                                       "The note contents.")],
-            capabilities=[],           # no capability => allowed, still mutating
-            read_only=False)
+            capabilities=[Capability.FS_WRITE], read_only=False)
 
     def run(self, args, context):
         self.calls.append(args["text"])
@@ -106,7 +106,9 @@ def build(tmp_path, model: ScriptedModel, tool: Tool, *, max_replans=2,
             features=FeatureFlags(planning=True, verification=True,
                                   recovery=True),
         ).validate()
-    agent = Agent(config, AgentDependencies(tools=[tool], model=model))
+    agent = Agent(config, AgentDependencies(
+        tools=[tool], model=model,
+        **journal_for_tools([tool], expose_bounded_text_result=True)))
     agent.planner = LLMPlanner(model, agent.registry)
     return agent
 

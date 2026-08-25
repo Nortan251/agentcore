@@ -17,6 +17,18 @@ class ActionTransitionError(ActionValidationError):
     """A requested action transition violates the frozen lifecycle."""
 
 
+class ActionAdapterError(ActionJournalError):
+    """A trusted action adapter contract is missing or malformed."""
+
+
+class ActionAdapterRegistrationError(ActionAdapterError):
+    """Trusted action-adapter registration is contradictory or duplicated."""
+
+
+class ActionEffectNormalizationError(ActionAdapterError):
+    """A capability adapter did not return bounded categorical effect truth."""
+
+
 class ActionStoreError(ActionJournalError):
     """Base class for durable action-store failures."""
 
