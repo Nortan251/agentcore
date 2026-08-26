@@ -24,6 +24,11 @@ from agentcore.action_journal import (
     ActionJournalEligibility,
     ActionOutcome,
     ActionRecord,
+    ActionReconciliationContext,
+    ActionReconciliationReport,
+    ActionReconciliationResult,
+    ActionReconciliationStatus,
+    ActionRecoveryClaim,
     ActionState,
     ActionStore,
     ActionTransitionProof,
@@ -49,7 +54,7 @@ from agentcore.errors import (
 from agentcore.fs.sensitive import DEFAULT_SENSITIVE_POLICY
 from agentcore.observability.events import Events
 from agentcore.observability.logging import StructuredLogger, get_logger
-from agentcore.permissions.levels import READ_ONLY_CAPABILITIES
+from agentcore.permissions.levels import READ_ONLY_CAPABILITIES, Capability
 from agentcore.permissions.policy import Decision, PermissionPolicy
 from agentcore.realtime.errors import CancellationRequested
 from agentcore.tools.base import ToolContext, ToolResult, ToolSpec
@@ -155,6 +160,14 @@ class ToolExecutor:
         self._id_factory = id_factory
         self._action_owner_id = action_owner_id or f"process:{os.getpid()}"
         self._action_owner_epoch = action_owner_epoch
+        self._action_mutation_quarantine: str | None = None
+
+    def quarantine_action_mutations(self, category: str) -> None:
+        """Fail future mutations closed after startup journal quarantine."""
+        allowed = {"journal_corrupt", "startup_scan_bound_exceeded"}
+        self._action_mutation_quarantine = (
+            category if category in allowed else "journal_corrupt"
+        )
 
     def _context(self, tool_name: str) -> ToolContext:
         return ToolContext(
@@ -247,6 +260,16 @@ class ToolExecutor:
             return self._invoke_fast(
                 tool, tool_spec, cleaned, checkpoint, log, elapsed)
 
+        if self._action_mutation_quarantine is not None:
+            return self._safe_pre_action_failure(
+                tool_name,
+                cleaned,
+                elapsed(),
+                log,
+                "action_journal_quarantined",
+                "Durable action recovery is quarantined for this workspace.",
+            )
+
         try:
             adapter = self._action_adapters.resolve(tool, tool_spec=tool_spec)
         except ActionAdapterRegistrationError as exc:
@@ -289,6 +312,471 @@ class ToolExecutor:
             log=log,
             elapsed=elapsed,
         )
+
+    def reconcile_action(
+        self,
+        claim: ActionRecoveryClaim,
+        *,
+        checkpoint: Callable[[], None] | None = None,
+    ) -> ActionReconciliationReport:
+        """Run one exact claimed read-only probe under executor authority."""
+        if not isinstance(claim, ActionRecoveryClaim):
+            raise TypeError("reconciliation claim type is invalid")
+        claim.validate()
+        store = self._action_store
+        if store is None:
+            return self._reconciliation_report(
+                claim,
+                ActionReconciliationStatus.ADAPTER_UNAVAILABLE,
+                ActionState.RECONCILE_REQUIRED,
+                claim.record_version,
+            )
+        try:
+            with store.execution_guard(claim.action_id):
+                return self._reconcile_under_action_guard(
+                    store,
+                    claim,
+                    checkpoint=checkpoint,
+                )
+        except CancellationRequested:
+            raise
+        except Exception:
+            return self._reconciliation_report(
+                claim,
+                ActionReconciliationStatus.PUBLICATION_UNCERTAIN,
+                ActionState.RECONCILE_REQUIRED,
+                claim.record_version,
+            )
+
+    def _reconcile_under_action_guard(
+        self,
+        store: ActionStore,
+        claim: ActionRecoveryClaim,
+        *,
+        checkpoint: Callable[[], None] | None,
+    ) -> ActionReconciliationReport:
+        current = self._load_exact_recovery_claim(store, claim)
+        if current is None:
+            return self._observed_reconciliation_report(
+                store,
+                claim,
+                ActionReconciliationStatus.STALE_CLAIM,
+            )
+
+        try:
+            tool = self.registry.get(current.tool_name)
+            tool_spec = tool.spec
+            adapter = self._action_adapters.resolve(
+                tool,
+                tool_spec=tool_spec,
+            )
+            reconciler = self._action_adapters.resolve_reconciler(
+                tool,
+                tool_spec=tool_spec,
+            )
+            if adapter is None or reconciler is None or not (
+                self._registration_matches_record(
+                    current,
+                    adapter.spec,
+                    tool_spec,
+                )
+            ):
+                raise ValueError("reconciliation registration mismatch")
+        except Exception:
+            return self._release_recovery_claim(
+                store,
+                current,
+                claim,
+                status=ActionReconciliationStatus.ADAPTER_UNAVAILABLE,
+                probe_entered=False,
+            )
+
+        checkpoint_report = self._reconciliation_checkpoint(
+            store,
+            current,
+            claim,
+            checkpoint,
+            probe_entered=False,
+        )
+        if checkpoint_report is not None:
+            return checkpoint_report
+
+        try:
+            probe_capabilities = frozenset(
+                Capability(value)
+                for value in current.reconciliation_capabilities
+            )
+            decision = self.policy.check(
+                probe_capabilities,
+                description=f"Reconcile {current.action_kind}",
+            )
+        except Exception:
+            return self._release_recovery_claim(
+                store,
+                current,
+                claim,
+                status=ActionReconciliationStatus.PROBE_FAILED,
+                probe_entered=False,
+            )
+        if not decision.allowed:
+            return self._release_recovery_claim(
+                store,
+                current,
+                claim,
+                status=ActionReconciliationStatus.PROBE_DENIED,
+                probe_entered=False,
+            )
+
+        checkpoint_report = self._reconciliation_checkpoint(
+            store,
+            current,
+            claim,
+            checkpoint,
+            probe_entered=False,
+        )
+        if checkpoint_report is not None:
+            return checkpoint_report
+
+        try:
+            context = ActionReconciliationContext.from_record(current)
+            result = reconciler.probe(context)
+            if not isinstance(result, ActionReconciliationResult):
+                raise TypeError("reconciliation result type is invalid")
+            result.validate()
+        except CancellationRequested:
+            self._release_recovery_claim(
+                store,
+                current,
+                claim,
+                status=ActionReconciliationStatus.UNRESOLVED,
+                probe_entered=True,
+            )
+            raise
+        except Exception:
+            return self._release_recovery_claim(
+                store,
+                current,
+                claim,
+                status=ActionReconciliationStatus.PROBE_FAILED,
+                probe_entered=True,
+            )
+
+        checkpoint_report = self._reconciliation_checkpoint(
+            store,
+            current,
+            claim,
+            checkpoint,
+            probe_entered=True,
+        )
+        if checkpoint_report is not None:
+            return checkpoint_report
+
+        try:
+            candidate, status = self._reconciliation_candidate(current, result)
+        except Exception:
+            return self._release_recovery_claim(
+                store,
+                current,
+                claim,
+                status=ActionReconciliationStatus.PROBE_FAILED,
+                probe_entered=True,
+            )
+        return self._publish_reconciliation_candidate(
+            store,
+            current,
+            candidate,
+            claim,
+            status,
+        )
+
+    def _reconciliation_checkpoint(
+        self,
+        store: ActionStore,
+        current: ActionRecord,
+        claim: ActionRecoveryClaim,
+        checkpoint: Callable[[], None] | None,
+        *,
+        probe_entered: bool,
+    ) -> ActionReconciliationReport | None:
+        if checkpoint is None:
+            return None
+        try:
+            checkpoint()
+        except CancellationRequested:
+            self._release_recovery_claim(
+                store,
+                current,
+                claim,
+                status=ActionReconciliationStatus.UNRESOLVED,
+                probe_entered=probe_entered,
+            )
+            raise
+        except Exception:
+            return self._release_recovery_claim(
+                store,
+                current,
+                claim,
+                status=ActionReconciliationStatus.PROBE_FAILED,
+                probe_entered=probe_entered,
+            )
+        return None
+
+    @staticmethod
+    def _registration_matches_record(
+        record: ActionRecord,
+        spec: ActionAdapterSpec,
+        tool_spec: ToolSpec,
+    ) -> bool:
+        mutation_capabilities = tuple(sorted(
+            str(capability)
+            for capability in tool_spec.capabilities
+            if capability not in READ_ONLY_CAPABILITIES
+        ))
+        reconciliation_capabilities = tuple(sorted(
+            str(capability)
+            for capability in spec.reconciliation_capabilities
+        ))
+        return (
+            not tool_spec.read_only
+            and record.tool_name == tool_spec.name == spec.tool_name
+            and record.tool_version == tool_spec.version == spec.tool_version
+            and record.action_kind == spec.action_kind
+            and record.eligibility is spec.eligibility
+            and record.effect_class is spec.effect_class
+            and record.mutation_capabilities == mutation_capabilities
+            and record.reconciliation_capabilities == (
+                reconciliation_capabilities
+            )
+            and bool(reconciliation_capabilities)
+        )
+
+    @staticmethod
+    def _load_exact_recovery_claim(
+        store: ActionStore,
+        claim: ActionRecoveryClaim,
+    ) -> ActionRecord | None:
+        try:
+            record = store.load(claim.action_id)
+            record.validate()
+        except Exception:
+            return None
+        metadata = record.reconciliation
+        if (
+            record.version != claim.record_version
+            or record.state is not ActionState.RECONCILE_REQUIRED
+            or metadata.claim_owner_id != claim.claim_owner_id
+            or metadata.claim_epoch != claim.claim_epoch
+        ):
+            return None
+        return record
+
+    def _reconciliation_candidate(
+        self,
+        current: ActionRecord,
+        result: ActionReconciliationResult,
+    ) -> tuple[ActionRecord, ActionReconciliationStatus]:
+        result.validate()
+        transition_id = new_action_transition_id(id_factory=self._id_factory)
+        at = self._clock.now()
+        if result.verdict is EffectVerdict.CONFIRMED_APPLIED:
+            outcome = ActionOutcome(
+                verdict=result.verdict,
+                result_class=result.result_class,
+                summary=result.summary,
+            )
+            return current.transition(
+                ActionState.SUCCEEDED,
+                transition_id=transition_id,
+                at=at,
+                effect_verdict=result.verdict,
+                evidence_refs=result.evidence_refs,
+                terminal_outcome=outcome,
+            ), ActionReconciliationStatus.SETTLED_SUCCEEDED
+        if result.verdict is EffectVerdict.CONFIRMED_NOT_APPLIED:
+            if result.retry_safe:
+                return current.transition(
+                    ActionState.AUTHORIZED,
+                    transition_id=transition_id,
+                    at=at,
+                    effect_verdict=result.verdict,
+                    proof=ActionTransitionProof.DEFINITIVE_NO_EFFECT,
+                    evidence_refs=result.evidence_refs,
+                ), ActionReconciliationStatus.RETRY_AUTHORIZED
+            outcome = ActionOutcome(
+                verdict=result.verdict,
+                result_class=result.result_class,
+                summary=result.summary,
+            )
+            return current.transition(
+                ActionState.FAILED,
+                transition_id=transition_id,
+                at=at,
+                effect_verdict=result.verdict,
+                evidence_refs=result.evidence_refs,
+                terminal_outcome=outcome,
+            ), ActionReconciliationStatus.SETTLED_FAILED
+        if result.verdict is EffectVerdict.CONFIRMED_PARTIAL:
+            outcome = ActionOutcome(
+                verdict=result.verdict,
+                result_class=result.result_class,
+                summary=result.summary,
+                partial_categories=result.partial_categories,
+            )
+            return current.transition(
+                ActionState.FAILED,
+                transition_id=transition_id,
+                at=at,
+                effect_verdict=result.verdict,
+                evidence_refs=result.evidence_refs,
+                terminal_outcome=outcome,
+            ), ActionReconciliationStatus.SETTLED_FAILED
+        metadata = ReconciliationMetadata(
+            disposition=result.reconciliation_disposition,
+            claim_epoch=current.reconciliation.claim_epoch,
+            probe_count=current.reconciliation.probe_count + 1,
+        )
+        return current.transition(
+            ActionState.RECONCILE_REQUIRED,
+            transition_id=transition_id,
+            at=at,
+            effect_verdict=EffectVerdict.OUTCOME_UNKNOWN,
+            evidence_refs=result.evidence_refs,
+            reconciliation=metadata,
+        ), ActionReconciliationStatus.UNRESOLVED
+
+    def _release_recovery_claim(
+        self,
+        store: ActionStore,
+        current: ActionRecord,
+        claim: ActionRecoveryClaim,
+        *,
+        status: ActionReconciliationStatus,
+        probe_entered: bool,
+    ) -> ActionReconciliationReport:
+        try:
+            metadata = ReconciliationMetadata(
+                disposition=ReconciliationDisposition.PROBE_LATER,
+                claim_epoch=current.reconciliation.claim_epoch,
+                probe_count=(
+                    current.reconciliation.probe_count
+                    + (1 if probe_entered else 0)
+                ),
+            )
+            candidate = current.transition(
+                ActionState.RECONCILE_REQUIRED,
+                transition_id=new_action_transition_id(
+                    id_factory=self._id_factory
+                ),
+                at=self._clock.now(),
+                effect_verdict=EffectVerdict.OUTCOME_UNKNOWN,
+                reconciliation=metadata,
+            )
+        except Exception:
+            return self._observed_reconciliation_report(
+                store,
+                claim,
+                ActionReconciliationStatus.PUBLICATION_UNCERTAIN,
+            )
+        return self._publish_reconciliation_candidate(
+            store,
+            current,
+            candidate,
+            claim,
+            status,
+        )
+
+    def _publish_reconciliation_candidate(
+        self,
+        store: ActionStore,
+        current: ActionRecord,
+        candidate: ActionRecord,
+        claim: ActionRecoveryClaim,
+        success_status: ActionReconciliationStatus,
+    ) -> ActionReconciliationReport:
+        try:
+            store.compare_and_swap(
+                current.action_id,
+                current.version,
+                candidate,
+            )
+        except Exception:
+            pass
+        try:
+            loaded = store.load(current.action_id)
+            loaded.validate()
+        except Exception:
+            return self._reconciliation_report(
+                claim,
+                ActionReconciliationStatus.PUBLICATION_UNCERTAIN,
+                candidate.state,
+                candidate.version,
+            )
+        if loaded == candidate:
+            return self._reconciliation_report(
+                claim,
+                success_status,
+                loaded.state,
+                loaded.version,
+            )
+        status = (
+            ActionReconciliationStatus.PUBLICATION_UNCERTAIN
+            if self._record_owns_recovery_claim(loaded, claim)
+            else ActionReconciliationStatus.STALE_CLAIM
+        )
+        return self._reconciliation_report(
+            claim,
+            status,
+            loaded.state,
+            loaded.version,
+        )
+
+    @staticmethod
+    def _record_owns_recovery_claim(
+        record: ActionRecord,
+        claim: ActionRecoveryClaim,
+    ) -> bool:
+        return (
+            record.state is ActionState.RECONCILE_REQUIRED
+            and record.version == claim.record_version
+            and record.reconciliation.claim_owner_id == claim.claim_owner_id
+            and record.reconciliation.claim_epoch == claim.claim_epoch
+        )
+
+    def _observed_reconciliation_report(
+        self,
+        store: ActionStore,
+        claim: ActionRecoveryClaim,
+        status: ActionReconciliationStatus,
+    ) -> ActionReconciliationReport:
+        try:
+            loaded = store.load(claim.action_id)
+            loaded.validate()
+            state = loaded.state
+            version = loaded.version
+        except Exception:
+            state = ActionState.RECONCILE_REQUIRED
+            version = claim.record_version
+        return self._reconciliation_report(
+            claim,
+            status,
+            state,
+            version,
+        )
+
+    @staticmethod
+    def _reconciliation_report(
+        claim: ActionRecoveryClaim,
+        status: ActionReconciliationStatus,
+        state: ActionState,
+        version: int,
+    ) -> ActionReconciliationReport:
+        return ActionReconciliationReport(
+            action_id=claim.action_id,
+            status=status,
+            action_state=state,
+            record_version=version,
+            claim_epoch=claim.claim_epoch,
+        ).validate()
 
     def _invoke_fast(
         self,
@@ -435,62 +923,92 @@ class ToolExecutor:
             if capability not in READ_ONLY_CAPABILITIES))
         reconciliation_capabilities = tuple(sorted(
             str(capability) for capability in spec.reconciliation_capabilities))
-        try:
-            policy_fingerprint = permission_policy_fingerprint(self.policy)
-            authority_scope = f"live:{invocation_id}"
-            receipt = AuthorityReceipt(
-                receipt_id=self._id_factory("auth"),
-                binding_digest=authority_binding_digest(
-                    action_kind=spec.action_kind,
-                    intent_digest=prepared.intent_digest,
+        store = self._action_store
+        resume_requested = trusted_context.action_id is not None
+        if resume_requested:
+            assert trusted_context.action_id is not None
+            try:
+                created = store.load(trusted_context.action_id)
+                created.validate()
+                if not self._matches_resume_request(
+                    created,
+                    prepared=prepared,
+                    spec=spec,
+                    tool_spec=tool_spec,
                     mutation_capabilities=mutation_capabilities,
+                    reconciliation_capabilities=reconciliation_capabilities,
+                    trusted_context=trusted_context,
+                ):
+                    raise ValueError("resume identity mismatch")
+            except Exception:
+                return self._journal_failure(
+                    tool_spec.name,
+                    redacted,
+                    elapsed(),
+                    kind="action_resume_unverified",
+                    message="The durable action identity could not be verified.",
+                    log=log,
+                    decision=decision,
+                    invocation_id=invocation_id,
+                    action_id=trusted_context.action_id,
+                )
+            created_here = False
+        else:
+            try:
+                policy_fingerprint = permission_policy_fingerprint(self.policy)
+                authority_scope = f"live:{invocation_id}"
+                receipt = AuthorityReceipt(
+                    receipt_id=self._id_factory("auth"),
+                    binding_digest=authority_binding_digest(
+                        action_kind=spec.action_kind,
+                        intent_digest=prepared.intent_digest,
+                        mutation_capabilities=mutation_capabilities,
+                        tool_name=tool_spec.name,
+                        tool_version=tool_spec.version,
+                        invocation_id=invocation_id,
+                        authority_scope=authority_scope,
+                        policy_fingerprint=policy_fingerprint,
+                    ),
+                    policy_fingerprint=policy_fingerprint,
+                    scope_ref=authority_scope,
+                    authorized_at=self._clock.now(),
+                ).validate()
+                assert spec.effect_class is not None
+                proposed = new_action(
+                    action_kind=spec.action_kind,
                     tool_name=tool_spec.name,
                     tool_version=tool_spec.version,
-                    invocation_id=invocation_id,
-                    authority_scope=authority_scope,
-                    policy_fingerprint=policy_fingerprint,
-                ),
-                policy_fingerprint=policy_fingerprint,
-                scope_ref=authority_scope,
-                authorized_at=self._clock.now(),
-            ).validate()
-            assert spec.effect_class is not None
-            proposed = new_action(
-                action_kind=spec.action_kind,
-                tool_name=tool_spec.name,
-                tool_version=tool_spec.version,
-                eligibility=spec.eligibility,
-                mutation_capabilities=mutation_capabilities,
-                reconciliation_capabilities=reconciliation_capabilities,
-                effect_class=spec.effect_class,
-                intent_digest=prepared.intent_digest,
-                intent_ref=None,
-                target_category=prepared.target_category,
-                target_fingerprint=prepared.target_fingerprint,
-                provenance=provenance,
-                authority=receipt,
-                deduplication_scope=trusted_context.deduplication_scope,
-                deduplication_key=trusted_context.deduplication_key,
-                clock=self._clock,
-                id_factory=self._id_factory,
-            )
-        except Exception:
-            return self._journal_failure(
-                tool_spec.name, redacted, elapsed(),
-                kind="action_record_invalid",
-                message="The durable action intent could not be constructed.",
-                log=log, decision=decision, invocation_id=invocation_id)
+                    eligibility=spec.eligibility,
+                    mutation_capabilities=mutation_capabilities,
+                    reconciliation_capabilities=reconciliation_capabilities,
+                    effect_class=spec.effect_class,
+                    intent_digest=prepared.intent_digest,
+                    intent_ref=None,
+                    target_category=prepared.target_category,
+                    target_fingerprint=prepared.target_fingerprint,
+                    provenance=provenance,
+                    authority=receipt,
+                    deduplication_scope=trusted_context.deduplication_scope,
+                    deduplication_key=trusted_context.deduplication_key,
+                    clock=self._clock,
+                    id_factory=self._id_factory,
+                )
+            except Exception:
+                return self._journal_failure(
+                    tool_spec.name, redacted, elapsed(),
+                    kind="action_record_invalid",
+                    message="The durable action intent could not be constructed.",
+                    log=log, decision=decision, invocation_id=invocation_id)
 
-        store = self._action_store
-        created = self._create_or_prove(store, proposed)
-        if created is None:
-            return self._journal_failure(
-                tool_spec.name, redacted, elapsed(),
-                kind="action_create_unverified",
-                message="The durable action intent could not be verified.",
-                log=log, decision=decision, invocation_id=invocation_id,
-                action_id=proposed.action_id)
-        created_here = created == proposed
+            created = self._create_or_prove(store, proposed)
+            if created is None:
+                return self._journal_failure(
+                    tool_spec.name, redacted, elapsed(),
+                    kind="action_create_unverified",
+                    message="The durable action intent could not be verified.",
+                    log=log, decision=decision, invocation_id=invocation_id,
+                    action_id=proposed.action_id)
+            created_here = created == proposed
 
         guard_entered = False
         try:
@@ -498,6 +1016,7 @@ class ToolExecutor:
                 guard_entered = True
                 return self._under_action_guard(
                     store=store, created=created, created_here=created_here,
+                    resume_requested=resume_requested,
                     tool=tool, tool_spec=tool_spec,
                     cleaned=cleaned, redacted=redacted,
                     adapter=adapter, spec=spec, checkpoint=checkpoint,
@@ -526,6 +1045,7 @@ class ToolExecutor:
         store: ActionStore,
         created: ActionRecord,
         created_here: bool,
+        resume_requested: bool,
         tool: Any,
         tool_spec: ToolSpec,
         cleaned: dict[str, Any],
@@ -551,11 +1071,21 @@ class ToolExecutor:
                 log=log, decision=decision, invocation_id=invocation_id,
                 action_id=created.action_id)
 
-        if not created_here or current.provenance.invocation_id != invocation_id:
+        if current.state is not ActionState.AUTHORIZED:
             return self._attached_invocation(
                 tool_spec.name, redacted, current, decision,
                 invocation_id, elapsed(), log)
-        if current.state is not ActionState.AUTHORIZED or current.attempts:
+        fresh_owner = (
+            created_here
+            and current.provenance.invocation_id == invocation_id
+            and not current.attempts
+        )
+        explicit_waiting_resume = resume_requested and not current.attempts
+        safe_retry = (
+            resume_requested
+            and self._has_checked_retry_proof(current)
+        )
+        if not (fresh_owner or explicit_waiting_resume or safe_retry):
             return self._attached_invocation(
                 tool_spec.name, redacted, current, decision,
                 invocation_id, elapsed(), log)
@@ -715,6 +1245,57 @@ class ToolExecutor:
         return identity is not None and record.deduplication_identity == identity
 
     @staticmethod
+    def _matches_resume_request(
+        record: ActionRecord,
+        *,
+        prepared: PreparedActionIntent,
+        spec: ActionAdapterSpec,
+        tool_spec: ToolSpec,
+        mutation_capabilities: tuple[str, ...],
+        reconciliation_capabilities: tuple[str, ...],
+        trusted_context: ActionInvocationContext,
+    ) -> bool:
+        requested_dedup = (
+            (trusted_context.deduplication_scope,
+             trusted_context.deduplication_key)
+            if trusted_context.deduplication_scope is not None
+            else None
+        )
+        return (
+            record.action_id == trusted_context.action_id
+            and record.action_kind == spec.action_kind
+            and record.tool_name == tool_spec.name
+            and record.tool_version == tool_spec.version
+            and record.eligibility is spec.eligibility
+            and record.effect_class is spec.effect_class
+            and record.mutation_capabilities == mutation_capabilities
+            and record.reconciliation_capabilities == (
+                reconciliation_capabilities
+            )
+            and record.intent_digest == prepared.intent_digest
+            and record.intent_ref == prepared.intent_ref
+            and record.target_category == prepared.target_category
+            and record.target_fingerprint == prepared.target_fingerprint
+            and (
+                requested_dedup is None
+                or record.deduplication_identity == requested_dedup
+            )
+        )
+
+    @staticmethod
+    def _has_checked_retry_proof(record: ActionRecord) -> bool:
+        if not record.attempts or not record.transitions:
+            return False
+        transition = record.transitions[-1]
+        return (
+            transition.to_state is ActionState.AUTHORIZED
+            and transition.proof is ActionTransitionProof.DEFINITIVE_NO_EFFECT
+            and transition.effect_verdict is (
+                EffectVerdict.CONFIRMED_NOT_APPLIED
+            )
+        )
+
+    @staticmethod
     def _same_action_lineage(
         record: ActionRecord,
         prior: ActionRecord,
@@ -779,13 +1360,25 @@ class ToolExecutor:
         self, store: ActionStore, claimed: ActionRecord,
     ) -> None:
         try:
-            candidate = claimed.transition(
-                ActionState.CANCELLED,
-                transition_id=new_action_transition_id(
-                    id_factory=self._id_factory),
-                at=self._clock.now(),
-                attempt_status=ActionAttemptStatus.NOT_INVOKED,
-                proof=ActionTransitionProof.LIVE_OWNER_NOT_INVOKED)
+            if len(claimed.attempts) > 1:
+                # A cancelled retry cannot terminalize older attempt history.
+                # Prove only this fresh claim harmless and preserve retry state.
+                candidate = claimed.transition(
+                    ActionState.AUTHORIZED,
+                    transition_id=new_action_transition_id(
+                        id_factory=self._id_factory),
+                    at=self._clock.now(),
+                    attempt_status=ActionAttemptStatus.NOT_INVOKED,
+                    effect_verdict=EffectVerdict.CONFIRMED_NOT_APPLIED,
+                    proof=ActionTransitionProof.DEFINITIVE_NO_EFFECT)
+            else:
+                candidate = claimed.transition(
+                    ActionState.CANCELLED,
+                    transition_id=new_action_transition_id(
+                        id_factory=self._id_factory),
+                    at=self._clock.now(),
+                    attempt_status=ActionAttemptStatus.NOT_INVOKED,
+                    proof=ActionTransitionProof.LIVE_OWNER_NOT_INVOKED)
             self._publish_and_reload(store, claimed, candidate)
         except Exception:
             return

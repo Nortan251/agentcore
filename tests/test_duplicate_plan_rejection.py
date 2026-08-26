@@ -213,11 +213,11 @@ def test_different_plan_is_accepted(tmp_path):
 
 
 # ===========================================================================
-# Journaled mutations remain first-attempt-only
+# Terminal journal truth fences generic replanning
 # ===========================================================================
 
 def test_duplicate_mutation_waits_for_action_recovery_after_failure(tmp_path):
-    """The first-attempt slice never re-runs a terminal journal action."""
+    """A terminal journal failure never becomes an unlinked replan action."""
     planner = ScriptedPlanner("A", "A")
     tool = FlakyTool()
     agent = build(tmp_path, planner, tool, max_replans=1)
@@ -225,14 +225,12 @@ def test_duplicate_mutation_waits_for_action_recovery_after_failure(tmp_path):
     agent.execute("goal")
 
     # ToolResult.retryable is not effect truth and cannot authorize a second
-    # physical mutation. The identical proposal is rejected after the
-    # journal's trusted normalizer publishes confirmed-not-applied failure;
-    # same-action recovery belongs to the later recovery slice.
+    # physical mutation. Terminal FAILED truth stops generic recovery before
+    # the planner could mint an unlinked replacement action.
     assert tool.runs == 1
     assert [c["variant"] for c in tool.calls] == ["A"]
-    assert ReplanLedger.load(agent.state).records[-1].outcome == (
-        "rejected_duplicate"
-    )
+    assert planner.replans == 0
+    assert ReplanLedger.load(agent.state).records == []
 
 
 # ===========================================================================

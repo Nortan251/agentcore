@@ -34,13 +34,27 @@ from agentcore.tasks.models import (
     VerificationStatus,
 )
 from agentcore.tools.executor import ToolExecutor
-from agentcore.action_journal import ActionInvocationContext
+from agentcore.action_journal import (
+    ActionInvocationContext,
+    ActionState,
+    require_action_id,
+)
+from agentcore.action_journal.errors import ActionValidationError
 from agentcore.util.clock import Clock, SystemClock
 
 #: Verification verdicts that mean "executed, but the goal was not shown to be
 #: achieved". These route into recovery instead of being accepted silently.
 _ADVERSE_VERDICTS = frozenset({VerificationStatus.FAILED,
                                VerificationStatus.UNVERIFIED})
+
+_ACTION_BINDINGS_KEY = "action_journal_bindings"
+_ACTION_BINDINGS_SCHEMA_VERSION = 1
+_MAX_ACTION_BINDINGS = 256
+_BLOCKED_ACTION_STATES = frozenset({
+    ActionState.AUTHORIZED,
+    ActionState.IN_FLIGHT,
+    ActionState.RECONCILE_REQUIRED,
+})
 
 
 @dataclass(frozen=True)
@@ -304,6 +318,18 @@ class TaskRunner:
         # C already checked in run(), but also check before making executable
         control.checkpoint()
 
+        try:
+            bound_action_id = self._load_action_binding(state, subtask.id)
+        except ActionValidationError:
+            subtask.transition_to(TaskStatus.BLOCKED)
+            report.skipped += 1
+            report.blocked = True
+            slog.warning(
+                Events.TASK_BLOCKED,
+                reason="action_binding_invalid",
+            )
+            return
+
         state.set_active_subtask(subtask.id)
         subtask.transition_to(TaskStatus.RUNNING)
         subtask.attempts += 1
@@ -319,13 +345,12 @@ class TaskRunner:
                 subtask.tool_name, subtask.tool_args,
                 checkpoint=checkpoint_cb,
                 action_context=ActionInvocationContext(
+                    action_id=bound_action_id,
                     run_id=state.run_id,
                     task_id=task.id,
                     subtask_id=subtask.id,
                     deduplication_scope=f"run:{state.run_id}",
-                    deduplication_key=(
-                        f"task:{task.id}:subtask:{subtask.id}"
-                    ),
+                    deduplication_key=f"workflow-step:{subtask.id}",
                 ),
                 run_id=state.run_id, task_id=task.id, subtask_id=subtask.id)
         except CancellationRequested as exc:
@@ -346,11 +371,22 @@ class TaskRunner:
 
         # Tool returned, record evidence FIRST
         state.record_tool_call(invocation)
+        journal_state = self._journal_state(invocation)
+        if journal_state is not None:
+            self._record_action_binding(
+                state,
+                subtask.id,
+                invocation.action_id,
+            )
 
         # P1-2 fix: physical outcome counter must be reflected BEFORE checkpoint,
         # so cancellation during physical Tool.run does not leave state.tool_calls
         # with evidence but report.executed/failed =0.
-        if invocation.ok:
+        if journal_state in _BLOCKED_ACTION_STATES or journal_state is (
+            ActionState.CANCELLED
+        ):
+            report.skipped += 1
+        elif invocation.ok:
             report.executed += 1
         else:
             report.failed += 1
@@ -366,6 +402,26 @@ class TaskRunner:
                 subtask.transition_to(TaskStatus.CANCELLED)
             state.set_active_subtask(None)
             raise exc
+
+        if journal_state in _BLOCKED_ACTION_STATES:
+            subtask.transition_to(TaskStatus.BLOCKED)
+            report.blocked = True
+            slog.info(
+                Events.TASK_BLOCKED,
+                reason=f"action_{journal_state.value}",
+            )
+            state.set_active_subtask(None)
+            return
+
+        if journal_state is ActionState.CANCELLED:
+            subtask.transition_to(TaskStatus.CANCELLED)
+            report.blocked = True
+            slog.info(
+                Events.TASK_BLOCKED,
+                reason="action_cancelled",
+            )
+            state.set_active_subtask(None)
+            return
 
         if invocation.ok:
             subtask.result = invocation.result.output
@@ -388,8 +444,78 @@ class TaskRunner:
         slog.warning(Events.SUBTASK_FINISHED, outcome="failed",
                      error=invocation.result.error)
 
-        self._recover(task, subtask, state, report, slog, control=control)
+        if journal_state is not ActionState.FAILED:
+            self._recover(task, subtask, state, report, slog, control=control)
         state.set_active_subtask(None)
+
+    @staticmethod
+    def _load_action_binding(
+        state: AgentState,
+        subtask_id: str,
+    ) -> str | None:
+        raw = state.scratch.get(_ACTION_BINDINGS_KEY)
+        if raw is None:
+            return None
+        if not isinstance(raw, dict) or set(raw) != {
+            "schema_version", "actions",
+        } or raw.get("schema_version") != _ACTION_BINDINGS_SCHEMA_VERSION:
+            raise ActionValidationError("action binding ledger is invalid")
+        actions = raw.get("actions")
+        if not isinstance(actions, dict) or len(actions) > _MAX_ACTION_BINDINGS:
+            raise ActionValidationError("action binding ledger is invalid")
+        for step_id, action_id in actions.items():
+            try:
+                ActionInvocationContext(
+                    task_id="task_000000000000",
+                    subtask_id=step_id,
+                ).validate()
+                require_action_id(action_id)
+            except Exception as exc:
+                raise ActionValidationError(
+                    "action binding ledger is invalid"
+                ) from exc
+        return actions.get(subtask_id)
+
+    @staticmethod
+    def _record_action_binding(
+        state: AgentState,
+        subtask_id: str,
+        action_id: str | None,
+    ) -> None:
+        if action_id is None:
+            raise ActionValidationError(
+                "journaled invocation lacks an action identity"
+            )
+        require_action_id(action_id)
+        existing = TaskRunner._load_action_binding(state, subtask_id)
+        if existing is not None and existing != action_id:
+            raise ActionValidationError(
+                "workflow step changed durable action identity"
+            )
+        raw = state.scratch.get(_ACTION_BINDINGS_KEY)
+        actions = dict(raw["actions"]) if raw is not None else {}
+        if subtask_id not in actions and len(actions) >= _MAX_ACTION_BINDINGS:
+            raise ActionValidationError("action binding ledger is full")
+        actions[subtask_id] = action_id
+        state.scratch[_ACTION_BINDINGS_KEY] = {
+            "schema_version": _ACTION_BINDINGS_SCHEMA_VERSION,
+            "actions": actions,
+        }
+
+    @staticmethod
+    def _journal_state(invocation) -> ActionState | None:
+        if invocation.action_state is None:
+            return None
+        if invocation.action_id is None:
+            raise ActionValidationError(
+                "journaled invocation lacks an action identity"
+            )
+        try:
+            return ActionState(invocation.action_state)
+        except (TypeError, ValueError) as exc:
+            raise ActionValidationError(
+                "journaled invocation state is invalid"
+            ) from exc
 
     def _recover(self, task: Task, subtask: Subtask, state: AgentState,
                  report: RunReport, log: StructuredLogger,

@@ -252,7 +252,7 @@ def test_unverified_outcome_is_not_treated_as_success(tmp_path):
 
 
 # ===========================================================================
-# Scenario 3: journaled mutation remains first-attempt-only
+# Scenario 3: terminal journal truth fences generic recovery
 # ===========================================================================
 
 def test_scenario_3_journaled_mutation_is_not_retried(tmp_path):
@@ -260,8 +260,9 @@ def test_scenario_3_journaled_mutation_is_not_retried(tmp_path):
     agent = Agent(cfg(tmp_path), AgentDependencies(tools=[tool]))
     report = agent.run_task(one_step_task("wipe"))
 
-    assert report.escalated is True
-    assert actions(report) == ["replan"]
+    assert report.status is TaskStatus.FAILED
+    assert report.escalated is False
+    assert actions(report) == []
     assert tool.runs == 1  # irreversible action never repeated
     assert not agent.state.pending_actions
 
@@ -486,7 +487,7 @@ def test_history_survives_state_round_trip(tmp_path):
     restored = AgentState.from_dict(agent.state.to_dict())
     history = RecoveryHistory.load(restored)
     subtask_id = restored.current_task.subtasks[0].id
-    assert history.replans(subtask_id) == 1
+    assert history.replans(subtask_id) == 0
     assert history.escalations(subtask_id) == 0
     assert not restored.pending_actions
 

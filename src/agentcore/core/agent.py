@@ -50,6 +50,10 @@ from agentcore.realtime.turn import Deadline, TurnPhase, require_run_id, require
 from agentcore.state.models import AgentPhase, AgentState
 from agentcore.state.store import InMemoryStateStore, StateStore
 from agentcore.realtime.store import TurnStore
+from agentcore.recovery.action import (
+    ActionRecoveryCoordinator,
+    ActionStartupRecoveryReport,
+)
 from agentcore.tasks.models import Task, TaskStatus
 from agentcore.tools.base import Tool
 from agentcore.tools.builtin import default_tools
@@ -145,6 +149,18 @@ class Agent:
             action_store=deps.action_store,
             action_adapters=deps.action_adapters,
         )
+        self.action_recovery: ActionRecoveryCoordinator | None = None
+        self.action_recovery_startup: (
+            ActionStartupRecoveryReport | None
+        ) = None
+        if deps.action_store is not None:
+            self.action_recovery = ActionRecoveryCoordinator(
+                deps.action_store,
+                self.executor,
+            )
+            self.action_recovery_startup = (
+                self.action_recovery.recover_startup()
+            )
 
         # Planner is resolved after the model, since the LLM planner needs it.
         self._injected_planner = deps.planner
