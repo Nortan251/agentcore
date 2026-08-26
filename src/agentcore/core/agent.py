@@ -15,6 +15,11 @@ import inspect
 import threading
 
 from agentcore.config.schema import AgentConfig
+from agentcore.core.action_binding import (
+    build_replan_binding_candidates,
+    carry_action_bindings,
+    resolve_replan_binding_transfers,
+)
 from agentcore.core.defaults import NoRetryStrategy, NullVerifier, PassthroughPlanner
 from agentcore.core.interfaces import (
     MemoryStore,
@@ -74,6 +79,21 @@ def _accepts_control_kwarg(func):
     except (ValueError, TypeError):
         return False
     param = sig.parameters.get("control")
+    if param is None:
+        return False
+    return param.kind in (
+        inspect.Parameter.KEYWORD_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    )
+
+
+def _accepts_action_bindings_kwarg(func):
+    """Check for the explicit trusted replan-binding extension point."""
+    try:
+        sig = inspect.signature(func)
+    except (ValueError, TypeError):
+        return False
+    param = sig.parameters.get("action_bindings")
     if param is None:
         return False
     return param.kind in (
@@ -1011,8 +1031,19 @@ class Agent:
                       max_replans=self.config.recovery.max_replans,
                       task_id=previous.id, reason=reason)
 
+        binding_candidates = {}
         try:
-            new_task = self.planner.replan(previous, self.state)
+            if _accepts_action_bindings_kwarg(self.planner.replan):
+                binding_offers, binding_candidates = (
+                    build_replan_binding_candidates(self.state, previous)
+                )
+                new_task = self.planner.replan(
+                    previous,
+                    self.state,
+                    action_bindings=binding_offers,
+                )
+            else:
+                new_task = self.planner.replan(previous, self.state)
         except CancellationRequested as exc:
             # Cancellation during planner.replan: attempt already consumed,
             # finish ledger as cancelled, cancel current task. No error record (P2-4).
@@ -1049,6 +1080,12 @@ class Agent:
             raise exc
 
         rejection = self._reject_reason(new_task, previous)
+        binding_transfers = {}
+        if rejection is None:
+            binding_transfers, rejection = resolve_replan_binding_transfers(
+                new_task,
+                binding_candidates,
+            )
         if rejection is not None:
             ledger.finish(reason=reason, outcome="rejected",
                           previous_task_id=previous.id, detail=rejection,
@@ -1080,6 +1117,19 @@ class Agent:
         # previous task is already archived in the ledger, so no history is lost.
         # Checkpoint before adopting
         control.checkpoint()
+
+        try:
+            carry_action_bindings(self.state, binding_transfers)
+        except Exception:
+            rejection = "trusted replan action binding could not be persisted"
+            ledger.finish(reason=reason, outcome="rejected",
+                          previous_task_id=previous.id, detail=rejection,
+                          signature=self._proposal_signature(new_task))
+            ledger.save(self.state)
+            self.log.warning(Events.REPLAN_REJECTED, attempt=attempt,
+                             detail=rejection)
+            self._abandon_replan(report, f"replan rejected: {rejection}")
+            return ReplanOutcome.ABANDON
 
         ledger.finish(reason=reason, outcome="accepted",
                       previous_task_id=previous.id, new_task_id=new_task.id)

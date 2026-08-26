@@ -30,6 +30,7 @@ inside the plan and are then mapped onto real generated ``Subtask`` ids.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -40,6 +41,8 @@ SCHEMA_VERSION = 1
 
 #: Hard ceiling on plan size — a defence against runaway model output.
 MAX_STEPS = 50
+
+_ACTION_BINDING_TOKEN = re.compile(r"^wfb_[0-9a-f]{12}$")
 
 
 @dataclass
@@ -53,6 +56,7 @@ class PlanStep:
     depends_on: list[str] = field(default_factory=list)
     expected_result: str = ""
     requires_verification: bool = False
+    action_binding_token: str | None = None
 
     @property
     def is_executable(self) -> bool:
@@ -60,7 +64,7 @@ class PlanStep:
         return bool(self.tool_name)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "id": self.id,
             "description": self.description,
             "tool_name": self.tool_name,
@@ -69,6 +73,9 @@ class PlanStep:
             "expected_result": self.expected_result,
             "requires_verification": self.requires_verification,
         }
+        if self.action_binding_token is not None:
+            result["action_binding_token"] = self.action_binding_token
+        return result
 
 
 @dataclass
@@ -122,6 +129,10 @@ def json_schema() -> dict[str, Any]:
                                        "items": {"type": "string"}},
                         "expected_result": {"type": "string"},
                         "requires_verification": {"type": "boolean"},
+                        "action_binding_token": {
+                            "type": "string",
+                            "pattern": "^wfb_[0-9a-f]{12}$",
+                        },
                     },
                 },
             },
@@ -264,6 +275,17 @@ def _parse_step(raw: Any, index: int) -> PlanStep:
         raise PlanSchemaError("step 'requires_verification' must be a boolean",
                               step=index, field="requires_verification")
 
+    action_binding_token = raw.get("action_binding_token")
+    if action_binding_token is not None and (
+        not isinstance(action_binding_token, str)
+        or not _ACTION_BINDING_TOKEN.fullmatch(action_binding_token)
+    ):
+        raise PlanSchemaError(
+            "step 'action_binding_token' is invalid",
+            step=index,
+            field="action_binding_token",
+        )
+
     return PlanStep(
         id=step_id.strip(),
         description=description.strip(),
@@ -272,6 +294,7 @@ def _parse_step(raw: Any, index: int) -> PlanStep:
         depends_on=[d.strip() for d in depends_on if d.strip()],
         expected_result=expected_result.strip(),
         requires_verification=requires_verification,
+        action_binding_token=action_binding_token,
     )
 
 

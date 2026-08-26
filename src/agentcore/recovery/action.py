@@ -106,8 +106,12 @@ class ActionRecoveryCoordinator:
                 return self._quarantine("startup_scan_bound_exceeded")
             records = self._store.list_nonterminal()
             items: list[ActionRecoveryItem] = []
+            settled_during_recovery = 0
             for record in records:
                 recovered, status = self._recover_record(record)
+                if status is None:
+                    settled_during_recovery += 1
+                    continue
                 items.append(ActionRecoveryItem(
                     action_id=recovered.action_id,
                     status=status,
@@ -115,7 +119,9 @@ class ActionRecoveryCoordinator:
                 ))
             report = ActionStartupRecoveryReport(
                 items=tuple(items),
-                terminal_count=len(action_ids) - len(records),
+                terminal_count=(
+                    len(action_ids) - len(records) + settled_during_recovery
+                ),
             )
         except ActionStoreOwnershipError:
             raise
@@ -127,8 +133,20 @@ class ActionRecoveryCoordinator:
     def _recover_record(
         self,
         record: ActionRecord,
-    ) -> tuple[ActionRecord, ActionRecoveryStatus]:
-        record.validate()
+    ) -> tuple[ActionRecord, ActionRecoveryStatus | None]:
+        # The startup scan released the store mutex before reaching here.
+        # Serialize only this action, then classify the authoritative reload.
+        with self._store.execution_guard(record.action_id):
+            current = self._store.load(record.action_id)
+            current.validate()
+            return self._recover_guarded_record(current)
+
+    def _recover_guarded_record(
+        self,
+        record: ActionRecord,
+    ) -> tuple[ActionRecord, ActionRecoveryStatus | None]:
+        if record.state.is_terminal:
+            return record, None
         if record.state is ActionState.AUTHORIZED:
             status = (
                 ActionRecoveryStatus.RETRY_READY

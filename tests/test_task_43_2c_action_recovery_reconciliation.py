@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import os
+import json
+import re
 import threading
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,17 +39,27 @@ from agentcore.action_journal import (
     new_action_transition_id,
 )
 from agentcore.action_journal.errors import ActionStoreError
-from agentcore.config.schema import AgentConfig, LoggingConfig, PermissionConfig
+from agentcore.config.schema import (
+    AgentConfig,
+    FeatureFlags,
+    LoggingConfig,
+    ModelConfig,
+    PermissionConfig,
+)
+from agentcore.core.action_binding import record_action_binding
 from agentcore.core.agent import Agent, AgentDependencies
 from agentcore.core.defaults import NullVerifier
-from agentcore.core.runner import TaskRunner
+from agentcore.core.replan import ReplanLedger, ReplanOutcome
+from agentcore.core.runner import RunReport, TaskRunner
 from agentcore.permissions.levels import Capability, PermissionLevel
 from agentcore.permissions.policy import Decision, Outcome, PermissionPolicy
+from agentcore.planning.planner import LLMPlanner
 from agentcore.realtime import TURN_SCHEMA_VERSION
 from agentcore.realtime.cancellation import CancellationReason
 from agentcore.realtime.errors import CancellationRequested
 from agentcore.recovery import ActionRecoveryCoordinator, ActionRecoveryStatus
-from agentcore.state.models import AgentState
+from agentcore.recovery.config import RecoveryConfig
+from agentcore.state.models import AgentPhase, AgentState
 from agentcore.tasks.models import Subtask, Task, TaskStatus
 from agentcore.tools.base import (
     ParamType,
@@ -376,6 +389,108 @@ def _invoke_resume(executor, record, *, checkpoint=None):
     )
 
 
+@pytest.mark.parametrize(
+    ("state", "expected_ok", "expected_kind"),
+    [
+        (ActionState.SUCCEEDED, True, "action_succeeded"),
+        (ActionState.FAILED, False, "action_failed"),
+        (
+            ActionState.RECONCILE_REQUIRED,
+            False,
+            "action_reconciliation_required",
+        ),
+    ],
+)
+def test_existing_truth_is_observable_without_current_mutation_permission(
+    state,
+    expected_ok,
+    expected_kind,
+):
+    policy = MatrixPolicy({Capability.FS_WRITE: False})
+    store = InMemoryActionStore(clock=FixedClock(NOW))
+    record = _seed(store, number=60 + list(ActionState).index(state), state=state)
+    executor, _, _, tool, _, _ = _build(store=store, policy=policy)
+
+    invocation = _invoke_resume(executor, record)
+
+    assert invocation.ok is expected_ok
+    assert invocation.action_id == record.action_id
+    assert invocation.action_state == state.value
+    assert invocation.result.metadata["kind"] == expected_kind
+    assert policy.calls == []
+    assert tool.runs == 0
+    assert store.load(record.action_id) == record
+
+
+class GuardObservedStore:
+    def __init__(self, wrapped) -> None:
+        self.wrapped = wrapped
+        self.guard_requested = threading.Event()
+
+    def __getattr__(self, name):
+        return getattr(self.wrapped, name)
+
+    @contextmanager
+    def execution_guard(self, action_id):
+        self.guard_requested.set()
+        with self.wrapped.execution_guard(action_id):
+            yield
+
+
+@pytest.mark.parametrize("allow_after_guard", [False, True])
+def test_retry_rechecks_current_mutation_authority_after_action_guard_wait(
+    allow_after_guard,
+):
+    underlying = InMemoryActionStore(clock=FixedClock(NOW))
+    authorized = _authorize_retry(underlying, number=64 + allow_after_guard)
+    store = GuardObservedStore(underlying)
+    policy = MatrixPolicy({Capability.FS_WRITE: True})
+    executor, _, _, tool, _, _ = _build(store=store, policy=policy)
+    results = []
+
+    with underlying.execution_guard(authorized.action_id):
+        worker = threading.Thread(
+            target=lambda: results.append(_invoke_resume(executor, authorized)),
+            daemon=True,
+        )
+        worker.start()
+        assert store.guard_requested.wait(WAIT)
+        policy.allowed[Capability.FS_WRITE] = allow_after_guard
+
+    worker.join(WAIT)
+    assert not worker.is_alive()
+    assert policy.calls == [frozenset({Capability.FS_WRITE})]
+    assert tool.runs == (1 if allow_after_guard else 0)
+    loaded = underlying.load(authorized.action_id)
+    if allow_after_guard:
+        assert results[0].ok
+        assert loaded.state is ActionState.SUCCEEDED
+        assert len(loaded.attempts) == 2
+    else:
+        assert not results[0].ok
+        assert results[0].result.metadata["kind"] == "permission_denied"
+        assert loaded == authorized
+
+
+def test_fresh_first_attempt_checks_mutation_authority_once():
+    policy = MatrixPolicy({Capability.FS_WRITE: True})
+    executor, _, store, tool, _, _ = _build(policy=policy)
+
+    invocation = executor.invoke(
+        "mutate",
+        {"payload": SECRET},
+        action_context=ActionInvocationContext(
+            deduplication_scope="workflow:fresh",
+            deduplication_key="step:first",
+        ),
+    )
+
+    assert invocation.ok
+    assert policy.calls == [frozenset({Capability.FS_WRITE})]
+    assert tool.runs == 1
+    assert len(store.list_actions()) == 1
+
+
 def test_startup_moves_prior_in_flight_to_reconciliation_without_retry():
     store = InMemoryActionStore(clock=FixedClock(NOW))
     prior = _seed(store, number=1, state=ActionState.IN_FLIGHT)
@@ -660,7 +775,7 @@ def test_authorized_no_attempt_still_requires_current_mutation_permission():
     assert store.load(waiting.action_id) == waiting
 
 
-@pytest.mark.parametrize("checkpoint_number", [1, 2, 3, 4])
+@pytest.mark.parametrize("checkpoint_number", [1, 2])
 def test_cancellation_at_every_pre_retry_checkpoint_prevents_physical_call(
     checkpoint_number,
 ):
@@ -864,6 +979,8 @@ def test_reconciliation_result_publication_faults_never_repeat_probe(
     report = coordinator.reconcile(_claim(coordinator, record))
 
     assert report.status is ActionReconciliationStatus.PUBLICATION_UNCERTAIN
+    assert report.action_state is ActionState.RECONCILE_REQUIRED
+    assert report.record_version == record.version + 1
     assert reconciler.calls == 1
     assert underlying.load(record.action_id).state is durable_state
     assert SECRET not in repr(report)
@@ -1046,6 +1163,85 @@ def test_agent_classifies_in_flight_actions_before_runner_is_available(tmp_path)
     agent.shutdown()
 
 
+@pytest.mark.parametrize("store_kind", ["memory", "json"])
+def test_startup_recovery_waits_for_live_same_process_action_guard(
+    tmp_path,
+    store_kind,
+):
+    entered = threading.Event()
+    release = threading.Event()
+
+    def run(args, context):
+        entered.set()
+        assert release.wait(WAIT)
+        return ToolResult.success("raw")
+
+    if store_kind == "memory":
+        executor_store = InMemoryActionStore(clock=FixedClock(NOW))
+        recovery_store = executor_store
+        stores_to_close = []
+    else:
+        domain = tmp_path / "shared-action-domain"
+        executor_store = JsonFileActionStore(domain, clock=FixedClock(NOW))
+        recovery_store = JsonFileActionStore(domain, clock=FixedClock(NOW))
+        stores_to_close = [executor_store, recovery_store]
+
+    observed_store = GuardObservedStore(recovery_store)
+    tool = MutationTool(run_hook=run)
+    executor, _, _, _, _, _ = _build(store=executor_store, tool=tool)
+    coordinator = ActionRecoveryCoordinator(
+        observed_store,
+        executor,
+        clock=FixedClock(NOW),
+        id_factory=DeterministicIds(),
+        owner_id="recovery:concurrent",
+    )
+    invocations = []
+    reports = []
+    try:
+        execution = threading.Thread(
+            target=lambda: invocations.append(executor.invoke(
+                "mutate",
+                {"payload": SECRET},
+                action_context=ActionInvocationContext(
+                    deduplication_scope="workflow:live",
+                    deduplication_key="step:live",
+                ),
+            )),
+            daemon=True,
+        )
+        execution.start()
+        assert entered.wait(WAIT)
+        action_id = executor_store.list_nonterminal()[0].action_id
+        assert executor_store.load(action_id).state is ActionState.IN_FLIGHT
+
+        recovery = threading.Thread(
+            target=lambda: reports.append(coordinator.recover_startup()),
+            daemon=True,
+        )
+        recovery.start()
+        assert observed_store.guard_requested.wait(WAIT)
+        assert recovery.is_alive()
+        assert executor_store.load(action_id).state is ActionState.IN_FLIGHT
+
+        release.set()
+        execution.join(WAIT)
+        recovery.join(WAIT)
+        assert not execution.is_alive()
+        assert not recovery.is_alive()
+
+        loaded = executor_store.load(action_id)
+        assert invocations[0].ok
+        assert loaded.state is ActionState.SUCCEEDED
+        assert reports[0].items == ()
+        assert reports[0].terminal_count == 1
+        assert tool.runs == 1
+    finally:
+        release.set()
+        for store in stores_to_close:
+            store.close()
+
+
 def test_probe_holds_no_general_store_mutex_and_other_action_can_retry():
     entered = threading.Event()
     release = threading.Event()
@@ -1109,40 +1305,224 @@ def test_probe_holds_no_general_store_mutex_and_other_action_can_retry():
     assert reports[0].status is ActionReconciliationStatus.UNRESOLVED
 
 
-def test_taskrunner_persists_safe_action_binding_across_replanned_task_identity():
+class IntentAwareMutationAdapter(MutationAdapter):
+    def prepare_intent(self, cleaned, context):
+        digest = "a" * 64 if cleaned.get("payload") == SECRET else "d" * 64
+        return PreparedActionIntent(
+            intent_digest=digest,
+            target_category="test.target",
+        )
+
+
+class ReplanBindingModel:
+    def __init__(self, *, payload=SECRET, echo_binding=True) -> None:
+        self.payload = payload
+        self.echo_binding = echo_binding
+        self.prompts = []
+        self.echoed_token = None
+
+    def complete(self, prompt, *, system=None, **options):
+        self.prompts.append(prompt)
+        token_match = re.search(r"token=(wfb_[0-9a-f]{12})", prompt)
+        step = {
+            "id": "replacement-step",
+            "description": "replacement trusted workflow step",
+            "tool_name": "mutate",
+            "tool_args": {"payload": self.payload},
+        }
+        if self.echo_binding:
+            assert token_match is not None
+            self.echoed_token = token_match.group(1)
+            step["action_binding_token"] = self.echoed_token
+        return json.dumps({
+            "objective": "replacement plan",
+            "steps": [step],
+        })
+
+
+def _exercise_real_replan_binding(
+    tmp_path,
+    record,
+    store,
+    *,
+    payload=SECRET,
+    echo_binding=True,
+    mutation_allowed=True,
+):
+    tool = MutationTool()
+    adapters = ActionAdapterRegistry()
+    adapters.register(
+        tool,
+        IntentAwareMutationAdapter(tool),
+        reconciler=FakeReconciler(),
+    )
+    model = ReplanBindingModel(
+        payload=payload,
+        echo_binding=echo_binding,
+    )
+    config = AgentConfig(
+        environment="test",
+        workspace_dir=str(tmp_path),
+        model=ModelConfig(),
+        permissions=PermissionConfig(level=PermissionLevel.AUTONOMOUS),
+        logging=LoggingConfig(level="CRITICAL"),
+        recovery=RecoveryConfig(max_replans=1, base_delay_seconds=0.0),
+        features=FeatureFlags(planning=True),
+    ).validate()
+    agent = Agent(
+        config,
+        AgentDependencies(
+            tools=[tool],
+            model=model,
+            verifier=NullVerifier(),
+            action_store=store,
+            action_adapters=adapters,
+        ),
+    )
+    policy = MatrixPolicy({Capability.FS_WRITE: mutation_allowed})
+    agent.policy = policy
+    agent.executor.policy = policy
+    agent.planner = LLMPlanner(model, agent.registry, max_replans=1)
+
+    prior_subtask = Subtask(
+        description="prior trusted workflow step",
+        tool_name="mutate",
+        tool_args={"payload": SECRET},
+    )
+    previous = Task(objective="prior plan", subtasks=[prior_subtask])
+    agent.state.set_task(previous)
+    agent.state.transition_phase(AgentPhase.EXECUTING, note="test replan")
+    record_action_binding(
+        agent.state,
+        prior_subtask.id,
+        action_id=record.action_id,
+        deduplication_scope=record.deduplication_scope,
+        deduplication_key=record.deduplication_key,
+    )
+    report = RunReport(
+        task_id=previous.id,
+        status=TaskStatus.FAILED,
+        replan_requested=True,
+    )
+
+    outcome = agent._replan(ReplanLedger(), report)
+    replacement = agent.state.current_task
+    assert outcome is ReplanOutcome.ADOPTED
+    assert replacement is not None
+    assert replacement.subtasks[0].id != prior_subtask.id
+    run_report = agent.runner.run(replacement, agent.state)
+    return agent, tool, policy, model, replacement, run_report
+
+
+def test_real_llmplanner_replan_carries_succeeded_action_to_new_subtask_id(
+    tmp_path,
+):
     store = InMemoryActionStore(clock=FixedClock(NOW))
-    executor, _, _, tool, _, _ = _build(store=store)
-    runner = TaskRunner(executor, verifier=NullVerifier())
-    state = AgentState()
-    workflow_step = "sub_000000000abc"
-    first = Task(
-        objective="first plan",
-        subtasks=[Subtask(
-            id=workflow_step,
-            description="perform the trusted workflow step",
-            tool_name="mutate",
-            tool_args={"payload": SECRET},
-        )],
+    record = _seed(store, number=70, state=ActionState.SUCCEEDED)
+    agent, tool, policy, model, replacement, report = (
+        _exercise_real_replan_binding(tmp_path, record, store)
     )
+    try:
+        assert report.status is TaskStatus.COMPLETED
+        assert agent.state.tool_calls[-1]["action_id"] == record.action_id
+        assert model.echoed_token is not None
+        assert tool.runs == 0
+        assert policy.calls == []
+        assert len(store.list_actions()) == 1
+        assert "trusted_action_binding_offers" not in replacement.metadata
+    finally:
+        agent.shutdown()
 
-    first_report = runner.run(first, state)
-    action_id = state.tool_calls[-1]["action_id"]
-    second = Task(
-        objective="replacement plan",
-        subtasks=[Subtask(
-            id=workflow_step,
-            description="carry forward the same trusted workflow step",
-            tool_name="mutate",
-            tool_args={"payload": SECRET},
-        )],
+
+def test_real_llmplanner_replan_keeps_reconciliation_required_action_blocked(
+    tmp_path,
+):
+    store = InMemoryActionStore(clock=FixedClock(NOW))
+    record = _seed(store, number=71, state=ActionState.RECONCILE_REQUIRED)
+    agent, tool, policy, _, _, report = _exercise_real_replan_binding(
+        tmp_path,
+        record,
+        store,
+        mutation_allowed=False,
     )
-    second_report = runner.run(second, state)
+    try:
+        assert report.blocked
+        assert agent.state.tool_calls[-1]["action_id"] == record.action_id
+        assert tool.runs == 0
+        assert policy.calls == []
+        assert len(store.list_actions()) == 1
+        assert store.load(record.action_id).state is (
+            ActionState.RECONCILE_REQUIRED
+        )
+    finally:
+        agent.shutdown()
 
-    assert first_report.status is TaskStatus.COMPLETED
-    assert second_report.status is TaskStatus.COMPLETED
-    assert tool.runs == 1
-    assert state.tool_calls[-1]["action_id"] == action_id
-    assert len(store.list_actions()) == 1
+
+def test_real_llmplanner_replan_retry_uses_same_action_and_current_authority(
+    tmp_path,
+):
+    store = InMemoryActionStore(clock=FixedClock(NOW))
+    record = _authorize_retry(store, number=72)
+    agent, tool, policy, _, _, report = _exercise_real_replan_binding(
+        tmp_path,
+        record,
+        store,
+    )
+    try:
+        assert report.status is TaskStatus.COMPLETED
+        assert agent.state.tool_calls[-1]["action_id"] == record.action_id
+        assert tool.runs == 1
+        assert policy.calls == [frozenset({Capability.FS_WRITE})]
+        loaded = store.load(record.action_id)
+        assert loaded.state is ActionState.SUCCEEDED
+        assert len(loaded.attempts) == 2
+        assert len(store.list_actions()) == 1
+    finally:
+        agent.shutdown()
+
+
+def test_real_llmplanner_copied_binding_with_changed_intent_fails_closed(
+    tmp_path,
+):
+    store = InMemoryActionStore(clock=FixedClock(NOW))
+    record = _seed(store, number=73, state=ActionState.SUCCEEDED)
+    agent, tool, policy, _, _, report = _exercise_real_replan_binding(
+        tmp_path,
+        record,
+        store,
+        payload="changed-safe-test-intent",
+    )
+    try:
+        assert report.status is TaskStatus.FAILED
+        assert agent.state.tool_calls[-1]["result"]["metadata"]["kind"] == (
+            "action_resume_unverified"
+        )
+        assert tool.runs == 0
+        assert policy.calls == []
+        assert len(store.list_actions()) == 1
+        assert store.load(record.action_id) == record
+    finally:
+        agent.shutdown()
+
+
+def test_real_llmplanner_unbound_different_action_gets_new_action_id(tmp_path):
+    store = InMemoryActionStore(clock=FixedClock(NOW))
+    record = _seed(store, number=74, state=ActionState.SUCCEEDED)
+    agent, tool, policy, _, _, report = _exercise_real_replan_binding(
+        tmp_path,
+        record,
+        store,
+        payload="deliberately-new-safe-action",
+        echo_binding=False,
+    )
+    try:
+        assert report.status is TaskStatus.COMPLETED
+        assert agent.state.tool_calls[-1]["action_id"] != record.action_id
+        assert tool.runs == 1
+        assert policy.calls == [frozenset({Capability.FS_WRITE})]
+        assert len(store.list_actions()) == 2
+    finally:
+        agent.shutdown()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX fork semantics")

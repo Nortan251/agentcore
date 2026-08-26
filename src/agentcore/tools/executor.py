@@ -708,8 +708,8 @@ class ToolExecutor:
             return self._reconciliation_report(
                 claim,
                 ActionReconciliationStatus.PUBLICATION_UNCERTAIN,
-                candidate.state,
-                candidate.version,
+                current.state,
+                current.version,
             )
         if loaded == candidate:
             return self._reconciliation_report(
@@ -885,37 +885,34 @@ class ToolExecutor:
                 message="Protected action payload storage is not available.",
                 log=log, invocation_id=invocation_id)
 
-        if checkpoint is not None:
-            checkpoint()
-        decision = self.policy.check(
-            tool_spec.capabilities,
-            description=(prepared.approval_description
-                         or tool_spec.description),
-        )
-        log.debug(Events.PERMISSION_CHECKED, **decision.to_dict())
-        if not decision.allowed:
-            log.warning(Events.TOOL_DENIED, **decision.to_dict())
-            return ToolInvocation(
-                tool_spec.name,
-                redacted,
-                ToolResult.failure(
-                    "Permission was not granted for this action.",
-                    kind="permission_denied"),
-                elapsed(), decision, invocation_id=invocation_id)
-        if checkpoint is not None:
-            checkpoint()
+        resume_requested = trusted_context.action_id is not None
+        decision: Decision | None = None
+        if not resume_requested:
+            if checkpoint is not None:
+                checkpoint()
+            decision = self.policy.check(
+                tool_spec.capabilities,
+                description=(prepared.approval_description
+                             or tool_spec.description),
+            )
+            log.debug(Events.PERMISSION_CHECKED, **decision.to_dict())
+            if not decision.allowed:
+                log.warning(Events.TOOL_DENIED, **decision.to_dict())
+                return ToolInvocation(
+                    tool_spec.name,
+                    redacted,
+                    ToolResult.failure(
+                        "Permission was not granted for this action.",
+                        kind="permission_denied"),
+                    elapsed(), decision, invocation_id=invocation_id)
+            if checkpoint is not None:
+                checkpoint()
 
         if self._action_store is None:
             return self._journal_failure(
                 tool_spec.name, redacted, elapsed(),
                 kind="action_store_unavailable",
                 message="The durable action journal is unavailable.",
-                log=log, decision=decision, invocation_id=invocation_id)
-        if spec.effect_class is ActionEffectClass.EXTERNALLY_IDEMPOTENT:
-            return self._journal_failure(
-                tool_spec.name, redacted, elapsed(),
-                kind="external_idempotency_contract_unavailable",
-                message="Stable external idempotency ownership is not available.",
                 log=log, decision=decision, invocation_id=invocation_id)
 
         mutation_capabilities = tuple(sorted(
@@ -924,7 +921,6 @@ class ToolExecutor:
         reconciliation_capabilities = tuple(sorted(
             str(capability) for capability in spec.reconciliation_capabilities))
         store = self._action_store
-        resume_requested = trusted_context.action_id is not None
         if resume_requested:
             assert trusted_context.action_id is not None
             try:
@@ -948,12 +944,22 @@ class ToolExecutor:
                     kind="action_resume_unverified",
                     message="The durable action identity could not be verified.",
                     log=log,
-                    decision=decision,
                     invocation_id=invocation_id,
                     action_id=trusted_context.action_id,
                 )
             created_here = False
         else:
+            assert decision is not None
+            if spec.effect_class is ActionEffectClass.EXTERNALLY_IDEMPOTENT:
+                return self._journal_failure(
+                    tool_spec.name, redacted, elapsed(),
+                    kind="external_idempotency_contract_unavailable",
+                    message=(
+                        "Stable external idempotency ownership is not "
+                        "available."
+                    ),
+                    log=log, decision=decision,
+                    invocation_id=invocation_id)
             try:
                 policy_fingerprint = permission_policy_fingerprint(self.policy)
                 authority_scope = f"live:{invocation_id}"
@@ -1019,7 +1025,8 @@ class ToolExecutor:
                     resume_requested=resume_requested,
                     tool=tool, tool_spec=tool_spec,
                     cleaned=cleaned, redacted=redacted,
-                    adapter=adapter, spec=spec, checkpoint=checkpoint,
+                    adapter=adapter, spec=spec, prepared=prepared,
+                    checkpoint=checkpoint,
                     decision=decision, invocation_id=invocation_id,
                     log=log, elapsed=elapsed)
         except CancellationRequested:
@@ -1052,8 +1059,9 @@ class ToolExecutor:
         redacted: dict[str, str],
         adapter: ToolActionAdapter,
         spec: ActionAdapterSpec,
+        prepared: PreparedActionIntent,
         checkpoint: Callable[[], None] | None,
-        decision: Decision,
+        decision: Decision | None,
         invocation_id: str,
         log: Any,
         elapsed: Callable[[], float],
@@ -1089,6 +1097,41 @@ class ToolExecutor:
             return self._attached_invocation(
                 tool_spec.name, redacted, current, decision,
                 invocation_id, elapsed(), log)
+
+        if resume_requested:
+            if spec.effect_class is ActionEffectClass.EXTERNALLY_IDEMPOTENT:
+                return self._journal_failure(
+                    tool_spec.name, redacted, elapsed(),
+                    kind="external_idempotency_contract_unavailable",
+                    message=(
+                        "Stable external idempotency ownership is not "
+                        "available."
+                    ),
+                    log=log, invocation_id=invocation_id,
+                    action_id=current.action_id,
+                    action_state=current.state.value,
+                )
+            decision = self.policy.check(
+                tool_spec.capabilities,
+                description=(prepared.approval_description
+                             or tool_spec.description),
+            )
+            log.debug(Events.PERMISSION_CHECKED, **decision.to_dict())
+            if not decision.allowed:
+                log.warning(Events.TOOL_DENIED, **decision.to_dict())
+                return ToolInvocation(
+                    tool_spec.name,
+                    redacted,
+                    ToolResult.failure(
+                        "Permission was not granted for this action.",
+                        kind="permission_denied"),
+                    elapsed(),
+                    decision,
+                    invocation_id=invocation_id,
+                    action_id=current.action_id,
+                    action_state=current.state.value,
+                )
+        assert decision is not None
 
         try:
             if checkpoint is not None:
@@ -1482,7 +1525,7 @@ class ToolExecutor:
         tool_name: str,
         redacted: dict[str, str],
         record: ActionRecord,
-        decision: Decision,
+        decision: Decision | None,
         invocation_id: str,
         duration: float,
         log: Any,
@@ -1509,7 +1552,7 @@ class ToolExecutor:
         tool_name: str,
         redacted: dict[str, str],
         record: ActionRecord,
-        decision: Decision,
+        decision: Decision | None,
         invocation_id: str,
         attempt_id: str | None,
         duration: float,
