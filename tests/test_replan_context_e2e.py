@@ -7,6 +7,7 @@ Proves the point of this task: across repeated attempts the planner is told
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import pytest
@@ -45,7 +46,23 @@ class ScriptedModel:
         self.systems.append(system)
         if not self.plans:
             raise AssertionError("ScriptedModel exhausted")
-        return self.plans.pop(0)
+        response = self.plans.pop(0)
+        offers = re.findall(
+            r"token=(wfb_[0-9a-f]{12}); prior_subtask_id=sub_[0-9a-f]{12}; "
+            r"tool_name=([a-zA-Z0-9_.-]+)",
+            prompt,
+        )
+        if offers:
+            payload = json.loads(response)
+            for step in payload.get("steps", []):
+                matches = [
+                    token for token, tool_name in offers
+                    if tool_name == step.get("tool_name")
+                ]
+                if len(matches) == 1:
+                    step["action_binding_token"] = matches[0]
+            response = json.dumps(payload)
+        return response
 
 
 class WriteTool(Tool):
@@ -184,11 +201,11 @@ def test_second_replan_sees_first_replan_reason(tmp_path):
 
 
 # ===========================================================================
-# End-to-end: history-informed replan succeeds
+# End-to-end: history-informed replan preserves action continuity
 # ===========================================================================
 
-def test_full_loop_replan_uses_history_and_succeeds(tmp_path):
-    """Initial plan fails; the replan (informed by history) succeeds."""
+def test_full_loop_replan_uses_history_without_repeating_mutation(tmp_path):
+    """Changed same-tool text cannot fabricate a second logical action."""
     model = ScriptedModel(
         plan_json("write a placeholder", "TODO later", EXPECTED,
                   objective=OBJECTIVE),
@@ -196,12 +213,12 @@ def test_full_loop_replan_uses_history_and_succeeds(tmp_path):
                   objective=OBJECTIVE),
     )
     tool = WriteTool()
-    agent = build(tmp_path, model, tool)
+    agent = build(tmp_path, model, tool, max_replans=1)
 
     report = agent.execute(OBJECTIVE)
 
-    assert report.status is TaskStatus.COMPLETED
-    assert [c["text"] for c in tool.calls] == ["TODO later", EXPECTED]
+    assert report.status is not TaskStatus.COMPLETED
+    assert [c["text"] for c in tool.calls] == ["TODO later"]
     assert len(model.prompts) == 2
 
     # the replan prompt contained the first failure
@@ -209,7 +226,7 @@ def test_full_loop_replan_uses_history_and_succeeds(tmp_path):
     assert "LATEST FAILED ATTEMPT" in model.prompts[1]
 
     subtask = agent.state.current_task.subtasks[0]
-    assert subtask.verification.status is VerificationStatus.PASSED
+    assert subtask.verification.status is VerificationStatus.FAILED
     assert ReplanLedger.load(agent.state).count == 1
 
 
@@ -217,7 +234,7 @@ def test_first_plan_has_no_history_and_no_replan_guidance(tmp_path):
     """No unnecessary context on the initial planning call."""
     model = ScriptedModel(plan_json("do it", EXPECTED, EXPECTED,
                                     objective=OBJECTIVE))
-    agent = build(tmp_path, model, WriteTool())
+    agent = build(tmp_path, model, WriteTool(), max_replans=1)
     agent.execute(OBJECTIVE)
 
     assert len(model.prompts) == 1
@@ -231,7 +248,7 @@ def test_no_extra_model_calls_for_history(tmp_path):
         plan_json("a", "A", EXPECTED, objective=OBJECTIVE),
         plan_json("b", EXPECTED, EXPECTED, objective=OBJECTIVE),
     )
-    agent = build(tmp_path, model, WriteTool())
+    agent = build(tmp_path, model, WriteTool(), max_replans=1)
     agent.execute(OBJECTIVE)
     # exactly one call per planning cycle: no summarisation call
     assert len(model.prompts) == 2
@@ -314,7 +331,7 @@ def test_planner_recovers_when_history_is_corrupt(tmp_path):
         plan_json("a", "A", EXPECTED, objective=OBJECTIVE),
         plan_json("b", EXPECTED, EXPECTED, objective=OBJECTIVE),
     )
-    agent = build(tmp_path, model, WriteTool())
+    agent = build(tmp_path, model, WriteTool(), max_replans=1)
 
     original_run = agent.runner.run
 
@@ -327,8 +344,8 @@ def test_planner_recovers_when_history_is_corrupt(tmp_path):
     agent.runner.run = corrupting_run
     report = agent.execute(OBJECTIVE)
 
-    assert report.status is TaskStatus.COMPLETED
-    assert len(model.prompts) == 2
+    assert report.status is not TaskStatus.COMPLETED
+    assert len(model.prompts) == 3
 
 
 def test_validation_still_applies_to_replanned_plans(tmp_path):

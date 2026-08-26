@@ -1033,10 +1033,10 @@ class Agent:
 
         binding_candidates = {}
         try:
+            binding_offers, binding_candidates = (
+                build_replan_binding_candidates(self.state, previous)
+            )
             if _accepts_action_bindings_kwarg(self.planner.replan):
-                binding_offers, binding_candidates = (
-                    build_replan_binding_candidates(self.state, previous)
-                )
                 new_task = self.planner.replan(
                     previous,
                     self.state,
@@ -1080,12 +1080,6 @@ class Agent:
             raise exc
 
         rejection = self._reject_reason(new_task, previous)
-        binding_transfers = {}
-        if rejection is None:
-            binding_transfers, rejection = resolve_replan_binding_transfers(
-                new_task,
-                binding_candidates,
-            )
         if rejection is not None:
             ledger.finish(reason=reason, outcome="rejected",
                           previous_task_id=previous.id, detail=rejection,
@@ -1112,6 +1106,20 @@ class Agent:
                 note="replan rejected: duplicate of a failed approach")
             # Keep the previous task in place; nothing about it changed.
             return ReplanOutcome.RETRY
+
+        binding_transfers, rejection = resolve_replan_binding_transfers(
+            new_task,
+            binding_candidates,
+        )
+        if rejection is not None:
+            ledger.finish(reason=reason, outcome="rejected",
+                          previous_task_id=previous.id, detail=rejection,
+                          signature=self._proposal_signature(new_task))
+            ledger.save(self.state)
+            self.log.warning(Events.REPLAN_REJECTED, attempt=attempt,
+                             detail=rejection)
+            self._abandon_replan(report, f"replan rejected: {rejection}")
+            return ReplanOutcome.ABANDON
 
         # Accepted: carry the objective forward and swap in the new plan. The
         # previous task is already archived in the ledger, so no history is lost.

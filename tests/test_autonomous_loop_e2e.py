@@ -52,13 +52,15 @@ class ScriptedModel:
 class WriteTool(Tool):
     """Mutating tool: retrying is not provably safe, so recovery replans."""
 
-    def __init__(self) -> None:
-        self.calls: list[str] = []
+    def __init__(self, name: str = "write_note",
+                 calls: list[str] | None = None) -> None:
+        self._name = name
+        self.calls = calls if calls is not None else []
 
     @property
     def spec(self):
         return tool_spec(
-            "write_note", "Write a note and return what was written.",
+            self._name, "Write a note and return what was written.",
             parameters=[ToolParameter("text", ParamType.STRING,
                                       "The note contents.")],
             capabilities=[Capability.FS_WRITE], read_only=False)
@@ -68,11 +70,12 @@ class WriteTool(Tool):
         return ToolResult.success(args["text"])
 
 
-def plan_json(text: str, expected: str, *, objective: str) -> str:
+def plan_json(text: str, expected: str, *, objective: str,
+              tool_name: str = "write_note") -> str:
     return json.dumps({"objective": objective, "steps": [{
         "id": "s1",
         "description": "write the note",
-        "tool_name": "write_note",
+        "tool_name": tool_name,
         "tool_args": {"text": text},
         "expected_result": expected,
         "requires_verification": True,
@@ -93,7 +96,7 @@ def full_config(tmp_path, *, max_replans: int = 2) -> AgentConfig:
 
 
 def build(tmp_path, model: ScriptedModel, tool: Tool, *, max_replans=2,
-          level=PermissionLevel.AUTONOMOUS):
+          level=PermissionLevel.AUTONOMOUS, extra_tools=()):
     config = full_config(tmp_path, max_replans=max_replans)
     if level is not PermissionLevel.AUTONOMOUS:
         config = AgentConfig(
@@ -106,9 +109,10 @@ def build(tmp_path, model: ScriptedModel, tool: Tool, *, max_replans=2,
             features=FeatureFlags(planning=True, verification=True,
                                   recovery=True),
         ).validate()
+    tools = [tool, *extra_tools]
     agent = Agent(config, AgentDependencies(
-        tools=[tool], model=model,
-        **journal_for_tools([tool], expose_bounded_text_result=True)))
+        tools=tools, model=model,
+        **journal_for_tools(tools, expose_bounded_text_result=True)))
     agent.planner = LLMPlanner(model, agent.registry)
     return agent
 
@@ -130,10 +134,12 @@ def test_full_autonomous_loop_recovers_via_replan(tmp_path):
         # replanned approach writes what was actually expected
         plan_json("the launch date 2026-03-01 is recorded",
                   "the launch date 2026-03-01 is recorded",
-                  objective=OBJECTIVE),
+                  objective=OBJECTIVE,
+                  tool_name="write_note_alternative"),
     )
     tool = WriteTool()
-    agent = build(tmp_path, model, tool)
+    alternative = WriteTool("write_note_alternative", tool.calls)
+    agent = build(tmp_path, model, tool, extra_tools=[alternative])
 
     report = agent.execute(OBJECTIVE)
 
@@ -197,11 +203,18 @@ def test_full_loop_gives_up_within_budget(tmp_path):
     expected = "the launch date 2026-03-01 is recorded"
     model = ScriptedModel(
         plan_json("wrong content A", expected, objective=OBJECTIVE),
-        plan_json("wrong content B", expected, objective=OBJECTIVE),
-        plan_json("wrong content C", expected, objective=OBJECTIVE),
+        plan_json("wrong content B", expected, objective=OBJECTIVE,
+                  tool_name="write_note_b"),
+        plan_json("wrong content C", expected, objective=OBJECTIVE,
+                  tool_name="write_note_c"),
     )
     tool = WriteTool()
-    agent = build(tmp_path, model, tool, max_replans=2)
+    alternatives = [
+        WriteTool("write_note_b", tool.calls),
+        WriteTool("write_note_c", tool.calls),
+    ]
+    agent = build(tmp_path, model, tool, max_replans=2,
+                  extra_tools=alternatives)
 
     report = agent.execute(OBJECTIVE)
 
@@ -261,9 +274,12 @@ def test_full_loop_state_is_fully_recoverable(tmp_path):
                   objective=OBJECTIVE),
         plan_json("the launch date 2026-03-01 is recorded",
                   "the launch date 2026-03-01 is recorded",
-                  objective=OBJECTIVE),
+                  objective=OBJECTIVE,
+                  tool_name="write_note_alternative"),
     )
-    agent = build(tmp_path, model, WriteTool())
+    tool = WriteTool()
+    alternative = WriteTool("write_note_alternative", tool.calls)
+    agent = build(tmp_path, model, tool, extra_tools=[alternative])
     agent.execute(OBJECTIVE)
 
     restored = AgentState.from_dict(json.loads(

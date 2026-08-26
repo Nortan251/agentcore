@@ -1348,6 +1348,7 @@ def _exercise_real_replan_binding(
     payload=SECRET,
     echo_binding=True,
     mutation_allowed=True,
+    expect_adopted=True,
 ):
     tool = MutationTool()
     adapters = ActionAdapterRegistry()
@@ -1407,6 +1408,10 @@ def _exercise_real_replan_binding(
 
     outcome = agent._replan(ReplanLedger(), report)
     replacement = agent.state.current_task
+    if not expect_adopted:
+        assert outcome is ReplanOutcome.ABANDON
+        assert replacement is previous
+        return agent, tool, policy, model, replacement, None
     assert outcome is ReplanOutcome.ADOPTED
     assert replacement is not None
     assert replacement.subtasks[0].id != prior_subtask.id
@@ -1505,20 +1510,317 @@ def test_real_llmplanner_copied_binding_with_changed_intent_fails_closed(
         agent.shutdown()
 
 
-def test_real_llmplanner_unbound_different_action_gets_new_action_id(tmp_path):
+def test_real_llmplanner_omitted_binding_same_intent_fails_closed(tmp_path):
     store = InMemoryActionStore(clock=FixedClock(NOW))
     record = _seed(store, number=74, state=ActionState.SUCCEEDED)
     agent, tool, policy, _, _, report = _exercise_real_replan_binding(
         tmp_path,
         record,
         store,
-        payload="deliberately-new-safe-action",
         echo_binding=False,
+        expect_adopted=False,
     )
     try:
+        assert report is None
+        assert agent.state.tool_calls == []
+        assert tool.runs == 0
+        assert policy.calls == []
+        assert len(store.list_actions()) == 1
+        assert store.load(record.action_id) == record
+    finally:
+        agent.shutdown()
+
+
+def test_real_llmplanner_omitted_binding_changed_intent_fails_closed(tmp_path):
+    store = InMemoryActionStore(clock=FixedClock(NOW))
+    record = _seed(store, number=75, state=ActionState.SUCCEEDED)
+    agent, tool, policy, _, _, report = _exercise_real_replan_binding(
+        tmp_path,
+        record,
+        store,
+        payload="deliberately-changed-safe-action",
+        echo_binding=False,
+        expect_adopted=False,
+    )
+    try:
+        assert report is None
+        assert agent.state.tool_calls == []
+        assert tool.runs == 0
+        assert policy.calls == []
+        assert len(store.list_actions()) == 1
+        assert store.load(record.action_id) == record
+    finally:
+        agent.shutdown()
+
+
+class MultiBindingModel:
+    def __init__(self, mode) -> None:
+        self.mode = mode
+        self.offers = []
+
+    def complete(self, prompt, *, system=None, **options):
+        self.offers = re.findall(
+            r"token=(wfb_[0-9a-f]{12}); prior_subtask_id=(sub_[0-9a-f]{12})",
+            prompt,
+        )
+        assert len(self.offers) == 2
+        selected = self.offers[1][0]
+        first = {
+            "id": "replacement-one",
+            "description": "selected replacement",
+            "tool_name": "mutate",
+            "tool_args": {"payload": SECRET},
+        }
+        steps = [first]
+        if self.mode == "correct":
+            first["action_binding_token"] = selected
+        elif self.mode == "wrong":
+            offered = {token for token, _ in self.offers}
+            wrong = "wfb_000000000000"
+            if wrong in offered:
+                wrong = "wfb_111111111111"
+            first["action_binding_token"] = wrong
+        elif self.mode == "reused":
+            first["action_binding_token"] = selected
+            steps.append({
+                "id": "replacement-two",
+                "description": "invalid repeated selection",
+                "tool_name": "mutate",
+                "tool_args": {"payload": SECRET},
+                "action_binding_token": selected,
+            })
+        return json.dumps({"objective": "replacement", "steps": steps})
+
+
+def _exercise_multiple_replan_bindings(tmp_path, mode):
+    store = InMemoryActionStore(clock=FixedClock(NOW))
+    records = [
+        _seed(store, number=76, state=ActionState.SUCCEEDED),
+        _seed(store, number=77, state=ActionState.SUCCEEDED),
+    ]
+    tool = MutationTool()
+    adapters = ActionAdapterRegistry()
+    adapters.register(
+        tool,
+        IntentAwareMutationAdapter(tool),
+        reconciler=FakeReconciler(),
+    )
+    model = MultiBindingModel(mode)
+    config = AgentConfig(
+        environment="test",
+        workspace_dir=str(tmp_path),
+        permissions=PermissionConfig(level=PermissionLevel.AUTONOMOUS),
+        logging=LoggingConfig(level="CRITICAL"),
+        recovery=RecoveryConfig(max_replans=1, base_delay_seconds=0.0),
+        features=FeatureFlags(planning=True),
+    ).validate()
+    agent = Agent(
+        config,
+        AgentDependencies(
+            tools=[tool],
+            model=model,
+            verifier=NullVerifier(),
+            action_store=store,
+            action_adapters=adapters,
+        ),
+    )
+    policy = MatrixPolicy({Capability.FS_WRITE: True})
+    agent.policy = policy
+    agent.executor.policy = policy
+    agent.planner = LLMPlanner(model, agent.registry, max_replans=1)
+    prior_subtasks = [
+        Subtask(
+            description=f"prior trusted workflow step {index}",
+            tool_name="mutate",
+            tool_args={"payload": SECRET},
+        )
+        for index in range(2)
+    ]
+    previous = Task(objective="prior plan", subtasks=prior_subtasks)
+    agent.state.set_task(previous)
+    agent.state.transition_phase(AgentPhase.EXECUTING, note="test replan")
+    for subtask, record in zip(prior_subtasks, records, strict=True):
+        record_action_binding(
+            agent.state,
+            subtask.id,
+            action_id=record.action_id,
+            deduplication_scope=record.deduplication_scope,
+            deduplication_key=record.deduplication_key,
+        )
+    report = RunReport(
+        task_id=previous.id,
+        status=TaskStatus.FAILED,
+        replan_requested=True,
+    )
+    outcome = agent._replan(ReplanLedger(), report)
+    return agent, store, records, tool, policy, outcome
+
+
+@pytest.mark.parametrize("mode", ["omitted", "wrong", "reused"])
+def test_multiple_same_tool_predecessor_bindings_require_unique_token(
+    tmp_path,
+    mode,
+):
+    agent, store, records, tool, policy, outcome = (
+        _exercise_multiple_replan_bindings(tmp_path, mode)
+    )
+    try:
+        assert outcome is ReplanOutcome.ABANDON
+        assert tool.runs == 0
+        assert policy.calls == []
+        assert len(store.list_actions()) == 2
+        assert [store.load(record.action_id) for record in records] == records
+    finally:
+        agent.shutdown()
+
+
+def test_multiple_same_tool_bindings_valid_token_selects_only_that_action(
+    tmp_path,
+):
+    agent, store, records, tool, policy, outcome = (
+        _exercise_multiple_replan_bindings(tmp_path, "correct")
+    )
+    try:
+        assert outcome is ReplanOutcome.ADOPTED
+        task = agent.state.current_task
+        assert task is not None
+        report = agent.runner.run(task, agent.state)
+        assert report.status is TaskStatus.COMPLETED
+        assert agent.state.tool_calls[-1]["action_id"] == records[1].action_id
+        assert tool.runs == 0
+        assert policy.calls == []
+        assert len(store.list_actions()) == 2
+    finally:
+        agent.shutdown()
+
+
+class OtherMutationTool(MutationTool):
+    @property
+    def spec(self):
+        return tool_spec(
+            "mutate_other",
+            "Independent trusted local mutation.",
+            version=self._version,
+            parameters=(ToolParameter("payload", ParamType.STRING),),
+            capabilities=(Capability.FS_WRITE,),
+            read_only=False,
+        )
+
+
+class OtherMutationAdapter(IntentAwareMutationAdapter):
+    def __init__(self, tool):
+        super().__init__(tool)
+        self.spec = replace(
+            self.spec,
+            action_kind="test.other-local-mutation.v1",
+        )
+
+
+class LegacyReplanPlanner:
+    def __init__(self, tool_name) -> None:
+        self.tool_name = tool_name
+
+    def plan(self, objective, *, context=None):
+        raise AssertionError("initial planning is not used")
+
+    def replan(self, task, state):
+        return Task(
+            objective="legacy replacement",
+            subtasks=[Subtask(
+                description="legacy replacement step",
+                tool_name=self.tool_name,
+                tool_args={"payload": SECRET},
+            )],
+        )
+
+
+def _exercise_legacy_replan(tmp_path, replacement_tool):
+    store = InMemoryActionStore(clock=FixedClock(NOW))
+    record = _seed(store, number=78, state=ActionState.SUCCEEDED)
+    original = MutationTool()
+    other = OtherMutationTool()
+    adapters = ActionAdapterRegistry()
+    adapters.register(
+        original,
+        IntentAwareMutationAdapter(original),
+        reconciler=FakeReconciler(),
+    )
+    adapters.register(
+        other,
+        OtherMutationAdapter(other),
+        reconciler=FakeReconciler(),
+    )
+    config = AgentConfig(
+        environment="test",
+        workspace_dir=str(tmp_path),
+        permissions=PermissionConfig(level=PermissionLevel.AUTONOMOUS),
+        logging=LoggingConfig(level="CRITICAL"),
+        recovery=RecoveryConfig(max_replans=1, base_delay_seconds=0.0),
+    ).validate()
+    agent = Agent(
+        config,
+        AgentDependencies(
+            tools=[original, other],
+            verifier=NullVerifier(),
+            action_store=store,
+            action_adapters=adapters,
+        ),
+    )
+    policy = MatrixPolicy({Capability.FS_WRITE: True})
+    agent.policy = policy
+    agent.executor.policy = policy
+    agent.planner = LegacyReplanPlanner(replacement_tool)
+    prior = Subtask(
+        description="prior trusted workflow step",
+        tool_name="mutate",
+        tool_args={"payload": SECRET},
+    )
+    previous = Task(objective="prior plan", subtasks=[prior])
+    agent.state.set_task(previous)
+    agent.state.transition_phase(AgentPhase.EXECUTING, note="test replan")
+    record_action_binding(
+        agent.state,
+        prior.id,
+        action_id=record.action_id,
+        deduplication_scope=record.deduplication_scope,
+        deduplication_key=record.deduplication_key,
+    )
+    report = RunReport(
+        task_id=previous.id,
+        status=TaskStatus.FAILED,
+        replan_requested=True,
+    )
+    outcome = agent._replan(ReplanLedger(), report)
+    return agent, store, record, original, other, policy, outcome
+
+
+def test_legacy_planner_cannot_omit_same_tool_continuity(tmp_path):
+    agent, store, record, original, other, policy, outcome = (
+        _exercise_legacy_replan(tmp_path, "mutate")
+    )
+    try:
+        assert outcome is ReplanOutcome.ABANDON
+        assert original.runs == 0
+        assert other.runs == 0
+        assert policy.calls == []
+        assert store.list_actions() == [record.action_id]
+    finally:
+        agent.shutdown()
+
+
+def test_legacy_planner_unrelated_tool_keeps_new_action_compatibility(tmp_path):
+    agent, store, record, original, other, policy, outcome = (
+        _exercise_legacy_replan(tmp_path, "mutate_other")
+    )
+    try:
+        assert outcome is ReplanOutcome.ADOPTED
+        task = agent.state.current_task
+        assert task is not None
+        report = agent.runner.run(task, agent.state)
         assert report.status is TaskStatus.COMPLETED
         assert agent.state.tool_calls[-1]["action_id"] != record.action_id
-        assert tool.runs == 1
+        assert original.runs == 0
+        assert other.runs == 1
         assert policy.calls == [frozenset({Capability.FS_WRITE})]
         assert len(store.list_actions()) == 2
     finally:

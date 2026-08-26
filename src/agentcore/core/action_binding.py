@@ -205,14 +205,17 @@ def resolve_replan_binding_transfers(
     if not candidates:
         return {}, None
     plan_meta = task.metadata.get("plan")
-    if not isinstance(plan_meta, dict):
-        return {}, None
-    annotations = plan_meta.get("annotations")
+    annotations = (
+        plan_meta.get("annotations", {})
+        if isinstance(plan_meta, dict)
+        else {}
+    )
     if not isinstance(annotations, dict):
-        return {}, None
+        annotations = {}
 
     subtasks = {subtask.id: subtask for subtask in task.subtasks}
     used: set[str] = set()
+    selected_subtasks: set[str] = set()
     transfers: dict[str, WorkflowActionBinding] = {}
     for subtask_id, annotation in annotations.items():
         if not isinstance(annotation, dict):
@@ -231,7 +234,19 @@ def resolve_replan_binding_transfers(
         if subtask is None or subtask.tool_name != trusted.offer.tool_name:
             return {}, "replan action binding changed tool identity"
         used.add(token)
+        selected_subtasks.add(subtask_id)
         transfers[subtask_id] = trusted.binding
+
+    candidate_tools = {
+        trusted.offer.tool_name
+        for trusted in candidates.values()
+    }
+    for subtask in task.subtasks:
+        if (
+            subtask.tool_name in candidate_tools
+            and subtask.id not in selected_subtasks
+        ):
+            return {}, "replan action continuity is unresolved"
     return transfers, None
 
 
