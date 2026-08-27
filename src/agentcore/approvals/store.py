@@ -21,7 +21,6 @@ from agentcore.approvals.errors import (
 from agentcore.approvals.models import (
     ApprovalRequest,
     ApprovalState,
-    require_approval_action_id,
     require_approval_request_id,
     validate_approval_successor,
 )
@@ -47,16 +46,6 @@ class ApprovalStore(Protocol):
         request_id: str,
         expected_version: int,
         candidate: ApprovalRequest,
-    ) -> ApprovalRequest: ...
-
-    def consume(
-        self,
-        request_id: str,
-        expected_version: int,
-        *,
-        action_id: str,
-        binding_digest: str,
-        consumed_at,
     ) -> ApprovalRequest: ...
 
     def list_requests(self) -> list[str]: ...
@@ -144,34 +133,6 @@ class InMemoryApprovalStore:
                 raise _version_conflict(current, expected_version)
             validate_approval_successor(current, candidate)
             _unique_receipt(records, candidate)
-            self._records[request_id] = candidate.to_dict()
-            return _snapshot(candidate)
-
-    def consume(
-        self,
-        request_id: str,
-        expected_version: int,
-        *,
-        action_id: str,
-        binding_digest: str,
-        consumed_at,
-    ) -> ApprovalRequest:
-        self._require_owner()
-        request_id = require_approval_request_id(request_id)
-        _expected_version(expected_version)
-        action_id = require_approval_action_id(action_id)
-        with self._lock:
-            self._require_owner()
-            records = self._audit_unlocked()
-            current = _find(records, request_id)
-            if current.version != expected_version:
-                raise _version_conflict(current, expected_version)
-            candidate = current.consume(
-                action_id=action_id,
-                binding_digest=binding_digest,
-                at=consumed_at,
-            )
-            validate_approval_successor(current, candidate)
             self._records[request_id] = candidate.to_dict()
             return _snapshot(candidate)
 
@@ -356,34 +317,6 @@ class JsonFileApprovalStore:
                 raise _version_conflict(current, expected_version)
             validate_approval_successor(current, candidate)
             _unique_receipt(records, candidate)
-            self._write_unlocked(self._path(request_id), candidate)
-            return self._read_unlocked(self._path(request_id), request_id)
-
-    def consume(
-        self,
-        request_id: str,
-        expected_version: int,
-        *,
-        action_id: str,
-        binding_digest: str,
-        consumed_at,
-    ) -> ApprovalRequest:
-        self._require_owner()
-        request_id = require_approval_request_id(request_id)
-        _expected_version(expected_version)
-        action_id = require_approval_action_id(action_id)
-        with self._domain.mutex:
-            self._require_owner()
-            records = self._audit_unlocked()
-            current = _find(records, request_id)
-            if current.version != expected_version:
-                raise _version_conflict(current, expected_version)
-            candidate = current.consume(
-                action_id=action_id,
-                binding_digest=binding_digest,
-                at=consumed_at,
-            )
-            validate_approval_successor(current, candidate)
             self._write_unlocked(self._path(request_id), candidate)
             return self._read_unlocked(self._path(request_id), request_id)
 

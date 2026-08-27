@@ -37,6 +37,7 @@ from agentcore.approvals import (
     ApprovalAuthorizationStatus,
     ApprovalInvocationContext,
     ApprovalState,
+    ApprovalStore,
     ApprovalUnavailableError,
     ApprovalValidationError,
     ApprovalVersionConflictError,
@@ -507,35 +508,80 @@ def test_concurrent_consumption_has_exactly_one_winner():
     assert approvals.load(request.request_id).state is ApprovalState.CONSUMED
 
 
-def test_wrong_action_and_stale_cas_cannot_consume_or_rewrite():
+def test_approval_stores_expose_no_unsealed_consume_operation():
+    for store_type in (
+        ApprovalStore,
+        InMemoryApprovalStore,
+        JsonFileApprovalStore,
+    ):
+        assert "consume" not in store_type.__dict__
+
+
+def test_wrong_action_rejected_and_authority_consumes_exactly_once():
     executor, authority, approvals, _, _, _ = _build()
     pending = _invoke(executor)
     approved = authority.record_decision(
         pending.approval_request_id, HumanApprovalDecision.APPROVE)
-    with pytest.raises(ApprovalValidationError):
-        approvals.consume(
-            approved.request_id,
-            approved.version,
+    binding = approved.as_binding()
+
+    with pytest.raises(ApprovalUnavailableError):
+        authority.authorize(
+            binding,
+            description="wrong action must not consume approval",
             action_id="act_ffffffffffff",
-            binding_digest=approved.binding_digest,
-            consumed_at=NOW,
+            request_id=approved.request_id,
         )
-    consumed = approvals.consume(
-        approved.request_id,
-        approved.version,
-        action_id=approved.action_id,
-        binding_digest=approved.binding_digest,
-        consumed_at=NOW,
+    assert approvals.load(approved.request_id) == approved
+
+    first = authority.authorize(
+        binding,
+        description="consume the exact approval once",
+        request_id=approved.request_id,
     )
-    with pytest.raises(ApprovalVersionConflictError):
-        approvals.consume(
-            approved.request_id,
-            approved.version,
-            action_id=approved.action_id,
-            binding_digest=approved.binding_digest,
-            consumed_at=NOW,
-        )
+    second = authority.authorize(
+        binding,
+        description="the consumed approval cannot be reused",
+        request_id=approved.request_id,
+    )
+    consumed = approvals.load(approved.request_id)
+
+    assert first.status is ApprovalAuthorizationStatus.AUTHORIZED
+    assert first.receipt == approved.receipt
+    assert second.status is ApprovalAuthorizationStatus.CONSUMED
     assert consumed.state is ApprovalState.CONSUMED
+    assert consumed.version == 2
+    assert consumed.consumed_action_id == approved.action_id
+    assert consumed.state_mac != approved.state_mac
+
+
+def test_compare_and_swap_rejects_stale_authority_sealed_candidate():
+    approved_executor, approved_authority, _, _, _, _ = _build(
+        ids=DeterministicIds())
+    approved_pending = _invoke(approved_executor)
+    approved = approved_authority.record_decision(
+        approved_pending.approval_request_id,
+        HumanApprovalDecision.APPROVE,
+    )
+
+    denied_executor, denied_authority, _, _, _, _ = _build(
+        ids=DeterministicIds())
+    denied_pending = _invoke(denied_executor)
+    denied = denied_authority.record_decision(
+        denied_pending.approval_request_id,
+        HumanApprovalDecision.DENY,
+    )
+
+    base_executor, _, base_store, _, _, _ = _build(ids=DeterministicIds())
+    base_pending = _invoke(base_executor)
+    assert approved.request_id == denied.request_id == (
+        base_pending.approval_request_id)
+    assert approved.action_id == denied.action_id
+
+    assert base_store.compare_and_swap(
+        approved.request_id, 0, approved) == approved
+    with pytest.raises(ApprovalVersionConflictError):
+        base_store.compare_and_swap(denied.request_id, 0, denied)
+    assert base_store.load(approved.request_id) == approved
 
 
 def test_generic_model_arguments_cannot_select_approval_identity():
