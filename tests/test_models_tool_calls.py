@@ -15,6 +15,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
+from conftest import journal_for_tools
 
 from agentcore.config.schema import (
     AgentConfig,
@@ -495,7 +496,9 @@ def agent_for(tmp_path, stub, tools, *, level=PermissionLevel.AUTONOMOUS,
         memory=MemoryConfig(),
         conversation=ConversationConfig(tools_enabled=True),
         features=FeatureFlags(memory=True)).validate()
-    return Agent(config, AgentDependencies(tools=list(tools)))
+    tools = list(tools)
+    return Agent(config, AgentDependencies(
+        tools=tools, **journal_for_tools(tools)))
 
 
 @pytest.fixture(autouse=True)

@@ -8,6 +8,7 @@ import json
 from typing import Any
 
 import pytest
+from conftest import journal_for_tools
 
 from agentcore.config.schema import (
     AgentConfig,
@@ -16,7 +17,7 @@ from agentcore.config.schema import (
     ModelConfig,
     PermissionConfig,
 )
-from agentcore.core.agent import Agent, AgentDependencies
+from agentcore.core.agent import Agent, AgentDependencies as _AgentDependencies
 from agentcore.core.defaults import NoRetryStrategy
 from agentcore.permissions.levels import Capability, PermissionLevel
 from agentcore.recovery.config import RecoveryConfig
@@ -32,6 +33,16 @@ from agentcore.tasks.models import (
     VerificationStatus,
 )
 from agentcore.tools.base import Tool, ToolResult, tool_spec
+
+
+def AgentDependencies(*, tools=None, **kwargs):
+    """Build explicit journal semantics for this module's fake mutations."""
+    resolved = list(tools) if tools is not None else None
+    return _AgentDependencies(
+        tools=resolved,
+        **kwargs,
+        **journal_for_tools(resolved or []),
+    )
 
 
 # -- tools ------------------------------------------------------------------
@@ -241,20 +252,18 @@ def test_unverified_outcome_is_not_treated_as_success(tmp_path):
 
 
 # ===========================================================================
-# Scenario 3: unsafe retry -> ESCALATE
+# Scenario 3: journaled mutation remains first-attempt-only
 # ===========================================================================
 
-def test_scenario_3_unsafe_retry_escalates(tmp_path):
+def test_scenario_3_journaled_mutation_is_not_retried(tmp_path):
     tool = DestructiveTool()
     agent = Agent(cfg(tmp_path), AgentDependencies(tools=[tool]))
     report = agent.run_task(one_step_task("wipe"))
 
     assert report.escalated is True
-    assert actions(report) == ["escalate"]
+    assert actions(report) == ["replan"]
     assert tool.runs == 1  # irreversible action never repeated
-    assert agent.state.pending_actions, "a human hand-off should be recorded"
-    action = agent.state.pending_actions[0]
-    assert "irreversible" in action.reason
+    assert not agent.state.pending_actions
 
 
 def test_permission_denial_escalates_and_never_reruns(tmp_path):
@@ -477,8 +486,9 @@ def test_history_survives_state_round_trip(tmp_path):
     restored = AgentState.from_dict(agent.state.to_dict())
     history = RecoveryHistory.load(restored)
     subtask_id = restored.current_task.subtasks[0].id
-    assert history.escalations(subtask_id) == 1
-    assert restored.pending_actions  # escalation survives too
+    assert history.replans(subtask_id) == 1
+    assert history.escalations(subtask_id) == 0
+    assert not restored.pending_actions
 
 
 def test_report_serialises_decisions(tmp_path):

@@ -11,6 +11,7 @@ import json
 from typing import Any
 
 import pytest
+from conftest import journal_for_tools
 
 from agentcore.config.schema import (
     AgentConfig,
@@ -419,7 +420,8 @@ def agent_for(tmp_path, planner, tool, verifier, *, max_replans=2) -> Agent:
         features=FeatureFlags(recovery=True),
     ).validate()
     return Agent(config, AgentDependencies(tools=[tool], planner=planner,
-                                           verifier=verifier))
+                                           verifier=verifier,
+                                           **journal_for_tools([tool])))
 
 
 def test_end_to_end_rejection_is_fed_back_to_the_planner(tmp_path):
@@ -478,9 +480,11 @@ def test_rejection_context_survives_resume(tmp_path):
         recovery=RecoveryConfig(max_replans=2, base_delay_seconds=0.0),
         features=FeatureFlags(recovery=True),
     ).validate()
-    agent = Agent(config, AgentDependencies(tools=[ActTool()], planner=planner,
+    tool = ActTool()
+    agent = Agent(config, AgentDependencies(tools=[tool], planner=planner,
                                             verifier=FailUntilVerifier(1),
-                                            state_store=store))
+                                            state_store=store,
+                                            **journal_for_tools([tool])))
     agent.execute("goal")
     run_id = agent.state.run_id
     agent.shutdown()

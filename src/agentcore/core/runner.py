@@ -34,6 +34,7 @@ from agentcore.tasks.models import (
     VerificationStatus,
 )
 from agentcore.tools.executor import ToolExecutor
+from agentcore.action_journal import ActionInvocationContext
 from agentcore.util.clock import Clock, SystemClock
 
 #: Verification verdicts that mean "executed, but the goal was not shown to be
@@ -317,6 +318,15 @@ class TaskRunner:
             invocation = self.executor.invoke(
                 subtask.tool_name, subtask.tool_args,
                 checkpoint=checkpoint_cb,
+                action_context=ActionInvocationContext(
+                    run_id=state.run_id,
+                    task_id=task.id,
+                    subtask_id=subtask.id,
+                    deduplication_scope=f"run:{state.run_id}",
+                    deduplication_key=(
+                        f"task:{task.id}:subtask:{subtask.id}"
+                    ),
+                ),
                 run_id=state.run_id, task_id=task.id, subtask_id=subtask.id)
         except CancellationRequested as exc:
             # Cancellation before physical tool execution (pre-permission or post-permission)

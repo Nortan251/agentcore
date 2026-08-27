@@ -4,6 +4,16 @@ from typing import Any, Mapping
 
 import pytest
 
+from agentcore.action_journal import (
+    ActionAdapterRegistry,
+    ActionAdapterSpec,
+    ActionEffectClass,
+    ActionJournalEligibility,
+    EffectVerdict,
+    InMemoryActionStore,
+    NormalizedActionEffect,
+    PreparedActionIntent,
+)
 from agentcore.config.schema import PermissionConfig, ToolConfig
 from agentcore.errors import ToolError, ToolNotFoundError, ToolValidationError
 from agentcore.permissions.levels import Capability, PermissionLevel
@@ -33,6 +43,29 @@ class WritingTool(Tool):
 
     def run(self, args: Mapping[str, Any], context: ToolContext) -> ToolResult:
         return ToolResult.success("would have written")
+
+
+class WritingAdapter:
+    spec = ActionAdapterSpec(
+        tool_name="pretend_write",
+        tool_version="1.0.0",
+        action_kind="test.pretend_write.v1",
+        eligibility=ActionJournalEligibility.DURABLE_LOCAL_MUTATION,
+        effect_class=ActionEffectClass.LOCALLY_VERIFIABLE_OR_REVERSIBLE,
+    )
+
+    def prepare_intent(self, cleaned, context):
+        return PreparedActionIntent(
+            intent_digest="a" * 64,
+            target_category="test.target",
+        )
+
+    def normalize_effect(self, result):
+        return NormalizedActionEffect(
+            verdict=EffectVerdict.CONFIRMED_APPLIED,
+            result_class="test.applied",
+            summary="The test effect was confirmed.",
+        )
 
 
 class ExplodingTool(Tool):
@@ -166,11 +199,17 @@ def test_executor_catches_unhandled_exceptions(registry, tmp_path):
 
 
 def test_executor_enforces_permissions(registry, tmp_path):
-    registry.register(WritingTool())
+    tool = WritingTool()
+    registry.register(tool)
+    adapters = ActionAdapterRegistry()
+    adapters.register(tool, WritingAdapter())
+    store = InMemoryActionStore()
     observe = ToolExecutor(registry,
                            PermissionPolicy(PermissionConfig(
                                level=PermissionLevel.OBSERVE)),
-                           workspace_dir=str(tmp_path))
+                           workspace_dir=str(tmp_path),
+                           action_store=store,
+                           action_adapters=adapters)
     inv = observe.invoke("pretend_write")
     assert not inv.ok
     assert inv.result.metadata["kind"] == "permission_denied"
@@ -179,7 +218,9 @@ def test_executor_enforces_permissions(registry, tmp_path):
     autonomous = ToolExecutor(registry,
                               PermissionPolicy(PermissionConfig(
                                   level=PermissionLevel.AUTONOMOUS)),
-                              workspace_dir=str(tmp_path))
+                              workspace_dir=str(tmp_path),
+                              action_store=store,
+                              action_adapters=adapters)
     assert autonomous.invoke("pretend_write").ok
 
 

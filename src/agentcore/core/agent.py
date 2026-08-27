@@ -56,6 +56,11 @@ from agentcore.tools.builtin import default_tools
 from agentcore.tools.executor import ToolExecutor, ToolInvocation
 from agentcore.tools.registry import ToolRegistry
 from agentcore.util.clock import Clock
+from agentcore.action_journal import (
+    ActionAdapterRegistry,
+    ActionInvocationContext,
+    ActionStore,
+)
 
 
 def _accepts_control_kwarg(func):
@@ -100,6 +105,10 @@ class AgentDependencies:
     #: injected durable store is host-owned; its ownership failures surface
     #: categorically rather than degrading to in-memory state.
     turn_coordinator: Any | None = None
+    #: Stage 5 action-effect truth. Both collaborators are host-injected;
+    #: Agent never creates a mutation journal or semantic adapter implicitly.
+    action_store: ActionStore | None = None
+    action_adapters: ActionAdapterRegistry | None = None
 
 
 class Agent:
@@ -133,6 +142,8 @@ class Agent:
             self.registry, self.policy,
             workspace=self.workspace,
             tool_settings=self.config.tools.settings,
+            action_store=deps.action_store,
+            action_adapters=deps.action_adapters,
         )
 
         # Planner is resolved after the model, since the LLM planner needs it.
@@ -599,7 +610,12 @@ class Agent:
     def call_tool(self, name: str, args: dict[str, Any] | None = None
                   ) -> ToolInvocation:
         """Invoke a single tool outside of a task, recording it in state."""
-        invocation = self.executor.invoke(name, args, run_id=self.state.run_id)
+        invocation = self.executor.invoke(
+            name,
+            args,
+            action_context=ActionInvocationContext(run_id=self.state.run_id),
+            run_id=self.state.run_id,
+        )
         self.state.record_tool_call(invocation)
         return invocation
 

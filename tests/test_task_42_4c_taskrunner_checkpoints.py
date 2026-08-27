@@ -14,6 +14,16 @@ from typing import Any
 
 import pytest
 
+from agentcore.action_journal import (
+    ActionAdapterRegistry,
+    ActionAdapterSpec,
+    ActionEffectClass,
+    ActionJournalEligibility,
+    EffectVerdict,
+    InMemoryActionStore,
+    NormalizedActionEffect,
+    PreparedActionIntent,
+)
 from agentcore.config.schema import AgentConfig, LoggingConfig, ModelConfig, PermissionConfig, ToolConfig
 from agentcore.core.agent import Agent, AgentDependencies
 from agentcore.core.runner import RunControl, RunReport, TaskRunner
@@ -105,6 +115,29 @@ class WriteTool(Tool):
     def run(self, args, context):
         self.runs += 1
         return ToolResult.success("wrote")
+
+
+class WriteActionAdapter:
+    spec = ActionAdapterSpec(
+        tool_name="write",
+        tool_version="1.0.0",
+        action_kind="test.write.v1",
+        eligibility=ActionJournalEligibility.DURABLE_LOCAL_MUTATION,
+        effect_class=ActionEffectClass.LOCALLY_VERIFIABLE_OR_REVERSIBLE,
+    )
+
+    def prepare_intent(self, cleaned, context):
+        return PreparedActionIntent(
+            intent_digest="a" * 64,
+            target_category="test.target",
+        )
+
+    def normalize_effect(self, result):
+        return NormalizedActionEffect(
+            verdict=EffectVerdict.CONFIRMED_APPLIED,
+            result_class="test.applied",
+            summary="The test effect was confirmed.",
+        )
 
 
 class GatedVerifier:
@@ -202,6 +235,10 @@ def make_task_with_tools(tool_names: list[str]) -> Task:
 
 def make_agent(tmp_path, tools, *, verifier=None, recovery=None, planner=None, approval_gate=None, level=PermissionLevel.AUTONOMOUS, state_store=None):
     config = _config(tmp_path, level=level)
+    adapters = ActionAdapterRegistry()
+    mutations = [tool for tool in tools if not tool.spec.read_only]
+    for tool in mutations:
+        adapters.register(tool, WriteActionAdapter())
     deps = AgentDependencies(
         tools=tools,
         verifier=verifier,
@@ -209,6 +246,8 @@ def make_agent(tmp_path, tools, *, verifier=None, recovery=None, planner=None, a
         planner=planner,
         approval_gate=approval_gate,
         state_store=state_store,
+        action_store=(InMemoryActionStore() if mutations else None),
+        action_adapters=adapters,
     )
     agent = Agent(config, deps)
     return agent
@@ -893,7 +932,15 @@ def test_toolexecutor_checkpoint_cannot_grant_denied(tmp_path):
     registry.register(write_tool)
     policy = PermissionPolicy(config.permissions)
     workspace = WorkspaceGuard(config.canonical_workspace(), config=config.filesystem)
-    executor = ToolExecutor(registry, policy, workspace=workspace)
+    adapters = ActionAdapterRegistry()
+    adapters.register(write_tool, WriteActionAdapter())
+    executor = ToolExecutor(
+        registry,
+        policy,
+        workspace=workspace,
+        action_store=InMemoryActionStore(),
+        action_adapters=adapters,
+    )
 
     def checkpoint_ok():
         return None

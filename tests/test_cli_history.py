@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from conftest import journal_for_tools
 
 from agentcore.cli import main, render_history
 from agentcore.config.schema import (
@@ -129,7 +130,9 @@ def make_run(tmp_path, *, planner=None, tool=None, verifier=None,
                       tools=[tool],
                       planner=planner or SeqPlanner("A"),
                       verifier=verifier or Verifier(VerificationStatus.PASSED),
-                      state_store=store))
+                      state_store=store,
+                      **journal_for_tools(
+                          [tool], expose_bounded_text_result=True)))
     agent.execute(objective)
     agent.shutdown()
     return agent.state.run_id, tool

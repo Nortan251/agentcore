@@ -11,6 +11,7 @@ import json
 from typing import Any
 
 import pytest
+from conftest import journal_for_tools
 
 from agentcore.config.schema import (
     AgentConfig,
@@ -144,7 +145,8 @@ def build(tmp_path, planner, tool, *, verifier=None, max_replans=2,
           level=PermissionLevel.AUTONOMOUS):
     return Agent(cfg(tmp_path, max_replans=max_replans, level=level),
                  AgentDependencies(tools=[tool], planner=planner,
-                                   verifier=verifier or AlwaysFailVerifier()))
+                                   verifier=verifier or AlwaysFailVerifier(),
+                                   **journal_for_tools([tool])))
 
 
 # ===========================================================================
@@ -211,22 +213,26 @@ def test_different_plan_is_accepted(tmp_path):
 
 
 # ===========================================================================
-# Transient failures remain repeatable
+# Journaled mutations remain first-attempt-only
 # ===========================================================================
 
-def test_duplicate_allowed_after_transient_failure(tmp_path):
-    """A timeout does not condemn the approach: the same plan may run again."""
+def test_duplicate_mutation_waits_for_action_recovery_after_failure(tmp_path):
+    """The first-attempt slice never re-runs a terminal journal action."""
     planner = ScriptedPlanner("A", "A")
     tool = FlakyTool()
     agent = build(tmp_path, planner, tool, max_replans=1)
 
     agent.execute("goal")
 
-    # executed twice: the duplicate was permitted because the prior failure
-    # was transient
-    assert tool.runs == 2
-    assert [c["variant"] for c in tool.calls] == ["A", "A"]
-    assert ReplanLedger.load(agent.state).records[-1].outcome == "accepted"
+    # ToolResult.retryable is not effect truth and cannot authorize a second
+    # physical mutation. The identical proposal is rejected after the
+    # journal's trusted normalizer publishes confirmed-not-applied failure;
+    # same-action recovery belongs to the later recovery slice.
+    assert tool.runs == 1
+    assert [c["variant"] for c in tool.calls] == ["A"]
+    assert ReplanLedger.load(agent.state).records[-1].outcome == (
+        "rejected_duplicate"
+    )
 
 
 # ===========================================================================
@@ -296,10 +302,12 @@ def test_duplicate_rejected_after_resume(tmp_path):
 
     store = JsonFileStateStore(tmp_path / "runs")
     planner = ScriptedPlanner("A", "B")
+    tool = RecordingTool()
     agent = Agent(cfg(tmp_path, max_replans=1),
-                  AgentDependencies(tools=[RecordingTool()], planner=planner,
+                  AgentDependencies(tools=[tool], planner=planner,
                                     verifier=AlwaysFailVerifier(),
-                                    state_store=store))
+                                    state_store=store,
+                                    **journal_for_tools([tool])))
     agent.execute("goal")
     run_id = agent.state.run_id
     agent.shutdown()

@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 import pytest
+from conftest import journal_for_tools
 
 from agentcore.config.schema import (
     AgentConfig,
@@ -110,9 +111,14 @@ def test_call_tool_records_state(agent):
     assert agent.state.history[-1].kind == "tool_call"
 
 
-def test_runtime_tool_registration_is_the_extension_point(agent):
+def test_runtime_tool_registration_is_the_extension_point(autonomous_config):
     """A new capability plugs in without touching the agent class."""
-    assert agent.register_tool(MutatingTool())
+    tool = MutatingTool()
+    agent = Agent(
+        autonomous_config,
+        AgentDependencies(tools=[], **journal_for_tools([tool])),
+    )
+    assert agent.register_tool(tool)
     inv = agent.call_tool("mutate")
     assert inv.ok
     assert "mutate" in agent.registry.names()
@@ -176,7 +182,10 @@ def test_permission_denial_surfaces_as_task_failure(tmp_path):
     cfg = AgentConfig(workspace_dir=str(tmp_path),
                       permissions=PermissionConfig(level=PermissionLevel.OBSERVE),
                       logging=LoggingConfig(level="CRITICAL"))
-    a = Agent(cfg, AgentDependencies(tools=[*default_tools(), MutatingTool()]))
+    tool = MutatingTool()
+    tools = [*default_tools(), tool]
+    a = Agent(cfg, AgentDependencies(
+        tools=tools, **journal_for_tools([tool])))
     task = Task(objective="write")
     task.add_subtask(Subtask(description="w", tool_name="mutate"))
     report = a.run_task(task)

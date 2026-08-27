@@ -13,9 +13,10 @@ import os
 import re
 import tempfile
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Protocol, runtime_checkable
+from typing import BinaryIO, ContextManager, Iterator, Protocol, runtime_checkable
 
 from agentcore.action_journal.errors import (
     ActionAlreadyExistsError,
@@ -74,6 +75,8 @@ class ActionStore(Protocol):
 
     def list_actions(self) -> list[str]: ...
 
+    def execution_guard(self, action_id: str) -> ContextManager[None]: ...
+
     def close(self) -> None: ...
 
     def __enter__(self) -> ActionStore: ...
@@ -87,6 +90,8 @@ class InMemoryActionStore:
     def __init__(self, *, clock: Clock | None = None) -> None:
         self._data: dict[str, dict] = {}
         self._lock = threading.RLock()
+        self._action_guards_lock = threading.Lock()
+        self._action_guards: dict[str, _ActionGuard] = {}
         self._clock = clock or SystemClock()
         self._owner_pid = os.getpid()
         self._closed = False
@@ -215,6 +220,29 @@ class InMemoryActionStore:
             records, _ = self._audit_unlocked()
             return [record.action_id for record in records]
 
+    @contextmanager
+    def execution_guard(self, action_id: str) -> Iterator[None]:
+        """Serialize one logical action without holding the store mutex."""
+        self._require_owner_process()
+        action_id = require_action_id(action_id)
+        with self._lock:
+            self._require_open()
+        guard = _retain_action_guard(
+            self._action_guards_lock, self._action_guards, action_id)
+        try:
+            guard.lock.acquire()
+            try:
+                self._require_owner_process()
+                with self._lock:
+                    self._require_open()
+                yield
+            finally:
+                guard.lock.release()
+        finally:
+            _release_action_guard(
+                self._action_guards_lock, self._action_guards,
+                action_id, guard)
+
     def close(self) -> None:
         # A child must not touch a mutex inherited from a running parent.
         if self._owner_pid != os.getpid():
@@ -234,10 +262,48 @@ class InMemoryActionStore:
 
 
 @dataclass
+class _ActionGuard:
+    lock: threading.Lock
+    references: int = 1
+
+
+def _retain_action_guard(
+    registry_lock: threading.Lock,
+    registry: dict[str, _ActionGuard],
+    action_id: str,
+) -> _ActionGuard:
+    with registry_lock:
+        guard = registry.get(action_id)
+        if guard is None:
+            guard = _ActionGuard(lock=threading.Lock())
+            registry[action_id] = guard
+        else:
+            guard.references += 1
+        return guard
+
+
+def _release_action_guard(
+    registry_lock: threading.Lock,
+    registry: dict[str, _ActionGuard],
+    action_id: str,
+    guard: _ActionGuard,
+) -> None:
+    with registry_lock:
+        current = registry.get(action_id)
+        if current is not guard:
+            return
+        guard.references -= 1
+        if guard.references == 0:
+            registry.pop(action_id, None)
+
+
+@dataclass
 class _StoreDomain:
     key: str
     handle: BinaryIO
     mutex: threading.RLock
+    action_guards_lock: threading.Lock
+    action_guards: dict[str, _ActionGuard]
     owner_pid: int
     references: int = 1
 
@@ -300,6 +366,8 @@ def _acquire_domain(directory: Path) -> _StoreDomain:
             key=key,
             handle=handle,
             mutex=threading.RLock(),
+            action_guards_lock=threading.Lock(),
+            action_guards={},
             owner_pid=owner_pid,
         )
         _DOMAINS[key] = domain
@@ -494,6 +562,35 @@ class JsonFileActionStore:
             self._require_open()
             records, _ = self._audit_unlocked()
             return [record.action_id for record in records]
+
+    @contextmanager
+    def execution_guard(self, action_id: str) -> Iterator[None]:
+        """Serialize one action across stores sharing this JSON domain."""
+        self._require_owner_process()
+        action_id = require_action_id(action_id)
+        with self._domain.mutex:
+            self._require_open()
+        guard = _retain_action_guard(
+            self._domain.action_guards_lock,
+            self._domain.action_guards,
+            action_id,
+        )
+        try:
+            guard.lock.acquire()
+            try:
+                self._require_owner_process()
+                with self._domain.mutex:
+                    self._require_open()
+                yield
+            finally:
+                guard.lock.release()
+        finally:
+            _release_action_guard(
+                self._domain.action_guards_lock,
+                self._domain.action_guards,
+                action_id,
+                guard,
+            )
 
     def _read_unlocked(self, path: Path, action_id: str) -> ActionRecord:
         if not path.exists():

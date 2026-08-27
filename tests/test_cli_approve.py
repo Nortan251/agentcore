@@ -12,6 +12,7 @@ import json
 import time
 
 import pytest
+from conftest import journal_for_tools
 
 from agentcore.cli import main
 from agentcore.config.schema import (
@@ -117,7 +118,7 @@ def seed(tmp_path, objective, *, planner, tool=None, verifier=None,
     tool = tool if tool is not None else WriteTool()
     agent = Agent(config_for(tmp_path, level=level), AgentDependencies(
         tools=[tool], planner=planner, verifier=verifier or PassVerifier(),
-        state_store=store))
+        state_store=store, **journal_for_tools([tool])))
     agent.execute(objective)
     agent.shutdown()
     time.sleep(0.004)
@@ -431,7 +432,8 @@ def test_resume_after_approval_still_enforces_permissions(tmp_path, capsys):
     agent = Agent(config_for(tmp_path, level=PermissionLevel.OBSERVE),
                   AgentDependencies(tools=[tool], planner=WritePlanner(),
                                     verifier=PassVerifier(),
-                                    state_store=store))
+                                    state_store=store,
+                                    **journal_for_tools([tool])))
     agent.resume(run_id)
     agent.run_task()
 
@@ -448,7 +450,8 @@ def test_resume_after_approval_proceeds_when_policy_allows(tmp_path, capsys):
     agent = Agent(config_for(tmp_path, level=PermissionLevel.AUTONOMOUS),
                   AgentDependencies(tools=[tool], planner=WritePlanner(),
                                     verifier=PassVerifier(),
-                                    state_store=store))
+                                    state_store=store,
+                                    **journal_for_tools([tool])))
     agent.resume(run_id)
     report = agent.run_task()
 
@@ -666,7 +669,8 @@ def test_end_to_end_escalation_approve_resume(tmp_path, capsys):
     agent = Agent(config_for(tmp_path, level=PermissionLevel.AUTONOMOUS),
                   AgentDependencies(tools=[tool], planner=WritePlanner(),
                                     verifier=PassVerifier(),
-                                    state_store=store))
+                                    state_store=store,
+                                    **journal_for_tools([tool])))
     agent.resume(run_id)
     report = agent.run_task()
     agent.shutdown()
