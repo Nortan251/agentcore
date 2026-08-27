@@ -44,7 +44,9 @@ from agentcore.action_journal.models import (
     ActionProvenance,
     EffectVerdict,
     ReconciliationDisposition,
+    require_action_id,
 )
+from agentcore.action_journal.reconciliation import ActionReconciler
 from agentcore.permissions.levels import (
     READ_ONLY_CAPABILITIES,
     Capability,
@@ -212,6 +214,7 @@ class NormalizedActionEffect:
 class ActionInvocationContext:
     """Trusted provenance/dedup supplied outside generic observability metadata."""
 
+    action_id: str | None = None
     turn_id: str | None = None
     operation_id: str | None = None
     run_id: str | None = None
@@ -225,6 +228,8 @@ class ActionInvocationContext:
         # ActionProvenance owns exact identity validation.  The placeholder is
         # fixed and never leaves this validation call.
         self.to_provenance("inv_000000000000")
+        if self.action_id is not None:
+            require_action_id(self.action_id)
         if (self.deduplication_scope is None) != (
                 self.deduplication_key is None):
             raise ActionValidationError(
@@ -278,6 +283,7 @@ class _RegisteredAdapter:
     tool_version: str
     read_only: bool
     capabilities: tuple[str, ...]
+    reconciler: ActionReconciler | None
 
     def prepare_intent(
         self,
@@ -306,7 +312,13 @@ class ActionAdapterRegistry:
                 reason="ownership_mismatch",
             )
 
-    def register(self, tool: Any, adapter: ToolActionAdapter) -> None:
+    def register(
+        self,
+        tool: Any,
+        adapter: ToolActionAdapter,
+        *,
+        reconciler: ActionReconciler | None = None,
+    ) -> None:
         self._require_owner_process()
         tool_spec = getattr(tool, "spec", None)
         adapter_spec = getattr(adapter, "spec", None)
@@ -352,6 +364,14 @@ class ActionAdapterRegistry:
                     not callable(getattr(adapter, "normalize_effect", None)):
                 raise ActionAdapterRegistrationError(
                     "journal-required adapter lacks preflight/normalization")
+        if reconciler is not None and not callable(
+                getattr(reconciler, "probe", None)):
+            raise ActionAdapterRegistrationError(
+                "action reconciler lacks a read-only probe")
+        if reconciler is not None and not (
+                adapter_spec.reconciliation_capabilities):
+            raise ActionAdapterRegistrationError(
+                "action reconciler lacks registered probe capabilities")
         key = (adapter_spec.tool_name, adapter_spec.tool_version)
         binding = _RegisteredAdapter(
             adapter=adapter,
@@ -362,6 +382,7 @@ class ActionAdapterRegistry:
             read_only=read_only,
             capabilities=tuple(sorted(str(capability)
                                       for capability in capabilities)),
+            reconciler=reconciler,
         )
         with self._lock:
             if key in self._by_tool:
@@ -410,6 +431,17 @@ class ActionAdapterRegistry:
         # ``spec`` property. A mutable/dynamic adapter cannot change its
         # eligibility or effect class after trusted registration.
         return binding
+
+    def resolve_reconciler(
+        self,
+        tool: Any,
+        *,
+        tool_spec: Any | None = None,
+    ) -> ActionReconciler | None:
+        binding = self.resolve(tool, tool_spec=tool_spec)
+        if binding is None:
+            return None
+        return binding.reconciler
 
     def __len__(self) -> int:
         self._require_owner_process()

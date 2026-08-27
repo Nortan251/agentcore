@@ -37,14 +37,16 @@ SECRET = "sk-cli-must-not-leak"
 class ActTool(Tool):
     """Mutating tool taking a credential-shaped argument."""
 
-    def __init__(self, *, fail_times: int = 0) -> None:
-        self.calls: list[dict] = []
+    def __init__(self, *, fail_times: int = 0, name: str = "act",
+                 calls: list[dict] | None = None) -> None:
+        self._name = name
+        self.calls = calls if calls is not None else []
         self.fail_times = fail_times
 
     @property
     def spec(self):
         return tool_spec(
-            "act", "Perform an action.",
+            self._name, "Perform an action.",
             parameters=[ToolParameter("variant", ParamType.STRING,
                                       required=False, default=""),
                         ToolParameter("api_key", ParamType.STRING,
@@ -93,12 +95,13 @@ class SeqPlanner:
 
     def plan(self, objective, *, context=None, replanning=False):
         variant = self.variants.pop(0) if self.variants else "Z"
+        tool_name = "act" if variant == "A" else f"act_{variant.lower()}"
         args = {"variant": variant}
         if self.secret:
             args["api_key"] = SECRET
         task = Task(objective=objective)
         task.add_subtask(Subtask(description=f"perform variant {variant}",
-                                 tool_name="act", tool_args=args))
+                                 tool_name=tool_name, tool_args=args))
         return task
 
     def replan(self, task, state):
@@ -125,14 +128,20 @@ def make_run(tmp_path, *, planner=None, tool=None, verifier=None,
     """Execute a run against a JSON store and return (run_id, tool)."""
     store = JsonFileStateStore(tmp_path / "runs")
     tool = tool if tool is not None else ActTool()
+    tools = [tool]
+    if isinstance(tool, ActTool) and not isinstance(tool, SafeTool):
+        tools.extend(
+            ActTool(name=f"act_{suffix}", calls=tool.calls)
+            for suffix in ("b", "c", "z")
+        )
     agent = Agent(config_for(tmp_path, max_replans=max_replans, level=level),
                   AgentDependencies(
-                      tools=[tool],
+                      tools=tools,
                       planner=planner or SeqPlanner("A"),
                       verifier=verifier or Verifier(VerificationStatus.PASSED),
                       state_store=store,
                       **journal_for_tools(
-                          [tool], expose_bounded_text_result=True)))
+                          tools, expose_bounded_text_result=True)))
     agent.execute(objective)
     agent.shutdown()
     return agent.state.run_id, tool
@@ -271,7 +280,8 @@ def test_rejected_proposal_is_not_a_tool_call(tmp_path, capsys):
                           VerificationStatus.PASSED))
     out = run_history(tmp_path, run_id, capsys)
     # exactly two executions were recorded, not three
-    assert out.count("tool 'act' -> ok") == 2
+    assert out.count("tool 'act' -> ok") == 1
+    assert out.count("tool 'act_b' -> ok") == 1
 
 
 def test_rejected_proposal_shows_safe_strategy(tmp_path, capsys):

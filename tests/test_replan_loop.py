@@ -127,10 +127,26 @@ class CountingPlanner:
         self.contexts.append(dict(context or {}))
         return self._build(objective)
 
-    def replan(self, task: Task, state: AgentState) -> Task:
+    def replan(
+        self,
+        task: Task,
+        state: AgentState,
+        *,
+        action_bindings=(),
+    ) -> Task:
         self.replans += 1
         self.replan_states.append(state)
-        return self._build(task.objective)
+        replacement = self._build(task.objective)
+        for offer in action_bindings:
+            subtask = replacement.subtasks[0]
+            if offer.tool_name == subtask.tool_name:
+                replacement.metadata["plan"] = {
+                    "annotations": {
+                        subtask.id: {"action_binding_token": offer.token},
+                    },
+                }
+                break
+        return replacement
 
 
 class RaisingPlanner(CountingPlanner):
@@ -230,7 +246,7 @@ def test_replan_called_exactly_once_and_new_plan_executed(tmp_path):
     report = agent.execute("do the thing")
 
     assert planner.replans == 1
-    assert tool.runs == 2          # original plan + replanned plan
+    assert tool.runs == 1          # durable action is observed, not rerun
     assert report.status is not TaskStatus.COMPLETED
     ledger = ReplanLedger.load(agent.state)
     assert ledger.count == 1
@@ -260,7 +276,7 @@ def test_successful_replan_completes_the_objective(tmp_path):
     report = agent.execute("do the thing")
 
     assert planner.replans == 1
-    assert tool.runs == 2
+    assert tool.runs == 1
     assert report.status is TaskStatus.COMPLETED
     assert agent.state.phase is AgentPhase.DONE
     subtask = agent.state.current_task.subtasks[0]
@@ -276,7 +292,7 @@ def test_multiple_replans_until_success(tmp_path):
     report = agent.execute("do the thing")
 
     assert planner.replans == 2
-    assert tool.runs == 3
+    assert tool.runs == 1
     assert report.status is TaskStatus.COMPLETED
     ledger = ReplanLedger.load(agent.state)
     assert ledger.count == 2
@@ -296,7 +312,7 @@ def test_planner_called_exactly_budget_times(tmp_path, budget):
     agent.execute("do the thing")
 
     assert planner.replans == budget
-    assert tool.runs == budget + 1          # initial attempt + one per replan
+    assert tool.runs == 1                   # replans observe durable truth
     assert ReplanLedger.load(agent.state).count == budget
 
 
@@ -505,7 +521,7 @@ def test_one_replan_per_recovery_event(tmp_path):
     agent.execute("do the thing")
     # 3 replans for 4 execution cycles: never two calls for one failure
     assert planner.replans == 3
-    assert tool.runs == 4
+    assert tool.runs == 1
 
 
 # ===========================================================================

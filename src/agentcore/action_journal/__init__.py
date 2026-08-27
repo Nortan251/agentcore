@@ -86,6 +86,15 @@ from agentcore.action_journal.store import (
     InMemoryActionStore,
     JsonFileActionStore,
 )
+from agentcore.action_journal.reconciliation import (
+    ActionReconciler,
+    ActionReconciliationContext,
+    ActionReconciliationReport,
+    ActionReconciliationResult,
+    ActionReconciliationStatus,
+    ActionRecoveryClaim,
+    ReconciliationAttemptEvidence,
+)
 
 __all__ = [
     "ACTION_JOURNAL_SCHEMA_VERSION",
@@ -137,6 +146,12 @@ __all__ = [
     "ActionOutcome",
     "ActionProvenance",
     "ActionRecord",
+    "ActionReconciler",
+    "ActionReconciliationContext",
+    "ActionReconciliationReport",
+    "ActionReconciliationResult",
+    "ActionReconciliationStatus",
+    "ActionRecoveryClaim",
     "ActionState",
     "ActionStore",
     "ActionStoreError",
@@ -156,6 +171,7 @@ __all__ = [
     "PreparedActionIntent",
     "ReconciliationDisposition",
     "ReconciliationMetadata",
+    "ReconciliationAttemptEvidence",
     "TERMINAL_ACTION_STATES",
     "ToolActionAdapter",
     "authority_binding_digest",

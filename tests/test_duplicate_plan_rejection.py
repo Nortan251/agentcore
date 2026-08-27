@@ -41,9 +41,10 @@ from agentcore.tools.base import ParamType, Tool, ToolParameter, ToolResult, too
 class RecordingTool(Tool):
     """Mutating tool (so recovery prefers REPLAN over retry)."""
 
-    def __init__(self, name: str = "act") -> None:
+    def __init__(self, name: str = "act",
+                 calls: list[dict[str, Any]] | None = None) -> None:
         self._name = name
-        self.calls: list[dict[str, Any]] = []
+        self.calls = calls if calls is not None else []
 
     @property
     def spec(self):
@@ -108,11 +109,16 @@ class ScriptedPlanner:
     def _build(self, objective: str, variant: str | None) -> Task:
         task = Task(objective=objective)
         args = {"variant": variant} if variant is not None else {}
+        tool_name = (
+            self.tool
+            if variant in {None, "A"}
+            else f"{self.tool}_{variant.lower()}"
+        )
         # Description deliberately varies so only the executable signature
         # can identify a duplicate.
         task.add_subtask(Subtask(
             description=f"attempt {self.calls} using {self.tool}",
-            tool_name=self.tool, tool_args=args))
+            tool_name=tool_name, tool_args=args))
         return task
 
     def plan(self, objective: str, *, context=None, replanning: bool = False):
@@ -143,10 +149,16 @@ def cfg(tmp_path, *, max_replans=2,
 
 def build(tmp_path, planner, tool, *, verifier=None, max_replans=2,
           level=PermissionLevel.AUTONOMOUS):
+    tools = [tool]
+    if isinstance(tool, RecordingTool):
+        tools.extend(
+            RecordingTool(f"{tool.spec.name}_{suffix}", tool.calls)
+            for suffix in ("b", "c", "exhausted")
+        )
     return Agent(cfg(tmp_path, max_replans=max_replans, level=level),
-                 AgentDependencies(tools=[tool], planner=planner,
+                 AgentDependencies(tools=tools, planner=planner,
                                    verifier=verifier or AlwaysFailVerifier(),
-                                   **journal_for_tools([tool])))
+                                   **journal_for_tools(tools)))
 
 
 # ===========================================================================
@@ -213,11 +225,11 @@ def test_different_plan_is_accepted(tmp_path):
 
 
 # ===========================================================================
-# Journaled mutations remain first-attempt-only
+# Terminal journal truth fences generic replanning
 # ===========================================================================
 
 def test_duplicate_mutation_waits_for_action_recovery_after_failure(tmp_path):
-    """The first-attempt slice never re-runs a terminal journal action."""
+    """A terminal journal failure never becomes an unlinked replan action."""
     planner = ScriptedPlanner("A", "A")
     tool = FlakyTool()
     agent = build(tmp_path, planner, tool, max_replans=1)
@@ -225,14 +237,12 @@ def test_duplicate_mutation_waits_for_action_recovery_after_failure(tmp_path):
     agent.execute("goal")
 
     # ToolResult.retryable is not effect truth and cannot authorize a second
-    # physical mutation. The identical proposal is rejected after the
-    # journal's trusted normalizer publishes confirmed-not-applied failure;
-    # same-action recovery belongs to the later recovery slice.
+    # physical mutation. Terminal FAILED truth stops generic recovery before
+    # the planner could mint an unlinked replacement action.
     assert tool.runs == 1
     assert [c["variant"] for c in tool.calls] == ["A"]
-    assert ReplanLedger.load(agent.state).records[-1].outcome == (
-        "rejected_duplicate"
-    )
+    assert planner.replans == 0
+    assert ReplanLedger.load(agent.state).records == []
 
 
 # ===========================================================================

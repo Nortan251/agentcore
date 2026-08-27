@@ -39,10 +39,13 @@ SECRET = "sk-live-must-not-leak"
 # -- fixtures ---------------------------------------------------------------
 
 class ActTool(Tool):
+    def __init__(self, name: str = "act") -> None:
+        self._name = name
+
     @property
     def spec(self):
         return tool_spec(
-            "act", "Perform an action.",
+            self._name, "Perform an action.",
             parameters=[ToolParameter("variant", ParamType.STRING,
                                       required=False, default="")],
             capabilities=[Capability.FS_WRITE], read_only=False)
@@ -68,9 +71,10 @@ class SeqPlanner:
 
     def plan(self, objective, *, context=None, replanning=False):
         variant = self.variants.pop(0) if self.variants else "Z"
+        tool_name = "act" if variant == "A" else f"act_{variant.lower()}"
         task = Task(objective=objective)
         task.add_subtask(Subtask(description=f"variant {variant}",
-                                 tool_name="act",
+                                 tool_name=tool_name,
                                  tool_args={"variant": variant}))
         return task
 
@@ -91,11 +95,13 @@ def make_run(tmp_path, objective, *, planner=None, verifier=None,
         features=FeatureFlags(recovery=True),
     ).validate()
     tool = ActTool()
+    tools = [tool, *(ActTool(f"act_{suffix}")
+                     for suffix in ("b", "c", "z"))]
     agent = Agent(config, AgentDependencies(
-        tools=[tool],
+        tools=tools,
         planner=planner or SeqPlanner("A"),
         verifier=verifier or Verifier(VerificationStatus.PASSED),
-        state_store=store, **journal_for_tools([tool])))
+        state_store=store, **journal_for_tools(tools)))
     agent.execute(objective)
     agent.shutdown()
     time.sleep(0.01)          # keep persisted timestamps distinct

@@ -18,8 +18,13 @@ checks and approval remain entirely with the existing runner/permission layer.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, Mapping
 
+from agentcore.core.action_binding import (
+    ACTION_BINDING_OFFERS_CONTEXT_KEY,
+    ReplanActionBindingOffer,
+)
 from agentcore.core.interfaces import ModelProvider
 from agentcore.observability.events import Events
 from agentcore.observability.logging import StructuredLogger, get_logger
@@ -114,7 +119,13 @@ class LLMPlanner:
                  executable=len(plan.executable_steps()))
         return task
 
-    def replan(self, task: Task, state: AgentState) -> Task:
+    def replan(
+        self,
+        task: Task,
+        state: AgentState,
+        *,
+        action_bindings: Sequence[ReplanActionBindingOffer] = (),
+    ) -> Task:
         """Re-plan the objective using the structured history in state.
 
         Reads the persisted :class:`ReplanLedger` and :class:`RecoveryHistory`
@@ -135,6 +146,14 @@ class LLMPlanner:
                               error=type(exc).__name__, message=str(exc))
             context = {"replanning": True, "objective": task.objective}
             categories = []
+
+        safe_offers: list[dict[str, str]] = []
+        for offer in action_bindings:
+            if not isinstance(offer, ReplanActionBindingOffer):
+                raise PlanningError("replan action binding offer is invalid")
+            safe_offers.append(offer.validate().to_model_context())
+        if safe_offers:
+            context[ACTION_BINDING_OFFERS_CONTEXT_KEY] = safe_offers
 
         self._log.info(Events.PLAN_REVISED, task_id=task.id,
                        run_id=state.run_id,
@@ -211,7 +230,9 @@ class LLMPlanner:
         * ``Task.add_subtask`` requires dependencies to exist already, so
           subtasks are inserted in topological order.
         """
-        task = Task(objective=plan.objective, metadata=dict(context or {}))
+        metadata = dict(context or {})
+        metadata.pop(ACTION_BINDING_OFFERS_CONTEXT_KEY, None)
+        task = Task(objective=plan.objective, metadata=metadata)
         subtasks = {step.id: self._to_subtask(step) for step in plan.steps}
         id_map = {step_id: sub.id for step_id, sub in subtasks.items()}
 
@@ -230,9 +251,18 @@ class LLMPlanner:
                 id_map[step.id]: {
                     "expected_result": step.expected_result,
                     "requires_verification": step.requires_verification,
+                    **(
+                        {"action_binding_token": step.action_binding_token}
+                        if step.action_binding_token is not None
+                        else {}
+                    ),
                 }
                 for step in plan.steps
-                if step.expected_result or step.requires_verification
+                if (
+                    step.expected_result
+                    or step.requires_verification
+                    or step.action_binding_token is not None
+                )
             },
         }
 

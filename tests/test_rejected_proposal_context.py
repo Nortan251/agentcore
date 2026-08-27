@@ -348,13 +348,15 @@ def test_context_dict_omits_empty_rejections():
 # ===========================================================================
 
 class ActTool(Tool):
-    def __init__(self) -> None:
-        self.calls: list[dict[str, Any]] = []
+    def __init__(self, name: str = "act",
+                 calls: list[dict[str, Any]] | None = None) -> None:
+        self._name = name
+        self.calls = calls if calls is not None else []
 
     @property
     def spec(self):
         return tool_spec(
-            "act", "Perform an action.",
+            self._name, "Perform an action.",
             parameters=[ToolParameter("variant", ParamType.STRING,
                                       required=False, default=""),
                         ToolParameter("api_key", ParamType.STRING,
@@ -396,10 +398,11 @@ class CapturingPlanner:
             self.prompts.append(build_user_prompt(
                 objective, [{"name": "act"}], context=context))
         variant = self.variants.pop(0) if self.variants else "Z"
+        tool_name = "act" if variant == "A" else f"act_{variant.lower()}"
         task = Task(objective=objective)
         task.add_subtask(Subtask(
             description=f"an attempt described as {variant}",
-            tool_name="act",
+            tool_name=tool_name,
             tool_args={"variant": variant, "api_key": SECRET}))
         return task
 
@@ -419,9 +422,11 @@ def agent_for(tmp_path, planner, tool, verifier, *, max_replans=2) -> Agent:
                                 base_delay_seconds=0.0),
         features=FeatureFlags(recovery=True),
     ).validate()
-    return Agent(config, AgentDependencies(tools=[tool], planner=planner,
+    tools = [tool, *(ActTool(f"act_{suffix}", tool.calls)
+                     for suffix in ("b", "c", "z"))]
+    return Agent(config, AgentDependencies(tools=tools, planner=planner,
                                            verifier=verifier,
-                                           **journal_for_tools([tool])))
+                                           **journal_for_tools(tools)))
 
 
 def test_end_to_end_rejection_is_fed_back_to_the_planner(tmp_path):
@@ -481,10 +486,12 @@ def test_rejection_context_survives_resume(tmp_path):
         features=FeatureFlags(recovery=True),
     ).validate()
     tool = ActTool()
-    agent = Agent(config, AgentDependencies(tools=[tool], planner=planner,
+    tools = [tool, *(ActTool(f"act_{suffix}", tool.calls)
+                     for suffix in ("b", "c", "z"))]
+    agent = Agent(config, AgentDependencies(tools=tools, planner=planner,
                                             verifier=FailUntilVerifier(1),
                                             state_store=store,
-                                            **journal_for_tools([tool])))
+                                            **journal_for_tools(tools)))
     agent.execute("goal")
     run_id = agent.state.run_id
     agent.shutdown()

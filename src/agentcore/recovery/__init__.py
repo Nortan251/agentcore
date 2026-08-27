@@ -37,9 +37,19 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     )
     from agentcore.recovery.history import RecoveryHistory, SubtaskRecoveryRecord
     from agentcore.recovery.policy import RecoveryPolicy, build_policy
+    from agentcore.recovery.action import (
+        ActionRecoveryCoordinator,
+        ActionRecoveryItem,
+        ActionRecoveryStatus,
+        ActionStartupRecoveryReport,
+    )
 
 #: Public name -> defining submodule.
 _EXPORTS: dict[str, str] = {
+    "ActionRecoveryCoordinator": "agentcore.recovery.action",
+    "ActionRecoveryItem": "agentcore.recovery.action",
+    "ActionRecoveryStatus": "agentcore.recovery.action",
+    "ActionStartupRecoveryReport": "agentcore.recovery.action",
     "RecoveryPolicy": "agentcore.recovery.policy",
     "build_policy": "agentcore.recovery.policy",
     "RecoveryConfig": "agentcore.recovery.config",

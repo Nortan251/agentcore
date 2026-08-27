@@ -15,6 +15,11 @@ import inspect
 import threading
 
 from agentcore.config.schema import AgentConfig
+from agentcore.core.action_binding import (
+    build_replan_binding_candidates,
+    carry_action_bindings,
+    resolve_replan_binding_transfers,
+)
 from agentcore.core.defaults import NoRetryStrategy, NullVerifier, PassthroughPlanner
 from agentcore.core.interfaces import (
     MemoryStore,
@@ -50,6 +55,10 @@ from agentcore.realtime.turn import Deadline, TurnPhase, require_run_id, require
 from agentcore.state.models import AgentPhase, AgentState
 from agentcore.state.store import InMemoryStateStore, StateStore
 from agentcore.realtime.store import TurnStore
+from agentcore.recovery.action import (
+    ActionRecoveryCoordinator,
+    ActionStartupRecoveryReport,
+)
 from agentcore.tasks.models import Task, TaskStatus
 from agentcore.tools.base import Tool
 from agentcore.tools.builtin import default_tools
@@ -70,6 +79,21 @@ def _accepts_control_kwarg(func):
     except (ValueError, TypeError):
         return False
     param = sig.parameters.get("control")
+    if param is None:
+        return False
+    return param.kind in (
+        inspect.Parameter.KEYWORD_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    )
+
+
+def _accepts_action_bindings_kwarg(func):
+    """Check for the explicit trusted replan-binding extension point."""
+    try:
+        sig = inspect.signature(func)
+    except (ValueError, TypeError):
+        return False
+    param = sig.parameters.get("action_bindings")
     if param is None:
         return False
     return param.kind in (
@@ -145,6 +169,18 @@ class Agent:
             action_store=deps.action_store,
             action_adapters=deps.action_adapters,
         )
+        self.action_recovery: ActionRecoveryCoordinator | None = None
+        self.action_recovery_startup: (
+            ActionStartupRecoveryReport | None
+        ) = None
+        if deps.action_store is not None:
+            self.action_recovery = ActionRecoveryCoordinator(
+                deps.action_store,
+                self.executor,
+            )
+            self.action_recovery_startup = (
+                self.action_recovery.recover_startup()
+            )
 
         # Planner is resolved after the model, since the LLM planner needs it.
         self._injected_planner = deps.planner
@@ -995,8 +1031,19 @@ class Agent:
                       max_replans=self.config.recovery.max_replans,
                       task_id=previous.id, reason=reason)
 
+        binding_candidates = {}
         try:
-            new_task = self.planner.replan(previous, self.state)
+            binding_offers, binding_candidates = (
+                build_replan_binding_candidates(self.state, previous)
+            )
+            if _accepts_action_bindings_kwarg(self.planner.replan):
+                new_task = self.planner.replan(
+                    previous,
+                    self.state,
+                    action_bindings=binding_offers,
+                )
+            else:
+                new_task = self.planner.replan(previous, self.state)
         except CancellationRequested as exc:
             # Cancellation during planner.replan: attempt already consumed,
             # finish ledger as cancelled, cancel current task. No error record (P2-4).
@@ -1060,10 +1107,37 @@ class Agent:
             # Keep the previous task in place; nothing about it changed.
             return ReplanOutcome.RETRY
 
+        binding_transfers, rejection = resolve_replan_binding_transfers(
+            new_task,
+            binding_candidates,
+        )
+        if rejection is not None:
+            ledger.finish(reason=reason, outcome="rejected",
+                          previous_task_id=previous.id, detail=rejection,
+                          signature=self._proposal_signature(new_task))
+            ledger.save(self.state)
+            self.log.warning(Events.REPLAN_REJECTED, attempt=attempt,
+                             detail=rejection)
+            self._abandon_replan(report, f"replan rejected: {rejection}")
+            return ReplanOutcome.ABANDON
+
         # Accepted: carry the objective forward and swap in the new plan. The
         # previous task is already archived in the ledger, so no history is lost.
         # Checkpoint before adopting
         control.checkpoint()
+
+        try:
+            carry_action_bindings(self.state, binding_transfers)
+        except Exception:
+            rejection = "trusted replan action binding could not be persisted"
+            ledger.finish(reason=reason, outcome="rejected",
+                          previous_task_id=previous.id, detail=rejection,
+                          signature=self._proposal_signature(new_task))
+            ledger.save(self.state)
+            self.log.warning(Events.REPLAN_REJECTED, attempt=attempt,
+                             detail=rejection)
+            self._abandon_replan(report, f"replan rejected: {rejection}")
+            return ReplanOutcome.ABANDON
 
         ledger.finish(reason=reason, outcome="accepted",
                       previous_task_id=previous.id, new_task_id=new_task.id)
