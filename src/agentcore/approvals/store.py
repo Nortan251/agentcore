@@ -394,12 +394,12 @@ class JsonFileApprovalStore:
             return [request.request_id for request in self._audit_unlocked()]
 
     def _read_unlocked(self, path: Path, request_id: str) -> ApprovalRequest:
-        if not path.exists():
-            raise ApprovalNotFoundError("approval request does not exist")
         try:
-            if path.stat().st_size > MAX_APPROVAL_RECORD_BYTES:
-                raise ApprovalStoreError("approval record exceeds size bound")
-            encoded = path.read_bytes()
+            # Open once and bound the read on that handle.  A separate stat()
+            # followed by Path.read_bytes() leaves a TOCTOU window in which a
+            # replaced or growing file can bypass the size check.
+            with path.open("rb") as handle:
+                encoded = handle.read(MAX_APPROVAL_RECORD_BYTES + 1)
             if len(encoded) > MAX_APPROVAL_RECORD_BYTES:
                 raise ApprovalStoreError("approval record exceeds size bound")
             payload = json.loads(
@@ -414,6 +414,9 @@ class JsonFileApprovalStore:
             return request
         except (ApprovalStoreError, ApprovalValidationError):
             raise
+        except FileNotFoundError as exc:
+            raise ApprovalNotFoundError(
+                "approval request does not exist") from exc
         except (OSError, UnicodeDecodeError, json.JSONDecodeError,
                 _DuplicateJsonKey, TypeError, ValueError) as exc:
             raise ApprovalStoreError(

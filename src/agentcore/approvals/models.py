@@ -201,6 +201,10 @@ class ApprovalRequest:
     consumed_action_id: str | None = None
     receipt: ApprovalReceipt | None = None
     schema_version: int = APPROVAL_SCHEMA_VERSION
+    # The authority-owned keyed authenticator for the complete current record.
+    # A newly constructed request carries a zero placeholder until the
+    # authority computes the MAC before publishing it.
+    state_mac: str = "0" * APPROVAL_DIGEST_HEX_CHARS
 
     def validate(self) -> ApprovalRequest:
         if self.schema_version != APPROVAL_SCHEMA_VERSION or isinstance(
@@ -215,6 +219,7 @@ class ApprovalRequest:
         _counter(self.version, "approval version")
         binding = self.as_binding().validate()
         _digest(self.binding_digest, "approval binding digest")
+        _digest(self.state_mac, "approval state MAC")
         created = _utc(self.created_at, "approval created_at")
         expires = _utc(self.expires_at, "approval expires_at")
         if expires <= created:
@@ -376,6 +381,7 @@ class ApprovalRequest:
             "consumed_action_id": self.consumed_action_id,
             "receipt": self.receipt.to_dict() if self.receipt else None,
             "schema_version": self.schema_version,
+            "state_mac": self.state_mac,
         }
 
     @classmethod
@@ -386,7 +392,7 @@ class ApprovalRequest:
             "tool_name", "tool_version", "policy_fingerprint",
             "principal_ref", "scope_ref", "semantics", "created_at",
             "expires_at", "decision_at", "consumed_at",
-            "consumed_action_id", "receipt", "schema_version",
+            "consumed_action_id", "receipt", "schema_version", "state_mac",
         }
         _exact_keys(data, expected, "approval request")
         raw_caps = data["mutation_capabilities"]
@@ -441,6 +447,7 @@ class ApprovalRequest:
                      if raw_receipt is not None else None),
             schema_version=_counter(data["schema_version"],
                                     "approval schema version"),
+            state_mac=_digest(data["state_mac"], "approval state MAC"),
         ).validate()
 
 

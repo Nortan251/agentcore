@@ -6,7 +6,7 @@ import hashlib
 import hmac
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from enum import Enum
 from typing import Any, Callable, Protocol
@@ -321,8 +321,7 @@ class DurableApprovalAuthority:
                 decision is HumanApprovalDecision.PENDING):
             raise ApprovalValidationError(
                 "a terminal human approval decision is required")
-        current = self._store.load(request_id)
-        current.validate()
+        current = self._verify_state(self._store.load(request_id))
         if current.principal_ref != self._principal_ref or (
                 current.scope_ref != self._scope_ref):
             raise ApprovalUnavailableError(
@@ -371,7 +370,9 @@ class DurableApprovalAuthority:
             created_at=now,
             expires_at=expires_at,
         )
+        request = self._seal_state(request)
         created = self._store.create(request)
+        created = self._verify_state(created)
         if created != request:
             raise ApprovalUnavailableError(
                 "approval request creation was not exact")
@@ -379,8 +380,8 @@ class DurableApprovalAuthority:
 
     def _load_exact(self, request_id: str,
                     binding: ApprovalBinding) -> ApprovalRequest:
-        current = self._store.load(require_approval_request_id(request_id))
-        current.validate()
+        current = self._verify_state(
+            self._store.load(require_approval_request_id(request_id)))
         expected = approval_binding_digest(
             self._key,
             request_id=current.request_id,
@@ -395,23 +396,32 @@ class DurableApprovalAuthority:
         return current
 
     def _expire_if_needed(self, current: ApprovalRequest) -> ApprovalRequest:
+        current = self._verify_state(current)
         if current.state not in {ApprovalState.PENDING, ApprovalState.APPROVED} or (
                 self._clock.now() < current.expires_at):
             return current
         return self._publish_or_observe(current, current.expire())
 
     def _consume(self, current: ApprovalRequest) -> ApprovalAuthorization:
+        current = self._verify_state(current)
         assert current.receipt is not None
+        candidate = self._seal_state(current.consume(
+            action_id=current.action_id,
+            binding_digest=current.binding_digest,
+            at=self._clock.now(),
+        ))
         try:
-            consumed = self._store.consume(
+            # Compare-and-swap is the durable APPROVED -> CONSUMED
+            # linearization point.  The authority seals the successor before
+            # publishing it because the persistence layer has no key and must
+            # remain infrastructure rather than an independent authority.
+            self._store.compare_and_swap(
                 current.request_id,
                 current.version,
-                action_id=current.action_id,
-                binding_digest=current.binding_digest,
-                consumed_at=self._clock.now(),
+                candidate,
             )
         except Exception:
-            observed = self._store.load(current.request_id)
+            observed = self._verify_state(self._store.load(current.request_id))
             if observed.state is not ApprovalState.CONSUMED:
                 raise
             return ApprovalAuthorization(
@@ -419,7 +429,11 @@ class DurableApprovalAuthority:
                 observed.action_id,
                 ApprovalAuthorizationStatus.CONSUMED,
             ).validate()
-        if consumed.state is not ApprovalState.CONSUMED or (
+        # Do not trust the CAS return value as proof of durable publication.
+        # Re-read the record through the store and authenticate that exact
+        # post-CAS state before exposing an authorization receipt.
+        consumed = self._verify_state(self._store.load(current.request_id))
+        if consumed != candidate or consumed.state is not ApprovalState.CONSUMED or (
                 consumed.receipt != current.receipt):
             raise ApprovalUnavailableError(
                 "approval consumption was not exact")
@@ -435,19 +449,37 @@ class DurableApprovalAuthority:
         current: ApprovalRequest,
         candidate: ApprovalRequest,
     ) -> ApprovalRequest:
+        current = self._verify_state(current)
+        candidate = self._seal_state(candidate)
         try:
             self._store.compare_and_swap(
                 current.request_id, current.version, candidate)
         except Exception:
             pass
-        observed = self._store.load(current.request_id)
-        observed.validate()
+        observed = self._verify_state(self._store.load(current.request_id))
         if observed == candidate:
             return observed
         if observed.version > current.version:
             return observed
         raise ApprovalUnavailableError(
             "approval decision publication is uncertain")
+
+    def _seal_state(self, request: ApprovalRequest) -> ApprovalRequest:
+        """Attach the authority MAC before a record can be published."""
+        request.validate()
+        return replace(
+            request,
+            state_mac=approval_state_mac(self._key, request),
+        ).validate()
+
+    def _verify_state(self, request: ApprovalRequest) -> ApprovalRequest:
+        """Verify the keyed current-state authenticator before trusting state."""
+        request.validate()
+        expected = approval_state_mac(self._key, request)
+        if not hmac.compare_digest(request.state_mac, expected):
+            raise ApprovalUnavailableError(
+                "approval state authentication failed")
+        return request
 
 
 def approval_binding_digest(
@@ -489,6 +521,56 @@ def approval_binding_digest(
     ).hexdigest()
 
 
+def approval_state_mac(key: bytes, request: ApprovalRequest) -> str:
+    """Authenticate the complete mutable approval record state.
+
+    This is deliberately separate from :func:`approval_binding_digest`: the
+    binding proves what action an approval names, while this MAC proves that
+    the durable state/decision/receipt currently came from the authority key.
+    """
+    if not isinstance(key, bytes) or len(key) != 32:
+        raise ApprovalValidationError("approval state MAC key is invalid")
+    request.validate()
+    receipt = request.receipt.to_dict() if request.receipt is not None else None
+    payload = {
+        "domain": "agentcore.durable-approval.state.v1",
+        "schema_version": request.schema_version,
+        "request_id": request.request_id,
+        "action_id": request.action_id,
+        "binding": {
+            "action_kind": request.action_kind,
+            "intent_digest": request.intent_digest,
+            "mutation_capabilities": list(request.mutation_capabilities),
+            "tool_name": request.tool_name,
+            "tool_version": request.tool_version,
+            "policy_fingerprint": request.policy_fingerprint,
+            "principal_ref": request.principal_ref,
+            "scope_ref": request.scope_ref,
+            "semantics": request.semantics.value,
+        },
+        "binding_digest": request.binding_digest,
+        "state": request.state.value,
+        "version": request.version,
+        "created_at": request.created_at.isoformat(),
+        "expires_at": request.expires_at.isoformat(),
+        "decision_at": (request.decision_at.isoformat()
+                         if request.decision_at is not None else None),
+        "consumed_at": (request.consumed_at.isoformat()
+                         if request.consumed_at is not None else None),
+        "consumed_action_id": request.consumed_action_id,
+        "receipt": receipt,
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hmac.new(
+        key,
+        b"agentcore.durable-approval.state.v1\x00" + encoded,
+        hashlib.sha256,
+    ).hexdigest()
+
+
 __all__ = [
     "MAX_APPROVAL_TTL",
     "ApprovalAuthorization",
@@ -500,4 +582,5 @@ __all__ = [
     "LegacyApprovalGateAdapter",
     "PendingApprovalGate",
     "approval_binding_digest",
+    "approval_state_mac",
 ]

@@ -11,6 +11,7 @@ from agentcore.approvals.authority import (
     LegacyApprovalGateAdapter,
     PendingApprovalGate,
     approval_binding_digest,
+    approval_state_mac,
 )
 from agentcore.approvals.errors import (
     ApprovalAlreadyExistsError,

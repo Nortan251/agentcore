@@ -37,6 +37,7 @@ from agentcore.approvals import (
     ApprovalAuthorizationStatus,
     ApprovalInvocationContext,
     ApprovalState,
+    ApprovalUnavailableError,
     ApprovalValidationError,
     ApprovalVersionConflictError,
     DurableApprovalAuthority,
@@ -218,6 +219,7 @@ def _build(
     clock=None,
     ids=None,
     logger=None,
+    key=None,
     ttl=timedelta(minutes=5),
 ):
     clock = clock or FixedClock(NOW)
@@ -234,7 +236,7 @@ def _build(
     adapters.register(tool, adapter)
     authority = DurableApprovalAuthority(
         approval_store,
-        KEY,
+        key or KEY,
         principal_ref="principal:local-owner",
         scope_ref="workspace:test",
         gate=gate,
@@ -275,6 +277,40 @@ def _approve_pending(executor, authority):
     approved = _invoke(
         executor, approval_request_id=pending.approval_request_id)
     return pending, approved
+
+
+def _approval_path(directory: Path, request_id: str) -> Path:
+    return directory / f"{request_id}.json"
+
+
+def _rewrite_approval(path: Path, mutate) -> dict[str, Any]:
+    record = json.loads(path.read_text(encoding="utf-8"))
+    mutate(record)
+    path.write_text(
+        json.dumps(record, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    return record
+
+
+def _forge_approved(record: dict[str, Any]) -> None:
+    record["state"] = "approved"
+    record["version"] = 1
+    record["decision_at"] = record["created_at"]
+    record["consumed_at"] = None
+    record["consumed_action_id"] = None
+    record["receipt"] = {
+        "receipt_id": "aprc_eeeeeeeeeeee",
+        "request_id": record["request_id"],
+        "action_id": record["action_id"],
+        "binding_digest": record["binding_digest"],
+        "policy_fingerprint": record["policy_fingerprint"],
+        "principal_ref": record["principal_ref"],
+        "scope_ref": record["scope_ref"],
+        "semantics": record["semantics"],
+        "approved_at": record["decision_at"],
+        "expires_at": record["expires_at"],
+    }
 
 
 def test_pending_and_denied_create_no_action_attempt_or_effect():
@@ -581,6 +617,258 @@ def test_corrupt_and_duplicate_key_json_fail_closed_without_repair(tmp_path):
         assert actions.list_actions() == []
         assert path.read_text(encoding="utf-8") == corrupt
         reopened.close()
+
+
+def test_json_forged_pending_to_approved_fails_before_action_or_tool_run(tmp_path):
+    directory = tmp_path / "approvals"
+    store = JsonFileApprovalStore(directory)
+    executor, _, _, actions, tool, _ = _build(approval_store=store)
+    pending = _invoke(executor)
+    store.close()
+
+    path = _approval_path(directory, pending.approval_request_id)
+    _rewrite_approval(path, _forge_approved)
+
+    reopened = JsonFileApprovalStore(directory)
+    second, _, _, _, second_tool, _ = _build(
+        approval_store=reopened, action_store=actions)
+    rejected = _invoke(
+        second, approval_request_id=pending.approval_request_id)
+    assert rejected.result.metadata["kind"] == "approval_unavailable"
+    assert actions.list_actions() == []
+    assert tool.runs == second_tool.runs == 0
+    reopened.close()
+
+
+def test_json_forged_denied_to_approved_fails_closed(tmp_path):
+    directory = tmp_path / "approvals"
+    store = JsonFileApprovalStore(directory)
+    executor, _, _, actions, tool, gate = _build(
+        approval_store=store,
+        gate=DecisionGate(HumanApprovalDecision.DENY),
+    )
+    denied = _invoke(executor)
+    assert denied.result.metadata["kind"] == "approval_denied"
+    store.close()
+
+    path = _approval_path(directory, denied.approval_request_id)
+    _rewrite_approval(path, _forge_approved)
+
+    reopened = JsonFileApprovalStore(directory)
+    second, _, _, _, second_tool, _ = _build(
+        approval_store=reopened, action_store=actions)
+    rejected = _invoke(
+        second, approval_request_id=denied.approval_request_id)
+    assert rejected.result.metadata["kind"] == "approval_unavailable"
+    assert actions.list_actions() == []
+    assert tool.runs == second_tool.runs == 0
+    assert gate.prompts
+    reopened.close()
+
+
+def test_json_forged_expired_to_approved_fails_closed(tmp_path):
+    clock = FixedClock(NOW)
+    directory = tmp_path / "approvals"
+    store = JsonFileApprovalStore(directory)
+    executor, _, _, actions, tool, _ = _build(
+        approval_store=store, clock=clock, ttl=timedelta(seconds=10))
+    pending = _invoke(executor)
+    clock.advance(11)
+    expired = _invoke(executor, approval_request_id=pending.approval_request_id)
+    assert expired.result.metadata["kind"] == "approval_expired"
+    store.close()
+
+    path = _approval_path(directory, pending.approval_request_id)
+    _rewrite_approval(path, _forge_approved)
+
+    reopened = JsonFileApprovalStore(directory)
+    second, _, _, _, second_tool, _ = _build(
+        approval_store=reopened, action_store=actions, clock=clock,
+        ttl=timedelta(seconds=10))
+    rejected = _invoke(
+        second, approval_request_id=pending.approval_request_id)
+    assert rejected.result.metadata["kind"] == "approval_unavailable"
+    assert actions.list_actions() == []
+    assert tool.runs == second_tool.runs == 0
+    reopened.close()
+
+
+def test_json_forged_consumed_to_approved_cannot_restore_authority(tmp_path):
+    directory = tmp_path / "approvals"
+    store = JsonFileApprovalStore(directory)
+    executor, authority, _, actions, tool, _ = _build(approval_store=store)
+    pending, completed = _approve_pending(executor, authority)
+    assert completed.ok
+    assert tool.runs == 1
+    store.close()
+
+    path = _approval_path(directory, pending.approval_request_id)
+    _rewrite_approval(path, _forge_approved)
+
+    reopened = JsonFileApprovalStore(directory)
+    second, _, _, _, second_tool, _ = _build(
+        approval_store=reopened, action_store=actions)
+    rejected = _invoke(
+        second, approval_request_id=pending.approval_request_id)
+    assert rejected.result.metadata["kind"] == "approval_unavailable"
+    assert len(actions.list_actions()) == 1
+    assert tool.runs == 1
+    assert second_tool.runs == 0
+    reopened.close()
+
+
+@pytest.mark.parametrize("field", ["decision_at", "receipt_id"])
+def test_json_approved_state_mutation_fails_state_authentication(tmp_path, field):
+    directory = tmp_path / "approvals"
+    store = JsonFileApprovalStore(directory)
+    executor, authority, _, actions, tool, _ = _build(approval_store=store)
+    pending = _invoke(executor)
+    authority.record_decision(
+        pending.approval_request_id, HumanApprovalDecision.APPROVE)
+    store.close()
+
+    path = _approval_path(directory, pending.approval_request_id)
+
+    def mutate(record):
+        if field == "decision_at":
+            record["decision_at"] = "2026-08-27T09:00:01+00:00"
+            record["receipt"]["approved_at"] = record["decision_at"]
+        else:
+            record["receipt"]["receipt_id"] = "aprc_ffffffffffff"
+
+    _rewrite_approval(path, mutate)
+    reopened = JsonFileApprovalStore(directory)
+    second, _, _, _, second_tool, _ = _build(
+        approval_store=reopened, action_store=actions)
+    rejected = _invoke(
+        second, approval_request_id=pending.approval_request_id)
+    assert rejected.result.metadata["kind"] == "approval_unavailable"
+    assert actions.list_actions() == []
+    assert tool.runs == second_tool.runs == 0
+    reopened.close()
+
+
+@pytest.mark.parametrize("field", ["consumed_at", "consumed_action_id"])
+def test_json_consumed_state_mutation_fails_closed(tmp_path, field):
+    directory = tmp_path / "approvals"
+    store = JsonFileApprovalStore(directory)
+    executor, authority, _, actions, tool, _ = _build(approval_store=store)
+    pending, completed = _approve_pending(executor, authority)
+    assert completed.ok
+    store.close()
+
+    path = _approval_path(directory, pending.approval_request_id)
+
+    def mutate(record):
+        if field == "consumed_at":
+            record["consumed_at"] = "2026-08-27T09:00:02+00:00"
+        else:
+            record["consumed_action_id"] = "act_ffffffffffff"
+
+    _rewrite_approval(path, mutate)
+    reopened = JsonFileApprovalStore(directory)
+    second, _, _, _, second_tool, _ = _build(
+        approval_store=reopened, action_store=actions)
+    rejected = _invoke(
+        second, approval_request_id=pending.approval_request_id)
+    assert rejected.result.metadata["kind"] == "approval_unavailable"
+    assert len(actions.list_actions()) == 1
+    assert tool.runs == 1
+    assert second_tool.runs == 0
+    reopened.close()
+
+
+@pytest.mark.parametrize("field", ["state", "version"])
+def test_json_state_or_version_mutation_without_mac_fails_closed(tmp_path, field):
+    directory = tmp_path / "approvals"
+    store = JsonFileApprovalStore(directory)
+    executor, _, _, actions, tool, _ = _build(approval_store=store)
+    pending = _invoke(executor)
+    store.close()
+
+    path = _approval_path(directory, pending.approval_request_id)
+
+    def mutate(record):
+        if field == "state":
+            record["state"] = "denied"
+            record["version"] = 1
+            record["decision_at"] = record["created_at"]
+        else:
+            record["version"] = 1
+
+    _rewrite_approval(path, mutate)
+    reopened = JsonFileApprovalStore(directory)
+    second, _, _, _, second_tool, _ = _build(
+        approval_store=reopened, action_store=actions)
+    rejected = _invoke(
+        second, approval_request_id=pending.approval_request_id)
+    assert rejected.result.metadata["kind"] == "approval_unavailable"
+    assert actions.list_actions() == []
+    assert tool.runs == second_tool.runs == 0
+    reopened.close()
+
+
+def test_json_state_mac_cannot_transfer_between_approval_requests(tmp_path):
+    directory = tmp_path / "approvals"
+    store = JsonFileApprovalStore(directory)
+    executor, _, _, actions, tool, _ = _build(approval_store=store)
+    first = _invoke(executor)
+    second = _invoke(executor)
+    store.close()
+
+    first_path = _approval_path(directory, first.approval_request_id)
+    second_path = _approval_path(directory, second.approval_request_id)
+    first_record = json.loads(first_path.read_text(encoding="utf-8"))
+    _rewrite_approval(
+        second_path,
+        lambda record: record.update(state_mac=first_record["state_mac"]),
+    )
+
+    reopened = JsonFileApprovalStore(directory)
+    replacement, _, _, _, second_tool, _ = _build(
+        approval_store=reopened, action_store=actions)
+    rejected = _invoke(
+        replacement, approval_request_id=second.approval_request_id)
+    assert rejected.result.metadata["kind"] == "approval_unavailable"
+    assert actions.list_actions() == []
+    assert tool.runs == second_tool.runs == 0
+    reopened.close()
+
+
+def test_json_wrong_installation_key_after_restart_fails_closed(tmp_path):
+    directory = tmp_path / "approvals"
+    store = JsonFileApprovalStore(directory)
+    executor, _, _, actions, tool, _ = _build(approval_store=store)
+    pending = _invoke(executor)
+    store.close()
+
+    reopened = JsonFileApprovalStore(directory)
+    _, wrong_authority, _, _, _, _ = _build(
+        approval_store=reopened,
+        action_store=actions,
+        key=StaticInstallationKeyProvider(b"z" * 32),
+    )
+    with pytest.raises(ApprovalUnavailableError):
+        wrong_authority.record_decision(
+            pending.approval_request_id, HumanApprovalDecision.APPROVE)
+    assert reopened.load(pending.approval_request_id).state is ApprovalState.PENDING
+    assert actions.list_actions() == []
+    assert tool.runs == 0
+    reopened.close()
+
+
+def test_json_reader_uses_single_bounded_handle(monkeypatch, tmp_path):
+    directory = tmp_path / "approvals"
+    store = JsonFileApprovalStore(directory)
+    executor, _, _, _, _, _ = _build(approval_store=store)
+    pending = _invoke(executor)
+
+    def forbidden_read_bytes(_):
+        raise AssertionError("approval records must not use Path.read_bytes")
+
+    monkeypatch.setattr(Path, "read_bytes", forbidden_read_bytes)
+    assert store.load(pending.approval_request_id).state is ApprovalState.PENDING
+    store.close()
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
