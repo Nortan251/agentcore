@@ -1108,7 +1108,7 @@ def test_inherited_idempotency_registry_fails_closed_after_fork():
         try:
             registry.resolve(tool)
         except ActionAdapterRegistrationError as exc:
-            os._exit(0 if exc.context.get("reason") == "ownership_mismatch" else 2)
+            os._exit(0 if exc.details.get("reason") == "ownership_mismatch" else 2)
         os._exit(3)
     waited, status = os.waitpid(pid, 0)
     assert waited == pid and os.waitstatus_to_exitcode(status) == 0
