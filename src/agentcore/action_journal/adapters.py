@@ -14,7 +14,7 @@ import re
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from agentcore.action_journal.errors import (
     ActionAdapterRegistrationError,
@@ -46,6 +46,11 @@ from agentcore.action_journal.models import (
     ReconciliationDisposition,
     require_action_id,
 )
+from agentcore.action_journal.idempotency import (
+    ActionExecutionPermit,
+    ExternalIdempotencyProvider,
+    ExternalIdempotencyRequest,
+)
 from agentcore.action_journal.reconciliation import ActionReconciler
 from agentcore.action_journal.protected_storage import (
     looks_like_evidence_reference,
@@ -69,6 +74,16 @@ _EPHEMERAL_INCOMPATIBLE_CAPABILITIES = frozenset({
     Capability.CREDENTIAL_ACCESS,
     Capability.SYSTEM_ADMIN,
     Capability.PAYMENT,
+})
+_RESERVED_IDEMPOTENCY_ARGUMENTS = frozenset({
+    "idempotency_key",
+    "idempotency_contract",
+    "idempotency_scope",
+    "idempotency_valid_until",
+    "external_idempotency_key",
+    "external_idempotency_contract",
+    "external_idempotency_scope",
+    "external_idempotency_valid_until",
 })
 
 
@@ -319,6 +334,10 @@ class _RegisteredAdapter:
     read_only: bool
     capabilities: tuple[str, ...]
     reconciler: ActionReconciler | None
+    establishes_external_contract: Callable[..., Any] | None
+    validates_external_contract: Callable[..., Any] | None
+    executes_external_effect: Callable[..., Any] | None
+    allows_indefinite_retention: bool
 
     def prepare_intent(
         self,
@@ -353,6 +372,7 @@ class ActionAdapterRegistry:
         adapter: ToolActionAdapter,
         *,
         reconciler: ActionReconciler | None = None,
+        idempotency_provider: ExternalIdempotencyProvider | None = None,
     ) -> None:
         self._require_owner_process()
         tool_spec = getattr(tool, "spec", None)
@@ -399,6 +419,37 @@ class ActionAdapterRegistry:
                     not callable(getattr(adapter, "normalize_effect", None)):
                 raise ActionAdapterRegistrationError(
                     "journal-required adapter lacks preflight/normalization")
+        external = (
+            adapter_spec.effect_class is ActionEffectClass.EXTERNALLY_IDEMPOTENT
+        )
+        if external and idempotency_provider is None:
+            raise ActionAdapterRegistrationError(
+                "externally idempotent adapter lacks a trusted provider")
+        if not external and idempotency_provider is not None:
+            raise ActionAdapterRegistrationError(
+                "non-external adapter carries an idempotency provider")
+        establish: Callable[..., Any] | None = None
+        validate: Callable[..., Any] | None = None
+        execute: Callable[..., Any] | None = None
+        indefinite = False
+        if idempotency_provider is not None:
+            establish = getattr(idempotency_provider, "establish_contract", None)
+            validate = getattr(idempotency_provider, "validate_contract", None)
+            execute = getattr(idempotency_provider, "execute", None)
+            indefinite = getattr(
+                idempotency_provider, "allows_indefinite_retention", None)
+            if not all(callable(method) for method in (
+                    establish, validate, execute)) or not isinstance(
+                        indefinite, bool):
+                raise ActionAdapterRegistrationError(
+                    "external idempotency provider is malformed")
+            parameter_names = {
+                getattr(parameter, "name", None)
+                for parameter in getattr(tool_spec, "parameters", ())
+            }
+            if parameter_names & _RESERVED_IDEMPOTENCY_ARGUMENTS:
+                raise ActionAdapterRegistrationError(
+                    "model-visible arguments cannot select idempotency metadata")
         if reconciler is not None and not callable(
                 getattr(reconciler, "probe", None)):
             raise ActionAdapterRegistrationError(
@@ -418,6 +469,10 @@ class ActionAdapterRegistry:
             capabilities=tuple(sorted(str(capability)
                                       for capability in capabilities)),
             reconciler=reconciler,
+            establishes_external_contract=establish,
+            validates_external_contract=validate,
+            executes_external_effect=execute,
+            allows_indefinite_retention=indefinite,
         )
         with self._lock:
             if key in self._by_tool:
@@ -477,6 +532,65 @@ class ActionAdapterRegistry:
         if binding is None:
             return None
         return binding.reconciler
+
+    def establish_external_idempotency(
+        self,
+        tool: Any,
+        request: ExternalIdempotencyRequest,
+        *,
+        tool_spec: Any | None = None,
+    ) -> tuple[Any, bool]:
+        """Call the registered key owner outside the registry mutex."""
+        binding = self.resolve(tool, tool_spec=tool_spec)
+        if binding is None or binding.establishes_external_contract is None:
+            raise ActionAdapterRegistrationError(
+                "external idempotency provider is unavailable")
+        request.validate()
+        return (
+            binding.establishes_external_contract(request),
+            binding.allows_indefinite_retention,
+        )
+
+    def validate_external_idempotency(
+        self,
+        tool: Any,
+        request: ExternalIdempotencyRequest,
+        stored_contract: Any,
+        *,
+        tool_spec: Any | None = None,
+    ) -> tuple[Any, bool]:
+        """Revalidate the exact durable guarantee under current registration."""
+        binding = self.resolve(tool, tool_spec=tool_spec)
+        if binding is None or binding.validates_external_contract is None:
+            raise ActionAdapterRegistrationError(
+                "external idempotency provider is unavailable")
+        request.validate()
+        return (
+            binding.validates_external_contract(request, stored_contract),
+            binding.allows_indefinite_retention,
+        )
+
+    def execute_external(
+        self,
+        tool: Any,
+        cleaned: Mapping[str, Any],
+        context: Any,
+        permit: ActionExecutionPermit,
+        *,
+        tool_spec: Any | None = None,
+    ) -> Any:
+        """Enter the registered provider seam with one immutable permit."""
+        binding = self.resolve(tool, tool_spec=tool_spec)
+        if binding is None or binding.executes_external_effect is None:
+            raise ActionAdapterRegistrationError(
+                "external idempotency provider is unavailable")
+        permit.validate()
+        if binding.tool_name != permit.tool_name or \
+                binding.tool_version != permit.tool_version:
+            raise ActionAdapterRegistrationError(
+                "execution permit does not match registered tool")
+        return binding.executes_external_effect(
+            tool, cleaned, context, permit)
 
     def __len__(self) -> int:
         self._require_owner_process()

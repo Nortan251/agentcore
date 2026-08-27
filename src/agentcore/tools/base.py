@@ -19,10 +19,13 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
 from agentcore.errors import ToolValidationError
 from agentcore.permissions.levels import Capability
+
+if TYPE_CHECKING:
+    from agentcore.action_journal.idempotency import ActionExecutionPermit
 
 
 class ParamType(str, Enum):
@@ -145,6 +148,9 @@ class ToolContext:
     #: this rather than interpreting ``workspace_dir`` themselves.
     workspace: Any = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    #: Present only at the trusted external-idempotency effect seam. It is
+    #: executor-created and never derived from model-visible tool arguments.
+    action_execution_permit: ActionExecutionPermit | None = None
 
 
 class Tool(ABC):
