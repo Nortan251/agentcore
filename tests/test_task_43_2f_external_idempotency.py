@@ -112,6 +112,7 @@ class FakeExternalTool(Tool):
     def __init__(self, *, lose_first_response=False, parameters=None) -> None:
         self.lose_first_response = lose_first_response
         self._parameters = parameters
+        self.version = "1.0.0"
         self.runs = 0
         self.remote_effects = 0
         self.remote: dict[str, ToolResult] = {}
@@ -124,7 +125,7 @@ class FakeExternalTool(Tool):
         return tool_spec(
             "external_mutation",
             "Perform one fake external mutation.",
-            version="1.0.0",
+            version=self.version,
             parameters=(self._parameters if self._parameters is not None else (
                 ToolParameter("payload", ParamType.STRING),
             )),
@@ -193,6 +194,9 @@ class FakeIdempotencyProvider:
         self.validate_calls = 0
         self.execute_calls = 0
         self.validation_mode = "valid"
+        self.contract = "fake.external.v1"
+        self.scope = "fake:account:primary"
+        self.fixed_key = None
         self.requests = []
         self.execute_hook = None
 
@@ -200,9 +204,10 @@ class FakeIdempotencyProvider:
         self.establish_calls += 1
         self.requests.append(request)
         return IdempotencyContract(
-            key=f"idem_{request.action_id.removeprefix('act_')}",
-            contract="fake.external.v1",
-            scope="fake:account:primary",
+            key=(self.fixed_key or
+                 f"idem_{request.action_id.removeprefix('act_')}"),
+            contract=self.contract,
+            scope=self.scope,
             valid_until=self.clock.now() + timedelta(seconds=self.horizon),
         )
 
@@ -224,12 +229,30 @@ class FakeIdempotencyProvider:
             )
         return stored_contract
 
-    def execute(self, tool, cleaned, context, permit):
+    def execute_if_current(self, request, tool, cleaned, context, permit):
         self.execute_calls += 1
+        request.validate()
+        permit.validate()
+        assert request.action_id == permit.action_id
         assert context.action_execution_permit is permit
         assert permit.idempotency.key not in cleaned.values()
         if self.execute_hook is not None:
             self.execute_hook()
+        live_spec = tool.spec
+        if live_spec.name != request.tool_name or \
+                live_spec.version != request.tool_version or \
+                live_spec.name != permit.tool_name or \
+                live_spec.version != permit.tool_version:
+            raise ValueError("live tool registration changed at request boundary")
+        current = self.validate_contract(request, permit.idempotency)
+        if current != permit.idempotency:
+            raise ValueError("provider no longer affirms the durable contract")
+        current.validate()
+        if current.valid_until is None:
+            if not self.allows_indefinite_retention:
+                raise ValueError("provider retention is not explicit")
+        elif self.clock.now() >= current.valid_until:
+            raise ValueError("provider guarantee expired at request boundary")
         return tool.run(cleaned, context)
 
 
@@ -306,6 +329,18 @@ def _ambiguous_runtime(*, horizon=3600):
     record = store.load(first.action_id)
     assert record.state is ActionState.RECONCILE_REQUIRED
     return executor, store, tool, provider, adapters, clock, first, record
+
+
+class MutateAtCheckpoint:
+    def __init__(self, target, mutation) -> None:
+        self.target = target
+        self.mutation = mutation
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        if self.calls == self.target:
+            self.mutation()
 
 
 def test_missing_trusted_provider_creates_no_action_attempt_or_effect():
@@ -462,6 +497,24 @@ def test_separate_logical_actions_receive_different_action_ids_and_keys():
     assert provider.establish_calls == tool.remote_effects == 2
 
 
+def test_same_remote_scope_and_key_cannot_cross_action_contract_labels():
+    clock = FixedClock(NOW)
+    provider = FakeIdempotencyProvider(clock)
+    provider.fixed_key = "idem_shared_remote_key"
+    executor, store, tool, provider, _ = _build(
+        clock=clock, provider=provider)
+    first = _invoke(executor, context=_context(key="step:one"))
+    assert first.ok
+
+    provider.contract = "fake.external.v2"
+    blocked = _invoke(executor, context=_context(key="step:two"))
+
+    assert blocked.result.metadata["kind"] == "action_create_unverified"
+    assert store.list_actions() == [first.action_id]
+    assert provider.establish_calls == 2
+    assert tool.runs == tool.remote_effects == 1
+
+
 def test_missing_registration_after_restart_blocks_same_action_retry():
     executor, store, tool, provider, _, clock, first, before = (
         _ambiguous_runtime()
@@ -548,6 +601,131 @@ def test_horizon_expiry_after_retry_proof_before_claim_fails_closed():
         ActionTransitionProof.EXTERNAL_IDEMPOTENCY_GUARANTEE)
     assert len(after.attempts) == len(before.attempts) == 1
     assert tool.runs == 1
+
+
+def _assert_retry_postclaim_change_blocks(mutation):
+    executor, store, tool, provider, _, clock, first, before = (
+        _ambiguous_runtime(horizon=5)
+    )
+    checkpoint = MutateAtCheckpoint(2, lambda: mutation(provider, tool, clock))
+    blocked = _invoke(
+        executor,
+        context=_context(action_id=first.action_id),
+        checkpoint=checkpoint,
+    )
+    after = store.load(first.action_id)
+    assert checkpoint.calls == 2
+    assert blocked.result.metadata["kind"] == (
+        "external_idempotency_contract_unavailable")
+    assert after.state is ActionState.IN_FLIGHT
+    assert after.state not in {ActionState.FAILED, ActionState.CANCELLED}
+    assert len(before.attempts) == 1 and len(after.attempts) == 2
+    assert before.attempts[-1].effect_verdict is EffectVerdict.OUTCOME_UNKNOWN
+    assert after.attempts[-1].status.value == "claimed"
+    assert provider.execute_calls == 1
+    assert tool.runs == tool.remote_effects == 1
+    return after
+
+
+def test_expiry_after_retry_claim_never_enters_provider_execution():
+    after = _assert_retry_postclaim_change_blocks(
+        lambda provider, tool, clock: clock.advance(5))
+    assert len(after.attempts) == 2  # No speculative third attempt.
+
+
+def test_provider_scope_change_after_retry_claim_blocks_before_seam():
+    _assert_retry_postclaim_change_blocks(
+        lambda provider, tool, clock: setattr(
+            provider, "validation_mode", "scope"))
+
+
+def test_contract_version_retired_after_retry_claim_blocks_before_seam():
+    _assert_retry_postclaim_change_blocks(
+        lambda provider, tool, clock: setattr(
+            provider, "validation_mode", "version"))
+
+
+def test_provider_unavailable_after_retry_claim_blocks_before_seam():
+    _assert_retry_postclaim_change_blocks(
+        lambda provider, tool, clock: setattr(
+            provider, "validation_mode", "error"))
+
+
+@pytest.mark.parametrize("mode", ["key", "extend"])
+def test_postclaim_final_check_rejects_key_or_horizon_rewrite(mode):
+    _assert_retry_postclaim_change_blocks(
+        lambda provider, tool, clock: setattr(
+            provider, "validation_mode", mode))
+
+
+def test_tool_version_change_after_retry_claim_blocks_before_seam():
+    _assert_retry_postclaim_change_blocks(
+        lambda provider, tool, clock: setattr(tool, "version", "2.0.0"))
+
+
+def test_first_attempt_expiry_after_claim_never_enters_provider_execution():
+    clock = FixedClock(NOW)
+    executor, store, tool, provider, _ = _build(clock=clock)
+    checkpoint = MutateAtCheckpoint(4, lambda: clock.advance(3600))
+    blocked = _invoke(executor, checkpoint=checkpoint)
+    record = store.load(blocked.action_id)
+
+    assert checkpoint.calls == 4
+    assert blocked.result.metadata["kind"] == (
+        "external_idempotency_contract_unavailable")
+    assert record.state is ActionState.IN_FLIGHT
+    assert record.state not in {ActionState.FAILED, ActionState.CANCELLED}
+    assert len(record.attempts) == 1
+    assert record.attempts[-1].status.value == "claimed"
+    assert record.idempotency.valid_until == NOW + timedelta(hours=1)
+    assert provider.establish_calls == 1
+    assert provider.execute_calls == tool.runs == tool.remote_effects == 0
+
+
+def test_provider_boundary_revalidates_after_executor_final_check():
+    clock = FixedClock(NOW)
+    provider = FakeIdempotencyProvider(clock, horizon=5)
+    executor, store, tool, provider, _ = _build(
+        clock=clock, provider=provider)
+    provider.execute_hook = lambda: clock.advance(5)
+
+    blocked = _invoke(executor)
+    record = store.load(blocked.action_id)
+
+    assert not blocked.ok
+    assert record.state is ActionState.RECONCILE_REQUIRED
+    assert provider.execute_calls == 1
+    assert tool.runs == tool.remote_effects == 0
+    assert record.idempotency.valid_until == NOW + timedelta(seconds=5)
+
+
+@pytest.mark.parametrize("mode", ["scope", "version", "error", "key", "extend"])
+def test_provider_boundary_rejects_current_contract_drift(mode):
+    clock = FixedClock(NOW)
+    executor, store, tool, provider, _ = _build(clock=clock)
+    provider.execute_hook = lambda: setattr(provider, "validation_mode", mode)
+
+    blocked = _invoke(executor)
+    record = store.load(blocked.action_id)
+
+    assert not blocked.ok
+    assert record.state is ActionState.RECONCILE_REQUIRED
+    assert provider.execute_calls == 1
+    assert tool.runs == tool.remote_effects == 0
+
+
+def test_provider_boundary_rejects_last_moment_tool_version_drift():
+    clock = FixedClock(NOW)
+    executor, store, tool, provider, _ = _build(clock=clock)
+    provider.execute_hook = lambda: setattr(tool, "version", "2.0.0")
+
+    blocked = _invoke(executor)
+    record = store.load(blocked.action_id)
+
+    assert not blocked.ok
+    assert record.state is ActionState.RECONCILE_REQUIRED
+    assert provider.execute_calls == 1
+    assert tool.runs == tool.remote_effects == 0
 
 
 def test_current_permission_deny_blocks_retry_despite_valid_guarantee():

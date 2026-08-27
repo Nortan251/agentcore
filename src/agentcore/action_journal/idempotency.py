@@ -70,7 +70,21 @@ class ActionExecutionPermit:
 
 
 class ExternalIdempotencyProvider(Protocol):
-    """Trusted owner of key creation, guarantee checks, and physical use."""
+    """Trusted owner of key creation, guarantee checks, and physical use.
+
+    ``execute_if_current`` is the provider mutation boundary.  Immediately
+    before sending the physical request, an implementation must revalidate
+    that ``permit.idempotency`` is the exact durable contract for ``request``
+    under the provider's *current* account/tenant namespace, endpoint,
+    recognized contract version, and exact live tool/action registration.  It
+    must reject an unavailable, expired, or mismatched guarantee or live tool
+    name/version without sending, and must never mint a replacement key or
+    accept an extended retention horizon at this boundary.
+
+    This provider-side check is required even though the generic executor also
+    validates immediately before calling this method: only the trusted
+    provider owns the final check at its actual request seam.
+    """
 
     allows_indefinite_retention: bool
 
@@ -85,8 +99,9 @@ class ExternalIdempotencyProvider(Protocol):
         stored_contract: IdempotencyContract,
     ) -> IdempotencyContract: ...
 
-    def execute(
+    def execute_if_current(
         self,
+        request: ExternalIdempotencyRequest,
         tool: Any,
         cleaned: Mapping[str, Any],
         context: Any,

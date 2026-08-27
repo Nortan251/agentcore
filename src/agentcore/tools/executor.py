@@ -1743,6 +1743,31 @@ class ToolExecutor:
                 invocation_id, attempt_id, elapsed(), log,
                 fallback_kind="action_control_failed")
 
+        if spec.effect_class is ActionEffectClass.EXTERNALLY_IDEMPOTENT:
+            try:
+                # The fresh attempt is already durably claimed.  Revalidate
+                # after the final checkpoint and immediately before entering
+                # the trusted provider boundary.  On failure, retain IN_FLIGHT:
+                # an older attempt may still have an unknown outcome.
+                self._validate_external_contract_for_record(
+                    tool, tool_spec, spec, claimed)
+            except Exception:
+                return self._journal_failure(
+                    tool_spec.name, redacted, elapsed(),
+                    kind="external_idempotency_contract_unavailable",
+                    message=(
+                        "The external idempotency guarantee expired or changed "
+                        "after the physical-attempt claim. The claimed attempt "
+                        "remains nonterminal and the provider execution "
+                        "boundary was not entered."
+                    ),
+                    log=log, decision=decision,
+                    invocation_id=invocation_id,
+                    action_id=claimed.action_id,
+                    attempt_id=attempt_id,
+                    action_state=ActionState.IN_FLIGHT.value,
+                )
+
         cancellation: CancellationRequested | None = None
         try:
             # Conservative physical mutation seam. It is entered exactly once.
@@ -1756,8 +1781,11 @@ class ToolExecutor:
                     tool_version=tool_spec.version,
                     idempotency=claimed.idempotency,
                 ).validate()
+                request = self._external_idempotency_request(
+                    claimed.action_id, spec, tool_spec)
                 result = self._action_adapters.execute_external(
                     tool,
+                    request,
                     cleaned,
                     self._context(
                         tool_spec.name,
@@ -2055,6 +2083,8 @@ class ToolExecutor:
     ) -> IdempotencyContract:
         if record.idempotency is None:
             raise ValueError("durable idempotency metadata is unavailable")
+        if getattr(tool, "spec", None) != tool_spec:
+            raise ValueError("registered tool identity or shape changed")
         request = self._external_idempotency_request(
             record.action_id, spec, tool_spec)
         candidate, allows_indefinite = (

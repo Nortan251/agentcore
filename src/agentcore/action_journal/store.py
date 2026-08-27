@@ -862,7 +862,7 @@ def _dedup_index(records: list[ActionRecord]) -> dict[
     index: dict[tuple[str, str], ActionRecord] = {}
     action_ids: set[str] = set()
     attempt_owners: dict[str, str] = {}
-    idempotency_owners: dict[tuple[str, str, str], str] = {}
+    idempotency_owners: dict[tuple[str, str], str] = {}
     for record in records:
         record.validate()
         if record.action_id in action_ids:
@@ -878,9 +878,10 @@ def _dedup_index(records: list[ActionRecord]) -> dict[
                     owner_count=2)
             attempt_owners[attempt.attempt_id] = record.action_id
         if record.idempotency is not None:
+            # Scope is the provider's actual remote namespace.  Contract is
+            # guarantee/version metadata and cannot partition key ownership.
             idempotency_identity = (
                 record.idempotency.scope,
-                record.idempotency.contract,
                 record.idempotency.key,
             )
             owner = idempotency_owners.get(idempotency_identity)
@@ -929,9 +930,9 @@ def _validate_candidate_links(records: list[ActionRecord],
             action_id=candidate.action_id)
     if candidate.idempotency is None:
         return
+    # A contract-label change does not create a new remote key namespace.
     identity = (
         candidate.idempotency.scope,
-        candidate.idempotency.contract,
         candidate.idempotency.key,
     )
     for record in records:
@@ -939,7 +940,6 @@ def _validate_candidate_links(records: list[ActionRecord],
             continue
         existing = (
             record.idempotency.scope,
-            record.idempotency.contract,
             record.idempotency.key,
         )
         if existing == identity and record.action_id != candidate.action_id:
