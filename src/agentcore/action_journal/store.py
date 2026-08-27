@@ -725,7 +725,8 @@ def _existing_create_owner(
 ) -> ActionRecord | None:
     for existing in records:
         if existing.action_id == requested.action_id:
-            if deduplication_compatible(existing, requested):
+            if existing.intent_ref == requested.intent_ref and (
+                    deduplication_compatible(existing, requested)):
                 return existing
             raise ActionAlreadyExistsError(
                 "action id owns a different immutable intent",

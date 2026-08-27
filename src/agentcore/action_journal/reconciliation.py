@@ -8,7 +8,8 @@ or mutation.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol
 
@@ -38,6 +39,11 @@ from agentcore.action_journal.models import (
     EffectVerdict,
     ReconciliationDisposition,
     require_action_id,
+)
+from agentcore.action_journal.protected_storage import (
+    is_evidence_reference,
+    looks_like_evidence_reference,
+    looks_like_protected_payload_reference,
 )
 
 
@@ -93,8 +99,23 @@ class ReconciliationAttemptEvidence:
 
 
 @dataclass(frozen=True)
+class ProtectedEvidenceView:
+    """Detached protected evidence exposed only to a trusted reconciler."""
+
+    reference: str
+    evidence: Mapping[str, object] = field(repr=False, compare=False)
+
+    def validate(self) -> ProtectedEvidenceView:
+        if not is_evidence_reference(self.reference) or not isinstance(
+                self.evidence, Mapping):
+            raise ActionValidationError(
+                "protected reconciliation evidence is invalid")
+        return self
+
+
+@dataclass(frozen=True)
 class ActionReconciliationContext:
-    """Content-free immutable action facts supplied to a read-only probe."""
+    """Immutable public facts plus executor-resolved protected probe input."""
 
     action_id: str
     action_kind: str
@@ -107,6 +128,10 @@ class ActionReconciliationContext:
     target_fingerprint: str | None
     attempts: tuple[ReconciliationAttemptEvidence, ...]
     evidence_refs: tuple[str, ...]
+    protected_payload: Mapping[str, object] | None = field(
+        default=None, repr=False, compare=False)
+    protected_evidence: tuple[ProtectedEvidenceView, ...] = field(
+        default=(), repr=False, compare=False)
 
     @classmethod
     def from_record(cls, record: ActionRecord) -> ActionReconciliationContext:
@@ -165,6 +190,18 @@ class ActionReconciliationContext:
                 )
             attempt.validate()
         _reference_tuple(self.evidence_refs, "reconciliation action evidence")
+        if self.protected_payload is not None and not isinstance(
+                self.protected_payload, Mapping):
+            raise ActionValidationError(
+                "protected reconciliation payload is invalid")
+        if not isinstance(self.protected_evidence, tuple):
+            raise ActionValidationError(
+                "protected reconciliation evidence is invalid")
+        for item in self.protected_evidence:
+            if not isinstance(item, ProtectedEvidenceView):
+                raise ActionValidationError(
+                    "protected reconciliation evidence is invalid")
+            item.validate()
         return self
 
 
@@ -181,6 +218,8 @@ class ActionReconciliationResult:
         ReconciliationDisposition.NONE
     )
     retry_safe: bool = False
+    protected_evidence: tuple[Mapping[str, object], ...] = field(
+        default=(), repr=False, compare=False)
 
     def validate(self) -> ActionReconciliationResult:
         if not isinstance(self.verdict, EffectVerdict):
@@ -203,6 +242,21 @@ class ActionReconciliationResult:
             "reconciliation evidence",
             normalization=True,
         )
+        if any(looks_like_evidence_reference(reference)
+               or looks_like_protected_payload_reference(reference)
+               for reference in self.evidence_refs):
+            raise ActionEffectNormalizationError(
+                "protected references are minted by trusted storage")
+        if not isinstance(self.protected_evidence, tuple) or len(
+                self.protected_evidence) > MAX_EVIDENCE_REFS or any(
+                    not isinstance(item, Mapping)
+                    for item in self.protected_evidence):
+            raise ActionEffectNormalizationError(
+                "protected reconciliation evidence is invalid")
+        if len(self.evidence_refs) + len(self.protected_evidence) > (
+                MAX_EVIDENCE_REFS):
+            raise ActionEffectNormalizationError(
+                "reconciliation evidence bound is exceeded")
         _categorical_tuple(self.partial_categories)
         if not isinstance(
             self.reconciliation_disposition, ReconciliationDisposition
@@ -407,5 +461,6 @@ __all__ = [
     "ActionReconciliationResult",
     "ActionReconciliationStatus",
     "ActionRecoveryClaim",
+    "ProtectedEvidenceView",
     "ReconciliationAttemptEvidence",
 ]

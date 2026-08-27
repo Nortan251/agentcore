@@ -51,3 +51,35 @@ class ActionDeduplicationConflictError(ActionStoreError):
 
 class ActionStoreOwnershipError(ActionStoreError):
     """Another process owns the durable action store."""
+
+
+class ProtectedStorageError(ActionJournalError):
+    """Base class for segregated protected action-storage failures."""
+
+
+class InstallationKeyError(ProtectedStorageError):
+    """Installation-local integrity key material is unavailable or corrupt."""
+
+
+class ProtectedReferenceError(ProtectedStorageError):
+    """A protected object reference is malformed or has the wrong namespace."""
+
+
+class ProtectedObjectNotFoundError(ProtectedStorageError):
+    """A required protected object does not exist."""
+
+
+class ProtectedObjectCorruptError(ProtectedStorageError):
+    """A protected object failed strict decoding or integrity validation."""
+
+
+class ProtectedObjectAlreadyExistsError(ProtectedStorageError):
+    """An immutable protected object reference is already occupied."""
+
+
+class ProtectedObjectTooLargeError(ProtectedStorageError):
+    """A protected object exceeds its fixed serialized size bound."""
+
+
+class ProtectedStoreOwnershipError(ProtectedStorageError):
+    """A protected store instance belongs to another process."""

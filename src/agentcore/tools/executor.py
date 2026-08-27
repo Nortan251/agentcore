@@ -9,9 +9,10 @@ entered. ActionJournal records are evidence; they never grant authority.
 from __future__ import annotations
 
 import os
+import hmac
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from agentcore.action_journal import (
@@ -34,13 +35,21 @@ from agentcore.action_journal import (
     ActionTransitionProof,
     AuthorityReceipt,
     EffectVerdict,
+    EvidenceStore,
     NormalizedActionEffect,
     PreparedActionIntent,
+    ProtectedActionPayloadStore,
+    ProtectedEvidenceView,
+    ProtectedPayloadPurpose,
     ReconciliationDisposition,
     ReconciliationMetadata,
     ToolActionAdapter,
     authority_binding_digest,
     deduplication_compatible,
+    is_evidence_reference,
+    is_protected_payload_reference,
+    looks_like_evidence_reference,
+    looks_like_protected_payload_reference,
     new_action,
     new_action_attempt_id,
     new_action_transition_id,
@@ -138,6 +147,8 @@ class ToolExecutor:
         logger: StructuredLogger | None = None,
         action_store: ActionStore | None = None,
         action_adapters: ActionAdapterRegistry | None = None,
+        protected_payload_store: ProtectedActionPayloadStore | None = None,
+        evidence_store: EvidenceStore | None = None,
         clock: Clock | None = None,
         id_factory: Callable[[str], str] = new_id,
         action_owner_id: str | None = None,
@@ -151,6 +162,8 @@ class ToolExecutor:
         self._tool_settings = dict(tool_settings or {})
         self._log = logger or get_logger("tools.executor")
         self._action_store = action_store
+        self._protected_payload_store = protected_payload_store
+        self._evidence_store = evidence_store
         self._action_adapters = (
             action_adapters
             if action_adapters is not None
@@ -168,6 +181,108 @@ class ToolExecutor:
         self._action_mutation_quarantine = (
             category if category in allowed else "journal_corrupt"
         )
+
+    def validate_action_protected_storage(self, record: ActionRecord) -> None:
+        """Validate every protected reference needed by one action.
+
+        Recovery calls this before classifying nonterminal truth.  It performs
+        only bounded local reads and grants no execution or reconciliation
+        authority.
+        """
+        self._resolve_action_protected_storage(record)
+
+    def _resolve_action_protected_storage(
+        self,
+        record: ActionRecord,
+    ) -> tuple[Mapping[str, Any] | None, tuple[ProtectedEvidenceView, ...]]:
+        if not isinstance(record, ActionRecord):
+            raise TypeError("protected action record type is invalid")
+        record.validate()
+        protected_payload: Mapping[str, Any] | None = None
+        if record.intent_ref is not None:
+            if not is_protected_payload_reference(record.intent_ref):
+                raise ValueError("protected payload reference namespace is invalid")
+            if self._protected_payload_store is None:
+                raise ValueError("protected payload store is unavailable")
+            stored = self._protected_payload_store.load(
+                record.intent_ref,
+                action_id=record.action_id,
+                purpose=ProtectedPayloadPurpose.ACTION_INTENT,
+                expected_intent_digest=record.intent_digest,
+            )
+            protected_payload = stored.payload
+
+        evidence_views: list[ProtectedEvidenceView] = []
+        reconciliation = ReconciliationMetadata()
+        for transition in record.transitions:
+            prior_reconciliation = reconciliation
+            for reference in transition.evidence_refs:
+                if looks_like_protected_payload_reference(reference):
+                    raise ValueError("payload reference used as evidence")
+                if not looks_like_evidence_reference(reference):
+                    continue
+                if not is_evidence_reference(reference):
+                    raise ValueError("protected evidence reference is malformed")
+                if self._evidence_store is None:
+                    raise ValueError("protected evidence store is unavailable")
+                if transition.attempt_id is not None:
+                    evidence = self._evidence_store.load_attempt_evidence(
+                        reference,
+                        action_id=record.action_id,
+                        attempt_id=transition.attempt_id,
+                        intent_digest=record.intent_digest,
+                    )
+                elif transition.from_state is ActionState.RECONCILE_REQUIRED and (
+                        prior_reconciliation.claim_epoch > 0):
+                    evidence = self._evidence_store.load_reconciliation_evidence(
+                        reference,
+                        action_id=record.action_id,
+                        claim_epoch=prior_reconciliation.claim_epoch,
+                        intent_digest=record.intent_digest,
+                    )
+                else:
+                    raise ValueError("protected evidence lifecycle binding is invalid")
+                evidence_views.append(ProtectedEvidenceView(
+                    reference=reference,
+                    evidence=evidence.evidence,
+                ).validate())
+            reconciliation = (
+                transition.reconciliation
+                if transition.to_state is ActionState.RECONCILE_REQUIRED
+                else ReconciliationMetadata()
+            )
+        return protected_payload, tuple(evidence_views)
+
+    def _protected_intent_matches(
+        self,
+        record: ActionRecord,
+        prepared: PreparedActionIntent,
+    ) -> bool:
+        try:
+            if record.intent_ref is None:
+                return (
+                    prepared.intent_ref is None
+                    and prepared.protected_payload is None
+                    and not prepared.requires_protected_payload
+                    and record.intent_digest == prepared.intent_digest
+                )
+            if prepared.intent_ref is not None or prepared.protected_payload is None or (
+                    self._protected_payload_store is None):
+                return False
+            stored = self._protected_payload_store.load(
+                record.intent_ref,
+                action_id=record.action_id,
+                purpose=ProtectedPayloadPurpose.ACTION_INTENT,
+                expected_intent_digest=record.intent_digest,
+            )
+            current_digest = self._protected_payload_store.intent_digest(
+                prepared.protected_payload,
+                purpose=ProtectedPayloadPurpose.ACTION_INTENT,
+            )
+            return hmac.compare_digest(
+                stored.intent_digest, current_digest)
+        except Exception:
+            return False
 
     def _context(self, tool_name: str) -> ToolContext:
         return ToolContext(
@@ -438,7 +553,14 @@ class ToolExecutor:
             return checkpoint_report
 
         try:
-            context = ActionReconciliationContext.from_record(current)
+            protected_payload, protected_evidence = (
+                self._resolve_action_protected_storage(current)
+            )
+            context = replace(
+                ActionReconciliationContext.from_record(current),
+                protected_payload=protected_payload,
+                protected_evidence=protected_evidence,
+            ).validate()
             result = reconciler.probe(context)
             if not isinstance(result, ActionReconciliationResult):
                 raise TypeError("reconciliation result type is invalid")
@@ -472,7 +594,13 @@ class ToolExecutor:
             return checkpoint_report
 
         try:
-            candidate, status = self._reconciliation_candidate(current, result)
+            trusted_evidence_refs = self._persist_reconciliation_evidence(
+                current, claim, result)
+            candidate, status = self._reconciliation_candidate(
+                current,
+                result,
+                trusted_evidence_refs=trusted_evidence_refs,
+            )
         except Exception:
             return self._release_recovery_claim(
                 store,
@@ -574,8 +702,15 @@ class ToolExecutor:
         self,
         current: ActionRecord,
         result: ActionReconciliationResult,
+        *,
+        trusted_evidence_refs: tuple[str, ...] = (),
     ) -> tuple[ActionRecord, ActionReconciliationStatus]:
         result.validate()
+        if not isinstance(trusted_evidence_refs, tuple) or any(
+                not is_evidence_reference(reference)
+                for reference in trusted_evidence_refs):
+            raise ValueError("trusted evidence references are invalid")
+        evidence_refs = result.evidence_refs + trusted_evidence_refs
         transition_id = new_action_transition_id(id_factory=self._id_factory)
         at = self._clock.now()
         if result.verdict is EffectVerdict.CONFIRMED_APPLIED:
@@ -589,7 +724,7 @@ class ToolExecutor:
                 transition_id=transition_id,
                 at=at,
                 effect_verdict=result.verdict,
-                evidence_refs=result.evidence_refs,
+                evidence_refs=evidence_refs,
                 terminal_outcome=outcome,
             ), ActionReconciliationStatus.SETTLED_SUCCEEDED
         if result.verdict is EffectVerdict.CONFIRMED_NOT_APPLIED:
@@ -600,7 +735,7 @@ class ToolExecutor:
                     at=at,
                     effect_verdict=result.verdict,
                     proof=ActionTransitionProof.DEFINITIVE_NO_EFFECT,
-                    evidence_refs=result.evidence_refs,
+                    evidence_refs=evidence_refs,
                 ), ActionReconciliationStatus.RETRY_AUTHORIZED
             outcome = ActionOutcome(
                 verdict=result.verdict,
@@ -612,7 +747,7 @@ class ToolExecutor:
                 transition_id=transition_id,
                 at=at,
                 effect_verdict=result.verdict,
-                evidence_refs=result.evidence_refs,
+                evidence_refs=evidence_refs,
                 terminal_outcome=outcome,
             ), ActionReconciliationStatus.SETTLED_FAILED
         if result.verdict is EffectVerdict.CONFIRMED_PARTIAL:
@@ -627,7 +762,7 @@ class ToolExecutor:
                 transition_id=transition_id,
                 at=at,
                 effect_verdict=result.verdict,
-                evidence_refs=result.evidence_refs,
+                evidence_refs=evidence_refs,
                 terminal_outcome=outcome,
             ), ActionReconciliationStatus.SETTLED_FAILED
         metadata = ReconciliationMetadata(
@@ -640,7 +775,7 @@ class ToolExecutor:
             transition_id=transition_id,
             at=at,
             effect_verdict=EffectVerdict.OUTCOME_UNKNOWN,
-            evidence_refs=result.evidence_refs,
+            evidence_refs=evidence_refs,
             reconciliation=metadata,
         ), ActionReconciliationStatus.UNRESOLVED
 
@@ -878,11 +1013,29 @@ class ToolExecutor:
                 message="The action intent could not be prepared safely.",
                 log=log, invocation_id=invocation_id)
 
-        if prepared.requires_protected_payload or prepared.intent_ref is not None:
+        protected_requested = (
+            prepared.requires_protected_payload
+            or prepared.protected_payload is not None
+            or prepared.intent_ref is not None
+        )
+        if protected_requested and self._protected_payload_store is None:
             return self._journal_failure(
                 tool_spec.name, redacted, elapsed(),
                 kind="protected_payload_unavailable",
                 message="Protected action payload storage is not available.",
+                log=log, invocation_id=invocation_id)
+        if prepared.intent_ref is not None:
+            return self._journal_failure(
+                tool_spec.name, redacted, elapsed(),
+                kind="protected_reference_untrusted",
+                message="Protected references are minted only by trusted storage.",
+                log=log, invocation_id=invocation_id)
+        if prepared.requires_protected_payload and (
+                prepared.protected_payload is None):
+            return self._journal_failure(
+                tool_spec.name, redacted, elapsed(),
+                kind="protected_payload_invalid",
+                message="The required protected action payload is unavailable.",
                 log=log, invocation_id=invocation_id)
 
         resume_requested = trusted_context.action_id is not None
@@ -960,6 +1113,38 @@ class ToolExecutor:
                     ),
                     log=log, decision=decision,
                     invocation_id=invocation_id)
+            proposed_action_id: str | None = None
+            protected_intent_ref: str | None = None
+            public_intent_digest = prepared.intent_digest
+            if prepared.protected_payload is not None:
+                try:
+                    assert self._protected_payload_store is not None
+                    proposed_action_id = self._id_factory("act")
+                    protected = self._protected_payload_store.create(
+                        proposed_action_id,
+                        prepared.protected_payload,
+                        purpose=ProtectedPayloadPurpose.ACTION_INTENT,
+                    )
+                    exact_protected = self._protected_payload_store.load(
+                        protected.reference,
+                        action_id=proposed_action_id,
+                        purpose=ProtectedPayloadPurpose.ACTION_INTENT,
+                        expected_intent_digest=protected.intent_digest,
+                    )
+                    if exact_protected != protected:
+                        raise ValueError("protected payload reload mismatch")
+                    protected_intent_ref = protected.reference
+                    public_intent_digest = protected.intent_digest
+                except Exception:
+                    return self._journal_failure(
+                        tool_spec.name, redacted, elapsed(),
+                        kind="protected_payload_unverified",
+                        message=(
+                            "The protected action payload could not be "
+                            "stored and verified."
+                        ),
+                        log=log, decision=decision,
+                        invocation_id=invocation_id)
             try:
                 policy_fingerprint = permission_policy_fingerprint(self.policy)
                 authority_scope = f"live:{invocation_id}"
@@ -967,7 +1152,7 @@ class ToolExecutor:
                     receipt_id=self._id_factory("auth"),
                     binding_digest=authority_binding_digest(
                         action_kind=spec.action_kind,
-                        intent_digest=prepared.intent_digest,
+                        intent_digest=public_intent_digest,
                         mutation_capabilities=mutation_capabilities,
                         tool_name=tool_spec.name,
                         tool_version=tool_spec.version,
@@ -988,12 +1173,13 @@ class ToolExecutor:
                     mutation_capabilities=mutation_capabilities,
                     reconciliation_capabilities=reconciliation_capabilities,
                     effect_class=spec.effect_class,
-                    intent_digest=prepared.intent_digest,
-                    intent_ref=None,
+                    intent_digest=public_intent_digest,
+                    intent_ref=protected_intent_ref,
                     target_category=prepared.target_category,
                     target_fingerprint=prepared.target_fingerprint,
                     provenance=provenance,
                     authority=receipt,
+                    action_id=proposed_action_id,
                     deduplication_scope=trusted_context.deduplication_scope,
                     deduplication_key=trusted_context.deduplication_key,
                     clock=self._clock,
@@ -1015,6 +1201,18 @@ class ToolExecutor:
                     log=log, decision=decision, invocation_id=invocation_id,
                     action_id=proposed.action_id)
             created_here = created == proposed
+            try:
+                self.validate_action_protected_storage(created)
+                if not self._protected_intent_matches(created, prepared):
+                    raise ValueError("protected intent mismatch")
+            except Exception:
+                return self._journal_failure(
+                    tool_spec.name, redacted, elapsed(),
+                    kind="protected_payload_unverified",
+                    message="The protected action payload could not be verified.",
+                    log=log, decision=decision,
+                    invocation_id=invocation_id,
+                    action_id=created.action_id)
 
         guard_entered = False
         try:
@@ -1071,6 +1269,9 @@ class ToolExecutor:
             current.validate()
             if not self._same_action_lineage(current, created):
                 raise ValueError("action reload changed immutable intent")
+            self.validate_action_protected_storage(current)
+            if not self._protected_intent_matches(current, prepared):
+                raise ValueError("protected intent mismatch")
         except Exception:
             return self._journal_failure(
                 tool_spec.name, redacted, elapsed(),
@@ -1210,8 +1411,20 @@ class ToolExecutor:
         except Exception:
             normalized = self._unknown_effect(spec, "tool.exception")
 
+        trusted_evidence_refs: tuple[str, ...] = ()
         try:
-            candidate = self._effect_candidate(claimed, normalized)
+            try:
+                trusted_evidence_refs = self._persist_attempt_evidence(
+                    claimed, normalized)
+            except Exception:
+                normalized = self._unknown_effect(
+                    spec, "evidence.storage_failed")
+                trusted_evidence_refs = ()
+            candidate = self._effect_candidate(
+                claimed,
+                normalized,
+                trusted_evidence_refs=trusted_evidence_refs,
+            )
         except Exception:
             try:
                 candidate = self._effect_candidate(
@@ -1283,12 +1496,12 @@ class ToolExecutor:
         if not deduplication_compatible(record, proposed):
             return False
         if record.action_id == proposed.action_id:
-            return True
+            return record.intent_ref == proposed.intent_ref
         identity = proposed.deduplication_identity
         return identity is not None and record.deduplication_identity == identity
 
-    @staticmethod
     def _matches_resume_request(
+        self,
         record: ActionRecord,
         *,
         prepared: PreparedActionIntent,
@@ -1315,8 +1528,7 @@ class ToolExecutor:
             and record.reconciliation_capabilities == (
                 reconciliation_capabilities
             )
-            and record.intent_digest == prepared.intent_digest
-            and record.intent_ref == prepared.intent_ref
+            and self._protected_intent_matches(record, prepared)
             and record.target_category == prepared.target_category
             and record.target_fingerprint == prepared.target_fingerprint
             and (
@@ -1456,7 +1668,13 @@ class ToolExecutor:
         self,
         claimed: ActionRecord,
         normalized: NormalizedActionEffect,
+        *,
+        trusted_evidence_refs: tuple[str, ...] = (),
     ) -> ActionRecord:
+        if not isinstance(trusted_evidence_refs, tuple) or any(
+                not is_evidence_reference(reference)
+                for reference in trusted_evidence_refs):
+            raise ValueError("trusted evidence references are invalid")
         verdict = normalized.verdict
         if verdict is EffectVerdict.CONFIRMED_APPLIED:
             state = ActionState.SUCCEEDED
@@ -1482,9 +1700,67 @@ class ToolExecutor:
             at=self._clock.now(),
             attempt_status=ActionAttemptStatus.INVOKED,
             effect_verdict=verdict,
-            evidence_refs=normalized.evidence_refs,
+            evidence_refs=normalized.evidence_refs + trusted_evidence_refs,
             reconciliation=reconciliation,
             terminal_outcome=outcome)
+
+    def _persist_attempt_evidence(
+        self,
+        claimed: ActionRecord,
+        normalized: NormalizedActionEffect,
+    ) -> tuple[str, ...]:
+        if not normalized.protected_evidence:
+            return ()
+        if self._evidence_store is None or not claimed.attempts:
+            raise ValueError("protected evidence storage is unavailable")
+        attempt_id = claimed.attempts[-1].attempt_id
+        references: list[str] = []
+        for material in normalized.protected_evidence:
+            stored = self._evidence_store.create_attempt_evidence(
+                claimed.action_id,
+                attempt_id,
+                claimed.intent_digest,
+                material,
+            )
+            exact = self._evidence_store.load_attempt_evidence(
+                stored.reference,
+                action_id=claimed.action_id,
+                attempt_id=attempt_id,
+                intent_digest=claimed.intent_digest,
+            )
+            if exact != stored:
+                raise ValueError("protected evidence reload mismatch")
+            references.append(stored.reference)
+        return tuple(references)
+
+    def _persist_reconciliation_evidence(
+        self,
+        current: ActionRecord,
+        claim: ActionRecoveryClaim,
+        result: ActionReconciliationResult,
+    ) -> tuple[str, ...]:
+        if not result.protected_evidence:
+            return ()
+        if self._evidence_store is None:
+            raise ValueError("protected evidence storage is unavailable")
+        references: list[str] = []
+        for material in result.protected_evidence:
+            stored = self._evidence_store.create_reconciliation_evidence(
+                current.action_id,
+                claim.claim_epoch,
+                current.intent_digest,
+                material,
+            )
+            exact = self._evidence_store.load_reconciliation_evidence(
+                stored.reference,
+                action_id=current.action_id,
+                claim_epoch=claim.claim_epoch,
+                intent_digest=current.intent_digest,
+            )
+            if exact != stored:
+                raise ValueError("protected evidence reload mismatch")
+            references.append(stored.reference)
+        return tuple(references)
 
     @staticmethod
     def _publish_and_reload(
