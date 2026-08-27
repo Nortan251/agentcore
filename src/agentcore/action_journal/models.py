@@ -74,6 +74,7 @@ _LOWER_HEX_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _CATEGORICAL = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]*$")
 _VERSION_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:+-]*$")
 _OPAQUE_REFERENCE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@+=-]*$")
+_TRUSTED_PROTECTED_PAYLOAD_REF = re.compile(r"^pap_[0-9a-f]{12}$")
 
 
 class ActionState(str, Enum):
@@ -1661,6 +1662,7 @@ def new_action(
     target_fingerprint: str | None,
     provenance: ActionProvenance,
     authority: AuthorityReceipt,
+    action_id: str | None = None,
     deduplication_scope: str | None = None,
     deduplication_key: str | None = None,
     idempotency: IdempotencyContract | None = None,
@@ -1675,7 +1677,11 @@ def new_action(
     resolved_clock = clock or SystemClock()
     now = _ensure_utc(resolved_clock.now(), "clock.now")
     record = ActionRecord(
-        action_id=_require_pattern(id_factory("act"), _ACTION_ID, "action id"),
+        action_id=_require_pattern(
+            action_id if action_id is not None else id_factory("act"),
+            _ACTION_ID,
+            "action id",
+        ),
         state=ActionState.AUTHORIZED,
         version=0,
         action_kind=action_kind,
@@ -1862,7 +1868,7 @@ def deduplication_compatible(first: ActionRecord,
     """Whether two trusted create requests describe the same logical intent."""
     first.validate()
     second.validate()
-    return (
+    same_logical_intent = (
         first.action_kind,
         first.tool_name,
         first.tool_version,
@@ -1871,7 +1877,6 @@ def deduplication_compatible(first: ActionRecord,
         first.reconciliation_capabilities,
         first.effect_class,
         first.intent_digest,
-        first.intent_ref,
         first.target_category,
         first.target_fingerprint,
         first.deduplication_identity,
@@ -1887,13 +1892,26 @@ def deduplication_compatible(first: ActionRecord,
         second.reconciliation_capabilities,
         second.effect_class,
         second.intent_digest,
-        second.intent_ref,
         second.target_category,
         second.target_fingerprint,
         second.deduplication_identity,
         second.idempotency,
         second.predecessor_action_id,
         second.duplicate_risk_acknowledgement,
+    )
+    if not same_logical_intent:
+        return False
+    if first.intent_ref == second.intent_ref:
+        return True
+    # Concurrent trusted callers may each durably stage an orphan payload
+    # before ActionStore deduplication linearizes them.  A keyed intent digest
+    # proves logical content equality without requiring the winning public
+    # record to adopt the losing action-bound reference.
+    return (
+        isinstance(first.intent_ref, str)
+        and isinstance(second.intent_ref, str)
+        and bool(_TRUSTED_PROTECTED_PAYLOAD_REF.fullmatch(first.intent_ref))
+        and bool(_TRUSTED_PROTECTED_PAYLOAD_REF.fullmatch(second.intent_ref))
     )
 
 

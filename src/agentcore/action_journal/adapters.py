@@ -13,7 +13,7 @@ import os
 import re
 import threading
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from agentcore.action_journal.errors import (
@@ -47,6 +47,10 @@ from agentcore.action_journal.models import (
     require_action_id,
 )
 from agentcore.action_journal.reconciliation import ActionReconciler
+from agentcore.action_journal.protected_storage import (
+    looks_like_evidence_reference,
+    looks_like_protected_payload_reference,
+)
 from agentcore.permissions.levels import (
     READ_ONLY_CAPABILITIES,
     Capability,
@@ -127,6 +131,11 @@ class PreparedActionIntent:
     target_fingerprint: str | None = None
     approval_description: str | None = None
     requires_protected_payload: bool = False
+    protected_payload: Mapping[str, Any] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def validate(self) -> PreparedActionIntent:
         _digest(self.intent_digest, "intent digest")
@@ -142,6 +151,12 @@ class PreparedActionIntent:
         if not isinstance(self.requires_protected_payload, bool):
             raise ActionValidationError(
                 "requires_protected_payload must be boolean")
+        if self.protected_payload is not None and not isinstance(
+                self.protected_payload, Mapping):
+            raise ActionValidationError("protected payload must be a mapping")
+        if self.intent_ref is not None and self.protected_payload is not None:
+            raise ActionValidationError(
+                "trusted payload content cannot carry a preselected reference")
         return self
 
 
@@ -157,6 +172,11 @@ class NormalizedActionEffect:
     reconciliation_disposition: ReconciliationDisposition = (
         ReconciliationDisposition.NONE
     )
+    protected_evidence: tuple[Mapping[str, Any], ...] = field(
+        default=(),
+        repr=False,
+        compare=False,
+    )
 
     def validate(self, spec: ActionAdapterSpec) -> NormalizedActionEffect:
         spec.validate()
@@ -168,6 +188,21 @@ class NormalizedActionEffect:
                    "effect summary", normalization=True)
         _reference_tuple(self.evidence_refs, MAX_EVIDENCE_REFS,
                          MAX_EVIDENCE_REF_CHARS, "effect evidence refs")
+        if any(looks_like_evidence_reference(reference)
+               or looks_like_protected_payload_reference(reference)
+               for reference in self.evidence_refs):
+            raise ActionEffectNormalizationError(
+                "protected references are minted by trusted storage")
+        if not isinstance(self.protected_evidence, tuple) or len(
+                self.protected_evidence) > MAX_EVIDENCE_REFS or any(
+                    not isinstance(item, Mapping)
+                    for item in self.protected_evidence):
+            raise ActionEffectNormalizationError(
+                "protected effect evidence is invalid")
+        if len(self.evidence_refs) + len(self.protected_evidence) > (
+                MAX_EVIDENCE_REFS):
+            raise ActionEffectNormalizationError(
+                "effect evidence bound is exceeded")
         _categorical_tuple(
             self.partial_categories,
             MAX_PARTIAL_CATEGORIES,

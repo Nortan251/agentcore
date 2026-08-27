@@ -69,6 +69,8 @@ from agentcore.action_journal import (
     ActionAdapterRegistry,
     ActionInvocationContext,
     ActionStore,
+    EvidenceStore,
+    ProtectedActionPayloadStore,
 )
 
 
@@ -133,6 +135,8 @@ class AgentDependencies:
     #: Agent never creates a mutation journal or semantic adapter implicitly.
     action_store: ActionStore | None = None
     action_adapters: ActionAdapterRegistry | None = None
+    protected_payload_store: ProtectedActionPayloadStore | None = None
+    evidence_store: EvidenceStore | None = None
 
 
 class Agent:
@@ -168,6 +172,8 @@ class Agent:
             tool_settings=self.config.tools.settings,
             action_store=deps.action_store,
             action_adapters=deps.action_adapters,
+            protected_payload_store=deps.protected_payload_store,
+            evidence_store=deps.evidence_store,
         )
         self.action_recovery: ActionRecoveryCoordinator | None = None
         self.action_recovery_startup: (

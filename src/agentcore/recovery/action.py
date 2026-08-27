@@ -139,6 +139,10 @@ class ActionRecoveryCoordinator:
         with self._store.execution_guard(record.action_id):
             current = self._store.load(record.action_id)
             current.validate()
+            validate_protected = getattr(
+                self._executor, "validate_action_protected_storage", None)
+            if callable(validate_protected):
+                validate_protected(current)
             return self._recover_guarded_record(current)
 
     def _recover_guarded_record(
