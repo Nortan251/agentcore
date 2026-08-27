@@ -9,6 +9,7 @@ from agentcore.permissions.levels import (
 from agentcore.permissions.policy import (
     AlwaysApproveGate,
     ApprovalGate,
+    CapabilityEvaluation,
     Decision,
     DenyAllApprovalGate,
     Outcome,
@@ -26,6 +27,7 @@ __all__ = [
     "Decision",
     "Outcome",
     "ApprovalGate",
+    "CapabilityEvaluation",
     "DenyAllApprovalGate",
     "AlwaysApproveGate",
 ]

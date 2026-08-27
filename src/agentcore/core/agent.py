@@ -12,9 +12,16 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
 import inspect
+import secrets
 import threading
 
 from agentcore.config.schema import AgentConfig
+from agentcore.approvals import (
+    ApprovalInvocationContext,
+    DurableApprovalAuthority,
+    InMemoryApprovalStore,
+    LegacyApprovalGateAdapter,
+)
 from agentcore.core.action_binding import (
     build_replan_binding_candidates,
     carry_action_bindings,
@@ -71,6 +78,7 @@ from agentcore.action_journal import (
     ActionStore,
     EvidenceStore,
     ProtectedActionPayloadStore,
+    StaticInstallationKeyProvider,
 )
 
 
@@ -137,6 +145,9 @@ class AgentDependencies:
     action_adapters: ActionAdapterRegistry | None = None
     protected_payload_store: ProtectedActionPayloadStore | None = None
     evidence_store: EvidenceStore | None = None
+    #: Host-owned durable human authority. It is never constructed from model
+    #: or provider state and remains independent of ActionJournal.
+    approval_authority: DurableApprovalAuthority | None = None
 
 
 class Agent:
@@ -166,6 +177,21 @@ class Agent:
             config=self.config.filesystem,
         )
 
+        approval_authority = deps.approval_authority
+        if approval_authority is None and deps.approval_gate is not None:
+            # Narrow compatibility seam for the pre-43.2e synchronous host
+            # gate.  Its boolean decision enters the same typed, one-shot
+            # lifecycle and never bypasses durable binding/consumption.  This
+            # process-local adapter intentionally grants no restart authority;
+            # hosts that need restart continuity inject a durable authority.
+            approval_authority = DurableApprovalAuthority(
+                InMemoryApprovalStore(),
+                StaticInstallationKeyProvider(secrets.token_bytes(32)),
+                principal_ref="principal:local-host",
+                scope_ref="scope:agent-instance",
+                gate=LegacyApprovalGateAdapter(deps.approval_gate),
+            )
+
         self.executor = ToolExecutor(
             self.registry, self.policy,
             workspace=self.workspace,
@@ -174,6 +200,7 @@ class Agent:
             action_adapters=deps.action_adapters,
             protected_payload_store=deps.protected_payload_store,
             evidence_store=deps.evidence_store,
+            approval_authority=approval_authority,
         )
         self.action_recovery: ActionRecoveryCoordinator | None = None
         self.action_recovery_startup: (
@@ -649,13 +676,15 @@ class Agent:
     def available_tools(self) -> list[dict[str, Any]]:
         return self.registry.describe()
 
-    def call_tool(self, name: str, args: dict[str, Any] | None = None
+    def call_tool(self, name: str, args: dict[str, Any] | None = None,
+                  *, approval_context: ApprovalInvocationContext | None = None
                   ) -> ToolInvocation:
         """Invoke a single tool outside of a task, recording it in state."""
         invocation = self.executor.invoke(
             name,
             args,
             action_context=ActionInvocationContext(run_id=self.state.run_id),
+            approval_context=approval_context,
             run_id=self.state.run_id,
         )
         self.state.record_tool_call(invocation)
