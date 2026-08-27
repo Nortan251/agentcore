@@ -51,6 +51,20 @@ class Decision:
         }
 
 
+@dataclass(frozen=True)
+class CapabilityEvaluation:
+    """Aggregate current policy truth before any approval is consulted."""
+
+    outcome: Outcome
+    capabilities: tuple[Capability, ...]
+    approval_capabilities: tuple[Capability, ...] = ()
+    denied: Decision | None = None
+
+    @property
+    def allowed(self) -> bool:
+        return self.outcome is Outcome.ALLOW
+
+
 class ApprovalGate(Protocol):
     """Where a CONFIRM-level approval request is routed.
 
@@ -144,26 +158,55 @@ class PermissionPolicy:
         REQUIRE_APPROVAL is resolved through the approval gate, turning into
         ALLOW or DENY so callers only ever see a terminal answer.
         """
-        caps = list(capabilities)
-        if not caps:
+        evaluation = self.evaluate_all(capabilities)
+        if not evaluation.capabilities:
             return Decision(Outcome.ALLOW, "no capabilities requested")
-
-        pending: Decision | None = None
-        for cap in caps:
-            decision = self.evaluate(cap)
-            if decision.outcome is Outcome.DENY:
-                return decision
-            if decision.outcome is Outcome.REQUIRE_APPROVAL:
-                pending = decision
-
-        if pending is None:
+        if evaluation.outcome is Outcome.DENY:
+            assert evaluation.denied is not None
+            return evaluation.denied
+        if evaluation.outcome is Outcome.ALLOW:
             return Decision(Outcome.ALLOW, "all capabilities permitted")
 
-        cap = pending.capability
-        assert cap is not None
-        approved = self.approval_gate.request(cap, description)
+        pending = evaluation.approval_capabilities
+        request_many = getattr(self.approval_gate, "request_many", None)
+        if callable(request_many):
+            approved = request_many(pending, description)
+            if not isinstance(approved, bool):
+                approved = False
+        else:
+            approved = all(
+                self.approval_gate.request(capability, description)
+                for capability in pending
+            )
+        cap = pending[0]
+        required = self.required_level(cap)
         if approved:
             return Decision(Outcome.ALLOW, "approved by gate", capability=cap,
-                            required_level=pending.required_level)
+                            required_level=required)
         return Decision(Outcome.DENY, "approval was not granted", capability=cap,
-                        required_level=pending.required_level)
+                        required_level=required)
+
+    def evaluate_all(
+        self,
+        capabilities: Iterable[Capability],
+    ) -> CapabilityEvaluation:
+        """Resolve the exact sorted set without entering a human boundary."""
+        values = tuple(capabilities)
+        if any(not isinstance(capability, Capability) for capability in values):
+            raise TypeError("capabilities must contain Capability values")
+        caps = tuple(sorted(set(values), key=str))
+        pending: list[Capability] = []
+        for capability in caps:
+            decision = self.evaluate(capability)
+            if decision.outcome is Outcome.DENY:
+                return CapabilityEvaluation(
+                    Outcome.DENY, caps, denied=decision)
+            if decision.outcome is Outcome.REQUIRE_APPROVAL:
+                pending.append(capability)
+        if pending:
+            return CapabilityEvaluation(
+                Outcome.REQUIRE_APPROVAL,
+                caps,
+                approval_capabilities=tuple(pending),
+            )
+        return CapabilityEvaluation(Outcome.ALLOW, caps)

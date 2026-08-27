@@ -15,6 +15,13 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
+from agentcore.approvals import (
+    ApprovalAuthorization,
+    ApprovalAuthorizationStatus,
+    ApprovalInvocationContext,
+    ApprovalReceipt as DurableApprovalReceipt,
+    DurableApprovalAuthority,
+)
 from agentcore.action_journal import (
     ActionAdapterRegistry,
     ActionAdapterRegistrationError,
@@ -64,7 +71,7 @@ from agentcore.fs.sensitive import DEFAULT_SENSITIVE_POLICY
 from agentcore.observability.events import Events
 from agentcore.observability.logging import StructuredLogger, get_logger
 from agentcore.permissions.levels import READ_ONLY_CAPABILITIES, Capability
-from agentcore.permissions.policy import Decision, PermissionPolicy
+from agentcore.permissions.policy import Decision, Outcome, PermissionPolicy
 from agentcore.realtime.errors import CancellationRequested
 from agentcore.tools.base import ToolContext, ToolResult, ToolSpec
 from agentcore.tools.registry import ToolRegistry
@@ -114,6 +121,7 @@ class ToolInvocation:
     action_id: str | None = None
     attempt_id: str | None = None
     action_state: str | None = None
+    approval_request_id: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -130,6 +138,7 @@ class ToolInvocation:
             "action_id": self.action_id,
             "attempt_id": self.attempt_id,
             "action_state": self.action_state,
+            "approval_request_id": self.approval_request_id,
         }
 
 
@@ -153,6 +162,7 @@ class ToolExecutor:
         id_factory: Callable[[str], str] = new_id,
         action_owner_id: str | None = None,
         action_owner_epoch: int = 1,
+        approval_authority: DurableApprovalAuthority | None = None,
     ) -> None:
         self.registry = registry
         self.policy = policy
@@ -173,6 +183,7 @@ class ToolExecutor:
         self._id_factory = id_factory
         self._action_owner_id = action_owner_id or f"process:{os.getpid()}"
         self._action_owner_epoch = action_owner_epoch
+        self._approval_authority = approval_authority
         self._action_mutation_quarantine: str | None = None
 
     def quarantine_action_mutations(self, category: str) -> None:
@@ -299,6 +310,7 @@ class ToolExecutor:
         *,
         checkpoint: Callable[[], None] | None = None,
         action_context: ActionInvocationContext | None = None,
+        approval_context: ApprovalInvocationContext | None = None,
         **context_meta: Any,
     ) -> ToolInvocation:
         """Validate, authorize, and invoke through the appropriate boundary."""
@@ -424,6 +436,7 @@ class ToolExecutor:
             spec=spec,
             checkpoint=checkpoint,
             action_context=action_context,
+            approval_context=approval_context,
             log=log,
             elapsed=elapsed,
         )
@@ -981,6 +994,120 @@ class ToolExecutor:
         return ToolInvocation(
             tool_spec.name, cleaned, result, duration, decision)
 
+    def _current_policy_decision(
+        self,
+        tool_spec: ToolSpec,
+        *,
+        description: str,
+    ) -> tuple[Decision, bool]:
+        """Return current aggregate policy truth without boolean approval."""
+        if type(self.policy).check is not PermissionPolicy.check:
+            decision = self.policy.check(
+                tool_spec.capabilities, description=description)
+            if not isinstance(decision, Decision):
+                raise TypeError("permission policy returned an invalid decision")
+            return decision, decision.outcome is Outcome.REQUIRE_APPROVAL
+        evaluation = self.policy.evaluate_all(tool_spec.capabilities)
+        if evaluation.outcome is Outcome.DENY:
+            assert evaluation.denied is not None
+            return evaluation.denied, False
+        if evaluation.outcome is Outcome.REQUIRE_APPROVAL:
+            capability = evaluation.approval_capabilities[0]
+            return Decision(
+                Outcome.REQUIRE_APPROVAL,
+                "explicit durable approval is required",
+                capability=capability,
+                required_level=self.policy.required_level(capability),
+            ), True
+        return Decision(Outcome.ALLOW, "all capabilities permitted"), False
+
+    def _authorize_approval(
+        self,
+        *,
+        action_kind: str,
+        intent_digest: str,
+        mutation_capabilities: tuple[str, ...],
+        tool_name: str,
+        tool_version: str,
+        description: str,
+        action_id: str | None,
+        approval_context: ApprovalInvocationContext | None,
+    ) -> ApprovalAuthorization:
+        authority = self._approval_authority
+        if authority is None:
+            raise ValueError("durable approval authority is unavailable")
+        binding = authority.binding(
+            action_kind=action_kind,
+            intent_digest=intent_digest,
+            mutation_capabilities=mutation_capabilities,
+            tool_name=tool_name,
+            tool_version=tool_version,
+            policy_fingerprint=permission_policy_fingerprint(self.policy),
+        )
+        return authority.authorize(
+            binding,
+            description=description,
+            action_id=action_id,
+            request_id=(approval_context.request_id
+                        if approval_context is not None else None),
+        )
+
+    @staticmethod
+    def _approval_invocation(
+        tool_name: str,
+        redacted: dict[str, str],
+        authorization: ApprovalAuthorization,
+        decision: Decision,
+        invocation_id: str,
+        duration: float,
+        log: Any,
+        *,
+        historical_action: ActionRecord | None = None,
+    ) -> ToolInvocation:
+        kinds = {
+            ApprovalAuthorizationStatus.PENDING: "approval_pending",
+            ApprovalAuthorizationStatus.DENIED: "approval_denied",
+            ApprovalAuthorizationStatus.EXPIRED: "approval_expired",
+            ApprovalAuthorizationStatus.CONSUMED: "approval_consumed",
+        }
+        messages = {
+            ApprovalAuthorizationStatus.PENDING: (
+                "This exact action is waiting for human approval."),
+            ApprovalAuthorizationStatus.DENIED: (
+                "Human approval was denied for this exact action."),
+            ApprovalAuthorizationStatus.EXPIRED: (
+                "The approval for this exact action expired."),
+            ApprovalAuthorizationStatus.CONSUMED: (
+                "The one-shot approval was already consumed."),
+        }
+        kind = kinds.get(authorization.status, "approval_invalid")
+        message = messages.get(
+            authorization.status, "Durable approval is invalid.")
+        log.warning(
+            Events.TOOL_DENIED,
+            reason=kind,
+            approval_request_id=authorization.request_id,
+            action_id=(historical_action.action_id
+                       if historical_action is not None else None),
+        )
+        return ToolInvocation(
+            tool_name,
+            redacted,
+            ToolResult.failure(
+                message,
+                kind=kind,
+                approval_request_id=authorization.request_id,
+            ),
+            duration,
+            decision,
+            invocation_id=invocation_id,
+            action_id=(historical_action.action_id
+                       if historical_action is not None else None),
+            action_state=(historical_action.state.value
+                          if historical_action is not None else None),
+            approval_request_id=authorization.request_id,
+        )
+
     def _invoke_journaled(
         self,
         *,
@@ -991,6 +1118,7 @@ class ToolExecutor:
         spec: ActionAdapterSpec,
         checkpoint: Callable[[], None] | None,
         action_context: ActionInvocationContext | None,
+        approval_context: ApprovalInvocationContext | None,
         log: Any,
         elapsed: Callable[[], float],
     ) -> ToolInvocation:
@@ -1011,6 +1139,18 @@ class ToolExecutor:
                 tool_spec.name, redacted, elapsed(),
                 kind="action_preflight_failed",
                 message="The action intent could not be prepared safely.",
+                log=log, invocation_id=invocation_id)
+
+        try:
+            if approval_context is not None:
+                if not isinstance(approval_context, ApprovalInvocationContext):
+                    raise TypeError("untrusted approval context type")
+                approval_context.validate()
+        except Exception:
+            return self._journal_failure(
+                tool_spec.name, redacted, elapsed(),
+                kind="approval_context_invalid",
+                message="The trusted approval context is invalid.",
                 log=log, invocation_id=invocation_id)
 
         protected_requested = (
@@ -1038,18 +1178,40 @@ class ToolExecutor:
                 message="The required protected action payload is unavailable.",
                 log=log, invocation_id=invocation_id)
 
-        resume_requested = trusted_context.action_id is not None
         decision: Decision | None = None
+        mutation_capabilities = tuple(sorted(
+            str(capability) for capability in tool_spec.capabilities
+            if capability not in READ_ONLY_CAPABILITIES))
+        reconciliation_capabilities = tuple(sorted(
+            str(capability) for capability in spec.reconciliation_capabilities))
+        try:
+            public_intent_digest = prepared.intent_digest
+            if prepared.protected_payload is not None:
+                assert self._protected_payload_store is not None
+                public_intent_digest = self._protected_payload_store.intent_digest(
+                    prepared.protected_payload,
+                    purpose=ProtectedPayloadPurpose.ACTION_INTENT,
+                )
+        except Exception:
+            return self._journal_failure(
+                tool_spec.name, redacted, elapsed(),
+                kind="protected_payload_unverified",
+                message="The protected action intent could not be verified.",
+                log=log, invocation_id=invocation_id)
+
+        resume_requested = trusted_context.action_id is not None
+        approval_receipt: DurableApprovalReceipt | None = None
+        approved_action_id: str | None = None
         if not resume_requested:
             if checkpoint is not None:
                 checkpoint()
-            decision = self.policy.check(
-                tool_spec.capabilities,
+            decision, approval_required = self._current_policy_decision(
+                tool_spec,
                 description=(prepared.approval_description
                              or tool_spec.description),
             )
             log.debug(Events.PERMISSION_CHECKED, **decision.to_dict())
-            if not decision.allowed:
+            if decision.outcome is Outcome.DENY:
                 log.warning(Events.TOOL_DENIED, **decision.to_dict())
                 return ToolInvocation(
                     tool_spec.name,
@@ -1058,6 +1220,71 @@ class ToolExecutor:
                         "Permission was not granted for this action.",
                         kind="permission_denied"),
                     elapsed(), decision, invocation_id=invocation_id)
+            if self._action_store is None:
+                return self._journal_failure(
+                    tool_spec.name, redacted, elapsed(),
+                    kind="action_store_unavailable",
+                    message="The durable action journal is unavailable.",
+                    log=log, decision=decision, invocation_id=invocation_id)
+            if approval_required:
+                try:
+                    authorization = self._authorize_approval(
+                        action_kind=spec.action_kind,
+                        intent_digest=public_intent_digest,
+                        mutation_capabilities=mutation_capabilities,
+                        tool_name=tool_spec.name,
+                        tool_version=tool_spec.version,
+                        description=(prepared.approval_description
+                                     or tool_spec.description),
+                        action_id=(None if approval_context is not None
+                                   else self._id_factory("act")),
+                        approval_context=approval_context,
+                    )
+                except Exception:
+                    return self._journal_failure(
+                        tool_spec.name, redacted, elapsed(),
+                        kind="approval_unavailable",
+                        message="Durable human approval is unavailable.",
+                        log=log, decision=decision,
+                        invocation_id=invocation_id,
+                        approval_request_id=(approval_context.request_id
+                                             if approval_context else None))
+                if not authorization.authorized:
+                    return self._approval_invocation(
+                        tool_spec.name, redacted, authorization, decision,
+                        invocation_id, elapsed(), log)
+                assert authorization.receipt is not None
+                approval_receipt = authorization.receipt
+                approved_action_id = authorization.action_id
+                rechecked, still_requires = self._current_policy_decision(
+                    tool_spec,
+                    description=(prepared.approval_description
+                                 or tool_spec.description),
+                )
+                try:
+                    current_fingerprint = permission_policy_fingerprint(
+                        self.policy)
+                except Exception:
+                    current_fingerprint = ""
+                if rechecked.outcome is Outcome.DENY or not (
+                        hmac.compare_digest(
+                            current_fingerprint,
+                            approval_receipt.policy_fingerprint)):
+                    return self._journal_failure(
+                        tool_spec.name, redacted, elapsed(),
+                        kind="approval_policy_changed",
+                        message=("Current mutation authority changed after "
+                                 "approval."),
+                        log=log, decision=rechecked,
+                        invocation_id=invocation_id,
+                        approval_request_id=authorization.request_id)
+                decision = Decision(
+                    Outcome.ALLOW,
+                    "authorized by durable one-shot approval",
+                    capability=(rechecked.capability if still_requires
+                                else None),
+                    required_level=rechecked.required_level,
+                )
             if checkpoint is not None:
                 checkpoint()
 
@@ -1067,12 +1294,6 @@ class ToolExecutor:
                 kind="action_store_unavailable",
                 message="The durable action journal is unavailable.",
                 log=log, decision=decision, invocation_id=invocation_id)
-
-        mutation_capabilities = tuple(sorted(
-            str(capability) for capability in tool_spec.capabilities
-            if capability not in READ_ONLY_CAPABILITIES))
-        reconciliation_capabilities = tuple(sorted(
-            str(capability) for capability in spec.reconciliation_capabilities))
         store = self._action_store
         if resume_requested:
             assert trusted_context.action_id is not None
@@ -1113,13 +1334,13 @@ class ToolExecutor:
                     ),
                     log=log, decision=decision,
                     invocation_id=invocation_id)
-            proposed_action_id: str | None = None
+            proposed_action_id: str | None = approved_action_id
             protected_intent_ref: str | None = None
-            public_intent_digest = prepared.intent_digest
             if prepared.protected_payload is not None:
                 try:
                     assert self._protected_payload_store is not None
-                    proposed_action_id = self._id_factory("act")
+                    if proposed_action_id is None:
+                        proposed_action_id = self._id_factory("act")
                     protected = self._protected_payload_store.create(
                         proposed_action_id,
                         prepared.protected_payload,
@@ -1147,23 +1368,34 @@ class ToolExecutor:
                         invocation_id=invocation_id)
             try:
                 policy_fingerprint = permission_policy_fingerprint(self.policy)
-                authority_scope = f"live:{invocation_id}"
-                receipt = AuthorityReceipt(
-                    receipt_id=self._id_factory("auth"),
-                    binding_digest=authority_binding_digest(
-                        action_kind=spec.action_kind,
-                        intent_digest=public_intent_digest,
-                        mutation_capabilities=mutation_capabilities,
-                        tool_name=tool_spec.name,
-                        tool_version=tool_spec.version,
-                        invocation_id=invocation_id,
-                        authority_scope=authority_scope,
+                if approval_receipt is None:
+                    authority_scope = f"live:{invocation_id}"
+                    receipt = AuthorityReceipt(
+                        receipt_id=self._id_factory("auth"),
+                        binding_digest=authority_binding_digest(
+                            action_kind=spec.action_kind,
+                            intent_digest=public_intent_digest,
+                            mutation_capabilities=mutation_capabilities,
+                            tool_name=tool_spec.name,
+                            tool_version=tool_spec.version,
+                            invocation_id=invocation_id,
+                            authority_scope=authority_scope,
+                            policy_fingerprint=policy_fingerprint,
+                        ),
                         policy_fingerprint=policy_fingerprint,
-                    ),
-                    policy_fingerprint=policy_fingerprint,
-                    scope_ref=authority_scope,
-                    authorized_at=self._clock.now(),
-                ).validate()
+                        scope_ref=authority_scope,
+                        authorized_at=self._clock.now(),
+                    ).validate()
+                else:
+                    receipt = AuthorityReceipt(
+                        receipt_id=self._id_factory("auth"),
+                        binding_digest=approval_receipt.binding_digest,
+                        policy_fingerprint=approval_receipt.policy_fingerprint,
+                        scope_ref=approval_receipt.scope_ref,
+                        authorized_at=approval_receipt.approved_at,
+                        expires_at=approval_receipt.expires_at,
+                        approval_request_id=approval_receipt.request_id,
+                    ).validate()
                 assert spec.effect_class is not None
                 proposed = new_action(
                     action_kind=spec.action_kind,
@@ -1225,6 +1457,7 @@ class ToolExecutor:
                     cleaned=cleaned, redacted=redacted,
                     adapter=adapter, spec=spec, prepared=prepared,
                     checkpoint=checkpoint,
+                    approval_context=approval_context,
                     decision=decision, invocation_id=invocation_id,
                     log=log, elapsed=elapsed)
         except CancellationRequested:
@@ -1259,6 +1492,7 @@ class ToolExecutor:
         spec: ActionAdapterSpec,
         prepared: PreparedActionIntent,
         checkpoint: Callable[[], None] | None,
+        approval_context: ApprovalInvocationContext | None,
         decision: Decision | None,
         invocation_id: str,
         log: Any,
@@ -1312,13 +1546,13 @@ class ToolExecutor:
                     action_id=current.action_id,
                     action_state=current.state.value,
                 )
-            decision = self.policy.check(
-                tool_spec.capabilities,
+            decision, approval_required = self._current_policy_decision(
+                tool_spec,
                 description=(prepared.approval_description
                              or tool_spec.description),
             )
             log.debug(Events.PERMISSION_CHECKED, **decision.to_dict())
-            if not decision.allowed:
+            if decision.outcome is Outcome.DENY:
                 log.warning(Events.TOOL_DENIED, **decision.to_dict())
                 return ToolInvocation(
                     tool_spec.name,
@@ -1332,7 +1566,93 @@ class ToolExecutor:
                     action_id=current.action_id,
                     action_state=current.state.value,
                 )
+            if approval_required:
+                try:
+                    authorization = self._authorize_approval(
+                        action_kind=current.action_kind,
+                        intent_digest=current.intent_digest,
+                        mutation_capabilities=current.mutation_capabilities,
+                        tool_name=current.tool_name,
+                        tool_version=current.tool_version,
+                        description=(prepared.approval_description
+                                     or tool_spec.description),
+                        # A retry already has durable action identity.  Pass it
+                        # even when continuing an existing request so a valid
+                        # approval for another same-shaped action cannot be
+                        # consumed at this execution seam.
+                        action_id=current.action_id,
+                        approval_context=approval_context,
+                    )
+                except Exception:
+                    return self._journal_failure(
+                        tool_spec.name, redacted, elapsed(),
+                        kind="approval_unavailable",
+                        message="Durable human approval is unavailable.",
+                        log=log, decision=decision,
+                        invocation_id=invocation_id,
+                        action_id=current.action_id,
+                        action_state=current.state.value,
+                        approval_request_id=(approval_context.request_id
+                                             if approval_context else None))
+                if not authorization.authorized:
+                    return self._approval_invocation(
+                        tool_spec.name, redacted, authorization, decision,
+                        invocation_id, elapsed(), log,
+                        historical_action=current)
+                assert authorization.receipt is not None
+                rechecked, still_requires = self._current_policy_decision(
+                    tool_spec,
+                    description=(prepared.approval_description
+                                 or tool_spec.description),
+                )
+                try:
+                    current_fingerprint = permission_policy_fingerprint(
+                        self.policy)
+                except Exception:
+                    current_fingerprint = ""
+                if rechecked.outcome is Outcome.DENY or not hmac.compare_digest(
+                        current_fingerprint,
+                        authorization.receipt.policy_fingerprint):
+                    return self._journal_failure(
+                        tool_spec.name, redacted, elapsed(),
+                        kind="approval_policy_changed",
+                        message=("Current mutation authority changed after "
+                                 "approval."),
+                        log=log, decision=rechecked,
+                        invocation_id=invocation_id,
+                        action_id=current.action_id,
+                        action_state=current.state.value,
+                        approval_request_id=authorization.request_id)
+                if self._clock.now() >= authorization.receipt.expires_at:
+                    return self._journal_failure(
+                        tool_spec.name, redacted, elapsed(),
+                        kind="approval_expired",
+                        message="The one-shot approval expired before execution.",
+                        log=log, decision=rechecked,
+                        invocation_id=invocation_id,
+                        action_id=current.action_id,
+                        action_state=current.state.value,
+                        approval_request_id=authorization.request_id)
+                decision = Decision(
+                    Outcome.ALLOW,
+                    "authorized by current durable one-shot approval",
+                    capability=(rechecked.capability if still_requires
+                                else None),
+                    required_level=rechecked.required_level,
+                )
         assert decision is not None
+
+        if not resume_requested and current.authority.expires_at is not None and (
+                self._clock.now() >= current.authority.expires_at):
+            return self._journal_failure(
+                tool_spec.name, redacted, elapsed(),
+                kind="approval_expired",
+                message="The one-shot approval expired before execution.",
+                log=log, decision=decision,
+                invocation_id=invocation_id,
+                action_id=current.action_id,
+                action_state=current.state.value,
+                approval_request_id=current.authority.approval_request_id)
 
         try:
             if checkpoint is not None:
@@ -1884,7 +2204,8 @@ class ToolExecutor:
             invocation_id=invocation_id,
             action_id=record.action_id,
             attempt_id=attempt_id,
-            action_state=record.state.value)
+            action_state=record.state.value,
+            approval_request_id=record.authority.approval_request_id)
 
     def _published_or_uncertain(
         self,
@@ -1940,6 +2261,7 @@ class ToolExecutor:
         action_id: str | None = None,
         attempt_id: str | None = None,
         action_state: str | None = None,
+        approval_request_id: str | None = None,
     ) -> ToolInvocation:
         log.warning(
             Events.TOOL_FAILED, reason=kind,
@@ -1948,4 +2270,5 @@ class ToolExecutor:
             tool_name, redacted, ToolResult.failure(message, kind=kind),
             duration, decision, invocation_id=invocation_id,
             action_id=action_id, attempt_id=attempt_id,
-            action_state=action_state)
+            action_state=action_state,
+            approval_request_id=approval_request_id)
