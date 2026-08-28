@@ -94,6 +94,11 @@ from agentcore.action_journal.store import (
     InMemoryActionStore,
     JsonFileActionStore,
 )
+from agentcore.action_journal.idempotency import (
+    ActionExecutionPermit,
+    ExternalIdempotencyProvider,
+    ExternalIdempotencyRequest,
+)
 from agentcore.action_journal.reconciliation import (
     ActionReconciler,
     ActionReconciliationContext,
@@ -183,6 +188,7 @@ __all__ = [
     "ActionAttemptStatus",
     "ActionDeduplicationConflictError",
     "ActionEffectNormalizationError",
+    "ActionExecutionPermit",
     "ActionEffectClass",
     "ActionJournalEligibility",
     "ActionJournalError",
@@ -211,6 +217,8 @@ __all__ = [
     "EffectVerdict",
     "EvidencePurpose",
     "EvidenceStore",
+    "ExternalIdempotencyProvider",
+    "ExternalIdempotencyRequest",
     "IdempotencyContract",
     "InMemoryActionStore",
     "InMemoryEvidenceStore",

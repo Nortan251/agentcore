@@ -28,6 +28,8 @@ from agentcore.action_journal.errors import (
     ActionVersionConflictError,
 )
 from agentcore.action_journal.models import (
+    MAX_DEDUPLICATION_KEY_CHARS,
+    MAX_DEDUPLICATION_SCOPE_CHARS,
     ActionRecord,
     ActionState,
     deduplication_compatible,
@@ -41,6 +43,7 @@ from agentcore.util.clock import Clock, SystemClock
 MAX_ACTION_RECORD_BYTES = 1_048_576
 
 _ACTION_ID = re.compile(r"^act_[0-9a-f]{12}$")
+_OPAQUE_REFERENCE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@+=-]*$")
 _OWNER_FILENAME = ".agentcore-action-store.lock"
 
 
@@ -77,6 +80,12 @@ class ActionStore(Protocol):
 
     def execution_guard(self, action_id: str) -> ContextManager[None]: ...
 
+    def find_by_deduplication(
+        self, scope: str, key: str,
+    ) -> ActionRecord | None: ...
+
+    def creation_guard(self, scope: str, key: str) -> ContextManager[None]: ...
+
     def close(self) -> None: ...
 
     def __enter__(self) -> ActionStore: ...
@@ -92,6 +101,8 @@ class InMemoryActionStore:
         self._lock = threading.RLock()
         self._action_guards_lock = threading.Lock()
         self._action_guards: dict[str, _ActionGuard] = {}
+        self._creation_guards_lock = threading.Lock()
+        self._creation_guards: dict[str, _ActionGuard] = {}
         self._clock = clock or SystemClock()
         self._owner_pid = os.getpid()
         self._closed = False
@@ -220,6 +231,43 @@ class InMemoryActionStore:
             records, _ = self._audit_unlocked()
             return [record.action_id for record in records]
 
+    def find_by_deduplication(
+        self, scope: str, key: str,
+    ) -> ActionRecord | None:
+        self._require_owner_process()
+        identity = _require_deduplication_identity(scope, key)
+        with self._lock:
+            self._require_open()
+            records, _ = self._audit_unlocked()
+            for record in records:
+                if record.deduplication_identity == identity:
+                    return _snapshot(record)
+            return None
+
+    @contextmanager
+    def creation_guard(self, scope: str, key: str) -> Iterator[None]:
+        """Serialize creation for one caller-owned deduplication identity."""
+        self._require_owner_process()
+        identity = _require_deduplication_identity(scope, key)
+        guard_key = _deduplication_guard_key(identity)
+        with self._lock:
+            self._require_open()
+        guard = _retain_action_guard(
+            self._creation_guards_lock, self._creation_guards, guard_key)
+        try:
+            guard.lock.acquire()
+            try:
+                self._require_owner_process()
+                with self._lock:
+                    self._require_open()
+                yield
+            finally:
+                guard.lock.release()
+        finally:
+            _release_action_guard(
+                self._creation_guards_lock, self._creation_guards,
+                guard_key, guard)
+
     @contextmanager
     def execution_guard(self, action_id: str) -> Iterator[None]:
         """Serialize one logical action without holding the store mutex."""
@@ -304,6 +352,8 @@ class _StoreDomain:
     mutex: threading.RLock
     action_guards_lock: threading.Lock
     action_guards: dict[str, _ActionGuard]
+    creation_guards_lock: threading.Lock
+    creation_guards: dict[str, _ActionGuard]
     owner_pid: int
     references: int = 1
 
@@ -368,6 +418,8 @@ def _acquire_domain(directory: Path) -> _StoreDomain:
             mutex=threading.RLock(),
             action_guards_lock=threading.Lock(),
             action_guards={},
+            creation_guards_lock=threading.Lock(),
+            creation_guards={},
             owner_pid=owner_pid,
         )
         _DOMAINS[key] = domain
@@ -563,6 +615,49 @@ class JsonFileActionStore:
             records, _ = self._audit_unlocked()
             return [record.action_id for record in records]
 
+    def find_by_deduplication(
+        self, scope: str, key: str,
+    ) -> ActionRecord | None:
+        self._require_owner_process()
+        identity = _require_deduplication_identity(scope, key)
+        with self._domain.mutex:
+            self._require_open()
+            records, _ = self._audit_unlocked()
+            for record in records:
+                if record.deduplication_identity == identity:
+                    return record
+            return None
+
+    @contextmanager
+    def creation_guard(self, scope: str, key: str) -> Iterator[None]:
+        """Serialize creation across stores sharing this JSON domain."""
+        self._require_owner_process()
+        identity = _require_deduplication_identity(scope, key)
+        guard_key = _deduplication_guard_key(identity)
+        with self._domain.mutex:
+            self._require_open()
+        guard = _retain_action_guard(
+            self._domain.creation_guards_lock,
+            self._domain.creation_guards,
+            guard_key,
+        )
+        try:
+            guard.lock.acquire()
+            try:
+                self._require_owner_process()
+                with self._domain.mutex:
+                    self._require_open()
+                yield
+            finally:
+                guard.lock.release()
+        finally:
+            _release_action_guard(
+                self._domain.creation_guards_lock,
+                self._domain.creation_guards,
+                guard_key,
+                guard,
+            )
+
     @contextmanager
     def execution_guard(self, action_id: str) -> Iterator[None]:
         """Serialize one action across stores sharing this JSON domain."""
@@ -682,6 +777,24 @@ class JsonFileActionStore:
             pass
 
 
+def _require_deduplication_identity(
+    scope: str, key: str,
+) -> tuple[str, str]:
+    for value, maximum, field_name in (
+        (scope, MAX_DEDUPLICATION_SCOPE_CHARS, "deduplication scope"),
+        (key, MAX_DEDUPLICATION_KEY_CHARS, "deduplication key"),
+    ):
+        if not isinstance(value, str) or len(value) > maximum or not (
+                _OPAQUE_REFERENCE.fullmatch(value)):
+            raise ActionValidationError(f"{field_name} is invalid")
+    return scope, key
+
+
+def _deduplication_guard_key(identity: tuple[str, str]) -> str:
+    scope, key = identity
+    return f"{len(scope)}:{scope}{key}"
+
+
 def _fsync_directory(directory: Path) -> None:
     """Flush replacement metadata on POSIX; make no false Windows claim."""
     if os.name == "nt":
@@ -749,7 +862,7 @@ def _dedup_index(records: list[ActionRecord]) -> dict[
     index: dict[tuple[str, str], ActionRecord] = {}
     action_ids: set[str] = set()
     attempt_owners: dict[str, str] = {}
-    idempotency_owners: dict[tuple[str, str, str], str] = {}
+    idempotency_owners: dict[tuple[str, str], str] = {}
     for record in records:
         record.validate()
         if record.action_id in action_ids:
@@ -765,9 +878,10 @@ def _dedup_index(records: list[ActionRecord]) -> dict[
                     owner_count=2)
             attempt_owners[attempt.attempt_id] = record.action_id
         if record.idempotency is not None:
+            # Scope is the provider's actual remote namespace.  Contract is
+            # guarantee/version metadata and cannot partition key ownership.
             idempotency_identity = (
                 record.idempotency.scope,
-                record.idempotency.contract,
                 record.idempotency.key,
             )
             owner = idempotency_owners.get(idempotency_identity)
@@ -816,9 +930,9 @@ def _validate_candidate_links(records: list[ActionRecord],
             action_id=candidate.action_id)
     if candidate.idempotency is None:
         return
+    # A contract-label change does not create a new remote key namespace.
     identity = (
         candidate.idempotency.scope,
-        candidate.idempotency.contract,
         candidate.idempotency.key,
     )
     for record in records:
@@ -826,7 +940,6 @@ def _validate_candidate_links(records: list[ActionRecord],
             continue
         existing = (
             record.idempotency.scope,
-            record.idempotency.contract,
             record.idempotency.key,
         )
         if existing == identity and record.action_id != candidate.action_id:

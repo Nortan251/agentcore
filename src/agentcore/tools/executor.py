@@ -12,6 +12,7 @@ import os
 import hmac
 import time
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -28,6 +29,7 @@ from agentcore.action_journal import (
     ActionAdapterSpec,
     ActionAttemptStatus,
     ActionEffectClass,
+    ActionExecutionPermit,
     ActionInvocationContext,
     ActionJournalEligibility,
     ActionOutcome,
@@ -43,6 +45,8 @@ from agentcore.action_journal import (
     AuthorityReceipt,
     EffectVerdict,
     EvidenceStore,
+    ExternalIdempotencyRequest,
+    IdempotencyContract,
     NormalizedActionEffect,
     PreparedActionIntent,
     ProtectedActionPayloadStore,
@@ -295,12 +299,18 @@ class ToolExecutor:
         except Exception:
             return False
 
-    def _context(self, tool_name: str) -> ToolContext:
+    def _context(
+        self,
+        tool_name: str,
+        *,
+        action_execution_permit: ActionExecutionPermit | None = None,
+    ) -> ToolContext:
         return ToolContext(
             config=dict(self._tool_settings.get(tool_name, {})),
             logger=self._log.bind(tool=tool_name),
             workspace_dir=self.workspace_dir,
             workspace=self.workspace,
+            action_execution_permit=action_execution_permit,
         )
 
     def invoke(
@@ -1324,48 +1334,6 @@ class ToolExecutor:
             created_here = False
         else:
             assert decision is not None
-            if spec.effect_class is ActionEffectClass.EXTERNALLY_IDEMPOTENT:
-                return self._journal_failure(
-                    tool_spec.name, redacted, elapsed(),
-                    kind="external_idempotency_contract_unavailable",
-                    message=(
-                        "Stable external idempotency ownership is not "
-                        "available."
-                    ),
-                    log=log, decision=decision,
-                    invocation_id=invocation_id)
-            proposed_action_id: str | None = approved_action_id
-            protected_intent_ref: str | None = None
-            if prepared.protected_payload is not None:
-                try:
-                    assert self._protected_payload_store is not None
-                    if proposed_action_id is None:
-                        proposed_action_id = self._id_factory("act")
-                    protected = self._protected_payload_store.create(
-                        proposed_action_id,
-                        prepared.protected_payload,
-                        purpose=ProtectedPayloadPurpose.ACTION_INTENT,
-                    )
-                    exact_protected = self._protected_payload_store.load(
-                        protected.reference,
-                        action_id=proposed_action_id,
-                        purpose=ProtectedPayloadPurpose.ACTION_INTENT,
-                        expected_intent_digest=protected.intent_digest,
-                    )
-                    if exact_protected != protected:
-                        raise ValueError("protected payload reload mismatch")
-                    protected_intent_ref = protected.reference
-                    public_intent_digest = protected.intent_digest
-                except Exception:
-                    return self._journal_failure(
-                        tool_spec.name, redacted, elapsed(),
-                        kind="protected_payload_unverified",
-                        message=(
-                            "The protected action payload could not be "
-                            "stored and verified."
-                        ),
-                        log=log, decision=decision,
-                        invocation_id=invocation_id)
             try:
                 policy_fingerprint = permission_policy_fingerprint(self.policy)
                 if approval_receipt is None:
@@ -1396,27 +1364,6 @@ class ToolExecutor:
                         expires_at=approval_receipt.expires_at,
                         approval_request_id=approval_receipt.request_id,
                     ).validate()
-                assert spec.effect_class is not None
-                proposed = new_action(
-                    action_kind=spec.action_kind,
-                    tool_name=tool_spec.name,
-                    tool_version=tool_spec.version,
-                    eligibility=spec.eligibility,
-                    mutation_capabilities=mutation_capabilities,
-                    reconciliation_capabilities=reconciliation_capabilities,
-                    effect_class=spec.effect_class,
-                    intent_digest=public_intent_digest,
-                    intent_ref=protected_intent_ref,
-                    target_category=prepared.target_category,
-                    target_fingerprint=prepared.target_fingerprint,
-                    provenance=provenance,
-                    authority=receipt,
-                    action_id=proposed_action_id,
-                    deduplication_scope=trusted_context.deduplication_scope,
-                    deduplication_key=trusted_context.deduplication_key,
-                    clock=self._clock,
-                    id_factory=self._id_factory,
-                )
             except Exception:
                 return self._journal_failure(
                     tool_spec.name, redacted, elapsed(),
@@ -1424,15 +1371,45 @@ class ToolExecutor:
                     message="The durable action intent could not be constructed.",
                     log=log, decision=decision, invocation_id=invocation_id)
 
-            created = self._create_or_prove(store, proposed)
+            created, created_here, create_error, proposed_action_id = (
+                self._create_fresh_action(
+                    store=store,
+                    tool=tool,
+                    tool_spec=tool_spec,
+                    spec=spec,
+                    prepared=prepared,
+                    trusted_context=trusted_context,
+                    public_intent_digest=public_intent_digest,
+                    provenance=provenance,
+                    authority=receipt,
+                    mutation_capabilities=mutation_capabilities,
+                    reconciliation_capabilities=reconciliation_capabilities,
+                    approved_action_id=approved_action_id,
+                )
+            )
             if created is None:
+                kind = create_error or "action_create_unverified"
+                messages = {
+                    "external_idempotency_contract_unavailable": (
+                        "Stable external idempotency ownership is not available."
+                    ),
+                    "protected_payload_unverified": (
+                        "The protected action payload could not be stored and "
+                        "verified."
+                    ),
+                    "action_record_invalid": (
+                        "The durable action intent could not be constructed."
+                    ),
+                }
                 return self._journal_failure(
                     tool_spec.name, redacted, elapsed(),
-                    kind="action_create_unverified",
-                    message="The durable action intent could not be verified.",
+                    kind=kind,
+                    message=messages.get(
+                        kind,
+                        "The durable action intent could not be verified.",
+                    ),
                     log=log, decision=decision, invocation_id=invocation_id,
-                    action_id=proposed.action_id)
-            created_here = created == proposed
+                    action_id=proposed_action_id)
             try:
                 self.validate_action_protected_storage(created)
                 if not self._protected_intent_matches(created, prepared):
@@ -1514,7 +1491,13 @@ class ToolExecutor:
                 log=log, decision=decision, invocation_id=invocation_id,
                 action_id=created.action_id)
 
-        if current.state is not ActionState.AUTHORIZED:
+        external_reconcile_retry = (
+            resume_requested
+            and current.state is ActionState.RECONCILE_REQUIRED
+            and spec.effect_class is ActionEffectClass.EXTERNALLY_IDEMPOTENT
+        )
+        if current.state is not ActionState.AUTHORIZED and not (
+                external_reconcile_retry):
             return self._attached_invocation(
                 tool_spec.name, redacted, current, decision,
                 invocation_id, elapsed(), log)
@@ -1528,24 +1511,15 @@ class ToolExecutor:
             resume_requested
             and self._has_checked_retry_proof(current)
         )
-        if not (fresh_owner or explicit_waiting_resume or safe_retry):
+        if not (
+            fresh_owner or explicit_waiting_resume or safe_retry
+            or external_reconcile_retry
+        ):
             return self._attached_invocation(
                 tool_spec.name, redacted, current, decision,
                 invocation_id, elapsed(), log)
 
         if resume_requested:
-            if spec.effect_class is ActionEffectClass.EXTERNALLY_IDEMPOTENT:
-                return self._journal_failure(
-                    tool_spec.name, redacted, elapsed(),
-                    kind="external_idempotency_contract_unavailable",
-                    message=(
-                        "Stable external idempotency ownership is not "
-                        "available."
-                    ),
-                    log=log, invocation_id=invocation_id,
-                    action_id=current.action_id,
-                    action_state=current.state.value,
-                )
             decision, approval_required = self._current_policy_decision(
                 tool_spec,
                 description=(prepared.approval_description
@@ -1640,6 +1614,42 @@ class ToolExecutor:
                                 else None),
                     required_level=rechecked.required_level,
                 )
+            if spec.effect_class is ActionEffectClass.EXTERNALLY_IDEMPOTENT:
+                try:
+                    self._validate_external_contract_for_record(
+                        tool, tool_spec, spec, current)
+                    if current.state is ActionState.RECONCILE_REQUIRED:
+                        authorized = current.transition(
+                            ActionState.AUTHORIZED,
+                            transition_id=new_action_transition_id(
+                                id_factory=self._id_factory),
+                            at=self._clock.now(),
+                            effect_verdict=EffectVerdict.OUTCOME_UNKNOWN,
+                            proof=(
+                                ActionTransitionProof
+                                .EXTERNAL_IDEMPOTENCY_GUARANTEE
+                            ),
+                        )
+                        stored = store.compare_and_swap(
+                            current.action_id, current.version, authorized)
+                        exact = store.load(current.action_id)
+                        if stored != authorized or exact != authorized:
+                            raise ValueError(
+                                "retry authorization publication mismatch")
+                        current = exact
+                except Exception:
+                    return self._journal_failure(
+                        tool_spec.name, redacted, elapsed(),
+                        kind="external_idempotency_contract_unavailable",
+                        message=(
+                            "The durable external idempotency guarantee could "
+                            "not be verified for this attempt."
+                        ),
+                        log=log, decision=decision,
+                        invocation_id=invocation_id,
+                        action_id=current.action_id,
+                        action_state=current.state.value,
+                    )
         assert decision is not None
 
         if not resume_requested and current.authority.expires_at is not None and (
@@ -1669,6 +1679,24 @@ class ToolExecutor:
                 tool_spec.name, redacted, published, decision,
                 invocation_id, None, elapsed(), log,
                 fallback_kind="action_control_failed")
+
+        if spec.effect_class is ActionEffectClass.EXTERNALLY_IDEMPOTENT:
+            try:
+                self._validate_external_contract_for_record(
+                    tool, tool_spec, spec, current)
+            except Exception:
+                return self._journal_failure(
+                    tool_spec.name, redacted, elapsed(),
+                    kind="external_idempotency_contract_unavailable",
+                    message=(
+                        "The external idempotency guarantee expired or changed "
+                        "before the physical-attempt claim."
+                    ),
+                    log=log, decision=decision,
+                    invocation_id=invocation_id,
+                    action_id=current.action_id,
+                    action_state=current.state.value,
+                )
 
         attempt_id = new_action_attempt_id(id_factory=self._id_factory)
         transition_id = new_action_transition_id(id_factory=self._id_factory)
@@ -1715,10 +1743,59 @@ class ToolExecutor:
                 invocation_id, attempt_id, elapsed(), log,
                 fallback_kind="action_control_failed")
 
+        if spec.effect_class is ActionEffectClass.EXTERNALLY_IDEMPOTENT:
+            try:
+                # The fresh attempt is already durably claimed.  Revalidate
+                # after the final checkpoint and immediately before entering
+                # the trusted provider boundary.  On failure, retain IN_FLIGHT:
+                # an older attempt may still have an unknown outcome.
+                self._validate_external_contract_for_record(
+                    tool, tool_spec, spec, claimed)
+            except Exception:
+                return self._journal_failure(
+                    tool_spec.name, redacted, elapsed(),
+                    kind="external_idempotency_contract_unavailable",
+                    message=(
+                        "The external idempotency guarantee expired or changed "
+                        "after the physical-attempt claim. The claimed attempt "
+                        "remains nonterminal and the provider execution "
+                        "boundary was not entered."
+                    ),
+                    log=log, decision=decision,
+                    invocation_id=invocation_id,
+                    action_id=claimed.action_id,
+                    attempt_id=attempt_id,
+                    action_state=ActionState.IN_FLIGHT.value,
+                )
+
         cancellation: CancellationRequested | None = None
         try:
             # Conservative physical mutation seam. It is entered exactly once.
-            result = tool.run(cleaned, self._context(tool_spec.name))
+            if spec.effect_class is ActionEffectClass.EXTERNALLY_IDEMPOTENT:
+                if claimed.idempotency is None:
+                    raise ValueError("claimed action lacks idempotency metadata")
+                permit = ActionExecutionPermit(
+                    action_id=claimed.action_id,
+                    attempt_id=attempt_id,
+                    tool_name=tool_spec.name,
+                    tool_version=tool_spec.version,
+                    idempotency=claimed.idempotency,
+                ).validate()
+                request = self._external_idempotency_request(
+                    claimed.action_id, spec, tool_spec)
+                result = self._action_adapters.execute_external(
+                    tool,
+                    request,
+                    cleaned,
+                    self._context(
+                        tool_spec.name,
+                        action_execution_permit=permit,
+                    ),
+                    permit,
+                    tool_spec=tool_spec,
+                )
+            else:
+                result = tool.run(cleaned, self._context(tool_spec.name))
             if not isinstance(result, ToolResult):
                 result = ToolResult.success(result)
             normalized = adapter.normalize_effect(result)
@@ -1808,6 +1885,222 @@ class ToolExecutor:
             except Exception:
                 return None
 
+    def _create_fresh_action(
+        self,
+        *,
+        store: ActionStore,
+        tool: Any,
+        tool_spec: ToolSpec,
+        spec: ActionAdapterSpec,
+        prepared: PreparedActionIntent,
+        trusted_context: ActionInvocationContext,
+        public_intent_digest: str,
+        provenance: Any,
+        authority: AuthorityReceipt,
+        mutation_capabilities: tuple[str, ...],
+        reconciliation_capabilities: tuple[str, ...],
+        approved_action_id: str | None,
+    ) -> tuple[ActionRecord | None, bool, str | None, str | None]:
+        """Create once per dedup identity, including provider key minting."""
+        dedup = (
+            (trusted_context.deduplication_scope,
+             trusted_context.deduplication_key)
+            if trusted_context.deduplication_scope is not None
+            else None
+        )
+        proposed_action_id = approved_action_id
+        try:
+            supports_creation_guard = (
+                dedup is not None
+                and callable(getattr(store, "creation_guard", None))
+                and callable(getattr(store, "find_by_deduplication", None))
+            )
+            if dedup is not None and spec.effect_class is (
+                    ActionEffectClass.EXTERNALLY_IDEMPOTENT) and not (
+                        supports_creation_guard):
+                return (
+                    None, False, "action_create_unverified",
+                    proposed_action_id,
+                )
+            creation_guard = (
+                store.creation_guard(*dedup)
+                if supports_creation_guard and dedup is not None
+                else nullcontext()
+            )
+            with creation_guard:
+                if supports_creation_guard and dedup is not None:
+                    existing = store.find_by_deduplication(*dedup)
+                    if existing is not None:
+                        existing.validate()
+                        if not self._matches_new_request(
+                            existing,
+                            prepared=prepared,
+                            spec=spec,
+                            tool_spec=tool_spec,
+                            mutation_capabilities=mutation_capabilities,
+                            reconciliation_capabilities=(
+                                reconciliation_capabilities
+                            ),
+                            trusted_context=trusted_context,
+                        ):
+                            return (
+                                None, False, "action_create_unverified",
+                                existing.action_id,
+                            )
+                        return existing, False, None, existing.action_id
+
+                if proposed_action_id is None:
+                    proposed_action_id = self._id_factory("act")
+
+                protected_intent_ref: str | None = None
+                effective_intent_digest = public_intent_digest
+                if prepared.protected_payload is not None:
+                    try:
+                        if self._protected_payload_store is None:
+                            raise ValueError("protected payload store unavailable")
+                        protected = self._protected_payload_store.create(
+                            proposed_action_id,
+                            prepared.protected_payload,
+                            purpose=ProtectedPayloadPurpose.ACTION_INTENT,
+                        )
+                        exact_protected = self._protected_payload_store.load(
+                            protected.reference,
+                            action_id=proposed_action_id,
+                            purpose=ProtectedPayloadPurpose.ACTION_INTENT,
+                            expected_intent_digest=protected.intent_digest,
+                        )
+                        if exact_protected != protected:
+                            raise ValueError("protected payload reload mismatch")
+                        protected_intent_ref = protected.reference
+                        effective_intent_digest = protected.intent_digest
+                    except Exception:
+                        return (
+                            None, False, "protected_payload_unverified",
+                            proposed_action_id,
+                        )
+
+                idempotency: IdempotencyContract | None = None
+                if spec.effect_class is (
+                        ActionEffectClass.EXTERNALLY_IDEMPOTENT):
+                    request = self._external_idempotency_request(
+                        proposed_action_id, spec, tool_spec)
+                    try:
+                        candidate, allows_indefinite = (
+                            self._action_adapters.establish_external_idempotency(
+                                tool, request, tool_spec=tool_spec)
+                        )
+                        idempotency = self._require_current_contract(
+                            candidate,
+                            allows_indefinite=allows_indefinite,
+                        )
+                    except Exception:
+                        return (
+                            None, False,
+                            "external_idempotency_contract_unavailable",
+                            proposed_action_id,
+                        )
+
+                try:
+                    if spec.effect_class is None:
+                        raise ValueError("action effect class is unavailable")
+                    proposed = new_action(
+                        action_kind=spec.action_kind,
+                        tool_name=tool_spec.name,
+                        tool_version=tool_spec.version,
+                        eligibility=spec.eligibility,
+                        mutation_capabilities=mutation_capabilities,
+                        reconciliation_capabilities=(
+                            reconciliation_capabilities
+                        ),
+                        effect_class=spec.effect_class,
+                        intent_digest=effective_intent_digest,
+                        intent_ref=protected_intent_ref,
+                        target_category=prepared.target_category,
+                        target_fingerprint=prepared.target_fingerprint,
+                        provenance=provenance,
+                        authority=authority,
+                        idempotency=idempotency,
+                        action_id=proposed_action_id,
+                        deduplication_scope=trusted_context.deduplication_scope,
+                        deduplication_key=trusted_context.deduplication_key,
+                        clock=self._clock,
+                        id_factory=self._id_factory,
+                    )
+                except Exception:
+                    return (
+                        None, False, "action_record_invalid",
+                        proposed_action_id,
+                    )
+                created = self._create_or_prove(store, proposed)
+                if created is None:
+                    return (
+                        None, False, "action_create_unverified",
+                        proposed_action_id,
+                    )
+                return created, created == proposed, None, proposed_action_id
+        except Exception:
+            return None, False, "action_create_unverified", proposed_action_id
+
+    @staticmethod
+    def _external_idempotency_request(
+        action_id: str,
+        spec: ActionAdapterSpec,
+        tool_spec: ToolSpec,
+    ) -> ExternalIdempotencyRequest:
+        return ExternalIdempotencyRequest(
+            action_id=action_id,
+            action_kind=spec.action_kind,
+            tool_name=tool_spec.name,
+            tool_version=tool_spec.version,
+            effect_class=ActionEffectClass.EXTERNALLY_IDEMPOTENT,
+        ).validate()
+
+    def _require_current_contract(
+        self,
+        candidate: Any,
+        *,
+        allows_indefinite: bool,
+        stored: IdempotencyContract | None = None,
+    ) -> IdempotencyContract:
+        if not isinstance(candidate, IdempotencyContract):
+            raise TypeError("provider returned an invalid contract type")
+        candidate.validate()
+        if stored is not None and candidate != stored:
+            raise ValueError("provider rewrote the durable contract")
+        if candidate.valid_until is None:
+            if not allows_indefinite:
+                raise ValueError("indefinite guarantee was not explicit")
+        elif self._clock.now() >= candidate.valid_until:
+            raise ValueError("external idempotency guarantee expired")
+        return candidate
+
+    def _validate_external_contract_for_record(
+        self,
+        tool: Any,
+        tool_spec: ToolSpec,
+        spec: ActionAdapterSpec,
+        record: ActionRecord,
+    ) -> IdempotencyContract:
+        if record.idempotency is None:
+            raise ValueError("durable idempotency metadata is unavailable")
+        if getattr(tool, "spec", None) != tool_spec:
+            raise ValueError("registered tool identity or shape changed")
+        request = self._external_idempotency_request(
+            record.action_id, spec, tool_spec)
+        candidate, allows_indefinite = (
+            self._action_adapters.validate_external_idempotency(
+                tool,
+                request,
+                record.idempotency,
+                tool_spec=tool_spec,
+            )
+        )
+        return self._require_current_contract(
+            candidate,
+            allows_indefinite=allows_indefinite,
+            stored=record.idempotency,
+        )
+
     @staticmethod
     def _is_create_owner(
         record: ActionRecord,
@@ -1857,6 +2150,37 @@ class ToolExecutor:
             )
         )
 
+    def _matches_new_request(
+        self,
+        record: ActionRecord,
+        *,
+        prepared: PreparedActionIntent,
+        spec: ActionAdapterSpec,
+        tool_spec: ToolSpec,
+        mutation_capabilities: tuple[str, ...],
+        reconciliation_capabilities: tuple[str, ...],
+        trusted_context: ActionInvocationContext,
+    ) -> bool:
+        requested_dedup = (
+            trusted_context.deduplication_scope,
+            trusted_context.deduplication_key,
+        )
+        return (
+            record.action_kind == spec.action_kind
+            and record.tool_name == tool_spec.name
+            and record.tool_version == tool_spec.version
+            and record.eligibility is spec.eligibility
+            and record.effect_class is spec.effect_class
+            and record.mutation_capabilities == mutation_capabilities
+            and record.reconciliation_capabilities == (
+                reconciliation_capabilities
+            )
+            and self._protected_intent_matches(record, prepared)
+            and record.target_category == prepared.target_category
+            and record.target_fingerprint == prepared.target_fingerprint
+            and record.deduplication_identity == requested_dedup
+        )
+
     @staticmethod
     def _has_checked_retry_proof(record: ActionRecord) -> bool:
         if not record.attempts or not record.transitions:
@@ -1864,9 +2188,24 @@ class ToolExecutor:
         transition = record.transitions[-1]
         return (
             transition.to_state is ActionState.AUTHORIZED
-            and transition.proof is ActionTransitionProof.DEFINITIVE_NO_EFFECT
-            and transition.effect_verdict is (
-                EffectVerdict.CONFIRMED_NOT_APPLIED
+            and (
+                (
+                    transition.proof is (
+                        ActionTransitionProof.DEFINITIVE_NO_EFFECT
+                    )
+                    and transition.effect_verdict is (
+                        EffectVerdict.CONFIRMED_NOT_APPLIED
+                    )
+                )
+                or (
+                    transition.proof is (
+                        ActionTransitionProof.EXTERNAL_IDEMPOTENCY_GUARANTEE
+                    )
+                    and transition.effect_verdict in {
+                        EffectVerdict.OUTCOME_UNKNOWN,
+                        EffectVerdict.CONFIRMED_NOT_APPLIED,
+                    }
+                )
             )
         )
 

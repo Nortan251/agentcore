@@ -1230,12 +1230,34 @@ def test_external_idempotency_identity_has_one_logical_owner(action_store):
     second = _new_record(
         2,
         effect_class=ActionEffectClass.EXTERNALLY_IDEMPOTENT,
-        idempotency=contract,
+        idempotency=replace(contract, contract="provider-contract.v2"),
     )
     action_store.create(first)
     with pytest.raises(ActionStoreError):
         action_store.create(second)
     assert action_store.list_actions() == [first.action_id]
+
+
+def test_external_idempotency_key_may_repeat_in_a_distinct_scope(action_store):
+    contract = IdempotencyContract(
+        key="provider-key-1",
+        contract="provider-contract.v1",
+        scope="mailbox:primary",
+        valid_until=NOW + timedelta(minutes=10),
+    )
+    first = _new_record(
+        1,
+        effect_class=ActionEffectClass.EXTERNALLY_IDEMPOTENT,
+        idempotency=contract,
+    )
+    second = _new_record(
+        2,
+        effect_class=ActionEffectClass.EXTERNALLY_IDEMPOTENT,
+        idempotency=replace(contract, scope="mailbox:secondary"),
+    )
+    action_store.create(first)
+    action_store.create(second)
+    assert action_store.list_actions() == [first.action_id, second.action_id]
 
 
 def test_attempt_namespace_is_unique_and_not_stage4_transport_namespace():
