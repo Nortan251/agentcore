@@ -32,6 +32,7 @@ from agentcore.action_journal.models import (
     MAX_DEDUPLICATION_SCOPE_CHARS,
     ActionRecord,
     ActionState,
+    EffectVerdict,
     deduplication_compatible,
     require_action_id,
     validate_action_successor,
@@ -863,6 +864,8 @@ def _dedup_index(records: list[ActionRecord]) -> dict[
     action_ids: set[str] = set()
     attempt_owners: dict[str, str] = {}
     idempotency_owners: dict[tuple[str, str], str] = {}
+    acknowledgement_owners: dict[str, str] = {}
+    risk_approval_owners: dict[str, str] = {}
     for record in records:
         record.validate()
         if record.action_id in action_ids:
@@ -890,6 +893,33 @@ def _dedup_index(records: list[ActionRecord]) -> dict[
                     "external idempotency identity has multiple action owners",
                     owner_count=2)
             idempotency_owners[idempotency_identity] = record.action_id
+        acknowledgement = record.duplicate_risk_acknowledgement
+        if acknowledgement is not None:
+            acknowledgement_owner = acknowledgement_owners.get(
+                acknowledgement.acknowledgement_id)
+            if acknowledgement_owner is not None and (
+                    acknowledgement_owner != record.action_id):
+                raise ActionStoreError(
+                    "duplicate-risk acknowledgement has multiple action "
+                    "owners",
+                    acknowledgement_id=(
+                        acknowledgement.acknowledgement_id),
+                    owner_count=2,
+                )
+            acknowledgement_owners[
+                acknowledgement.acknowledgement_id] = record.action_id
+            approval_owner = risk_approval_owners.get(
+                acknowledgement.approval_request_id)
+            if approval_owner is not None and approval_owner != (
+                    record.action_id):
+                raise ActionStoreError(
+                    "duplicate-risk approval has multiple action owners",
+                    approval_request_id=(
+                        acknowledgement.approval_request_id),
+                    owner_count=2,
+                )
+            risk_approval_owners[
+                acknowledgement.approval_request_id] = record.action_id
         identity = record.deduplication_identity
         if identity is None:
             continue
@@ -928,6 +958,30 @@ def _validate_candidate_links(records: list[ActionRecord],
         raise ActionStoreError(
             "predecessor action does not exist",
             action_id=candidate.action_id)
+    acknowledgement = candidate.duplicate_risk_acknowledgement
+    if acknowledgement is not None:
+        predecessor = _find_record(
+            records, acknowledgement.predecessor_action_id)
+        if not _is_current_unresolved_duplicate_risk(predecessor) or not (
+                _was_unresolved_duplicate_risk_at(
+                    predecessor, acknowledgement.acknowledged_at)):
+            raise ActionStoreError(
+                "duplicate-risk predecessor is not unresolved",
+                action_id=candidate.action_id)
+        for record in records:
+            existing = record.duplicate_risk_acknowledgement
+            if existing is None or record.action_id == candidate.action_id:
+                continue
+            if existing.acknowledgement_id == (
+                    acknowledgement.acknowledgement_id):
+                raise ActionStoreError(
+                    "duplicate-risk acknowledgement is already owned",
+                    action_id=candidate.action_id)
+            if existing.approval_request_id == (
+                    acknowledgement.approval_request_id):
+                raise ActionStoreError(
+                    "duplicate-risk approval is already owned",
+                    action_id=candidate.action_id)
     if candidate.idempotency is None:
         return
     # A contract-label change does not create a new remote key namespace.
@@ -967,6 +1021,48 @@ def _validate_predecessor_graph(records: list[ActionRecord]) -> None:
             visited.add(current.action_id)
             predecessor = current.predecessor_action_id
             current = by_id.get(predecessor) if predecessor is not None else None
+
+    for record in records:
+        acknowledgement = record.duplicate_risk_acknowledgement
+        if acknowledgement is None:
+            continue
+        predecessor = by_id[acknowledgement.predecessor_action_id]
+        if not _was_unresolved_duplicate_risk_at(
+                predecessor, acknowledgement.acknowledged_at):
+            raise ActionStoreError(
+                "duplicate-risk relation lacks unresolved predecessor truth",
+                action_id=record.action_id)
+
+
+def _is_current_unresolved_duplicate_risk(record: ActionRecord) -> bool:
+    return (
+        record.state is ActionState.RECONCILE_REQUIRED
+        and any(attempt.effect_verdict is EffectVerdict.OUTCOME_UNKNOWN
+                for attempt in record.attempts)
+    )
+
+
+def _was_unresolved_duplicate_risk_at(record: ActionRecord, at) -> bool:
+    """Audit that ambiguity existed when the human acknowledgement occurred.
+
+    Equal timestamps are intentionally treated conservatively as concurrent:
+    the keyed approval binding and executor version check order the live path,
+    while this schema-only audit proves that an unresolved transition existed
+    no later than acknowledgement without rejecting a legitimate later
+    settlement recorded by a coarse/fixed clock at the same instant.
+    """
+    unresolved = False
+    for transition in record.transitions:
+        if transition.at > at:
+            break
+        if transition.effect_verdict is EffectVerdict.OUTCOME_UNKNOWN and (
+                transition.to_state is ActionState.RECONCILE_REQUIRED):
+            unresolved = True
+        elif transition.from_state is ActionState.RECONCILE_REQUIRED and (
+                transition.effect_verdict is not EffectVerdict.OUTCOME_UNKNOWN
+                and transition.at < at):
+            unresolved = False
+    return unresolved
 
 
 def _find_record(records: list[ActionRecord], action_id: str) -> ActionRecord:

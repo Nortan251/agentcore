@@ -76,6 +76,7 @@ from agentcore.action_journal import (
     ActionAdapterRegistry,
     ActionInvocationContext,
     ActionStore,
+    DuplicateRiskInvocationContext,
     EvidenceStore,
     ProtectedActionPayloadStore,
     StaticInstallationKeyProvider,
@@ -677,7 +678,10 @@ class Agent:
         return self.registry.describe()
 
     def call_tool(self, name: str, args: dict[str, Any] | None = None,
-                  *, approval_context: ApprovalInvocationContext | None = None
+                  *, approval_context: ApprovalInvocationContext | None = None,
+                  duplicate_risk_context: (
+                      DuplicateRiskInvocationContext | None
+                  ) = None,
                   ) -> ToolInvocation:
         """Invoke a single tool outside of a task, recording it in state."""
         invocation = self.executor.invoke(
@@ -685,6 +689,7 @@ class Agent:
             args,
             action_context=ActionInvocationContext(run_id=self.state.run_id),
             approval_context=approval_context,
+            duplicate_risk_context=duplicate_risk_context,
             run_id=self.state.run_id,
         )
         self.state.record_tool_call(invocation)

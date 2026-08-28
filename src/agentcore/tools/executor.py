@@ -8,6 +8,8 @@ entered. ActionJournal records are evidence; they never grant authority.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import hmac
 import time
@@ -43,6 +45,8 @@ from agentcore.action_journal import (
     ActionStore,
     ActionTransitionProof,
     AuthorityReceipt,
+    DuplicateRiskAcknowledgement,
+    DuplicateRiskInvocationContext,
     EffectVerdict,
     EvidenceStore,
     ExternalIdempotencyRequest,
@@ -64,6 +68,7 @@ from agentcore.action_journal import (
     new_action,
     new_action_attempt_id,
     new_action_transition_id,
+    new_duplicate_risk_acknowledgement_id,
     permission_policy_fingerprint,
 )
 from agentcore.errors import (
@@ -85,6 +90,33 @@ from agentcore.util.ids import new_id
 
 _REDACTED = "***"
 _SENSITIVE_FAILURE_REASONS = frozenset({"sensitive", "sensitive_target"})
+_DUPLICATE_RISK_APPROVAL_ACTION_KIND = "agentcore.duplicate_risk.v1"
+_DUPLICATE_RISK_DEDUPLICATION_SCOPE = "agentcore:duplicate-risk:v1"
+_DUPLICATE_RISK_POLICY_FINGERPRINT = hashlib.sha256(
+    b"agentcore.duplicate-risk.policy-independent.v1"
+).hexdigest()
+
+
+class _DuplicateRiskBlocked(Exception):
+    """Internal safe categorical stop before a successor effect seam."""
+
+    def __init__(
+        self,
+        kind: str,
+        message: str,
+        *,
+        request_id: str | None = None,
+        action_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.safe_message = message
+        self.request_id = request_id
+        self.action_id = action_id
+
+
+class _ExternalContractBlocked(Exception):
+    """Internal marker for a final provider-contract pre-seam stop."""
 
 
 def _safe_args_for_log(args: Mapping[str, Any]) -> dict[str, Any]:
@@ -321,6 +353,7 @@ class ToolExecutor:
         checkpoint: Callable[[], None] | None = None,
         action_context: ActionInvocationContext | None = None,
         approval_context: ApprovalInvocationContext | None = None,
+        duplicate_risk_context: DuplicateRiskInvocationContext | None = None,
         **context_meta: Any,
     ) -> ToolInvocation:
         """Validate, authorize, and invoke through the appropriate boundary."""
@@ -447,6 +480,7 @@ class ToolExecutor:
             checkpoint=checkpoint,
             action_context=action_context,
             approval_context=approval_context,
+            duplicate_risk_context=duplicate_risk_context,
             log=log,
             elapsed=elapsed,
         )
@@ -1062,6 +1096,611 @@ class ToolExecutor:
                         if approval_context is not None else None),
         )
 
+    def _validate_current_duplicate_risk_permission(
+        self,
+        *,
+        record: ActionRecord,
+        tool_spec: ToolSpec,
+        prepared: PreparedActionIntent,
+    ) -> Decision:
+        """Recheck current mutation authority for a successor first attempt.
+
+        The duplicate-risk receipt grants no capability. If current policy now
+        requires ordinary approval, the exact separately consumed approval on
+        the successor is reauthenticated without prompting or consuming it a
+        second time.
+        """
+        decision, approval_required = self._current_policy_decision(
+            tool_spec,
+            description=(prepared.approval_description
+                         or tool_spec.description),
+        )
+        acknowledgement = record.duplicate_risk_acknowledgement
+        request_id = (
+            acknowledgement.approval_request_id
+            if acknowledgement is not None else None
+        )
+        if decision.outcome is Outcome.DENY:
+            raise _DuplicateRiskBlocked(
+                "permission_denied",
+                "Current permission policy denies this new action.",
+                request_id=request_id,
+                action_id=record.action_id,
+            )
+        if not approval_required:
+            return decision
+
+        normal_request_id = record.authority.approval_request_id
+        authority = self._approval_authority
+        if normal_request_id is None or authority is None:
+            raise _DuplicateRiskBlocked(
+                "approval_policy_changed",
+                "Current permission policy requires a separate ordinary "
+                "approval for this new action.",
+                request_id=request_id,
+                action_id=record.action_id,
+            )
+        try:
+            binding = authority.binding(
+                action_kind=record.action_kind,
+                intent_digest=record.intent_digest,
+                mutation_capabilities=record.mutation_capabilities,
+                tool_name=record.tool_name,
+                tool_version=record.tool_version,
+                policy_fingerprint=permission_policy_fingerprint(self.policy),
+            )
+            receipt = authority.validate_consumed(
+                binding,
+                request_id=normal_request_id,
+                action_id=record.action_id,
+            )
+            if not (
+                hmac.compare_digest(
+                    receipt.binding_digest,
+                    record.authority.binding_digest,
+                )
+                and receipt.scope_ref == record.authority.scope_ref
+                and receipt.approved_at == record.authority.authorized_at
+                and receipt.expires_at == record.authority.expires_at
+            ):
+                raise ValueError("ordinary approval receipt changed")
+        except AgentError as exc:
+            reason = exc.details.get("reason")
+            raise _DuplicateRiskBlocked(
+                ("approval_expired" if reason == "expired"
+                 else "approval_policy_changed"),
+                ("The ordinary approval expired before execution."
+                 if reason == "expired" else
+                 "Current permission policy requires a new ordinary approval "
+                 "for this action."),
+                request_id=normal_request_id,
+                action_id=record.action_id,
+            ) from exc
+        except Exception as exc:
+            raise _DuplicateRiskBlocked(
+                "approval_policy_changed",
+                "Current permission policy requires a new ordinary approval "
+                "for this action.",
+                request_id=normal_request_id,
+                action_id=record.action_id,
+            ) from exc
+        return Decision(
+            Outcome.ALLOW,
+            "authorized by current durable one-shot approval",
+            capability=decision.capability,
+            required_level=decision.required_level,
+        )
+
+    def _authorize_duplicate_risk(
+        self,
+        *,
+        store: ActionStore,
+        tool: Any,
+        tool_spec: ToolSpec,
+        spec: ActionAdapterSpec,
+        prepared: PreparedActionIntent,
+        public_intent_digest: str,
+        mutation_capabilities: tuple[str, ...],
+        reconciliation_capabilities: tuple[str, ...],
+        context: DuplicateRiskInvocationContext,
+        successor_action_id: str,
+    ) -> DuplicateRiskAcknowledgement:
+        """Obtain one separately bound human duplicate-risk decision."""
+        predecessor = self._load_duplicate_risk_predecessor(
+            store=store,
+            tool=tool,
+            tool_spec=tool_spec,
+            spec=spec,
+            prepared=prepared,
+            successor_intent_digest=public_intent_digest,
+            successor_target_category=prepared.target_category,
+            successor_target_fingerprint=prepared.target_fingerprint,
+            mutation_capabilities=mutation_capabilities,
+            reconciliation_capabilities=reconciliation_capabilities,
+            predecessor_action_id=context.predecessor_action_id,
+        )
+        authority = self._approval_authority
+        if authority is None:
+            raise _DuplicateRiskBlocked(
+                "duplicate_risk_acknowledgement_required",
+                "The earlier action is unresolved. A new action requires "
+                "explicit human acknowledgement that it may duplicate the "
+                "earlier effect.",
+                action_id=successor_action_id,
+            )
+        binding = self._duplicate_risk_approval_binding(
+            authority=authority,
+            predecessor=predecessor,
+            successor_action_id=successor_action_id,
+            action_kind=spec.action_kind,
+            intent_digest=public_intent_digest,
+            target_category=prepared.target_category,
+            target_fingerprint=prepared.target_fingerprint,
+            effect_class=spec.effect_class,
+            mutation_capabilities=mutation_capabilities,
+            reconciliation_capabilities=reconciliation_capabilities,
+            tool_name=tool_spec.name,
+            tool_version=tool_spec.version,
+        )
+        try:
+            authorization = authority.authorize(
+                binding,
+                description=(
+                    "The earlier action is still unresolved. Approve a new "
+                    "action that may duplicate its effect."
+                ),
+                action_id=successor_action_id,
+                request_id=context.approval_request_id,
+            )
+        except AgentError as exc:
+            reason = exc.details.get("reason")
+            kind = (
+                "duplicate_risk_acknowledgement_expired"
+                if reason == "expired"
+                else "duplicate_risk_binding_invalid"
+            )
+            raise _DuplicateRiskBlocked(
+                kind,
+                ("The duplicate-risk acknowledgement expired."
+                 if reason == "expired" else
+                 "The duplicate-risk approval does not match this exact new "
+                 "action."),
+                request_id=context.approval_request_id,
+                action_id=successor_action_id,
+            ) from exc
+        except Exception as exc:
+            raise _DuplicateRiskBlocked(
+                "duplicate_risk_binding_invalid",
+                "The duplicate-risk approval does not match this exact new "
+                "action.",
+                request_id=context.approval_request_id,
+                action_id=successor_action_id,
+            ) from exc
+
+        receipt: DurableApprovalReceipt | None = None
+        if authorization.authorized:
+            receipt = authorization.receipt
+        elif authorization.status is ApprovalAuthorizationStatus.CONSUMED:
+            try:
+                receipt = authority.validate_consumed(
+                    binding,
+                    request_id=authorization.request_id,
+                    action_id=successor_action_id,
+                )
+            except AgentError as exc:
+                reason = exc.details.get("reason")
+                raise _DuplicateRiskBlocked(
+                    ("duplicate_risk_acknowledgement_expired"
+                     if reason == "expired"
+                     else "duplicate_risk_binding_invalid"),
+                    ("The duplicate-risk acknowledgement expired."
+                     if reason == "expired" else
+                     "The consumed duplicate-risk approval is not valid for "
+                     "this exact new action."),
+                    request_id=authorization.request_id,
+                    action_id=successor_action_id,
+                ) from exc
+        else:
+            kinds = {
+                ApprovalAuthorizationStatus.PENDING: (
+                    "duplicate_risk_acknowledgement_required"),
+                ApprovalAuthorizationStatus.DENIED: (
+                    "duplicate_risk_acknowledgement_denied"),
+                ApprovalAuthorizationStatus.EXPIRED: (
+                    "duplicate_risk_acknowledgement_expired"),
+            }
+            messages = {
+                ApprovalAuthorizationStatus.PENDING: (
+                    "The earlier action is unresolved. A new action requires "
+                    "explicit human acknowledgement that it may duplicate "
+                    "the earlier effect."),
+                ApprovalAuthorizationStatus.DENIED: (
+                    "Human duplicate-risk acknowledgement was denied."),
+                ApprovalAuthorizationStatus.EXPIRED: (
+                    "The duplicate-risk acknowledgement expired."),
+            }
+            raise _DuplicateRiskBlocked(
+                kinds.get(
+                    authorization.status,
+                    "duplicate_risk_binding_invalid",
+                ),
+                messages.get(
+                    authorization.status,
+                    "The duplicate-risk approval is invalid.",
+                ),
+                request_id=authorization.request_id,
+                action_id=successor_action_id,
+            )
+        if receipt is None:
+            raise _DuplicateRiskBlocked(
+                "duplicate_risk_binding_invalid",
+                "The duplicate-risk approval lacks an authenticated receipt.",
+                request_id=authorization.request_id,
+                action_id=successor_action_id,
+            )
+        acknowledgement = self._duplicate_risk_acknowledgement(
+            predecessor.action_id, receipt)
+        self._validate_duplicate_risk_before_create(
+            store=store,
+            tool=tool,
+            tool_spec=tool_spec,
+            spec=spec,
+            prepared=prepared,
+            public_intent_digest=public_intent_digest,
+            mutation_capabilities=mutation_capabilities,
+            reconciliation_capabilities=reconciliation_capabilities,
+            successor_action_id=successor_action_id,
+            acknowledgement=acknowledgement,
+        )
+        return acknowledgement
+
+    def _load_duplicate_risk_predecessor(
+        self,
+        *,
+        store: ActionStore,
+        tool: Any,
+        tool_spec: ToolSpec,
+        spec: ActionAdapterSpec,
+        prepared: PreparedActionIntent,
+        successor_intent_digest: str,
+        successor_target_category: str,
+        successor_target_fingerprint: str | None,
+        mutation_capabilities: tuple[str, ...],
+        reconciliation_capabilities: tuple[str, ...],
+        predecessor_action_id: str,
+    ) -> ActionRecord:
+        try:
+            predecessor = store.load(predecessor_action_id)
+            predecessor.validate()
+        except Exception as exc:
+            raise _DuplicateRiskBlocked(
+                "duplicate_risk_predecessor_changed",
+                "The unresolved predecessor could not be verified.",
+            ) from exc
+        if predecessor.state is not ActionState.RECONCILE_REQUIRED or not any(
+                attempt.effect_verdict is EffectVerdict.OUTCOME_UNKNOWN
+                for attempt in predecessor.attempts):
+            raise _DuplicateRiskBlocked(
+                "duplicate_risk_predecessor_changed",
+                "The earlier action is no longer in the acknowledged "
+                "unresolved state.",
+            )
+        if predecessor.reconciliation.claim_owner_id is not None:
+            raise _DuplicateRiskBlocked(
+                "duplicate_risk_predecessor_changed",
+                "The earlier action is currently being reconciled.",
+            )
+        if predecessor.reconciliation.disposition is (
+                ReconciliationDisposition.PROBE_LATER):
+            raise _DuplicateRiskBlocked(
+                "duplicate_risk_reconciliation_available",
+                "The earlier action still has an authoritative reconciliation "
+                "path; resolve that truth before creating a risky repeat.",
+            )
+        same_intent = (
+            predecessor.action_kind == spec.action_kind
+            and predecessor.tool_name == tool_spec.name
+            and predecessor.tool_version == tool_spec.version
+            and predecessor.eligibility is spec.eligibility
+            and predecessor.effect_class is spec.effect_class
+            and predecessor.mutation_capabilities == mutation_capabilities
+            and predecessor.reconciliation_capabilities == (
+                reconciliation_capabilities)
+            and hmac.compare_digest(
+                predecessor.intent_digest, successor_intent_digest)
+            and predecessor.target_category == successor_target_category
+            and predecessor.target_fingerprint == (
+                successor_target_fingerprint)
+            and self._protected_intent_matches(predecessor, prepared)
+        )
+        if not same_intent:
+            raise _DuplicateRiskBlocked(
+                "duplicate_risk_binding_invalid",
+                "The requested new action is not equivalent to the unresolved "
+                "predecessor.",
+            )
+        if predecessor.effect_class is (
+                ActionEffectClass.EXTERNALLY_IDEMPOTENT):
+            try:
+                self._validate_external_contract_for_record(
+                    tool, tool_spec, spec, predecessor)
+            except Exception:
+                pass
+            else:
+                raise _DuplicateRiskBlocked(
+                    "duplicate_risk_same_action_retry_available",
+                    "The earlier action still has a live provider-backed "
+                    "same-action retry guarantee.",
+                )
+        return predecessor
+
+    def _duplicate_risk_approval_binding(
+        self,
+        *,
+        authority: DurableApprovalAuthority,
+        predecessor: ActionRecord,
+        successor_action_id: str,
+        action_kind: str,
+        intent_digest: str,
+        target_category: str,
+        target_fingerprint: str | None,
+        effect_class: ActionEffectClass | None,
+        mutation_capabilities: tuple[str, ...],
+        reconciliation_capabilities: tuple[str, ...],
+        tool_name: str,
+        tool_version: str,
+    ):
+        if effect_class is None:
+            raise ValueError("duplicate-risk successor lacks an effect class")
+        payload = {
+            "domain": "agentcore.duplicate-risk.intent.v1",
+            "predecessor": {
+                "action_id": predecessor.action_id,
+                "version": predecessor.version,
+                "state": predecessor.state.value,
+                "attempts": [
+                    {
+                        "attempt_id": attempt.attempt_id,
+                        "status": attempt.status.value,
+                        "effect_verdict": (
+                            attempt.effect_verdict.value
+                            if attempt.effect_verdict is not None else None
+                        ),
+                    }
+                    for attempt in predecessor.attempts
+                ],
+                "reconciliation": {
+                    "disposition": (
+                        predecessor.reconciliation.disposition.value),
+                    "claim_epoch": predecessor.reconciliation.claim_epoch,
+                    "probe_count": predecessor.reconciliation.probe_count,
+                },
+            },
+            "successor": {
+                "action_id": successor_action_id,
+                "action_kind": action_kind,
+                "intent_digest": intent_digest,
+                "target_category": target_category,
+                "target_fingerprint": target_fingerprint,
+                "effect_class": effect_class.value,
+                "mutation_capabilities": list(mutation_capabilities),
+                "reconciliation_capabilities": list(
+                    reconciliation_capabilities),
+                "tool_name": tool_name,
+                "tool_version": tool_version,
+            },
+        }
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        # This inner digest is canonical input only. The durable authority's
+        # outer binding digest is the installation-keyed acknowledgement proof.
+        risk_intent_digest = hashlib.sha256(
+            b"agentcore.duplicate-risk.intent.v1\x00" + encoded
+        ).hexdigest()
+        return authority.binding(
+            action_kind=_DUPLICATE_RISK_APPROVAL_ACTION_KIND,
+            intent_digest=risk_intent_digest,
+            mutation_capabilities=mutation_capabilities,
+            tool_name=tool_name,
+            tool_version=tool_version,
+            policy_fingerprint=_DUPLICATE_RISK_POLICY_FINGERPRINT,
+        )
+
+    @staticmethod
+    def _duplicate_risk_acknowledgement(
+        predecessor_action_id: str,
+        receipt: DurableApprovalReceipt,
+    ) -> DuplicateRiskAcknowledgement:
+        receipt.validate()
+        receipt_suffix = receipt.receipt_id.removeprefix("aprc_")
+        acknowledgement_id = new_duplicate_risk_acknowledgement_id(
+            id_factory=lambda prefix: f"{prefix}_{receipt_suffix}")
+        return DuplicateRiskAcknowledgement(
+            acknowledgement_id=acknowledgement_id,
+            predecessor_action_id=predecessor_action_id,
+            approval_request_id=receipt.request_id,
+            binding_digest=receipt.binding_digest,
+            acknowledged_at=receipt.approved_at,
+        ).validate()
+
+    def _validate_duplicate_risk_before_create(
+        self,
+        *,
+        store: ActionStore,
+        tool: Any,
+        tool_spec: ToolSpec,
+        spec: ActionAdapterSpec,
+        prepared: PreparedActionIntent,
+        public_intent_digest: str,
+        mutation_capabilities: tuple[str, ...],
+        reconciliation_capabilities: tuple[str, ...],
+        successor_action_id: str | None,
+        acknowledgement: DuplicateRiskAcknowledgement,
+    ) -> None:
+        if successor_action_id is None:
+            raise _DuplicateRiskBlocked(
+                "duplicate_risk_binding_invalid",
+                "The duplicate-risk successor identity is unavailable.",
+            )
+        predecessor = self._load_duplicate_risk_predecessor(
+            store=store,
+            tool=tool,
+            tool_spec=tool_spec,
+            spec=spec,
+            prepared=prepared,
+            successor_intent_digest=public_intent_digest,
+            successor_target_category=prepared.target_category,
+            successor_target_fingerprint=prepared.target_fingerprint,
+            mutation_capabilities=mutation_capabilities,
+            reconciliation_capabilities=reconciliation_capabilities,
+            predecessor_action_id=acknowledgement.predecessor_action_id,
+        )
+        authority = self._approval_authority
+        if authority is None:
+            raise _DuplicateRiskBlocked(
+                "duplicate_risk_binding_invalid",
+                "The durable duplicate-risk authority is unavailable.",
+                request_id=acknowledgement.approval_request_id,
+                action_id=successor_action_id,
+            )
+        binding = self._duplicate_risk_approval_binding(
+            authority=authority,
+            predecessor=predecessor,
+            successor_action_id=successor_action_id,
+            action_kind=spec.action_kind,
+            intent_digest=public_intent_digest,
+            target_category=prepared.target_category,
+            target_fingerprint=prepared.target_fingerprint,
+            effect_class=spec.effect_class,
+            mutation_capabilities=mutation_capabilities,
+            reconciliation_capabilities=reconciliation_capabilities,
+            tool_name=tool_spec.name,
+            tool_version=tool_spec.version,
+        )
+        try:
+            receipt = authority.validate_consumed(
+                binding,
+                request_id=acknowledgement.approval_request_id,
+                action_id=successor_action_id,
+            )
+        except AgentError as exc:
+            reason = exc.details.get("reason")
+            raise _DuplicateRiskBlocked(
+                ("duplicate_risk_acknowledgement_expired"
+                 if reason == "expired"
+                 else "duplicate_risk_predecessor_changed"),
+                ("The duplicate-risk acknowledgement expired before the new "
+                 "action could execute."
+                 if reason == "expired" else
+                 "The predecessor changed after duplicate-risk "
+                 "acknowledgement."),
+                request_id=acknowledgement.approval_request_id,
+                action_id=successor_action_id,
+            ) from exc
+        expected = self._duplicate_risk_acknowledgement(
+            predecessor.action_id, receipt)
+        if expected != acknowledgement:
+            raise _DuplicateRiskBlocked(
+                "duplicate_risk_binding_invalid",
+                "The stored duplicate-risk acknowledgement is not the exact "
+                "authenticated receipt.",
+                request_id=acknowledgement.approval_request_id,
+                action_id=successor_action_id,
+            )
+
+    @staticmethod
+    def _duplicate_risk_context_matches_record(
+        context: DuplicateRiskInvocationContext,
+        record: ActionRecord,
+    ) -> bool:
+        acknowledgement = record.duplicate_risk_acknowledgement
+        return (
+            acknowledgement is not None
+            and context.predecessor_action_id == record.predecessor_action_id
+            and context.successor_action_id == record.action_id
+            and (
+                context.approval_request_id is None
+                or context.approval_request_id == (
+                    acknowledgement.approval_request_id)
+            )
+        )
+
+    def _validate_duplicate_risk_record(
+        self,
+        *,
+        store: ActionStore,
+        record: ActionRecord,
+        tool: Any,
+        tool_spec: ToolSpec,
+        spec: ActionAdapterSpec,
+        prepared: PreparedActionIntent,
+    ) -> None:
+        acknowledgement = record.duplicate_risk_acknowledgement
+        if acknowledgement is None:
+            return
+        if record.predecessor_action_id != (
+                acknowledgement.predecessor_action_id):
+            raise _DuplicateRiskBlocked(
+                "duplicate_risk_binding_invalid",
+                "The successor predecessor linkage is invalid.",
+                request_id=acknowledgement.approval_request_id,
+                action_id=record.action_id,
+            )
+        self._validate_duplicate_risk_before_create(
+            store=store,
+            tool=tool,
+            tool_spec=tool_spec,
+            spec=spec,
+            prepared=prepared,
+            public_intent_digest=record.intent_digest,
+            mutation_capabilities=record.mutation_capabilities,
+            reconciliation_capabilities=record.reconciliation_capabilities,
+            successor_action_id=record.action_id,
+            acknowledgement=acknowledgement,
+        )
+
+    @staticmethod
+    def _duplicate_risk_blocked_invocation(
+        tool_name: str,
+        redacted: dict[str, str],
+        blocked: _DuplicateRiskBlocked,
+        decision: Decision | None,
+        invocation_id: str,
+        duration: float,
+        log: Any,
+        *,
+        fallback_action_id: str | None = None,
+        action_state: str | None = None,
+        attempt_id: str | None = None,
+    ) -> ToolInvocation:
+        action_id = blocked.action_id or fallback_action_id
+        log.warning(
+            Events.TOOL_DENIED,
+            reason=blocked.kind,
+            action_id=action_id,
+            approval_request_id=blocked.request_id,
+        )
+        metadata: dict[str, Any] = {"kind": blocked.kind}
+        if blocked.request_id is not None:
+            metadata["approval_request_id"] = blocked.request_id
+        return ToolInvocation(
+            tool_name,
+            redacted,
+            ToolResult.failure(blocked.safe_message, **metadata),
+            duration,
+            decision,
+            invocation_id=invocation_id,
+            action_id=action_id,
+            attempt_id=attempt_id,
+            action_state=action_state,
+            approval_request_id=blocked.request_id,
+        )
+
     @staticmethod
     def _approval_invocation(
         tool_name: str,
@@ -1073,6 +1712,7 @@ class ToolExecutor:
         log: Any,
         *,
         historical_action: ActionRecord | None = None,
+        planned_action_id: str | None = None,
     ) -> ToolInvocation:
         kinds = {
             ApprovalAuthorizationStatus.PENDING: "approval_pending",
@@ -1112,7 +1752,8 @@ class ToolExecutor:
             decision,
             invocation_id=invocation_id,
             action_id=(historical_action.action_id
-                       if historical_action is not None else None),
+                       if historical_action is not None
+                       else planned_action_id),
             action_state=(historical_action.state.value
                           if historical_action is not None else None),
             approval_request_id=authorization.request_id,
@@ -1129,6 +1770,7 @@ class ToolExecutor:
         checkpoint: Callable[[], None] | None,
         action_context: ActionInvocationContext | None,
         approval_context: ApprovalInvocationContext | None,
+        duplicate_risk_context: DuplicateRiskInvocationContext | None,
         log: Any,
         elapsed: Callable[[], float],
     ) -> ToolInvocation:
@@ -1156,11 +1798,31 @@ class ToolExecutor:
                 if not isinstance(approval_context, ApprovalInvocationContext):
                     raise TypeError("untrusted approval context type")
                 approval_context.validate()
+            if duplicate_risk_context is not None:
+                if not isinstance(
+                        duplicate_risk_context,
+                        DuplicateRiskInvocationContext):
+                    raise TypeError("untrusted duplicate-risk context type")
+                duplicate_risk_context.validate()
+                if trusted_context.action_id is not None and (
+                        duplicate_risk_context.successor_action_id !=
+                        trusted_context.action_id):
+                    raise ValueError(
+                        "duplicate-risk successor does not match action resume")
+                if trusted_context.deduplication_scope is not None:
+                    raise ValueError(
+                        "duplicate-risk creation owns its deduplication identity")
         except Exception:
             return self._journal_failure(
                 tool_spec.name, redacted, elapsed(),
-                kind="approval_context_invalid",
-                message="The trusted approval context is invalid.",
+                kind=("duplicate_risk_context_invalid"
+                      if duplicate_risk_context is not None
+                      else "approval_context_invalid"),
+                message=(
+                    "The trusted duplicate-risk context is invalid."
+                    if duplicate_risk_context is not None else
+                    "The trusted approval context is invalid."
+                ),
                 log=log, invocation_id=invocation_id)
 
         protected_requested = (
@@ -1212,6 +1874,11 @@ class ToolExecutor:
         resume_requested = trusted_context.action_id is not None
         approval_receipt: DurableApprovalReceipt | None = None
         approved_action_id: str | None = None
+        duplicate_risk_acknowledgement: (
+            DuplicateRiskAcknowledgement | None
+        ) = None
+        duplicate_risk_successor_id: str | None = None
+        creation_context = trusted_context
         if not resume_requested:
             if checkpoint is not None:
                 checkpoint()
@@ -1236,6 +1903,63 @@ class ToolExecutor:
                     kind="action_store_unavailable",
                     message="The durable action journal is unavailable.",
                     log=log, decision=decision, invocation_id=invocation_id)
+            if duplicate_risk_context is not None:
+                duplicate_risk_successor_id = (
+                    duplicate_risk_context.successor_action_id
+                    or self._id_factory("act")
+                )
+                try:
+                    duplicate_risk_acknowledgement = (
+                        self._authorize_duplicate_risk(
+                            store=self._action_store,
+                            tool=tool,
+                            tool_spec=tool_spec,
+                            spec=spec,
+                            prepared=prepared,
+                            public_intent_digest=public_intent_digest,
+                            mutation_capabilities=mutation_capabilities,
+                            reconciliation_capabilities=(
+                                reconciliation_capabilities),
+                            context=duplicate_risk_context,
+                            successor_action_id=(
+                                duplicate_risk_successor_id),
+                        )
+                    )
+                    creation_context = replace(
+                        trusted_context,
+                        deduplication_scope=(
+                            _DUPLICATE_RISK_DEDUPLICATION_SCOPE),
+                        deduplication_key=(
+                            "approval:"
+                            + duplicate_risk_acknowledgement
+                            .approval_request_id),
+                    ).validate()
+                    approved_action_id = duplicate_risk_successor_id
+                except _DuplicateRiskBlocked as exc:
+                    return self._duplicate_risk_blocked_invocation(
+                        tool_spec.name,
+                        redacted,
+                        exc,
+                        decision,
+                        invocation_id,
+                        elapsed(),
+                        log,
+                        fallback_action_id=duplicate_risk_successor_id,
+                    )
+                except Exception:
+                    return self._journal_failure(
+                        tool_spec.name, redacted, elapsed(),
+                        kind="duplicate_risk_binding_invalid",
+                        message=(
+                            "The duplicate-risk acknowledgement could not be "
+                            "authenticated."
+                        ),
+                        log=log, decision=decision,
+                        invocation_id=invocation_id,
+                        action_id=duplicate_risk_successor_id,
+                        approval_request_id=(
+                            duplicate_risk_context.approval_request_id),
+                    )
             if approval_required:
                 try:
                     authorization = self._authorize_approval(
@@ -1246,8 +1970,12 @@ class ToolExecutor:
                         tool_version=tool_spec.version,
                         description=(prepared.approval_description
                                      or tool_spec.description),
-                        action_id=(None if approval_context is not None
-                                   else self._id_factory("act")),
+                        action_id=(
+                            duplicate_risk_successor_id
+                            if duplicate_risk_successor_id is not None
+                            else (None if approval_context is not None
+                                  else self._id_factory("act"))
+                        ),
                         approval_context=approval_context,
                     )
                 except Exception:
@@ -1262,7 +1990,8 @@ class ToolExecutor:
                 if not authorization.authorized:
                     return self._approval_invocation(
                         tool_spec.name, redacted, authorization, decision,
-                        invocation_id, elapsed(), log)
+                        invocation_id, elapsed(), log,
+                        planned_action_id=duplicate_risk_successor_id)
                 assert authorization.receipt is not None
                 approval_receipt = authorization.receipt
                 approved_action_id = authorization.action_id
@@ -1297,6 +2026,131 @@ class ToolExecutor:
                 )
             if checkpoint is not None:
                 checkpoint()
+            if duplicate_risk_acknowledgement is not None:
+                rechecked, now_requires_approval = (
+                    self._current_policy_decision(
+                        tool_spec,
+                        description=(prepared.approval_description
+                                     or tool_spec.description),
+                    )
+                )
+                log.debug(Events.PERMISSION_CHECKED, **rechecked.to_dict())
+                if rechecked.outcome is Outcome.DENY:
+                    log.warning(Events.TOOL_DENIED, **rechecked.to_dict())
+                    return ToolInvocation(
+                        tool_spec.name,
+                        redacted,
+                        ToolResult.failure(
+                            "Permission was not granted for this action.",
+                            kind="permission_denied",
+                        ),
+                        elapsed(),
+                        rechecked,
+                        invocation_id=invocation_id,
+                        action_id=duplicate_risk_successor_id,
+                        approval_request_id=(
+                            duplicate_risk_acknowledgement
+                            .approval_request_id),
+                    )
+                try:
+                    current_fingerprint = permission_policy_fingerprint(
+                        self.policy)
+                except Exception:
+                    current_fingerprint = ""
+                approval_is_current = (
+                    approval_receipt is not None
+                    and hmac.compare_digest(
+                        current_fingerprint,
+                        approval_receipt.policy_fingerprint,
+                    )
+                    and self._clock.now() < approval_receipt.expires_at
+                )
+                if now_requires_approval and not approval_is_current:
+                    return self._journal_failure(
+                        tool_spec.name,
+                        redacted,
+                        elapsed(),
+                        kind="approval_policy_changed",
+                        message=(
+                            "Current permission policy requires a separate "
+                            "ordinary approval for this new action."
+                        ),
+                        log=log,
+                        decision=rechecked,
+                        invocation_id=invocation_id,
+                        action_id=duplicate_risk_successor_id,
+                        approval_request_id=(
+                            duplicate_risk_acknowledgement
+                            .approval_request_id),
+                    )
+                if approval_receipt is not None and not approval_is_current:
+                    return self._journal_failure(
+                        tool_spec.name,
+                        redacted,
+                        elapsed(),
+                        kind="approval_policy_changed",
+                        message=(
+                            "Current mutation authority changed after ordinary "
+                            "approval."
+                        ),
+                        log=log,
+                        decision=rechecked,
+                        invocation_id=invocation_id,
+                        action_id=duplicate_risk_successor_id,
+                        approval_request_id=approval_receipt.request_id,
+                    )
+                decision = (
+                    Decision(
+                        Outcome.ALLOW,
+                        "authorized by durable one-shot approval",
+                        capability=(rechecked.capability
+                                    if now_requires_approval else None),
+                        required_level=rechecked.required_level,
+                    )
+                    if approval_receipt is not None else rechecked
+                )
+                try:
+                    self._validate_duplicate_risk_before_create(
+                        store=self._action_store,
+                        tool=tool,
+                        tool_spec=tool_spec,
+                        spec=spec,
+                        prepared=prepared,
+                        public_intent_digest=public_intent_digest,
+                        mutation_capabilities=mutation_capabilities,
+                        reconciliation_capabilities=(
+                            reconciliation_capabilities),
+                        successor_action_id=(
+                            duplicate_risk_successor_id),
+                        acknowledgement=(
+                            duplicate_risk_acknowledgement),
+                    )
+                except _DuplicateRiskBlocked as exc:
+                    return self._duplicate_risk_blocked_invocation(
+                        tool_spec.name,
+                        redacted,
+                        exc,
+                        decision,
+                        invocation_id,
+                        elapsed(),
+                        log,
+                        fallback_action_id=duplicate_risk_successor_id,
+                    )
+                except Exception:
+                    return self._journal_failure(
+                        tool_spec.name, redacted, elapsed(),
+                        kind="duplicate_risk_binding_invalid",
+                        message=(
+                            "The duplicate-risk acknowledgement could not be "
+                            "revalidated before successor creation."
+                        ),
+                        log=log, decision=decision,
+                        invocation_id=invocation_id,
+                        action_id=duplicate_risk_successor_id,
+                        approval_request_id=(
+                            duplicate_risk_acknowledgement
+                            .approval_request_id),
+                    )
 
         if self._action_store is None:
             return self._journal_failure(
@@ -1320,6 +2174,10 @@ class ToolExecutor:
                     trusted_context=trusted_context,
                 ):
                     raise ValueError("resume identity mismatch")
+                if duplicate_risk_context is not None and not (
+                        self._duplicate_risk_context_matches_record(
+                            duplicate_risk_context, created)):
+                    raise ValueError("duplicate-risk resume identity mismatch")
             except Exception:
                 return self._journal_failure(
                     tool_spec.name,
@@ -1371,22 +2229,40 @@ class ToolExecutor:
                     message="The durable action intent could not be constructed.",
                     log=log, decision=decision, invocation_id=invocation_id)
 
-            created, created_here, create_error, proposed_action_id = (
-                self._create_fresh_action(
-                    store=store,
-                    tool=tool,
-                    tool_spec=tool_spec,
-                    spec=spec,
-                    prepared=prepared,
-                    trusted_context=trusted_context,
-                    public_intent_digest=public_intent_digest,
-                    provenance=provenance,
-                    authority=receipt,
-                    mutation_capabilities=mutation_capabilities,
-                    reconciliation_capabilities=reconciliation_capabilities,
-                    approved_action_id=approved_action_id,
+            try:
+                created, created_here, create_error, proposed_action_id = (
+                    self._create_fresh_action(
+                        store=store,
+                        tool=tool,
+                        tool_spec=tool_spec,
+                        spec=spec,
+                        prepared=prepared,
+                        trusted_context=creation_context,
+                        public_intent_digest=public_intent_digest,
+                        provenance=provenance,
+                        authority=receipt,
+                        mutation_capabilities=mutation_capabilities,
+                        reconciliation_capabilities=(
+                            reconciliation_capabilities),
+                        approved_action_id=approved_action_id,
+                        predecessor_action_id=(
+                            duplicate_risk_context.predecessor_action_id
+                            if duplicate_risk_context is not None else None),
+                        duplicate_risk_acknowledgement=(
+                            duplicate_risk_acknowledgement),
+                    )
                 )
-            )
+            except _DuplicateRiskBlocked as exc:
+                return self._duplicate_risk_blocked_invocation(
+                    tool_spec.name,
+                    redacted,
+                    exc,
+                    decision,
+                    invocation_id,
+                    elapsed(),
+                    log,
+                    fallback_action_id=duplicate_risk_successor_id,
+                )
             if created is None:
                 kind = create_error or "action_create_unverified"
                 messages = {
@@ -1680,6 +2556,48 @@ class ToolExecutor:
                 invocation_id, None, elapsed(), log,
                 fallback_kind="action_control_failed")
 
+        if current.duplicate_risk_acknowledgement is not None and not (
+                current.attempts):
+            try:
+                decision = self._validate_current_duplicate_risk_permission(
+                    record=current,
+                    tool_spec=tool_spec,
+                    prepared=prepared,
+                )
+                self._validate_duplicate_risk_record(
+                    store=store,
+                    record=current,
+                    tool=tool,
+                    tool_spec=tool_spec,
+                    spec=spec,
+                    prepared=prepared,
+                )
+            except _DuplicateRiskBlocked as exc:
+                return self._duplicate_risk_blocked_invocation(
+                    tool_spec.name,
+                    redacted,
+                    exc,
+                    decision,
+                    invocation_id,
+                    elapsed(),
+                    log,
+                    fallback_action_id=current.action_id,
+                    action_state=current.state.value,
+                )
+            except Exception:
+                return self._journal_failure(
+                    tool_spec.name, redacted, elapsed(),
+                    kind="duplicate_risk_binding_invalid",
+                    message=(
+                        "The duplicate-risk acknowledgement could not be "
+                        "revalidated before the physical-attempt claim."
+                    ),
+                    log=log, decision=decision,
+                    invocation_id=invocation_id,
+                    action_id=current.action_id,
+                    action_state=current.state.value,
+                )
+
         if spec.effect_class is ActionEffectClass.EXTERNALLY_IDEMPOTENT:
             try:
                 self._validate_external_contract_for_record(
@@ -1743,70 +2661,47 @@ class ToolExecutor:
                 invocation_id, attempt_id, elapsed(), log,
                 fallback_kind="action_control_failed")
 
-        if spec.effect_class is ActionEffectClass.EXTERNALLY_IDEMPOTENT:
-            try:
-                # The fresh attempt is already durably claimed.  Revalidate
-                # after the final checkpoint and immediately before entering
-                # the trusted provider boundary.  On failure, retain IN_FLIGHT:
-                # an older attempt may still have an unknown outcome.
-                self._validate_external_contract_for_record(
-                    tool, tool_spec, spec, claimed)
-            except Exception:
-                return self._journal_failure(
-                    tool_spec.name, redacted, elapsed(),
-                    kind="external_idempotency_contract_unavailable",
-                    message=(
-                        "The external idempotency guarantee expired or changed "
-                        "after the physical-attempt claim. The claimed attempt "
-                        "remains nonterminal and the provider execution "
-                        "boundary was not entered."
-                    ),
-                    log=log, decision=decision,
-                    invocation_id=invocation_id,
-                    action_id=claimed.action_id,
-                    attempt_id=attempt_id,
-                    action_state=ActionState.IN_FLIGHT.value,
-                )
-
-        cancellation: CancellationRequested | None = None
         try:
-            # Conservative physical mutation seam. It is entered exactly once.
-            if spec.effect_class is ActionEffectClass.EXTERNALLY_IDEMPOTENT:
-                if claimed.idempotency is None:
-                    raise ValueError("claimed action lacks idempotency metadata")
-                permit = ActionExecutionPermit(
-                    action_id=claimed.action_id,
-                    attempt_id=attempt_id,
-                    tool_name=tool_spec.name,
-                    tool_version=tool_spec.version,
-                    idempotency=claimed.idempotency,
-                ).validate()
-                request = self._external_idempotency_request(
-                    claimed.action_id, spec, tool_spec)
-                result = self._action_adapters.execute_external(
-                    tool,
-                    request,
-                    cleaned,
-                    self._context(
-                        tool_spec.name,
-                        action_execution_permit=permit,
-                    ),
-                    permit,
-                    tool_spec=tool_spec,
-                )
-            else:
-                result = tool.run(cleaned, self._context(tool_spec.name))
-            if not isinstance(result, ToolResult):
-                result = ToolResult.success(result)
-            normalized = adapter.normalize_effect(result)
-            if not isinstance(normalized, NormalizedActionEffect):
-                raise TypeError("adapter normalization type")
-            normalized.validate(spec)
-        except CancellationRequested as exc:
-            cancellation = exc
-            normalized = self._unknown_effect(spec, "tool.cancelled")
-        except Exception:
-            normalized = self._unknown_effect(spec, "tool.exception")
+            normalized, cancellation = self._execute_claimed_effect(
+                store=store,
+                claimed=claimed,
+                tool=tool,
+                tool_spec=tool_spec,
+                cleaned=cleaned,
+                adapter=adapter,
+                spec=spec,
+                prepared=prepared,
+                attempt_id=attempt_id,
+            )
+        except _DuplicateRiskBlocked as exc:
+            return self._duplicate_risk_blocked_invocation(
+                tool_spec.name,
+                redacted,
+                exc,
+                decision,
+                invocation_id,
+                elapsed(),
+                log,
+                fallback_action_id=claimed.action_id,
+                action_state=ActionState.IN_FLIGHT.value,
+                attempt_id=attempt_id,
+            )
+        except _ExternalContractBlocked:
+            return self._journal_failure(
+                tool_spec.name, redacted, elapsed(),
+                kind="external_idempotency_contract_unavailable",
+                message=(
+                    "The external idempotency guarantee expired or changed "
+                    "after the physical-attempt claim. The claimed attempt "
+                    "remains nonterminal and the provider execution boundary "
+                    "was not entered."
+                ),
+                log=log, decision=decision,
+                invocation_id=invocation_id,
+                action_id=claimed.action_id,
+                attempt_id=attempt_id,
+                action_state=ActionState.IN_FLIGHT.value,
+            )
 
         trusted_evidence_refs: tuple[str, ...] = ()
         try:
@@ -1865,6 +2760,128 @@ class ToolExecutor:
             tool_spec.name, redacted, published, decision,
             invocation_id, attempt_id, elapsed(), log)
 
+    def _execute_claimed_effect(
+        self,
+        *,
+        store: ActionStore,
+        claimed: ActionRecord,
+        tool: Any,
+        tool_spec: ToolSpec,
+        cleaned: dict[str, Any],
+        adapter: ToolActionAdapter,
+        spec: ActionAdapterSpec,
+        prepared: PreparedActionIntent,
+        attempt_id: str,
+    ) -> tuple[NormalizedActionEffect, CancellationRequested | None]:
+        """Perform final trusted checks and enter one physical effect seam.
+
+        For the first attempt of a deliberate risky repeat, the predecessor's
+        per-action guard is held from final current-snapshot verification
+        through the physical call.  This prevents reconciliation from changing
+        predecessor truth in the check/execute gap without holding the general
+        ActionStore mutex or any ApprovalStore mutex across provider I/O.
+        """
+        first_risky_attempt = (
+            claimed.duplicate_risk_acknowledgement is not None
+            and len(claimed.attempts) == 1
+        )
+        predecessor_guard = (
+            store.execution_guard(claimed.predecessor_action_id)
+            if first_risky_attempt
+            and claimed.predecessor_action_id is not None
+            else nullcontext()
+        )
+        try:
+            with predecessor_guard:
+                if spec.effect_class is (
+                        ActionEffectClass.EXTERNALLY_IDEMPOTENT):
+                    try:
+                        # Generic final fail-closed validation remains inside
+                        # the exact predecessor snapshot boundary. The provider
+                        # then validates again at its actual request seam.
+                        self._validate_external_contract_for_record(
+                            tool, tool_spec, spec, claimed)
+                    except Exception as exc:
+                        raise _ExternalContractBlocked() from exc
+                if first_risky_attempt:
+                    # Risk approval is deliberately the last host authority
+                    # validation before the physical tool/provider boundary.
+                    self._validate_current_duplicate_risk_permission(
+                        record=claimed,
+                        tool_spec=tool_spec,
+                        prepared=prepared,
+                    )
+                    self._validate_duplicate_risk_record(
+                        store=store,
+                        record=claimed,
+                        tool=tool,
+                        tool_spec=tool_spec,
+                        spec=spec,
+                        prepared=prepared,
+                    )
+
+                cancellation: CancellationRequested | None = None
+                try:
+                    # Conservative physical mutation seam. It is entered once.
+                    if spec.effect_class is (
+                            ActionEffectClass.EXTERNALLY_IDEMPOTENT):
+                        if claimed.idempotency is None:
+                            raise ValueError(
+                                "claimed action lacks idempotency metadata")
+                        permit = ActionExecutionPermit(
+                            action_id=claimed.action_id,
+                            attempt_id=attempt_id,
+                            tool_name=tool_spec.name,
+                            tool_version=tool_spec.version,
+                            idempotency=claimed.idempotency,
+                        ).validate()
+                        request = self._external_idempotency_request(
+                            claimed.action_id, spec, tool_spec)
+                        result = self._action_adapters.execute_external(
+                            tool,
+                            request,
+                            cleaned,
+                            self._context(
+                                tool_spec.name,
+                                action_execution_permit=permit,
+                            ),
+                            permit,
+                            tool_spec=tool_spec,
+                        )
+                    else:
+                        result = tool.run(
+                            cleaned, self._context(tool_spec.name))
+                    if not isinstance(result, ToolResult):
+                        result = ToolResult.success(result)
+                    normalized = adapter.normalize_effect(result)
+                    if not isinstance(normalized, NormalizedActionEffect):
+                        raise TypeError("adapter normalization type")
+                    normalized.validate(spec)
+                except CancellationRequested as exc:
+                    cancellation = exc
+                    normalized = self._unknown_effect(
+                        spec, "tool.cancelled")
+                except Exception:
+                    normalized = self._unknown_effect(
+                        spec, "tool.exception")
+                return normalized, cancellation
+        except (_DuplicateRiskBlocked, _ExternalContractBlocked):
+            raise
+        except Exception as exc:
+            if first_risky_attempt:
+                raise _DuplicateRiskBlocked(
+                    "duplicate_risk_predecessor_changed",
+                    "The predecessor execution boundary could not be "
+                    "verified before the successor effect seam.",
+                    request_id=(
+                        claimed.duplicate_risk_acknowledgement
+                        .approval_request_id
+                        if claimed.duplicate_risk_acknowledgement is not None
+                        else None),
+                    action_id=claimed.action_id,
+                ) from exc
+            raise
+
     @staticmethod
     def _create_or_prove(
         store: ActionStore, proposed: ActionRecord,
@@ -1900,6 +2917,10 @@ class ToolExecutor:
         mutation_capabilities: tuple[str, ...],
         reconciliation_capabilities: tuple[str, ...],
         approved_action_id: str | None,
+        predecessor_action_id: str | None = None,
+        duplicate_risk_acknowledgement: (
+            DuplicateRiskAcknowledgement | None
+        ) = None,
     ) -> tuple[ActionRecord | None, bool, str | None, str | None]:
         """Create once per dedup identity, including provider key minting."""
         dedup = (
@@ -2000,6 +3021,26 @@ class ToolExecutor:
                             proposed_action_id,
                         )
 
+                # Provider/protected setup may take long enough for the
+                # one-shot risk horizon or predecessor snapshot to change.
+                # Reauthenticate after that work and immediately before
+                # constructing/publishing the successor. ActionStore.create()
+                # then atomically rechecks current predecessor truth.
+                if duplicate_risk_acknowledgement is not None:
+                    self._validate_duplicate_risk_before_create(
+                        store=store,
+                        tool=tool,
+                        tool_spec=tool_spec,
+                        spec=spec,
+                        prepared=prepared,
+                        public_intent_digest=public_intent_digest,
+                        mutation_capabilities=mutation_capabilities,
+                        reconciliation_capabilities=(
+                            reconciliation_capabilities),
+                        successor_action_id=proposed_action_id,
+                        acknowledgement=duplicate_risk_acknowledgement,
+                    )
+
                 try:
                     if spec.effect_class is None:
                         raise ValueError("action effect class is unavailable")
@@ -2023,6 +3064,9 @@ class ToolExecutor:
                         action_id=proposed_action_id,
                         deduplication_scope=trusted_context.deduplication_scope,
                         deduplication_key=trusted_context.deduplication_key,
+                        predecessor_action_id=predecessor_action_id,
+                        duplicate_risk_acknowledgement=(
+                            duplicate_risk_acknowledgement),
                         clock=self._clock,
                         id_factory=self._id_factory,
                     )
@@ -2038,6 +3082,8 @@ class ToolExecutor:
                         proposed_action_id,
                     )
                 return created, created == proposed, None, proposed_action_id
+        except _DuplicateRiskBlocked:
+            raise
         except Exception:
             return None, False, "action_create_unverified", proposed_action_id
 
