@@ -21,6 +21,7 @@ from agentcore.action_journal.errors import (
     ActionNotFoundError,
     ActionStoreError,
     ActionStoreOwnershipError,
+    ActionStartupScanBoundExceededError,
     ActionTransitionError,
     ActionValidationError,
     ActionVersionConflictError,
@@ -94,6 +95,10 @@ from agentcore.action_journal.store import (
     ActionStore,
     InMemoryActionStore,
     JsonFileActionStore,
+)
+from agentcore.action_journal.health import (
+    ActionDomainHealth,
+    ActionDomainHealthState,
 )
 from agentcore.action_journal.idempotency import (
     ActionExecutionPermit,
@@ -188,6 +193,8 @@ __all__ = [
     "ActionAttempt",
     "ActionAttemptStatus",
     "ActionDeduplicationConflictError",
+    "ActionDomainHealth",
+    "ActionDomainHealthState",
     "ActionEffectNormalizationError",
     "ActionExecutionPermit",
     "ActionEffectClass",
@@ -208,6 +215,7 @@ __all__ = [
     "ActionStore",
     "ActionStoreError",
     "ActionStoreOwnershipError",
+    "ActionStartupScanBoundExceededError",
     "ActionTransition",
     "ActionTransitionError",
     "ActionTransitionProof",

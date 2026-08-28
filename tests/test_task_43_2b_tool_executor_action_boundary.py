@@ -286,6 +286,7 @@ def _build_executor(
         action_owner_epoch=1,
         logger=logger or RecordingLogger(),
     )
+    assert executor._mark_action_startup_healthy(resolved_store)
     return executor, resolved_store, adapters, resolved_adapter
 
 
@@ -823,6 +824,7 @@ def test_registered_classification_is_an_immutable_snapshot():
         action_owner_id="process:test",
         logger=RecordingLogger(),
     )
+    assert executor._mark_action_startup_healthy(store)
 
     invocation = _invoke(executor, context=_context())
 

@@ -168,7 +168,9 @@ def build_runner(tools, level=PermissionLevel.AUTONOMOUS, **kwargs):
     registry = ToolRegistry()
     registry.register_all(tools)
     policy = PermissionPolicy(PermConfig(level=level))
-    executor = ToolExecutor(registry, policy, **journal_for_tools(tools))
+    journal = journal_for_tools(tools)
+    executor = ToolExecutor(registry, policy, **journal)
+    assert executor._mark_action_startup_healthy(journal["action_store"])
     runner = ConversationToolRunner(executor, registry, policy=policy,
                                     **kwargs)
     return runner, registry, executor, policy

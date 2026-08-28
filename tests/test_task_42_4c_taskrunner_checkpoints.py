@@ -934,13 +934,15 @@ def test_toolexecutor_checkpoint_cannot_grant_denied(tmp_path):
     workspace = WorkspaceGuard(config.canonical_workspace(), config=config.filesystem)
     adapters = ActionAdapterRegistry()
     adapters.register(write_tool, WriteActionAdapter())
+    action_store = InMemoryActionStore()
     executor = ToolExecutor(
         registry,
         policy,
         workspace=workspace,
-        action_store=InMemoryActionStore(),
+        action_store=action_store,
         action_adapters=adapters,
     )
+    assert executor._mark_action_startup_healthy(action_store)
 
     def checkpoint_ok():
         return None

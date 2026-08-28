@@ -24,6 +24,7 @@ from agentcore.action_journal.errors import (
     ActionNotFoundError,
     ActionStoreError,
     ActionStoreOwnershipError,
+    ActionStartupScanBoundExceededError,
     ActionValidationError,
     ActionVersionConflictError,
 )
@@ -79,6 +80,8 @@ class ActionStore(Protocol):
 
     def list_actions(self) -> list[str]: ...
 
+    def audit(self, *, maximum_records: int) -> list[ActionRecord]: ...
+
     def execution_guard(self, action_id: str) -> ContextManager[None]: ...
 
     def find_by_deduplication(
@@ -117,8 +120,16 @@ class InMemoryActionStore:
         if self._closed:
             raise ActionStoreError("action store is closed")
 
-    def _audit_unlocked(self) -> tuple[list[ActionRecord],
-                                       dict[tuple[str, str], ActionRecord]]:
+    def _audit_unlocked(
+        self,
+        *,
+        maximum_records: int | None = None,
+    ) -> tuple[list[ActionRecord], dict[tuple[str, str], ActionRecord]]:
+        if maximum_records is not None and len(self._data) > maximum_records:
+            raise ActionStartupScanBoundExceededError(
+                "action startup scan bound exceeded",
+                maximum=maximum_records,
+            )
         records: list[ActionRecord] = []
         for action_id in sorted(self._data):
             validated_id = require_action_id(action_id)
@@ -231,6 +242,16 @@ class InMemoryActionStore:
             self._require_open()
             records, _ = self._audit_unlocked()
             return [record.action_id for record in records]
+
+    def audit(self, *, maximum_records: int) -> list[ActionRecord]:
+        """Return one fully validated bounded snapshot of the whole domain."""
+        self._require_owner_process()
+        maximum_records = _validate_startup_audit_bound(maximum_records)
+        with self._lock:
+            self._require_open()
+            records, _ = self._audit_unlocked(
+                maximum_records=maximum_records)
+            return [_snapshot(record) for record in records]
 
     def find_by_deduplication(
         self, scope: str, key: str,
@@ -504,10 +525,33 @@ class JsonFileActionStore:
     def _path(self, action_id: str) -> Path:
         return self._directory / f"{require_action_id(action_id)}.json"
 
-    def _audit_unlocked(self) -> tuple[list[ActionRecord],
-                                       dict[tuple[str, str], ActionRecord]]:
+    def _audit_unlocked(
+        self,
+        *,
+        maximum_records: int | None = None,
+    ) -> tuple[list[ActionRecord], dict[tuple[str, str], ActionRecord]]:
         records: list[ActionRecord] = []
-        for path in sorted(self._directory.glob("*.json")):
+        paths: list[Path] = []
+        try:
+            with os.scandir(self._directory) as entries:
+                for entry in entries:
+                    if not entry.name.endswith(".json"):
+                        continue
+                    paths.append(Path(entry.path))
+                    if maximum_records is not None and len(paths) > (
+                            maximum_records):
+                        raise ActionStartupScanBoundExceededError(
+                            "action startup scan bound exceeded",
+                            maximum=maximum_records,
+                        )
+        except ActionStoreError:
+            raise
+        except OSError as exc:
+            raise ActionStoreError(
+                "action store domain could not be enumerated",
+                error=type(exc).__name__,
+            ) from exc
+        for path in sorted(paths, key=lambda candidate: candidate.name):
             action_id = require_action_id(path.stem)
             records.append(self._read_unlocked(path, action_id))
         return records, _dedup_index(records)
@@ -615,6 +659,16 @@ class JsonFileActionStore:
             self._require_open()
             records, _ = self._audit_unlocked()
             return [record.action_id for record in records]
+
+    def audit(self, *, maximum_records: int) -> list[ActionRecord]:
+        """Return one fully validated bounded snapshot of the whole domain."""
+        self._require_owner_process()
+        maximum_records = _validate_startup_audit_bound(maximum_records)
+        with self._domain.mutex:
+            self._require_open()
+            records, _ = self._audit_unlocked(
+                maximum_records=maximum_records)
+            return records
 
     def find_by_deduplication(
         self, scope: str, key: str,
@@ -789,6 +843,12 @@ def _require_deduplication_identity(
                 _OPAQUE_REFERENCE.fullmatch(value)):
             raise ActionValidationError(f"{field_name} is invalid")
     return scope, key
+
+
+def _validate_startup_audit_bound(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ActionValidationError("startup action audit bound is invalid")
+    return value
 
 
 def _deduplication_guard_key(identity: tuple[str, str]) -> str:

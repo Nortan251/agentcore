@@ -334,6 +334,7 @@ def _build(
         action_owner_id="process:test",
         logger=logger,
     )
+    assert executor._mark_action_startup_healthy(store)
     return {
         "executor": executor,
         "store": store,
@@ -530,6 +531,22 @@ def test_canonical_ambiguous_effect_then_acknowledged_new_action_runs_twice():
     assert runtime["store"].load(predecessor.action_id).to_dict() == (
         predecessor_before)
     assert first.action_id != successor_call.action_id
+
+
+def test_valid_risk_acknowledgement_cannot_bypass_journal_quarantine():
+    runtime, _, predecessor = _ambiguous()
+    pending, context = _approve_risk(runtime, predecessor)
+    before = predecessor.to_dict()
+    runtime["executor"].quarantine_action_mutations("journal_corrupt")
+
+    blocked = _invoke(runtime, risk_context=context)
+
+    assert blocked.result.metadata["kind"] == "action_journal_quarantined"
+    assert runtime["approval_store"].load(
+        pending.approval_request_id).state is ApprovalState.APPROVED
+    assert runtime["store"].load(predecessor.action_id).to_dict() == before
+    assert runtime["store"].list_actions() == [predecessor.action_id]
+    assert runtime["tool"].remote_effects == 1
 
 
 def test_ambiguous_predecessor_without_trusted_risk_context_does_not_repeat():

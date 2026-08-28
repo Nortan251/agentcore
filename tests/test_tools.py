@@ -210,6 +210,7 @@ def test_executor_enforces_permissions(registry, tmp_path):
                            workspace_dir=str(tmp_path),
                            action_store=store,
                            action_adapters=adapters)
+    assert observe._mark_action_startup_healthy(store)
     inv = observe.invoke("pretend_write")
     assert not inv.ok
     assert inv.result.metadata["kind"] == "permission_denied"
@@ -221,6 +222,7 @@ def test_executor_enforces_permissions(registry, tmp_path):
                               workspace_dir=str(tmp_path),
                               action_store=store,
                               action_adapters=adapters)
+    assert autonomous._mark_action_startup_healthy(store)
     assert autonomous.invoke("pretend_write").ok
 
 

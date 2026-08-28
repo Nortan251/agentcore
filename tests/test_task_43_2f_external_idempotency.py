@@ -305,6 +305,7 @@ def _build(
         action_owner_id="process:test",
         logger=logger or RecordingLogger(),
     )
+    assert executor._mark_action_startup_healthy(store)
     return executor, store, tool, provider, adapters
 
 
@@ -442,6 +443,20 @@ def test_canonical_lost_response_retry_has_one_remote_effect_and_same_key():
         ActionTransitionProof.EXTERNAL_IDEMPOTENCY_GUARANTEE
     ) for transition in succeeded.transitions)
     assert succeeded.attempts[0].effect_verdict is EffectVerdict.OUTCOME_UNKNOWN
+
+
+def test_valid_external_retry_contract_cannot_bypass_journal_quarantine():
+    executor, store, tool, provider, _, _, first, record = (
+        _ambiguous_runtime())
+    before = record.to_dict()
+    executor.quarantine_action_mutations("journal_corrupt")
+
+    blocked = _invoke(executor, context=_context(action_id=first.action_id))
+
+    assert blocked.result.metadata["kind"] == "action_journal_quarantined"
+    assert store.load(record.action_id).to_dict() == before
+    assert tool.remote_effects == 1
+    assert provider.execute_calls == 1
 
 
 @pytest.mark.parametrize("mode", ["key", "version", "scope", "extend"])
@@ -1057,6 +1072,7 @@ def _build_non_external(effect_class, *, raises=False):
         id_factory=DeterministicIds(),
         logger=RecordingLogger(),
     )
+    assert executor._mark_action_startup_healthy(store)
     return executor, store, tool
 
 

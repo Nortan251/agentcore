@@ -357,6 +357,7 @@ def _build(
         action_owner_id="process:current",
         action_owner_epoch=2,
     )
+    assert executor._mark_action_startup_healthy(resolved_store)
     coordinator = ActionRecoveryCoordinator(
         resolved_store,
         executor,
@@ -1188,7 +1189,7 @@ def test_startup_recovery_waits_for_live_same_process_action_guard(
 
     observed_store = GuardObservedStore(recovery_store)
     tool = MutationTool(run_hook=run)
-    executor, _, _, _, _, _ = _build(store=executor_store, tool=tool)
+    executor, _, _, _, _, _ = _build(store=observed_store, tool=tool)
     coordinator = ActionRecoveryCoordinator(
         observed_store,
         executor,

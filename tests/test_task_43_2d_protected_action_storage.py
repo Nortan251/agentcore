@@ -241,6 +241,7 @@ def _build_executor(
         action_owner_epoch=1,
         logger=logger or RecordingLogger(),
     )
+    assert executor._mark_action_startup_healthy(store)
     return executor, store, tool, resolved_payload_store, resolved_evidence_store
 
 

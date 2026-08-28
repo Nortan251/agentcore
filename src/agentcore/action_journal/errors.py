@@ -53,6 +53,10 @@ class ActionStoreOwnershipError(ActionStoreError):
     """Another process owns the durable action store."""
 
 
+class ActionStartupScanBoundExceededError(ActionStoreError):
+    """A bounded startup audit found more records than it may validate."""
+
+
 class ProtectedStorageError(ActionJournalError):
     """Base class for segregated protected action-storage failures."""
 
