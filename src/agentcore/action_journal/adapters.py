@@ -64,6 +64,7 @@ from agentcore.permissions.levels import (
 
 
 _LOWER_HEX_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+_APPROVAL_REQUEST_ID = re.compile(r"^apr_[0-9a-f]{12}$")
 _CATEGORICAL = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]*$")
 _VERSION_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:+-]*$")
 _OPAQUE_REFERENCE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@+=-]*$")
@@ -307,6 +308,41 @@ class ActionInvocationContext:
             subtask_id=self.subtask_id,
             schedule_occurrence_id=self.schedule_occurrence_id,
         ).validate()
+
+
+@dataclass(frozen=True)
+class DuplicateRiskInvocationContext:
+    """Trusted host continuity for one deliberate new risky-repeat action.
+
+    This object is accepted only as an explicit executor keyword argument. It
+    is never reconstructed from model-visible tool arguments, generic
+    ``ToolContext.metadata``, or provider output.  The successor identity is
+    minted by trusted runtime code before the human risk decision and remains
+    stable across pending/approved continuation.
+    """
+
+    predecessor_action_id: str
+    successor_action_id: str | None = None
+    approval_request_id: str | None = None
+
+    def validate(self) -> DuplicateRiskInvocationContext:
+        require_action_id(self.predecessor_action_id)
+        if self.successor_action_id is not None:
+            require_action_id(self.successor_action_id)
+            if self.successor_action_id == self.predecessor_action_id:
+                raise ActionValidationError(
+                    "duplicate-risk successor must be a new action")
+        if self.approval_request_id is not None:
+            if not isinstance(self.approval_request_id, str) or not (
+                    _APPROVAL_REQUEST_ID.fullmatch(
+                        self.approval_request_id)):
+                raise ActionValidationError(
+                    "duplicate-risk approval request id is invalid")
+            if self.successor_action_id is None:
+                raise ActionValidationError(
+                    "duplicate-risk approval continuation requires the "
+                    "successor action id")
+        return self
 
 
 class ToolActionAdapter(Protocol):

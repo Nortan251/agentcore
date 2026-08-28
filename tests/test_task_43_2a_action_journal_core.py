@@ -1150,6 +1150,21 @@ def test_duplicate_risk_acknowledgement_is_immutable_through_cas(action_store):
             ),
         )
 
+    predecessor = action_store.claim_attempt(
+        predecessor.action_id,
+        predecessor.version,
+        attempt_id=_id("aat", 91),
+        invocation_id=_id("inv", 91),
+        owner_id="process:immutable-risk-test",
+        owner_epoch=1,
+        transition_id=_id("atx", 91),
+    )
+    predecessor = action_store.compare_and_swap(
+        predecessor.action_id,
+        predecessor.version,
+        _to_reconcile(predecessor, number=92),
+    )
+
     linked_with = action_store.create(_new_record(
         3,
         predecessor_action_id=predecessor.action_id,

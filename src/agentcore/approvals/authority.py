@@ -309,6 +309,49 @@ class DurableApprovalAuthority:
         return ApprovalAuthorization(
             current.request_id, current.action_id, status).validate()
 
+    def validate_consumed(
+        self,
+        binding: ApprovalBinding,
+        *,
+        request_id: str,
+        action_id: str,
+    ) -> ApprovalReceipt:
+        """Authenticate one exact consumed approval without consuming again.
+
+        This is a validation seam, not a second authorization.  It exists for
+        durable workflows whose already-consumed receipt must remain current
+        until a later first physical-effect boundary.  The request must still
+        match the exact binding and action, its authority-owned state MAC must
+        verify, and its original expiry horizon must still be live.
+        """
+        self._require_owner()
+        binding.validate()
+        if binding.principal_ref != self._principal_ref or (
+                binding.scope_ref != self._scope_ref):
+            raise ApprovalUnavailableError(
+                "approval binding belongs to another authority",
+                reason="authority_mismatch",
+            )
+        current = self._load_exact(request_id, binding)
+        if current.action_id != require_approval_action_id(action_id):
+            raise ApprovalUnavailableError(
+                "approval request belongs to another action",
+                reason="action_mismatch",
+            )
+        if current.state is not ApprovalState.CONSUMED or (
+                current.receipt is None):
+            raise ApprovalUnavailableError(
+                "approval request is not durably consumed",
+                reason=current.state.value,
+            )
+        if self._clock.now() >= current.expires_at:
+            raise ApprovalUnavailableError(
+                "consumed approval has expired",
+                reason="expired",
+            )
+        current.receipt.validate()
+        return current.receipt
+
     def record_decision(
         self,
         request_id: str,
