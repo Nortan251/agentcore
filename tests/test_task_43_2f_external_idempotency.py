@@ -30,6 +30,7 @@ from agentcore.action_journal import (
     StaticInstallationKeyProvider,
 )
 from agentcore.action_journal.errors import ActionValidationError
+from agentcore.errors import ToolError
 from agentcore.approvals import (
     APPROVAL_SCHEMA_VERSION,
     ApprovalInvocationContext,
@@ -45,6 +46,7 @@ from agentcore.realtime import TURN_SCHEMA_VERSION
 from agentcore.realtime.errors import CancellationRequested
 from agentcore.recovery.action import ActionRecoveryCoordinator
 from agentcore.tools.base import (
+    FunctionTool,
     ParamType,
     Tool,
     ToolContext,
@@ -419,6 +421,55 @@ def test_first_attempt_receives_exact_durable_key_and_output_cannot_replace_it()
     assert record.idempotency.key.startswith("idem_")
     assert record.idempotency.key != "provider-output-cannot-replace-key"
     assert provider.establish_calls == provider.execute_calls == 1
+
+
+def test_registry_execution_lease_spans_external_provider_request_boundary():
+    executor, store, tool, provider, _ = _build()
+    replacement = FakeExternalTool()
+    provider_entered = threading.Event()
+    release_provider = threading.Event()
+    invocations = []
+    invocation_errors = []
+
+    def pause_at_provider_boundary():
+        provider_entered.set()
+        assert release_provider.wait(5), "provider boundary was not released"
+
+    provider.execute_hook = pause_at_provider_boundary
+
+    def invoke():
+        try:
+            invocations.append(_invoke(
+                executor,
+                context=_context(key="step:registry-provider-lease"),
+            ))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            invocation_errors.append(exc)
+
+    worker = threading.Thread(target=invoke)
+    worker.start()
+    assert provider_entered.wait(5), "external provider seam was not entered"
+    try:
+        # An unrelated name remains mutable while provider I/O is blocked.
+        assert executor.registry.register(FunctionTool(
+            tool_spec("external_unrelated", "unrelated read"),
+            lambda args, context: "ok",
+        ))
+        with pytest.raises(ToolError) as blocked:
+            executor.registry.register(replacement, replace=True)
+        assert blocked.value.details.get("reason") == "execution_lease_active"
+        assert executor.registry.get("external_mutation") is tool
+    finally:
+        release_provider.set()
+    worker.join(5)
+
+    assert not worker.is_alive(), "external invocation deadlocked"
+    assert invocation_errors == []
+    assert len(invocations) == 1 and invocations[0].ok
+    assert store.load(invocations[0].action_id).state is ActionState.SUCCEEDED
+    assert provider.execute_calls == tool.runs == tool.remote_effects == 1
+    assert executor.registry.register(replacement, replace=True)
+    assert executor.registry.get("external_mutation") is replacement
 
 
 def test_canonical_lost_response_retry_has_one_remote_effect_and_same_key():

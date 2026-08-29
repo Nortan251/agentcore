@@ -86,7 +86,7 @@ from agentcore.permissions.levels import READ_ONLY_CAPABILITIES, Capability
 from agentcore.permissions.policy import Decision, Outcome, PermissionPolicy
 from agentcore.realtime.errors import CancellationRequested
 from agentcore.tools.base import ToolContext, ToolResult, ToolSpec
-from agentcore.tools.registry import ToolRegistry
+from agentcore.tools.registry import ToolRegistry, ToolRegistryLeaseError
 from agentcore.util.clock import Clock, SystemClock
 from agentcore.util.ids import new_id
 
@@ -1065,7 +1065,43 @@ class ToolExecutor:
         log: Any,
         elapsed: Callable[[], float],
     ) -> ToolInvocation:
-        """Original validation/checkpoint/policy/checkpoint/run sequence."""
+        """Run one fast-path invocation under its exact registry binding."""
+        try:
+            with self.registry.execution_lease(tool_spec.name, tool):
+                return self._invoke_fast_with_current_binding(
+                    tool,
+                    tool_spec,
+                    cleaned,
+                    checkpoint,
+                    log,
+                    elapsed,
+                )
+        except ToolRegistryLeaseError:
+            log.warning(
+                Events.TOOL_FAILED,
+                reason="tool_registration_changed",
+                error="registered tool changed before execution",
+            )
+            return ToolInvocation(
+                tool_spec.name,
+                cleaned,
+                ToolResult.failure(
+                    "The registered tool changed before execution.",
+                    kind="tool_registration_changed",
+                ),
+                elapsed(),
+            )
+
+    def _invoke_fast_with_current_binding(
+        self,
+        tool: Any,
+        tool_spec: ToolSpec,
+        cleaned: dict[str, Any],
+        checkpoint: Callable[[], None] | None,
+        log: Any,
+        elapsed: Callable[[], float],
+    ) -> ToolInvocation:
+        """Validation/checkpoint/policy/checkpoint/run with a live lease."""
         if checkpoint is not None:
             checkpoint()
         decision = self.policy.check(
@@ -3127,7 +3163,10 @@ class ToolExecutor:
             else nullcontext()
         )
         try:
-            with predecessor_guard:
+            with predecessor_guard, self.registry.execution_lease(
+                tool_spec.name,
+                tool,
+            ):
                 final_decision = self._validate_current_execution_authority(
                     record=claimed,
                     tool=tool,
@@ -3210,6 +3249,17 @@ class ToolExecutor:
                     normalized = self._unknown_effect(
                         spec, "tool.exception")
                 return normalized, cancellation, final_decision
+        except ToolRegistryLeaseError as exc:
+            external = spec.effect_class is (
+                ActionEffectClass.EXTERNALLY_IDEMPOTENT
+            )
+            raise _CurrentAuthorityBlocked(
+                ("external_idempotency_contract_unavailable" if external else
+                 "action_adapter_invalid"),
+                ("The external idempotency registration changed before "
+                 "execution." if external else
+                 "The trusted tool registration changed before execution."),
+            ) from exc
         except (
             _CurrentAuthorityBlocked,
             _DuplicateRiskBlocked,

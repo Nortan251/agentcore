@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timezone
 from typing import Any, Mapping
+
+import pytest
 
 from agentcore.action_journal import (
     ActionAdapterRegistry,
@@ -18,6 +21,7 @@ from agentcore.action_journal import (
     PreparedActionIntent,
 )
 from agentcore.config.schema import PermissionConfig
+from agentcore.errors import ToolError
 from agentcore.permissions.levels import Capability, PermissionLevel
 from agentcore.permissions.policy import PermissionPolicy
 from agentcore.tools.base import (
@@ -39,10 +43,12 @@ NOW = datetime(2026, 8, 29, 9, 0, tzinfo=timezone.utc)
 class DeterministicIds:
     def __init__(self) -> None:
         self.counts: dict[str, int] = {}
+        self.lock = threading.Lock()
 
     def __call__(self, prefix: str) -> str:
-        number = self.counts.get(prefix, 0) + 1
-        self.counts[prefix] = number
+        with self.lock:
+            number = self.counts.get(prefix, 0) + 1
+            self.counts[prefix] = number
         return f"{prefix}_{number:012x}"
 
 
@@ -293,6 +299,131 @@ def test_tool_registry_replacement_after_claim_blocks_stale_effect_object():
     assert record.attempts[-1].status is ActionAttemptStatus.CLAIMED
     assert tool.runs == 0
     assert replacement.runs == 0
+
+
+@pytest.mark.parametrize("mutation", ["replace", "unregister"])
+def test_registry_binding_cannot_change_after_final_authority_validation(
+    monkeypatch,
+    mutation,
+):
+    executor, store, tool = _build()
+    replacement = MutationTool()
+    validation_passed = threading.Event()
+    mutation_finished = threading.Event()
+    invocation = []
+    invocation_errors = []
+    registry_errors = []
+    registry_mutated = []
+    original_validate = executor._validate_current_execution_authority
+
+    def validate_then_pause(**kwargs):
+        decision = original_validate(**kwargs)
+        validation_passed.set()
+        assert mutation_finished.wait(5), "registry mutation did not finish"
+        return decision
+
+    monkeypatch.setattr(
+        executor,
+        "_validate_current_execution_authority",
+        validate_then_pause,
+    )
+
+    def invoke():
+        try:
+            invocation.append(executor.invoke(
+                "stage5_mutation",
+                {"payload": "private"},
+                action_context=_context(key=f"step:lease-{mutation}"),
+            ))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            invocation_errors.append(exc)
+
+    worker = threading.Thread(target=invoke)
+    worker.start()
+    assert validation_passed.wait(5), "final authority validation did not run"
+    try:
+        if mutation == "replace":
+            executor.registry.register(replacement, replace=True)
+        else:
+            executor.registry.unregister("stage5_mutation")
+        registry_mutated.append(True)
+    except ToolError as exc:
+        registry_errors.append(exc)
+    finally:
+        mutation_finished.set()
+    worker.join(5)
+
+    assert not worker.is_alive(), "journaled invocation deadlocked"
+    assert invocation_errors == []
+    assert len(invocation) == 1 and invocation[0].ok
+    assert tool.runs == 1 and replacement.runs == 0
+    assert not registry_mutated, (
+        "stale original tool entered the physical seam after its registry "
+        f"binding was {mutation}d"
+    )
+    assert len(registry_errors) == 1
+    assert registry_errors[0].details.get("reason") == (
+        "execution_lease_active")
+    assert executor.registry.get("stage5_mutation") is tool
+
+    if mutation == "replace":
+        assert executor.registry.register(replacement, replace=True)
+        assert executor.registry.get("stage5_mutation") is replacement
+    else:
+        executor.registry.unregister("stage5_mutation")
+        assert not executor.registry.has("stage5_mutation")
+
+
+def test_concurrent_journaled_invocations_share_registry_execution_leases(
+    monkeypatch,
+):
+    executor, _, tool = _build()
+    replacement = MutationTool()
+    seam_barrier = threading.Barrier(3)
+    original_run = tool.run
+    invocations = []
+    invocation_errors = []
+
+    def concurrent_run(args, context):
+        seam_barrier.wait(5)
+        seam_barrier.wait(5)
+        return original_run(args, context)
+
+    monkeypatch.setattr(tool, "run", concurrent_run)
+
+    def invoke(key):
+        try:
+            invocations.append(executor.invoke(
+                "stage5_mutation",
+                {"payload": "private"},
+                action_context=_context(key=key),
+            ))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            invocation_errors.append(exc)
+
+    workers = [
+        threading.Thread(target=invoke, args=("step:concurrent-one",)),
+        threading.Thread(target=invoke, args=("step:concurrent-two",)),
+    ]
+    for worker in workers:
+        worker.start()
+    seam_barrier.wait(5)
+    try:
+        with pytest.raises(ToolError) as blocked:
+            executor.registry.register(replacement, replace=True)
+        assert blocked.value.details.get("reason") == (
+            "execution_lease_active")
+        assert executor.registry.get("stage5_mutation") is tool
+    finally:
+        seam_barrier.wait(5)
+    for worker in workers:
+        worker.join(5)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert invocation_errors == []
+    assert len(invocations) == 2 and all(item.ok for item in invocations)
+    assert tool.runs == 2 and replacement.runs == 0
+    assert executor.registry.register(replacement, replace=True)
 
 
 def test_caller_cannot_occupy_internal_duplicate_risk_deduplication_scope():
