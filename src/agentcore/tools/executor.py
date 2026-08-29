@@ -1244,9 +1244,12 @@ class ToolExecutor:
             )
 
         try:
-            current_tool_spec = tool.spec
+            current_tool = self.registry.get(tool_spec.name)
+            if current_tool is not tool:
+                raise ValueError("current tool registration changed")
+            current_tool_spec = current_tool.spec
             current_adapter = self._action_adapters.resolve(
-                tool,
+                current_tool,
                 tool_spec=current_tool_spec,
             )
             if current_tool_spec != tool_spec or current_adapter is not adapter or (

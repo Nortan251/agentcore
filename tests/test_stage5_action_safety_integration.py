@@ -268,6 +268,33 @@ def test_tool_registration_drift_after_claim_blocks_ordinary_effect_seam():
     assert tool.runs == 0
 
 
+def test_tool_registry_replacement_after_claim_blocks_stale_effect_object():
+    executor, store, tool = _build()
+    replacement = MutationTool()
+    calls = 0
+
+    def checkpoint():
+        nonlocal calls
+        calls += 1
+        if calls == 4:
+            executor.registry.unregister("stage5_mutation")
+            executor.registry.register(replacement)
+
+    blocked = executor.invoke(
+        "stage5_mutation",
+        {"payload": "private"},
+        action_context=_context(key="step:registry-replacement"),
+        checkpoint=checkpoint,
+    )
+    record = store.load(blocked.action_id)
+
+    assert blocked.result.metadata["kind"] == "action_adapter_invalid"
+    assert record.state is ActionState.IN_FLIGHT
+    assert record.attempts[-1].status is ActionAttemptStatus.CLAIMED
+    assert tool.runs == 0
+    assert replacement.runs == 0
+
+
 def test_caller_cannot_occupy_internal_duplicate_risk_deduplication_scope():
     executor, store, tool = _build()
 
