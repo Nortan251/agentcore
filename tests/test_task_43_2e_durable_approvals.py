@@ -256,6 +256,7 @@ def _build(
         id_factory=ids,
         logger=logger or RecordingLogger(),
     )
+    assert executor._mark_action_startup_healthy(action_store)
     return executor, authority, approval_store, action_store, tool, gate
 
 
@@ -352,6 +353,23 @@ def test_approved_exact_intent_consumes_once_and_authority_carries_request_id():
     assert reused.result.metadata["kind"] == "approval_consumed"
     assert tool.runs == 1
     assert len(actions.list_actions()) == 1
+
+
+def test_valid_durable_approval_cannot_bypass_action_domain_quarantine():
+    executor, authority, approvals, actions, tool, _ = _build()
+    pending = _invoke(executor)
+    authority.record_decision(
+        pending.approval_request_id, HumanApprovalDecision.APPROVE)
+    executor.quarantine_action_mutations("journal_corrupt")
+
+    blocked = _invoke(
+        executor, approval_request_id=pending.approval_request_id)
+
+    assert blocked.result.metadata["kind"] == "action_journal_quarantined"
+    assert approvals.load(pending.approval_request_id).state is (
+        ApprovalState.APPROVED)
+    assert actions.list_actions() == []
+    assert tool.runs == 0
 
 
 @pytest.mark.parametrize(

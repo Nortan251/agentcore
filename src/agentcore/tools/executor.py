@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import hmac
+import threading
 import time
 from collections.abc import Callable, Mapping
 from contextlib import nullcontext
@@ -31,6 +32,8 @@ from agentcore.action_journal import (
     ActionAdapterSpec,
     ActionAttemptStatus,
     ActionEffectClass,
+    ActionDomainHealth,
+    ActionDomainHealthState,
     ActionExecutionPermit,
     ActionInvocationContext,
     ActionJournalEligibility,
@@ -220,14 +223,43 @@ class ToolExecutor:
         self._action_owner_id = action_owner_id or f"process:{os.getpid()}"
         self._action_owner_epoch = action_owner_epoch
         self._approval_authority = approval_authority
-        self._action_mutation_quarantine: str | None = None
+        self._action_domain_health_lock = threading.Lock()
+        self._action_domain_health = (
+            ActionDomainHealth.validation_pending()
+            if action_store is not None
+            else ActionDomainHealth.healthy()
+        )
+
+    @property
+    def action_domain_health(self) -> ActionDomainHealth:
+        """Return an immutable snapshot of the startup mutation gate."""
+        with self._action_domain_health_lock:
+            return self._action_domain_health
+
+    def _mark_action_startup_healthy(self, store: ActionStore) -> bool:
+        """Accept one exact coordinator/store startup proof.
+
+        This private one-way seam can complete a pending startup.  It can
+        never clear a quarantine, and a coordinator for a different store
+        cannot authorize this executor's mutation domain.
+        """
+        with self._action_domain_health_lock:
+            if store is not self._action_store:
+                return False
+            if self._action_domain_health.state is (
+                    ActionDomainHealthState.QUARANTINED):
+                return False
+            self._action_domain_health = ActionDomainHealth.healthy()
+            return True
 
     def quarantine_action_mutations(self, category: str) -> None:
         """Fail future mutations closed after startup journal quarantine."""
-        allowed = {"journal_corrupt", "startup_scan_bound_exceeded"}
-        self._action_mutation_quarantine = (
-            category if category in allowed else "journal_corrupt"
-        )
+        with self._action_domain_health_lock:
+            if self._action_domain_health.state is (
+                    ActionDomainHealthState.QUARANTINED):
+                return
+            self._action_domain_health = ActionDomainHealth.quarantined(
+                category)
 
     def validate_action_protected_storage(self, record: ActionRecord) -> None:
         """Validate every protected reference needed by one action.
@@ -430,16 +462,6 @@ class ToolExecutor:
             return self._invoke_fast(
                 tool, tool_spec, cleaned, checkpoint, log, elapsed)
 
-        if self._action_mutation_quarantine is not None:
-            return self._safe_pre_action_failure(
-                tool_name,
-                cleaned,
-                elapsed(),
-                log,
-                "action_journal_quarantined",
-                "Durable action recovery is quarantined for this workspace.",
-            )
-
         try:
             adapter = self._action_adapters.resolve(tool, tool_spec=tool_spec)
         except ActionAdapterRegistrationError as exc:
@@ -471,6 +493,20 @@ class ToolExecutor:
                 tool_name, cleaned, elapsed(), log, "action_adapter_invalid",
                 "The trusted action classification is invalid.",
             )
+        action_domain_health = self.action_domain_health
+        if action_domain_health.state is not ActionDomainHealthState.HEALTHY:
+            return self._safe_pre_action_failure(
+                tool_name,
+                cleaned,
+                elapsed(),
+                log,
+                "action_journal_quarantined",
+                "Durable action recovery is quarantined for this workspace.",
+                quarantine_category=(
+                    action_domain_health.error_category
+                    or "startup_validation_incomplete"
+                ),
+            )
         return self._invoke_journaled(
             tool=tool,
             tool_spec=tool_spec,
@@ -495,6 +531,14 @@ class ToolExecutor:
         if not isinstance(claim, ActionRecoveryClaim):
             raise TypeError("reconciliation claim type is invalid")
         claim.validate()
+        if self.action_domain_health.state is not (
+                ActionDomainHealthState.HEALTHY):
+            return self._reconciliation_report(
+                claim,
+                ActionReconciliationStatus.PUBLICATION_UNCERTAIN,
+                ActionState.RECONCILE_REQUIRED,
+                claim.record_version,
+            )
         store = self._action_store
         if store is None:
             return self._reconciliation_report(
@@ -3625,11 +3669,14 @@ class ToolExecutor:
         log: Any,
         kind: str,
         message: str,
+        **safe_metadata: Any,
     ) -> ToolInvocation:
         redacted = _redacted_args(cleaned)
         log.warning(Events.TOOL_FAILED, reason=kind)
         return ToolInvocation(
-            tool_name, redacted, ToolResult.failure(message, kind=kind),
+            tool_name,
+            redacted,
+            ToolResult.failure(message, kind=kind, **safe_metadata),
             duration)
 
     @staticmethod

@@ -8,6 +8,7 @@ Those operations remain under :class:`agentcore.tools.executor.ToolExecutor`.
 from __future__ import annotations
 
 import os
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -16,10 +17,12 @@ from agentcore.action_journal import (
     MAX_RECONCILIATION_PROBES,
     ActionAttemptStatus,
     ActionRecord,
+    ActionDomainHealthState,
     ActionReconciliationReport,
     ActionRecoveryClaim,
     ActionState,
     ActionStore,
+    ActionStartupScanBoundExceededError,
     EffectVerdict,
     ReconciliationDisposition,
     ReconciliationMetadata,
@@ -88,6 +91,7 @@ class ActionRecoveryCoordinator:
         self._max_startup_actions = max_startup_actions
         self._owner_pid = os.getpid()
         self._startup_report: ActionStartupRecoveryReport | None = None
+        self._startup_lock = threading.Lock()
 
     def _require_owner_process(self) -> None:
         if self._owner_pid != os.getpid():
@@ -98,37 +102,74 @@ class ActionRecoveryCoordinator:
     def recover_startup(self) -> ActionStartupRecoveryReport:
         """Validate the domain and conservatively classify nonterminal truth."""
         self._require_owner_process()
-        if self._startup_report is not None:
-            return self._startup_report
-        try:
-            action_ids = self._store.list_actions()
-            if len(action_ids) > self._max_startup_actions:
+        with self._startup_lock:
+            if self._startup_report is not None:
+                return self._startup_report
+            try:
+                # First prove the complete bounded core domain and every
+                # nonterminal protected dependency before rewriting even a
+                # valid owner-lost record.
+                records = self._store.audit(
+                    maximum_records=self._max_startup_actions)
+                self._validate_nonterminal_dependencies(records)
+
+                items: list[ActionRecoveryItem] = []
+                classified: dict[str, ActionRecord] = {}
+                for record in records:
+                    if record.is_terminal:
+                        classified[record.action_id] = record
+                        continue
+                    recovered, status = self._recover_record(record)
+                    classified[recovered.action_id] = recovered
+                    if status is None:
+                        continue
+                    items.append(ActionRecoveryItem(
+                        action_id=recovered.action_id,
+                        status=status,
+                        record_version=recovered.version,
+                    ))
+
+                # Recovery may publish conservative classifications.  Re-audit
+                # the resulting whole domain and its live dependencies before
+                # opening the executor mutation gate.
+                final_records = self._store.audit(
+                    maximum_records=self._max_startup_actions)
+                self._validate_nonterminal_dependencies(final_records)
+                final_by_id = {
+                    record.action_id: record for record in final_records}
+                if final_by_id != classified:
+                    raise ActionStoreError(
+                        "action journal changed during startup validation")
+                report = ActionStartupRecoveryReport(
+                    items=tuple(items),
+                    terminal_count=sum(
+                        record.is_terminal for record in final_records),
+                )
+                mark_healthy = getattr(
+                    self._executor, "_mark_action_startup_healthy", None)
+                if not callable(mark_healthy) or not mark_healthy(self._store):
+                    return self._quarantine("journal_corrupt")
+            except ActionStoreOwnershipError:
+                raise
+            except ActionStartupScanBoundExceededError:
                 return self._quarantine("startup_scan_bound_exceeded")
-            records = self._store.list_nonterminal()
-            items: list[ActionRecoveryItem] = []
-            settled_during_recovery = 0
-            for record in records:
-                recovered, status = self._recover_record(record)
-                if status is None:
-                    settled_during_recovery += 1
-                    continue
-                items.append(ActionRecoveryItem(
-                    action_id=recovered.action_id,
-                    status=status,
-                    record_version=recovered.version,
-                ))
-            report = ActionStartupRecoveryReport(
-                items=tuple(items),
-                terminal_count=(
-                    len(action_ids) - len(records) + settled_during_recovery
-                ),
-            )
-        except ActionStoreOwnershipError:
-            raise
-        except Exception:
-            return self._quarantine("journal_corrupt")
-        self._startup_report = report
-        return report
+            except Exception:
+                return self._quarantine("journal_corrupt")
+            self._startup_report = report
+            return report
+
+    def _validate_nonterminal_dependencies(
+        self,
+        records: list[ActionRecord],
+    ) -> None:
+        validate_protected = getattr(
+            self._executor, "validate_action_protected_storage", None)
+        if not callable(validate_protected):
+            raise ActionValidationError(
+                "protected action validation boundary is unavailable")
+        for record in records:
+            if not record.is_terminal:
+                validate_protected(record)
 
     def _recover_record(
         self,
@@ -220,6 +261,7 @@ class ActionRecoveryCoordinator:
     ) -> ActionRecoveryClaim | None:
         """CAS one fresh owner identity and epoch onto an unresolved action."""
         self._require_owner_process()
+        self._require_action_domain_healthy()
         action_id = require_action_id(action_id)
         if isinstance(expected_version, bool) or not isinstance(
             expected_version, int
@@ -273,6 +315,7 @@ class ActionRecoveryCoordinator:
     def claim_next(self, *, limit: int = 1) -> tuple[ActionRecoveryClaim, ...]:
         """Select a bounded prefix of currently claimable records."""
         self._require_owner_process()
+        self._require_action_domain_healthy()
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ActionValidationError("recovery claim limit is invalid")
         limit = min(limit, self._max_startup_actions)
@@ -296,6 +339,7 @@ class ActionRecoveryCoordinator:
     ) -> ActionReconciliationReport:
         """Ask the sole executor authority to run the claimed read-only probe."""
         self._require_owner_process()
+        self._require_action_domain_healthy()
         try:
             return self._executor.reconcile_action(
                 claim,
@@ -303,6 +347,12 @@ class ActionRecoveryCoordinator:
             )
         except CancellationRequested:
             raise
+
+    def _require_action_domain_healthy(self) -> None:
+        health = getattr(self._executor, "action_domain_health", None)
+        if health is None or health.state is not ActionDomainHealthState.HEALTHY:
+            raise ActionStoreError(
+                "action recovery is unavailable before healthy startup")
 
     def _publish_exact(
         self,
@@ -315,12 +365,16 @@ class ActionRecoveryCoordinator:
                 current.version,
                 candidate,
             )
+        except ActionStoreOwnershipError:
+            raise
         except Exception:
             pass
         try:
             loaded = self._store.load(current.action_id)
             loaded.validate()
             return loaded if loaded == candidate else None
+        except ActionStoreOwnershipError:
+            raise
         except Exception:
             return None
 
