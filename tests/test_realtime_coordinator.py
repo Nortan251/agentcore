@@ -4,6 +4,7 @@ import os
 import select
 import signal
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -565,7 +566,13 @@ def test_fork_during_admission_fences_inherited_lane_cleanup(tmp_path):
         exited, _, _ = select.select([child_read], [], [], 5)
         assert child_read in exited, "forked child did not exit"
         assert os.read(child_read, 1) == b""
-        waited_pid, status = os.waitpid(child_pid[0], os.WNOHANG)
+        deadline = time.monotonic() + 5
+        waited_pid = 0
+        status = 0
+        while waited_pid == 0 and time.monotonic() < deadline:
+            waited_pid, status = os.waitpid(child_pid[0], os.WNOHANG)
+            if waited_pid == 0:
+                time.sleep(0.01)
         assert waited_pid == child_pid[0]
         child_reaped = True
         assert os.waitstatus_to_exitcode(status) == 0

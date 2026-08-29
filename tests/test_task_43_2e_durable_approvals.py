@@ -261,7 +261,7 @@ def _build(
 
 
 def _invoke(executor, *, approval_request_id=None, action_id=None,
-            payload=SENSITIVE):
+            payload=SENSITIVE, checkpoint=None):
     return executor.invoke(
         "approve_mutation",
         {"payload": payload},
@@ -269,6 +269,7 @@ def _invoke(executor, *, approval_request_id=None, action_id=None,
                         if action_id is not None else None),
         approval_context=(ApprovalInvocationContext(approval_request_id)
                           if approval_request_id is not None else None),
+        checkpoint=checkpoint,
     )
 
 
@@ -464,6 +465,38 @@ def test_expired_approval_is_durable_and_never_runs():
     assert approvals.load(pending.approval_request_id).state is (
         ApprovalState.EXPIRED)
     assert actions.list_actions() == []
+    assert tool.runs == 0
+
+
+def test_approval_expiry_after_claim_blocks_final_physical_seam():
+    clock = FixedClock(NOW)
+    executor, authority, approvals, actions, tool, _ = _build(
+        clock=clock, ttl=timedelta(seconds=5))
+    pending = _invoke(executor)
+    authority.record_decision(
+        pending.approval_request_id, HumanApprovalDecision.APPROVE)
+    calls = 0
+
+    def checkpoint():
+        nonlocal calls
+        calls += 1
+        if calls == 4:
+            clock.advance(5)
+
+    blocked = _invoke(
+        executor,
+        approval_request_id=pending.approval_request_id,
+        checkpoint=checkpoint,
+    )
+    record = actions.load(blocked.action_id)
+
+    assert calls == 4
+    assert blocked.result.metadata["kind"] == "approval_expired"
+    assert blocked.action_state == ActionState.IN_FLIGHT.value
+    assert record.state is ActionState.IN_FLIGHT
+    assert record.attempts[-1].status is ActionAttemptStatus.CLAIMED
+    assert approvals.load(pending.approval_request_id).state is (
+        ApprovalState.CONSUMED)
     assert tool.runs == 0
 
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import threading
 from typing import Any, Mapping
 
 import pytest
@@ -30,7 +32,7 @@ from agentcore.tools.base import (
 )
 from agentcore.tools.builtin import EchoTool, WorkspaceInfoTool, default_tools
 from agentcore.tools.executor import ToolExecutor
-from agentcore.tools.registry import ToolRegistry
+from agentcore.tools.registry import ToolRegistry, ToolRegistryLeaseError
 
 
 class WritingTool(Tool):
@@ -125,6 +127,91 @@ def test_registry_queries(registry):
     assert catalogue[0]["parameters"][0]["name"] == "message"
 
 
+def test_registry_execution_lease_is_per_name_and_reference_counted():
+    registry = ToolRegistry()
+    original = EchoTool()
+    replacement = EchoTool()
+    unrelated = WorkspaceInfoTool()
+    registry.register(original)
+    unrelated_registered = threading.Event()
+    unrelated_errors = []
+
+    def register_unrelated():
+        try:
+            registry.register(unrelated)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            unrelated_errors.append(exc)
+        finally:
+            unrelated_registered.set()
+
+    with registry.execution_lease("echo", original):
+        worker = threading.Thread(target=register_unrelated)
+        worker.start()
+        assert unrelated_registered.wait(1), (
+            "registry metadata mutex was held while the lease was yielded")
+        worker.join(1)
+        assert unrelated_errors == []
+        assert registry.get("workspace_info") is unrelated
+
+        with registry.execution_lease("echo", original):
+            with pytest.raises(ToolRegistryLeaseError) as replaced:
+                registry.register(replacement, replace=True)
+            with pytest.raises(ToolRegistryLeaseError) as removed:
+                registry.unregister("echo")
+            assert replaced.value.details["reason"] == "execution_lease_active"
+            assert removed.value.details["reason"] == "execution_lease_active"
+        with pytest.raises(ToolRegistryLeaseError):
+            registry.register(replacement, replace=True)
+
+    assert registry.register(replacement, replace=True)
+    assert registry.get("echo") is replacement
+
+
+def test_registry_execution_lease_rejects_missing_or_changed_binding():
+    registry = ToolRegistry()
+    original = EchoTool()
+    replacement = EchoTool()
+    registry.register(original)
+
+    with pytest.raises(ToolRegistryLeaseError) as changed:
+        with registry.execution_lease("echo", replacement):
+            raise AssertionError("mismatched lease body ran")
+    assert changed.value.details["reason"] == "ownership_mismatch"
+
+    registry.unregister("echo")
+    with pytest.raises(ToolRegistryLeaseError) as missing:
+        with registry.execution_lease("echo", original):
+            raise AssertionError("missing lease body ran")
+    assert missing.value.details["reason"] == "registration_missing"
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_inherited_registry_fails_before_touching_metadata_mutex():
+    registry = ToolRegistry()
+    registry.register(EchoTool())
+    read_fd, write_fd = os.pipe()
+    child_pid = os.fork()
+    if child_pid == 0:
+        os.close(read_fd)
+        try:
+            registry.get("echo")
+        except ToolRegistryLeaseError as exc:
+            payload = exc.details.get("reason", "missing").encode("ascii")
+        else:
+            payload = b"unexpected_success"
+        os.write(write_fd, payload)
+        os.close(write_fd)
+        os._exit(0)
+    os.close(write_fd)
+    try:
+        assert os.read(read_fd, 64) == b"ownership_mismatch"
+        waited_pid, status = os.waitpid(child_pid, 0)
+        assert waited_pid == child_pid
+        assert os.waitstatus_to_exitcode(status) == 0
+    finally:
+        os.close(read_fd)
+
+
 # -- argument validation ----------------------------------------------------
 
 def test_validate_args_applies_defaults():
@@ -168,6 +255,55 @@ def test_executor_runs_tool(executor):
     assert inv.result.output == "hello"
     assert inv.result.metadata["length"] == 5
     assert inv.duration_ms >= 0
+
+
+def test_fast_path_releases_registry_mutex_but_fences_its_binding(tmp_path):
+    entered = threading.Event()
+    release = threading.Event()
+    invocations = []
+
+    def blocking_read(args, context):
+        entered.set()
+        assert release.wait(5), "fast-path test tool was not released"
+        return "original"
+
+    original = FunctionTool(tool_spec("leased_read", "leased read"),
+                            blocking_read)
+    replacement = FunctionTool(
+        tool_spec("leased_read", "leased read"),
+        lambda args, context: "replacement",
+    )
+    unrelated = FunctionTool(
+        tool_spec("unrelated_read", "unrelated read"),
+        lambda args, context: "unrelated",
+    )
+    registry = ToolRegistry()
+    registry.register(original)
+    executor = ToolExecutor(
+        registry,
+        PermissionPolicy(PermissionConfig(level=PermissionLevel.AUTONOMOUS)),
+        workspace_dir=str(tmp_path),
+    )
+    worker = threading.Thread(
+        target=lambda: invocations.append(executor.invoke("leased_read")))
+    worker.start()
+    assert entered.wait(5), "fast-path physical seam was not entered"
+    try:
+        # This succeeds from another thread of control while run() is blocked,
+        # proving the short metadata mutex is not held across physical I/O.
+        assert registry.register(unrelated)
+        with pytest.raises(ToolRegistryLeaseError) as blocked:
+            registry.register(replacement, replace=True)
+        assert blocked.value.details["reason"] == "execution_lease_active"
+        assert registry.get("leased_read") is original
+    finally:
+        release.set()
+    worker.join(5)
+
+    assert not worker.is_alive()
+    assert len(invocations) == 1 and invocations[0].result.output == "original"
+    assert registry.register(replacement, replace=True)
+    assert executor.invoke("leased_read").result.output == "replacement"
 
 
 def test_executor_applies_defaults_and_options(executor):

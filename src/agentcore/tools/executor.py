@@ -86,7 +86,7 @@ from agentcore.permissions.levels import READ_ONLY_CAPABILITIES, Capability
 from agentcore.permissions.policy import Decision, Outcome, PermissionPolicy
 from agentcore.realtime.errors import CancellationRequested
 from agentcore.tools.base import ToolContext, ToolResult, ToolSpec
-from agentcore.tools.registry import ToolRegistry
+from agentcore.tools.registry import ToolRegistry, ToolRegistryLeaseError
 from agentcore.util.clock import Clock, SystemClock
 from agentcore.util.ids import new_id
 
@@ -98,6 +98,9 @@ _DUPLICATE_RISK_DEDUPLICATION_SCOPE = "agentcore:duplicate-risk:v1"
 _DUPLICATE_RISK_POLICY_FINGERPRINT = hashlib.sha256(
     b"agentcore.duplicate-risk.policy-independent.v1"
 ).hexdigest()
+_RESERVED_INTERNAL_DEDUPLICATION_SCOPES = frozenset({
+    _DUPLICATE_RISK_DEDUPLICATION_SCOPE,
+})
 
 
 class _DuplicateRiskBlocked(Exception):
@@ -120,6 +123,24 @@ class _DuplicateRiskBlocked(Exception):
 
 class _ExternalContractBlocked(Exception):
     """Internal marker for a final provider-contract pre-seam stop."""
+
+
+class _CurrentAuthorityBlocked(Exception):
+    """Internal safe categorical stop at the final mutation boundary."""
+
+    def __init__(
+        self,
+        kind: str,
+        message: str,
+        *,
+        request_id: str | None = None,
+        decision: Decision | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.safe_message = message
+        self.request_id = request_id
+        self.decision = decision
 
 
 def _safe_args_for_log(args: Mapping[str, Any]) -> dict[str, Any]:
@@ -390,7 +411,18 @@ class ToolExecutor:
     ) -> ToolInvocation:
         """Validate, authorize, and invoke through the appropriate boundary."""
         supplied = dict(args or {})
-        tool = self.registry.get(tool_name)
+        try:
+            tool = self.registry.get(tool_name)
+        except ToolRegistryLeaseError:
+            return ToolInvocation(
+                tool_name,
+                {},
+                ToolResult.failure(
+                    "The trusted tool registration could not be verified.",
+                    kind="action_adapter_invalid",
+                ),
+                0.0,
+            )
         tool_spec = tool.spec
         mutation = not tool_spec.read_only
         log = (self._log.bind(tool=tool_name) if mutation
@@ -495,13 +527,19 @@ class ToolExecutor:
             )
         action_domain_health = self.action_domain_health
         if action_domain_health.state is not ActionDomainHealthState.HEALTHY:
+            startup_pending = action_domain_health.state is (
+                ActionDomainHealthState.VALIDATION_PENDING
+            )
             return self._safe_pre_action_failure(
                 tool_name,
                 cleaned,
                 elapsed(),
                 log,
-                "action_journal_quarantined",
-                "Durable action recovery is quarantined for this workspace.",
+                ("action_journal_startup_pending" if startup_pending else
+                 "action_journal_quarantined"),
+                ("Durable action startup validation is still pending."
+                 if startup_pending else
+                 "Durable action recovery is quarantined for this workspace."),
                 quarantine_category=(
                     action_domain_health.error_category
                     or "startup_validation_incomplete"
@@ -756,6 +794,22 @@ class ToolExecutor:
         spec: ActionAdapterSpec,
         tool_spec: ToolSpec,
     ) -> bool:
+        return (
+            ToolExecutor._execution_registration_matches_record(
+                record,
+                spec,
+                tool_spec,
+            )
+            and bool(record.reconciliation_capabilities)
+        )
+
+    @staticmethod
+    def _execution_registration_matches_record(
+        record: ActionRecord,
+        spec: ActionAdapterSpec,
+        tool_spec: ToolSpec,
+    ) -> bool:
+        """Match the complete immutable registration needed by a mutation."""
         mutation_capabilities = tuple(sorted(
             str(capability)
             for capability in tool_spec.capabilities
@@ -776,7 +830,6 @@ class ToolExecutor:
             and record.reconciliation_capabilities == (
                 reconciliation_capabilities
             )
-            and bool(reconciliation_capabilities)
         )
 
     @staticmethod
@@ -1023,7 +1076,43 @@ class ToolExecutor:
         log: Any,
         elapsed: Callable[[], float],
     ) -> ToolInvocation:
-        """Original validation/checkpoint/policy/checkpoint/run sequence."""
+        """Run one fast-path invocation under its exact registry binding."""
+        try:
+            with self.registry.execution_lease(tool_spec.name, tool):
+                return self._invoke_fast_with_current_binding(
+                    tool,
+                    tool_spec,
+                    cleaned,
+                    checkpoint,
+                    log,
+                    elapsed,
+                )
+        except ToolRegistryLeaseError:
+            log.warning(
+                Events.TOOL_FAILED,
+                reason="tool_registration_changed",
+                error="registered tool changed before execution",
+            )
+            return ToolInvocation(
+                tool_spec.name,
+                cleaned,
+                ToolResult.failure(
+                    "The registered tool changed before execution.",
+                    kind="tool_registration_changed",
+                ),
+                elapsed(),
+            )
+
+    def _invoke_fast_with_current_binding(
+        self,
+        tool: Any,
+        tool_spec: ToolSpec,
+        cleaned: dict[str, Any],
+        checkpoint: Callable[[], None] | None,
+        log: Any,
+        elapsed: Callable[[], float],
+    ) -> ToolInvocation:
+        """Validation/checkpoint/policy/checkpoint/run with a live lease."""
         if checkpoint is not None:
             checkpoint()
         decision = self.policy.check(
@@ -1140,12 +1229,158 @@ class ToolExecutor:
                         if approval_context is not None else None),
         )
 
+    def _validate_consumed_current_approval(
+        self,
+        *,
+        record: ActionRecord,
+        receipt: DurableApprovalReceipt,
+    ) -> DurableApprovalReceipt:
+        """Reauthenticate one exact current-invocation approval receipt."""
+        authority = self._approval_authority
+        if authority is None:
+            raise ValueError("durable approval authority is unavailable")
+        if not isinstance(receipt, DurableApprovalReceipt):
+            raise TypeError("durable approval receipt type is invalid")
+        receipt.validate()
+        binding = authority.binding(
+            action_kind=record.action_kind,
+            intent_digest=record.intent_digest,
+            mutation_capabilities=record.mutation_capabilities,
+            tool_name=record.tool_name,
+            tool_version=record.tool_version,
+            policy_fingerprint=permission_policy_fingerprint(self.policy),
+        )
+        exact = authority.validate_consumed(
+            binding,
+            request_id=receipt.request_id,
+            action_id=record.action_id,
+        )
+        if exact != receipt:
+            raise ValueError("durable approval receipt changed")
+        return exact
+
+    def _validate_current_execution_authority(
+        self,
+        *,
+        record: ActionRecord,
+        tool: Any,
+        tool_spec: ToolSpec,
+        adapter: ToolActionAdapter,
+        spec: ActionAdapterSpec,
+        prepared: PreparedActionIntent,
+        current_approval_receipt: DurableApprovalReceipt | None,
+    ) -> Decision:
+        """Fail closed on current registration, health, policy, and approval.
+
+        This check runs after the exact durable attempt reload and the final
+        checkpoint.  Journal history is deliberately not consulted as a grant:
+        a policy that currently requires approval needs the exact consumed
+        receipt carried by this invocation.
+        """
+        health = self.action_domain_health
+        if health.state is not ActionDomainHealthState.HEALTHY:
+            startup_pending = health.state is (
+                ActionDomainHealthState.VALIDATION_PENDING
+            )
+            raise _CurrentAuthorityBlocked(
+                ("action_journal_startup_pending" if startup_pending else
+                 "action_journal_quarantined"),
+                ("Durable action startup validation is still pending."
+                 if startup_pending else
+                 "Durable action recovery is quarantined for this workspace."),
+            )
+
+        try:
+            current_tool = self.registry.get(tool_spec.name)
+            if current_tool is not tool:
+                raise ValueError("current tool registration changed")
+            current_tool_spec = current_tool.spec
+            current_adapter = self._action_adapters.resolve(
+                current_tool,
+                tool_spec=current_tool_spec,
+            )
+            if current_tool_spec != tool_spec or current_adapter is not adapter or (
+                    current_adapter.spec != spec) or not (
+                        self._execution_registration_matches_record(
+                            record,
+                            current_adapter.spec,
+                            current_tool_spec,
+                        )
+                    ):
+                raise ValueError("current action registration changed")
+        except Exception as exc:
+            external = spec.effect_class is (
+                ActionEffectClass.EXTERNALLY_IDEMPOTENT
+            )
+            raise _CurrentAuthorityBlocked(
+                ("external_idempotency_contract_unavailable" if external else
+                 "action_adapter_invalid"),
+                ("The external idempotency registration changed before "
+                 "execution." if external else
+                 "The trusted action registration changed before execution."),
+            ) from exc
+
+        try:
+            decision, approval_required = self._current_policy_decision(
+                tool_spec,
+                description=(prepared.approval_description
+                             or tool_spec.description),
+            )
+        except Exception as exc:
+            raise _CurrentAuthorityBlocked(
+                "permission_policy_unavailable",
+                "Current mutation permission could not be verified.",
+            ) from exc
+        if decision.outcome is Outcome.DENY:
+            raise _CurrentAuthorityBlocked(
+                "permission_denied",
+                "Current permission policy denies this action.",
+                decision=decision,
+            )
+        if not approval_required:
+            return decision
+        if current_approval_receipt is None:
+            raise _CurrentAuthorityBlocked(
+                "approval_policy_changed",
+                "Current permission policy requires a fresh approval.",
+                decision=decision,
+            )
+        try:
+            self._validate_consumed_current_approval(
+                record=record,
+                receipt=current_approval_receipt,
+            )
+        except AgentError as exc:
+            expired = exc.details.get("reason") == "expired"
+            raise _CurrentAuthorityBlocked(
+                "approval_expired" if expired else "approval_policy_changed",
+                ("The one-shot approval expired before execution."
+                 if expired else
+                 "Current permission policy requires a fresh approval."),
+                request_id=current_approval_receipt.request_id,
+                decision=decision,
+            ) from exc
+        except Exception as exc:
+            raise _CurrentAuthorityBlocked(
+                "approval_policy_changed",
+                "Current permission policy requires a fresh approval.",
+                request_id=current_approval_receipt.request_id,
+                decision=decision,
+            ) from exc
+        return Decision(
+            Outcome.ALLOW,
+            "authorized by current durable one-shot approval",
+            capability=decision.capability,
+            required_level=decision.required_level,
+        )
+
     def _validate_current_duplicate_risk_permission(
         self,
         *,
         record: ActionRecord,
         tool_spec: ToolSpec,
         prepared: PreparedActionIntent,
+        current_approval_receipt: DurableApprovalReceipt | None = None,
     ) -> Decision:
         """Recheck current mutation authority for a successor first attempt.
 
@@ -1174,7 +1409,11 @@ class ToolExecutor:
         if not approval_required:
             return decision
 
-        normal_request_id = record.authority.approval_request_id
+        normal_request_id = (
+            current_approval_receipt.request_id
+            if current_approval_receipt is not None
+            else record.authority.approval_request_id
+        )
         authority = self._approval_authority
         if normal_request_id is None or authority is None:
             raise _DuplicateRiskBlocked(
@@ -1185,29 +1424,35 @@ class ToolExecutor:
                 action_id=record.action_id,
             )
         try:
-            binding = authority.binding(
-                action_kind=record.action_kind,
-                intent_digest=record.intent_digest,
-                mutation_capabilities=record.mutation_capabilities,
-                tool_name=record.tool_name,
-                tool_version=record.tool_version,
-                policy_fingerprint=permission_policy_fingerprint(self.policy),
-            )
-            receipt = authority.validate_consumed(
-                binding,
-                request_id=normal_request_id,
-                action_id=record.action_id,
-            )
-            if not (
-                hmac.compare_digest(
-                    receipt.binding_digest,
-                    record.authority.binding_digest,
+            if current_approval_receipt is not None:
+                self._validate_consumed_current_approval(
+                    record=record,
+                    receipt=current_approval_receipt,
                 )
-                and receipt.scope_ref == record.authority.scope_ref
-                and receipt.approved_at == record.authority.authorized_at
-                and receipt.expires_at == record.authority.expires_at
-            ):
-                raise ValueError("ordinary approval receipt changed")
+            else:
+                binding = authority.binding(
+                    action_kind=record.action_kind,
+                    intent_digest=record.intent_digest,
+                    mutation_capabilities=record.mutation_capabilities,
+                    tool_name=record.tool_name,
+                    tool_version=record.tool_version,
+                    policy_fingerprint=permission_policy_fingerprint(self.policy),
+                )
+                receipt = authority.validate_consumed(
+                    binding,
+                    request_id=normal_request_id,
+                    action_id=record.action_id,
+                )
+                if not (
+                    hmac.compare_digest(
+                        receipt.binding_digest,
+                        record.authority.binding_digest,
+                    )
+                    and receipt.scope_ref == record.authority.scope_ref
+                    and receipt.approved_at == record.authority.authorized_at
+                    and receipt.expires_at == record.authority.expires_at
+                ):
+                    raise ValueError("ordinary approval receipt changed")
         except AgentError as exc:
             reason = exc.details.get("reason")
             raise _DuplicateRiskBlocked(
@@ -1826,6 +2071,23 @@ class ToolExecutor:
                 raise TypeError("untrusted action context type")
             trusted_context.validate()
             provenance = trusted_context.to_provenance(invocation_id)
+        except Exception:
+            return self._journal_failure(
+                tool_spec.name, redacted, elapsed(),
+                kind="action_preflight_failed",
+                message="The action intent could not be prepared safely.",
+                log=log, invocation_id=invocation_id)
+
+        if trusted_context.deduplication_scope in (
+                _RESERVED_INTERNAL_DEDUPLICATION_SCOPES):
+            return self._journal_failure(
+                tool_spec.name, redacted, elapsed(),
+                kind="action_deduplication_scope_reserved",
+                message=("The trusted deduplication scope is reserved for "
+                         "an internal AgentCore action flow."),
+                log=log, invocation_id=invocation_id)
+
+        try:
             prepared = adapter.prepare_intent(cleaned, trusted_context)
             if not isinstance(prepared, PreparedActionIntent):
                 raise TypeError("adapter preflight type")
@@ -2355,6 +2617,7 @@ class ToolExecutor:
                     adapter=adapter, spec=spec, prepared=prepared,
                     checkpoint=checkpoint,
                     approval_context=approval_context,
+                    current_approval_receipt=approval_receipt,
                     decision=decision, invocation_id=invocation_id,
                     log=log, elapsed=elapsed)
         except CancellationRequested:
@@ -2390,6 +2653,7 @@ class ToolExecutor:
         prepared: PreparedActionIntent,
         checkpoint: Callable[[], None] | None,
         approval_context: ApprovalInvocationContext | None,
+        current_approval_receipt: DurableApprovalReceipt | None,
         decision: Decision | None,
         invocation_id: str,
         log: Any,
@@ -2488,12 +2752,62 @@ class ToolExecutor:
                         action_state=current.state.value,
                         approval_request_id=(approval_context.request_id
                                              if approval_context else None))
-                if not authorization.authorized:
+                if authorization.authorized:
+                    assert authorization.receipt is not None
+                    current_approval_receipt = authorization.receipt
+                elif authorization.status is (
+                        ApprovalAuthorizationStatus.CONSUMED) and not (
+                            current.attempts) and approval_context is not None:
+                    try:
+                        assert self._approval_authority is not None
+                        binding = self._approval_authority.binding(
+                            action_kind=current.action_kind,
+                            intent_digest=current.intent_digest,
+                            mutation_capabilities=current.mutation_capabilities,
+                            tool_name=current.tool_name,
+                            tool_version=current.tool_version,
+                            policy_fingerprint=permission_policy_fingerprint(
+                                self.policy),
+                        )
+                        current_approval_receipt = (
+                            self._approval_authority.validate_consumed(
+                                binding,
+                                request_id=authorization.request_id,
+                                action_id=current.action_id,
+                            )
+                        )
+                    except AgentError as exc:
+                        expired = exc.details.get("reason") == "expired"
+                        return self._journal_failure(
+                            tool_spec.name, redacted, elapsed(),
+                            kind=("approval_expired" if expired else
+                                  "approval_unavailable"),
+                            message=(
+                                "The one-shot approval expired before execution."
+                                if expired else
+                                "Durable human approval is unavailable."
+                            ),
+                            log=log, decision=decision,
+                            invocation_id=invocation_id,
+                            action_id=current.action_id,
+                            action_state=current.state.value,
+                            approval_request_id=authorization.request_id)
+                    except Exception:
+                        return self._journal_failure(
+                            tool_spec.name, redacted, elapsed(),
+                            kind="approval_unavailable",
+                            message="Durable human approval is unavailable.",
+                            log=log, decision=decision,
+                            invocation_id=invocation_id,
+                            action_id=current.action_id,
+                            action_state=current.state.value,
+                            approval_request_id=authorization.request_id)
+                else:
                     return self._approval_invocation(
                         tool_spec.name, redacted, authorization, decision,
                         invocation_id, elapsed(), log,
                         historical_action=current)
-                assert authorization.receipt is not None
+                assert current_approval_receipt is not None
                 rechecked, still_requires = self._current_policy_decision(
                     tool_spec,
                     description=(prepared.approval_description
@@ -2506,7 +2820,7 @@ class ToolExecutor:
                     current_fingerprint = ""
                 if rechecked.outcome is Outcome.DENY or not hmac.compare_digest(
                         current_fingerprint,
-                        authorization.receipt.policy_fingerprint):
+                        current_approval_receipt.policy_fingerprint):
                     return self._journal_failure(
                         tool_spec.name, redacted, elapsed(),
                         kind="approval_policy_changed",
@@ -2517,7 +2831,7 @@ class ToolExecutor:
                         action_id=current.action_id,
                         action_state=current.state.value,
                         approval_request_id=authorization.request_id)
-                if self._clock.now() >= authorization.receipt.expires_at:
+                if self._clock.now() >= current_approval_receipt.expires_at:
                     return self._journal_failure(
                         tool_spec.name, redacted, elapsed(),
                         kind="approval_expired",
@@ -2607,6 +2921,7 @@ class ToolExecutor:
                     record=current,
                     tool_spec=tool_spec,
                     prepared=prepared,
+                    current_approval_receipt=current_approval_receipt,
                 )
                 self._validate_duplicate_risk_record(
                     store=store,
@@ -2706,16 +3021,34 @@ class ToolExecutor:
                 fallback_kind="action_control_failed")
 
         try:
-            normalized, cancellation = self._execute_claimed_effect(
-                store=store,
-                claimed=claimed,
-                tool=tool,
-                tool_spec=tool_spec,
-                cleaned=cleaned,
-                adapter=adapter,
-                spec=spec,
-                prepared=prepared,
+            normalized, cancellation, final_decision = (
+                self._execute_claimed_effect(
+                    store=store,
+                    claimed=claimed,
+                    tool=tool,
+                    tool_spec=tool_spec,
+                    cleaned=cleaned,
+                    adapter=adapter,
+                    spec=spec,
+                    prepared=prepared,
+                    attempt_id=attempt_id,
+                    current_approval_receipt=current_approval_receipt,
+                )
+            )
+            decision = final_decision
+        except _CurrentAuthorityBlocked as exc:
+            return self._journal_failure(
+                tool_spec.name, redacted, elapsed(),
+                kind=exc.kind,
+                message=(exc.safe_message + " The claimed attempt remains "
+                         "nonterminal and the physical effect seam was not "
+                         "entered."),
+                log=log, decision=(exc.decision or decision),
+                invocation_id=invocation_id,
+                action_id=claimed.action_id,
                 attempt_id=attempt_id,
+                action_state=ActionState.IN_FLIGHT.value,
+                approval_request_id=exc.request_id,
             )
         except _DuplicateRiskBlocked as exc:
             return self._duplicate_risk_blocked_invocation(
@@ -2816,7 +3149,12 @@ class ToolExecutor:
         spec: ActionAdapterSpec,
         prepared: PreparedActionIntent,
         attempt_id: str,
-    ) -> tuple[NormalizedActionEffect, CancellationRequested | None]:
+        current_approval_receipt: DurableApprovalReceipt | None,
+    ) -> tuple[
+        NormalizedActionEffect,
+        CancellationRequested | None,
+        Decision,
+    ]:
         """Perform final trusted checks and enter one physical effect seam.
 
         For the first attempt of a deliberate risky repeat, the predecessor's
@@ -2836,7 +3174,19 @@ class ToolExecutor:
             else nullcontext()
         )
         try:
-            with predecessor_guard:
+            with predecessor_guard, self.registry.execution_lease(
+                tool_spec.name,
+                tool,
+            ):
+                final_decision = self._validate_current_execution_authority(
+                    record=claimed,
+                    tool=tool,
+                    tool_spec=tool_spec,
+                    adapter=adapter,
+                    spec=spec,
+                    prepared=prepared,
+                    current_approval_receipt=current_approval_receipt,
+                )
                 if spec.effect_class is (
                         ActionEffectClass.EXTERNALLY_IDEMPOTENT):
                     try:
@@ -2854,6 +3204,7 @@ class ToolExecutor:
                         record=claimed,
                         tool_spec=tool_spec,
                         prepared=prepared,
+                        current_approval_receipt=current_approval_receipt,
                     )
                     self._validate_duplicate_risk_record(
                         store=store,
@@ -2908,8 +3259,23 @@ class ToolExecutor:
                 except Exception:
                     normalized = self._unknown_effect(
                         spec, "tool.exception")
-                return normalized, cancellation
-        except (_DuplicateRiskBlocked, _ExternalContractBlocked):
+                return normalized, cancellation, final_decision
+        except ToolRegistryLeaseError as exc:
+            external = spec.effect_class is (
+                ActionEffectClass.EXTERNALLY_IDEMPOTENT
+            )
+            raise _CurrentAuthorityBlocked(
+                ("external_idempotency_contract_unavailable" if external else
+                 "action_adapter_invalid"),
+                ("The external idempotency registration changed before "
+                 "execution." if external else
+                 "The trusted tool registration changed before execution."),
+            ) from exc
+        except (
+            _CurrentAuthorityBlocked,
+            _DuplicateRiskBlocked,
+            _ExternalContractBlocked,
+        ):
             raise
         except Exception as exc:
             if first_risky_attempt:

@@ -382,6 +382,13 @@ class ActionRecoveryCoordinator:
         quarantine = getattr(self._executor, "quarantine_action_mutations", None)
         if callable(quarantine):
             quarantine(category)
+        # Quarantine is sticky.  A later coordinator must report the original
+        # fail-closed reason rather than replacing it with a less precise one.
+        health = getattr(self._executor, "action_domain_health", None)
+        if health is not None and health.state is (
+                ActionDomainHealthState.QUARANTINED) and (
+                    health.error_category is not None):
+            category = health.error_category
         report = ActionStartupRecoveryReport(
             quarantined=True,
             error_category=category,
