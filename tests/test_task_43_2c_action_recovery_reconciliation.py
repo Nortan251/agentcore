@@ -460,7 +460,8 @@ def test_retry_rechecks_current_mutation_authority_after_action_guard_wait(
 
     worker.join(WAIT)
     assert not worker.is_alive()
-    assert policy.calls == [frozenset({Capability.FS_WRITE})]
+    assert policy.calls == [frozenset({Capability.FS_WRITE})] * (
+        2 if allow_after_guard else 1)
     assert tool.runs == (1 if allow_after_guard else 0)
     loaded = underlying.load(authorized.action_id)
     if allow_after_guard:
@@ -473,7 +474,7 @@ def test_retry_rechecks_current_mutation_authority_after_action_guard_wait(
         assert loaded == authorized
 
 
-def test_fresh_first_attempt_checks_mutation_authority_once():
+def test_fresh_first_attempt_checks_authority_at_authorization_and_final_seam():
     policy = MatrixPolicy({Capability.FS_WRITE: True})
     executor, _, store, tool, _, _ = _build(policy=policy)
 
@@ -487,7 +488,7 @@ def test_fresh_first_attempt_checks_mutation_authority_once():
     )
 
     assert invocation.ok
-    assert policy.calls == [frozenset({Capability.FS_WRITE})]
+    assert policy.calls == [frozenset({Capability.FS_WRITE})] * 2
     assert tool.runs == 1
     assert len(store.list_actions()) == 1
 
@@ -1478,7 +1479,7 @@ def test_real_llmplanner_replan_retry_uses_same_action_and_current_authority(
         assert report.status is TaskStatus.COMPLETED
         assert agent.state.tool_calls[-1]["action_id"] == record.action_id
         assert tool.runs == 1
-        assert policy.calls == [frozenset({Capability.FS_WRITE})]
+        assert policy.calls == [frozenset({Capability.FS_WRITE})] * 2
         loaded = store.load(record.action_id)
         assert loaded.state is ActionState.SUCCEEDED
         assert len(loaded.attempts) == 2
@@ -1822,7 +1823,7 @@ def test_legacy_planner_unrelated_tool_keeps_new_action_compatibility(tmp_path):
         assert agent.state.tool_calls[-1]["action_id"] != record.action_id
         assert original.runs == 0
         assert other.runs == 1
-        assert policy.calls == [frozenset({Capability.FS_WRITE})]
+        assert policy.calls == [frozenset({Capability.FS_WRITE})] * 2
         assert len(store.list_actions()) == 2
     finally:
         agent.shutdown()

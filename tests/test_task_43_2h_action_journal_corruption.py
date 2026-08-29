@@ -396,7 +396,7 @@ def test_pending_startup_gate_and_healthy_empty_startup():
     pending = _invoke_mutation(runtime)
     assert not pending.ok
     assert pending.result.metadata == {
-        "kind": "action_journal_quarantined",
+        "kind": "action_journal_startup_pending",
         "quarantine_category": "startup_validation_incomplete",
     }
     assert store.list_actions() == []
@@ -827,6 +827,31 @@ def test_startup_bound_quarantines_without_partial_enable_or_recovery(
     assert runtime["mutation"].runs == 0
     assert len(store.list_actions()) == 3
     store.close()
+
+
+def test_later_coordinator_preserves_first_sticky_quarantine_reason():
+    store = InMemoryActionStore(clock=FixedClock(NOW))
+    _seed(store, 83, ActionState.AUTHORIZED)
+    _seed(store, 84, ActionState.AUTHORIZED)
+    runtime = _runtime(store, max_startup_actions=1)
+
+    first = runtime["coordinator"].recover_startup()
+    second = ActionRecoveryCoordinator(
+        store,
+        runtime["executor"],
+        clock=FixedClock(NOW),
+        id_factory=DeterministicIds(),
+        owner_id="recovery:second",
+        max_startup_actions=10,
+    ).recover_startup()
+    blocked = _invoke_mutation(runtime)
+
+    assert first.error_category == "startup_scan_bound_exceeded"
+    assert second.quarantined
+    assert second.error_category == "startup_scan_bound_exceeded"
+    assert blocked.result.metadata["quarantine_category"] == (
+        "startup_scan_bound_exceeded")
+    assert runtime["mutation"].runs == 0
 
 
 @pytest.mark.parametrize("corrupt_number", [90, 92])

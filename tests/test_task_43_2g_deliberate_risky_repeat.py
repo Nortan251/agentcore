@@ -720,6 +720,88 @@ def test_current_confirm_policy_requires_separate_normal_approval():
         risk_pending.approval_request_id)
 
 
+def test_zero_attempt_successor_accepts_fresh_current_approval_after_restart():
+    runtime, _, predecessor = _ambiguous()
+    _, context = _approve_risk(runtime, predecessor)
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    creation_checkpoints = 0
+
+    def crash_after_successor_creation():
+        nonlocal creation_checkpoints
+        creation_checkpoints += 1
+        if creation_checkpoints == 3:
+            raise SimulatedCrash()
+
+    with pytest.raises(SimulatedCrash):
+        _invoke(
+            runtime,
+            risk_context=context,
+            checkpoint=crash_after_successor_creation,
+        )
+    waiting = runtime["store"].load(context.successor_action_id)
+    assert waiting.state is ActionState.AUTHORIZED
+    assert waiting.attempts == ()
+    assert waiting.authority.approval_request_id is None
+
+    runtime["executor"].policy = _policy(PermissionLevel.CONFIRM)
+    pending = _invoke(
+        runtime,
+        action_context=ActionInvocationContext(
+            action_id=context.successor_action_id),
+    )
+    assert pending.result.metadata["kind"] == "approval_pending"
+    assert pending.action_id == context.successor_action_id
+    assert runtime["store"].load(context.successor_action_id).attempts == ()
+    runtime["authority"].record_decision(
+        pending.approval_request_id,
+        HumanApprovalDecision.APPROVE,
+    )
+
+    def crash_after_approval_consumption():
+        raise SimulatedCrash()
+
+    with pytest.raises(SimulatedCrash):
+        _invoke(
+            runtime,
+            action_context=ActionInvocationContext(
+                action_id=context.successor_action_id),
+            approval_request_id=pending.approval_request_id,
+            checkpoint=crash_after_approval_consumption,
+        )
+    assert runtime["approval_store"].load(
+        pending.approval_request_id).state is ApprovalState.CONSUMED
+    assert runtime["store"].load(context.successor_action_id).attempts == ()
+
+    restarted = _build(
+        policy=_policy(PermissionLevel.CONFIRM),
+        clock=runtime["clock"],
+        ids=runtime["ids"],
+        store=runtime["store"],
+        tool=runtime["tool"],
+        adapter=runtime["adapter"],
+        approval_store=runtime["approval_store"],
+    )
+    completed = _invoke(
+        restarted,
+        action_context=ActionInvocationContext(
+            action_id=context.successor_action_id),
+        approval_request_id=pending.approval_request_id,
+    )
+    successor = runtime["store"].load(context.successor_action_id)
+
+    assert completed.ok
+    assert completed.action_id == context.successor_action_id
+    assert successor.state is ActionState.SUCCEEDED
+    assert len(successor.attempts) == 1
+    assert successor.authority.approval_request_id is None
+    assert successor.duplicate_risk_acknowledgement is not None
+    assert runtime["store"].load(predecessor.action_id).state is (
+        ActionState.RECONCILE_REQUIRED)
+
+
 def test_predecessor_normal_approval_cannot_authorize_successor_risk():
     runtime = _build(policy=_policy(PermissionLevel.CONFIRM))
     first_pending = _invoke(
