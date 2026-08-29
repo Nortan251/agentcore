@@ -411,7 +411,18 @@ class ToolExecutor:
     ) -> ToolInvocation:
         """Validate, authorize, and invoke through the appropriate boundary."""
         supplied = dict(args or {})
-        tool = self.registry.get(tool_name)
+        try:
+            tool = self.registry.get(tool_name)
+        except ToolRegistryLeaseError:
+            return ToolInvocation(
+                tool_name,
+                {},
+                ToolResult.failure(
+                    "The trusted tool registration could not be verified.",
+                    kind="action_adapter_invalid",
+                ),
+                0.0,
+            )
         tool_spec = tool.spec
         mutation = not tool_spec.read_only
         log = (self._log.bind(tool=tool_name) if mutation
