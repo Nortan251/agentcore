@@ -1,0 +1,205 @@
+name: codex-verified-automerge
+
+on:
+  workflow_run:
+    workflows: ["filesystem-linux", "filesystem-windows"]
+    types: [completed]
+  pull_request_review:
+    types: [submitted, dismissed]
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: codex-verified-automerge
+  cancel-in-progress: false
+
+jobs:
+  gate-and-merge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge only exact-head Codex PRs with clean review and CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import datetime as dt
+          import json
+          import os
+          import subprocess
+          from typing import Any
+
+          REPO = os.environ["GH_REPO"]
+          CODEX_BOT = "chatgpt-codex-connector[bot]"
+          REQUIRED_WORKFLOWS = {
+              "filesystem-linux",
+              "filesystem-windows",
+          }
+
+
+          def api(path: str, *, method: str = "GET", fields: dict[str, str] | None = None) -> Any:
+              cmd = ["gh", "api"]
+              if method != "GET":
+                  cmd += ["--method", method]
+              cmd.append(path)
+              if fields:
+                  for key, value in fields.items():
+                      cmd += ["-f", f"{key}={value}"]
+              raw = subprocess.check_output(cmd, text=True)
+              return json.loads(raw)
+
+
+          def parse_time(value: str) -> dt.datetime:
+              return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+          def current_main_sha() -> str:
+              return api(f"repos/{REPO}/git/ref/heads/main")["object"]["sha"]
+
+
+          def latest_required_runs(pr_number: int, head_sha: str) -> dict[str, dict[str, Any]]:
+              payload = api(
+                  f"repos/{REPO}/actions/runs"
+                  f"?event=pull_request&head_sha={head_sha}&per_page=100"
+              )
+              latest: dict[str, dict[str, Any]] = {}
+              for run in payload.get("workflow_runs", []):
+                  name = run.get("name")
+                  if name not in REQUIRED_WORKFLOWS:
+                      continue
+                  if not any(
+                      item.get("number") == pr_number
+                      for item in run.get("pull_requests", [])
+                  ):
+                      continue
+                  previous = latest.get(name)
+                  order = (run.get("updated_at") or "", int(run.get("id", 0)))
+                  previous_order = (
+                      (previous.get("updated_at") or "", int(previous.get("id", 0)))
+                      if previous
+                      else ("", 0)
+                  )
+                  if order > previous_order:
+                      latest[name] = run
+              return latest
+
+
+          def ci_is_green(pr_number: int, head_sha: str) -> tuple[bool, str]:
+              latest = latest_required_runs(pr_number, head_sha)
+              missing = REQUIRED_WORKFLOWS.difference(latest)
+              if missing:
+                  return False, f"missing CI: {sorted(missing)}"
+              for name in sorted(REQUIRED_WORKFLOWS):
+                  run = latest[name]
+                  if run.get("status") != "completed" or run.get("conclusion") != "success":
+                      return False, (
+                          f"{name} is {run.get('status')}/{run.get('conclusion')}"
+                      )
+              return True, "required CI is green"
+
+
+          def codex_review_is_clean(pr_number: int, head_sha: str) -> tuple[bool, str]:
+              # Codex posts a GitHub review when it has suggestions. Treat any
+              # Codex review or inline review comment for this exact head as a
+              # blocker. A clean Codex review is represented by a +1 reaction.
+              reviews = api(f"repos/{REPO}/pulls/{pr_number}/reviews?per_page=100")
+              for review in reviews:
+                  if (
+                      review.get("user", {}).get("login") == CODEX_BOT
+                      and review.get("commit_id") == head_sha
+                  ):
+                      return False, "Codex posted review findings for current head"
+
+              comments = api(f"repos/{REPO}/pulls/{pr_number}/comments?per_page=100")
+              for comment in comments:
+                  if (
+                      comment.get("user", {}).get("login") == CODEX_BOT
+                      and comment.get("commit_id") == head_sha
+                  ):
+                      return False, "Codex posted inline findings for current head"
+
+              commit = api(f"repos/{REPO}/commits/{head_sha}")
+              head_time = parse_time(commit["commit"]["committer"]["date"])
+              reactions = api(f"repos/{REPO}/issues/{pr_number}/reactions?per_page=100")
+              for reaction in reactions:
+                  if (
+                      reaction.get("user", {}).get("login") == CODEX_BOT
+                      and reaction.get("content") == "+1"
+                      and reaction.get("created_at")
+                      and parse_time(reaction["created_at"]) >= head_time
+                  ):
+                      return True, "Codex clean-review reaction found for current head"
+              return False, "waiting for clean Codex review on current head"
+
+
+          main_sha = current_main_sha()
+          pulls = api(f"repos/{REPO}/pulls?state=open&base=main&per_page=100")
+          eligible = [
+              pr for pr in pulls
+              if not pr.get("draft")
+              and pr.get("head", {}).get("repo", {}).get("full_name") == REPO
+              and str(pr.get("head", {}).get("ref", "")).startswith("codex/")
+          ]
+
+          if not eligible:
+              print("No eligible open codex/** PRs.")
+
+          for pr in eligible:
+              number = int(pr["number"])
+              head_sha = pr["head"]["sha"]
+              base_sha = pr["base"]["sha"]
+              print(f"PR #{number}: head={head_sha} base={base_sha}")
+
+              if base_sha != main_sha:
+                  print(f"  skip: base is not current main {main_sha}")
+                  continue
+
+              ci_ok, ci_reason = ci_is_green(number, head_sha)
+              print(f"  CI: {ci_reason}")
+              if not ci_ok:
+                  continue
+
+              review_ok, review_reason = codex_review_is_clean(number, head_sha)
+              print(f"  review: {review_reason}")
+              if not review_ok:
+                  continue
+
+              # Re-read all mutable refs immediately before merge. If main or
+              # the PR head moved after the checks above, do nothing and let a
+              # later event/scheduled run evaluate the new state.
+              fresh_pr = api(f"repos/{REPO}/pulls/{number}")
+              fresh_main = current_main_sha()
+              if fresh_pr.get("state") != "open" or fresh_pr.get("draft"):
+                  print("  skip: PR is no longer open/ready")
+                  continue
+              if fresh_pr["head"]["sha"] != head_sha:
+                  print("  skip: PR head moved after verification")
+                  continue
+              if fresh_pr["base"]["sha"] != fresh_main or fresh_main != main_sha:
+                  print("  skip: main moved after verification")
+                  continue
+              if fresh_pr.get("mergeable") is not True:
+                  print(f"  skip: GitHub mergeable={fresh_pr.get('mergeable')}")
+                  continue
+
+              result = api(
+                  f"repos/{REPO}/pulls/{number}/merge",
+                  method="PUT",
+                  fields={"sha": head_sha, "merge_method": "merge"},
+              )
+              if result.get("merged"):
+                  print(f"  merged PR #{number}: {result.get('sha')}")
+                  # main changed; remaining PRs must be re-tested against it.
+                  main_sha = result["sha"]
+              else:
+                  print(f"  merge declined by GitHub: {result.get('message')}")
+          PY
