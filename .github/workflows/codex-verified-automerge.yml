@@ -93,7 +93,11 @@ jobs:
               return latest
 
 
-          def ci_is_green(pr_number: int, head_sha: str) -> tuple[bool, str]:
+          def ci_is_green(
+              pr_number: int,
+              head_sha: str,
+              main_sha: str,
+          ) -> tuple[bool, str]:
               latest = latest_required_runs(pr_number, head_sha)
               missing = REQUIRED_WORKFLOWS.difference(latest)
               if missing:
@@ -104,7 +108,25 @@ jobs:
                       return False, (
                           f"{name} is {run.get('status')}/{run.get('conclusion')}"
                       )
-              return True, "required CI is green"
+                  run_pr = next(
+                      (
+                          item for item in run.get("pull_requests", [])
+                          if item.get("number") == pr_number
+                      ),
+                      None,
+                  )
+                  if run_pr is None:
+                      return False, f"{name} lacks exact PR provenance"
+                  tested_head = run_pr.get("head", {}).get("sha")
+                  tested_base = run_pr.get("base", {}).get("sha")
+                  if tested_head != head_sha:
+                      return False, f"{name} was not run for current PR head"
+                  if tested_base != main_sha:
+                      return False, (
+                          f"{name} was tested against {tested_base}, "
+                          f"not current main {main_sha}"
+                      )
+              return True, "required CI is green for current head and current main"
 
 
           def codex_review_is_clean(pr_number: int, head_sha: str) -> tuple[bool, str]:
@@ -163,7 +185,7 @@ jobs:
                   print(f"  skip: base is not current main {main_sha}")
                   continue
 
-              ci_ok, ci_reason = ci_is_green(number, head_sha)
+              ci_ok, ci_reason = ci_is_green(number, head_sha, main_sha)
               print(f"  CI: {ci_reason}")
               if not ci_ok:
                   continue
