@@ -2,6 +2,13 @@
 
 Implementation baseline: `9d37123c5a7ca56ddfedf34ec436fa1fcabc2123`.
 
+The subsequent [protected Google connection stage](google-oauth-protected-credentials.md)
+now supplies production Windows refresh storage and a host OAuth lifecycle.
+This document continues to define the underlying credential/executor authority
+contract; its references to unavailable OAuth/persistence describe the original
+foundation slice. Agent and conversation policy views now read the executor's
+current policy dynamically.
+
 This first slice supplies a host-injected credential boundary for authenticated
 **pure reads**. It adds no OAuth flow, Google API, default external tool,
 credential UI, production persistence, paid service, or mutation permission.

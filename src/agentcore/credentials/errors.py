@@ -24,6 +24,17 @@ class CredentialFailure(str, Enum):
     UNSAFE_RESULT = "credential_unsafe_result"
     UNSUPPORTED = "credential_operation_unsupported"
     CAPACITY = "credential_capacity_reached"
+    CORRUPT = "credential_store_corrupt"
+    STORAGE_CHANGED = "credential_store_changed"
+    COMMIT_FAILED = "credential_commit_failed"
+    OAUTH_CALLBACK = "oauth_callback_invalid"
+    OAUTH_STATE = "oauth_state_mismatch"
+    OAUTH_REPLAY = "oauth_response_replayed"
+    OAUTH_TIMEOUT = "oauth_authorization_expired"
+    OAUTH_DENIED = "oauth_authorization_denied"
+    OAUTH_UNCERTAIN = "oauth_exchange_uncertain"
+    IDENTITY_TOKEN = "oauth_identity_invalid"
+    RECONNECT = "oauth_reconnect_required"
 
 
 _MESSAGES = {
@@ -45,6 +56,17 @@ _MESSAGES = {
     CredentialFailure.UNSAFE_RESULT: "The authenticated provider result was withheld.",
     CredentialFailure.UNSUPPORTED: "This authenticated operation is not supported.",
     CredentialFailure.CAPACITY: "The credential service capacity has been reached.",
+    CredentialFailure.CORRUPT: "The protected credential record could not be verified.",
+    CredentialFailure.STORAGE_CHANGED: "The protected credential storage changed unexpectedly.",
+    CredentialFailure.COMMIT_FAILED: "The credential update was not confirmed durable.",
+    CredentialFailure.OAUTH_CALLBACK: "The authorization callback is invalid.",
+    CredentialFailure.OAUTH_STATE: "The authorization state does not match.",
+    CredentialFailure.OAUTH_REPLAY: "The authorization response has already been consumed.",
+    CredentialFailure.OAUTH_TIMEOUT: "The authorization attempt has expired.",
+    CredentialFailure.OAUTH_DENIED: "Authorization was not granted.",
+    CredentialFailure.OAUTH_UNCERTAIN: "The token exchange outcome is uncertain.",
+    CredentialFailure.IDENTITY_TOKEN: "The Google identity proof could not be verified.",
+    CredentialFailure.RECONNECT: "A new Google authorization is required.",
 }
 
 
