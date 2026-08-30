@@ -80,6 +80,13 @@ paths are unsupported. A non-shareable ownership handle excludes a second
 writer. The host should use a dedicated directory beneath its private local
 application-data area, outside repositories and agent workspaces.
 
+Windows may initially assign a newly created directory to a default owner group
+from the process token, especially on elevated hosts. The backend accepts only
+the token user or its OS-reported default owner, then sets the directory owner
+to the current user when needed, with the same private DACL. It does not enable
+ownership privileges or accept an unrelated owner. See Microsoft's
+[new-object ownership rules](https://learn.microsoft.com/en-us/windows/win32/secauthz/owner-of-a-new-object).
+
 Linux/macOS **production storage is unsupported and fails closed**. Tests may
 explicitly supply a protector with `test_only=True`. The test protector lives
 under `tests/`, uses cryptography's Fernet with synthetic material, and is never
@@ -163,6 +170,13 @@ refresh token go in the POST body, never the token endpoint URL. Responses are
 bounded and strictly parsed. The socket timeout is 10 seconds per I/O, not a
 hard preemptive deadline for a slow server. The host can locally disconnect or
 close while a remote operation is outstanding; its later result cannot publish.
+
+OAuth HTTPS uses a verified-client SSLContext with default system CAs and modern
+strict X.509 verification, but never enables TLS session-key logging. It avoids
+the SSLKEYLOGFILE hook in Python's convenience context factory without mutating
+the shared process environment. Code exchange, refresh and certificate-fetch
+regressions verify this even when SSLKEYLOGFILE is set. See
+[Python TLS context behavior](https://docs.python.org/3/library/ssl.html#ssl.create_default_context).
 
 ## Identity verification
 

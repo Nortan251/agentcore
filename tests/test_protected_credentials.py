@@ -458,6 +458,8 @@ def test_windows_dpapi_roundtrip_corruption_purpose_and_durable_restart(tmp_path
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows DACL integration")
 def test_windows_directory_dacl_is_protected_and_restricts_access(connected, tmp_path):
+    import win32api
+    import win32con
     import win32security
     directory = tmp_path / "credentials"
     sd = win32security.GetFileSecurity(str(directory), win32security.DACL_SECURITY_INFORMATION | win32security.OWNER_SECURITY_INFORMATION)
@@ -466,6 +468,60 @@ def test_windows_directory_dacl_is_protected_and_restricts_access(connected, tmp
     assert acl.GetAceCount() == 2
     allowed = {win32security.ConvertSidToStringSid(acl.GetAce(i)[2]) for i in range(acl.GetAceCount())}
     assert allowed == {win32security.ConvertSidToStringSid(sd.GetSecurityDescriptorOwner()), "S-1-5-18"}
+    token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
+    try:
+        assert sd.GetSecurityDescriptorOwner() == win32security.GetTokenInformation(token, win32security.TokenUser)[0]
+    finally:
+        token.Close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows token default-owner security rules")
+@pytest.mark.parametrize("owner_kind", ["user", "default_group", "unrelated"])
+def test_windows_private_directory_handles_token_default_group_owner(tmp_path, monkeypatch, owner_kind):
+    from types import SimpleNamespace
+    import win32api
+    import win32con
+    import win32security
+    from agentcore.credentials._protected_file import _windows_private_directory
+
+    token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
+    try:
+        user = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
+    finally:
+        token.Close()
+    default = win32security.CreateWellKnownSid(win32security.WinBuiltinAdministratorsSid, None)
+    unrelated = win32security.CreateWellKnownSid(win32security.WinWorldSid, None)
+    owner = {"user": user, "default_group": default, "unrelated": unrelated}[owner_kind]
+
+    def information(token, kind):
+        if kind == win32security.TokenUser:
+            return user, 0
+        assert kind == win32security.TokenOwner
+        return default
+
+    applied = []
+    monkeypatch.setattr(win32security, "GetTokenInformation", information)
+    monkeypatch.setattr(win32security, "GetFileSecurity", lambda *args:
+                        SimpleNamespace(GetSecurityDescriptorOwner=lambda: owner))
+    monkeypatch.setattr(win32security, "SetNamedSecurityInfo", lambda *args: applied.append(args))
+    if owner_kind == "unrelated":
+        with pytest.raises(CredentialError):
+            _windows_private_directory(tmp_path)
+        assert not applied
+        return
+    _windows_private_directory(tmp_path)
+    assert len(applied) == 1
+    arguments = applied[0]
+    assert arguments[2] & win32security.PROTECTED_DACL_SECURITY_INFORMATION
+    if owner_kind == "default_group":
+        assert arguments[2] & win32security.OWNER_SECURITY_INFORMATION
+        assert arguments[3] == user
+    else:
+        assert arguments[3] is None
+    acl = arguments[5]
+    assert acl.GetAceCount() == 2
+    assert {win32security.ConvertSidToStringSid(acl.GetAce(i)[2]) for i in range(2)} == {
+        win32security.ConvertSidToStringSid(user), "S-1-5-18"}
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permissions")

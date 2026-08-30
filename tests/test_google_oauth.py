@@ -369,6 +369,46 @@ def test_http_success_uses_secret_post_fields_not_url_or_query(monkeypatch):
     assert response.access._read() == ACCESS and REFRESH not in repr(response)
 
 
+@pytest.mark.parametrize("operation", ["exchange", "refresh", "certificates"])
+def test_oauth_https_ignores_tls_key_logging_environment_without_disabling_verification(tmp_path, monkeypatch, operation):
+    keylog = tmp_path / "tls-session-secrets.log"
+    monkeypatch.setenv("SSLKEYLOGFILE", str(keylog))
+    contexts = []
+
+    class Connection:
+        def __init__(self, host, *, timeout, context):
+            contexts.append(context)
+        def request(self, *args, **kwargs):
+            pass
+        def getresponse(self):
+            body = ({"test-key": "synthetic-certificate"} if operation == "certificates" else
+                    {"access_token": ACCESS, "expires_in": 3600, "token_type": "Bearer"})
+            return SimpleNamespace(status=200, read=lambda _: json.dumps(body).encode(),
+                                   getheader=lambda *_: "application/json")
+        def close(self):
+            pass
+
+    monkeypatch.setattr("http.client.HTTPSConnection", Connection)
+    transport = GoogleOAuthHttp()
+    config = GoogleOAuthConfig(CLIENT_ID, client_secret=SecretMaterial(CLIENT_SECRET))
+    if operation == "exchange":
+        transport.exchange(config, SecretMaterial(CODE), SecretMaterial(STATE), "http://127.0.0.1:1234/")
+    elif operation == "refresh":
+        transport.refresh(config, SecretMaterial(REFRESH))
+    else:
+        transport.certificates(GOOGLE_CERTIFICATES_ENDPOINT)
+    assert len(contexts) == 1
+    context = contexts[0]
+    assert context.keylog_filename is None
+    assert not keylog.exists()
+    assert os.environ["SSLKEYLOGFILE"] == str(keylog)  # no process-wide environment mutation
+    assert context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname
+    assert context.minimum_version >= ssl.TLSVersion.TLSv1_2
+    assert context.verify_flags & ssl.VERIFY_X509_STRICT
+    assert context.verify_flags & ssl.VERIFY_X509_PARTIAL_CHAIN
+    assert context.cert_store_stats()["x509_ca"] > 0
+
+
 def test_token_json_duplicate_keys_rejected():
     with pytest.raises(CredentialError):
         OAuthTokenResponse.parse(b'{"access_token":"first","access_token":"second","expires_in":3600,"token_type":"Bearer"}')

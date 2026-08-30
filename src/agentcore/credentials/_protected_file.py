@@ -40,20 +40,29 @@ def _windows_private_directory(path: Path) -> None:
     token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
     try:
         user = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
+        default_owner = win32security.GetTokenInformation(token, win32security.TokenOwner)
     finally:
         token.Close()
     descriptor = win32security.GetFileSecurity(str(path), win32security.OWNER_SECURITY_INFORMATION)
-    if descriptor.GetSecurityDescriptorOwner() != user:
+    owner = descriptor.GetSecurityDescriptorOwner()
+    # Windows may create objects with the token's default owner group (e.g.
+    # Administrators on an elevated desktop/CI host), rather than TokenUser.
+    # Accept only those two token-authorized owners, and make the private
+    # directory explicitly user-owned without enabling any extra privilege.
+    if owner != user and owner != default_owner:
         raise CredentialError(CredentialFailure.UNAVAILABLE)
     acl = win32security.ACL()
     inheritance = win32con.OBJECT_INHERIT_ACE | win32con.CONTAINER_INHERIT_ACE
     acl.AddAccessAllowedAceEx(win32security.ACL_REVISION_DS, inheritance, ntsecuritycon.FILE_ALL_ACCESS, user)
     system = win32security.CreateWellKnownSid(win32security.WinLocalSystemSid, None)
     acl.AddAccessAllowedAceEx(win32security.ACL_REVISION_DS, inheritance, ntsecuritycon.FILE_ALL_ACCESS, system)
-    win32security.SetNamedSecurityInfo(
-        str(path), win32security.SE_FILE_OBJECT,
-        win32security.DACL_SECURITY_INFORMATION | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
-        None, None, acl, None)
+    security = win32security.DACL_SECURITY_INFORMATION | win32security.PROTECTED_DACL_SECURITY_INFORMATION
+    replacement_owner = None
+    if owner != user:
+        security |= win32security.OWNER_SECURITY_INFORMATION
+        replacement_owner = user
+    win32security.SetNamedSecurityInfo(str(path), win32security.SE_FILE_OBJECT,
+                                      security, replacement_owner, None, acl, None)
 
 
 class ProtectedFile(RuntimeOnly):

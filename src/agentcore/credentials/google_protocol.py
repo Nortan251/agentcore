@@ -132,6 +132,17 @@ class GoogleTokenTransport(Protocol):
     def refresh(self, config: GoogleOAuthConfig, refresh: SecretMaterial) -> OAuthTokenResponse: ...
 
 
+def _oauth_tls_context() -> ssl.SSLContext:
+    # create_default_context reads SSLKEYLOGFILE and can write session keys.
+    # Build its verified-client equivalent without that environment hook or
+    # any process-wide environment mutation. Keep modern X.509 verification.
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN | ssl.VERIFY_X509_STRICT
+    context.load_default_certs(ssl.Purpose.SERVER_AUTH)
+    context.keylog_filename = None
+    return context
+
+
 class GoogleOAuthHttp(RuntimeOnly):
     """Pinned HTTPS endpoints, default TLS verification, bounded bodies.
 
@@ -151,7 +162,7 @@ class GoogleOAuthHttp(RuntimeOnly):
         failure = CredentialFailure.OAUTH_UNCERTAIN
         result = None
         try:
-            connection = http.client.HTTPSConnection(host, timeout=10, context=ssl.create_default_context())
+            connection = http.client.HTTPSConnection(host, timeout=10, context=_oauth_tls_context())
             # Override a process-wide HTTPConnection.debuglevel setting too.
             connection.debuglevel = 0
             try:
