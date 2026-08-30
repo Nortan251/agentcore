@@ -414,7 +414,13 @@ class CredentialRuntime(RuntimeOnly):
                     else:
                         public = detached_public_json(
                             {"output": raw.output, "metadata": raw.metadata},
-                            secrets=lease._secret_variants(),
+                            # Inert binding IDs stay host-side in this slice.
+                            # Use the pinned binding, not provider-owned data.
+                            secrets=lease._redaction_variants((
+                                binding.info.reference,
+                                binding.info.account_id,
+                                binding.info.connection_id,
+                            )),
                         )
                         safe_result = ToolResult(
                             ok=True, output=public["output"], metadata=public["metadata"])

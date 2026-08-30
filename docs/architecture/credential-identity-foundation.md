@@ -129,6 +129,12 @@ values and untrusted correlation fields are excluded from executor logs and
 ToolInvocation. Credential/account/scope selectors are not ordinary parameters.
 Incoming model data cannot replace the trusted binding.
 
+The active account, connection, and credential-reference IDs are also withheld
+if a provider echoes them in a result, including ordinary `id` fields and common
+transport encodings. These IDs remain inert metadata, not secrets or permission.
+Trusted host metadata APIs may use them; provider output is not an account
+selection or binding-metadata export channel in this first slice.
+
 Provider output must be a ToolResult with bounded plain JSON. No arbitrary
 object repr, serializer, iterator, non-finite number, or unbounded tree is used.
 Results are detached, credential-shaped fields are rejected, and literal/common

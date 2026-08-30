@@ -528,6 +528,34 @@ def test_successful_result_is_detached_from_provider_owned_mutable_data():
     assert result.result.output == {"items": [{"title": "initial"}]}
 
 
+@pytest.mark.parametrize("identifier", ["reference", "account_id", "connection_id"])
+@pytest.mark.parametrize("surface", ["output", "metadata"])
+@pytest.mark.parametrize("encoded", [False, True])
+def test_active_binding_identifiers_are_withheld_from_provider_results(
+    identifier, surface, encoded, caplog,
+):
+    echoed = []
+
+    def provider(args, lease):
+        value = getattr(lease.info, identifier)
+        if encoded:
+            value = base64.b64encode(value.encode("utf-8")).decode("ascii")
+        echoed.append(value)
+        payload = {"items": [{"id": value}]}
+        return (ToolResult.success(payload) if surface == "output" else
+                ToolResult(ok=True, output="safe", metadata=payload))
+
+    bundle = setup_runtime(provider)
+    executor_for(bundle)
+    result = invoke(bundle)
+    assert not result.ok
+    assert result.result.metadata["kind"] == CredentialFailure.UNSAFE_RESULT.value
+    public = json.dumps(result.to_dict()) + caplog.text
+    assert echoed[0] not in public
+    assert getattr(bundle.info, identifier) not in public
+    bundle.vault.revoke(bundle.info.reference)
+
+
 def test_numeric_credential_cannot_escape_as_a_json_number():
     bundle = setup_runtime(lambda args, lease: ToolResult.success(int(lease.reveal())))
     rotated = bundle.vault.rotate(bundle.info.reference, IDENTITY,

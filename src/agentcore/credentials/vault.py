@@ -80,22 +80,24 @@ class CredentialLease(RuntimeOnly):
             raise CredentialError(CredentialFailure.AUTHORITY)
         return self._material._read()
 
-    def _secret_variants(self) -> tuple[str, ...]:
+    def _redaction_variants(self, identifiers: tuple[str, str, str]) -> tuple[str, ...]:
         # Expiry during a read does not stop result scrubbing. This internal
         # access is for redaction only, never a fresh provider invocation.
         self._require_owner()
         if self._material is None:
             raise CredentialError(CredentialFailure.AUTHORITY)
         value = self._material._read()
-        encoded = value.encode("utf-8")
-        variants = {
-            value,
-            json.dumps(value, ensure_ascii=True)[1:-1],
-            quote(value, safe=""),
-            quote_plus(value, safe=""),
-            base64.b64encode(encoded).decode("ascii"),
-            base64.urlsafe_b64encode(encoded).decode("ascii").rstrip("="),
-        }
+        variants: set[str] = set()
+        for private_value in (value, *identifiers):
+            encoded = private_value.encode("utf-8")
+            variants.update({
+                private_value,
+                json.dumps(private_value, ensure_ascii=True)[1:-1],
+                quote(private_value, safe=""),
+                quote_plus(private_value, safe=""),
+                base64.b64encode(encoded).decode("ascii"),
+                base64.urlsafe_b64encode(encoded).decode("ascii").rstrip("="),
+            })
         # A provider may accidentally coerce opaque text to a JSON number.
         # Include canonical decimal casts, which lose signs/leading zeros,
         # exponent formatting, or precision. These are redaction-only values.
