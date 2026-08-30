@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 from pathlib import Path
 
 
@@ -88,10 +89,7 @@ def test_clean_codex_review_is_bound_to_exact_head_sha():
     old_head = "1" * 40
     old_clean = _review(
         head=old_head,
-        body=(
-            f"{POLICY.CLEAN_MARKER}\n"
-            f"Reviewed commit: {old_head}"
-        ),
+        body=f"{POLICY.CLEAN_MARKER}\nReviewed commit: {old_head}",
     )
 
     ok, reason = POLICY.codex_review_state_from_payloads(
@@ -107,10 +105,7 @@ def test_exact_head_clean_codex_review_passes():
     head = "a" * 40
     clean = _review(
         head=head,
-        body=(
-            f"{POLICY.CLEAN_MARKER}\n"
-            f"Reviewed commit: {head}"
-        ),
+        body=f"{POLICY.CLEAN_MARKER}\nReviewed commit: {head}",
     )
 
     ok, reason = POLICY.codex_review_state_from_payloads(
@@ -126,10 +121,7 @@ def test_exact_head_codex_findings_block_even_if_clean_marker_also_exists():
     head = "b" * 40
     clean = _review(
         head=head,
-        body=(
-            f"{POLICY.CLEAN_MARKER}\n"
-            f"Reviewed commit: {head}"
-        ),
+        body=f"{POLICY.CLEAN_MARKER}\nReviewed commit: {head}",
     )
 
     ok, reason = POLICY.codex_review_state_from_payloads(
@@ -157,6 +149,26 @@ def test_unstructured_codex_review_is_not_clean_authority():
     assert reason == "Codex posted review findings for current head"
 
 
+def test_paginated_later_codex_finding_is_not_omitted():
+    head = "d" * 40
+    clean = _review(
+        head=head,
+        body=f"{POLICY.CLEAN_MARKER}\nReviewed commit: {head}",
+    )
+    review_pages = [[clean], []]
+    comment_pages = [[], [_comment(head=head)]]
+
+    reviews = POLICY.flatten_pages(review_pages)
+    comments = POLICY.flatten_pages(comment_pages)
+    ok, reason = POLICY.codex_review_state_from_payloads(
+        reviews=reviews,
+        comments=comments,
+        head_sha=head,
+    )
+    assert not ok
+    assert reason == "Codex posted inline findings for current head"
+
+
 def test_governance_paths_cannot_use_automatic_merge():
     blocked_cases = [
         ["src/agentcore/runtime.py", ".github/workflows/filesystem-linux.yml"],
@@ -171,6 +183,23 @@ def test_governance_paths_cannot_use_automatic_merge():
         assert "manual merge" in reason
 
 
+def test_renaming_governance_file_out_of_protected_path_is_blocked():
+    files = [
+        {
+            "status": "renamed",
+            "previous_filename": ".github/workflows/filesystem-linux.yml",
+            "filename": "docs/not-a-workflow.yml",
+        }
+    ]
+    evidence = POLICY.file_evidence_paths(files)
+    assert ".github/workflows/filesystem-linux.yml" in evidence
+    assert "docs/not-a-workflow.yml" in evidence
+
+    ok, reason = POLICY.changed_paths_are_auto_merge_safe(evidence)
+    assert not ok
+    assert "manual merge" in reason
+
+
 def test_normal_runtime_and_test_changes_remain_auto_merge_eligible():
     ok, reason = POLICY.changed_paths_are_auto_merge_safe(
         [
@@ -181,3 +210,41 @@ def test_normal_runtime_and_test_changes_remain_auto_merge_eligible():
     )
     assert ok
     assert "does not modify" in reason
+
+
+def test_atomic_push_rejects_if_main_moves_after_verification(monkeypatch):
+    calls = []
+
+    def fake_run_git(*args, check=True):
+        calls.append((args, check))
+        # Models the remote rejecting the push because main changed after the
+        # verified base was observed but before the final update.
+        return subprocess.CompletedProcess(["git", *args], 1, "", "stale lease")
+
+    monkeypatch.setattr(POLICY, "run_git", fake_run_git)
+    expected_main = "1" * 40
+    merge_sha = "2" * 40
+
+    assert not POLICY.push_merge_with_expected_main(merge_sha, expected_main)
+    assert len(calls) == 1
+    args, check = calls[0]
+    assert args[0] == "push"
+    assert f"--force-with-lease=refs/heads/main:{expected_main}" in args
+    assert f"{merge_sha}:refs/heads/main" in args
+    assert check is False
+
+
+def test_atomic_push_uses_exact_main_lease_when_remote_is_unchanged(monkeypatch):
+    calls = []
+
+    def fake_run_git(*args, check=True):
+        calls.append((args, check))
+        return subprocess.CompletedProcess(["git", *args], 0, "", "")
+
+    monkeypatch.setattr(POLICY, "run_git", fake_run_git)
+    expected_main = "3" * 40
+    merge_sha = "4" * 40
+
+    assert POLICY.push_merge_with_expected_main(merge_sha, expected_main)
+    args, _ = calls[0]
+    assert f"--force-with-lease=refs/heads/main:{expected_main}" in args
