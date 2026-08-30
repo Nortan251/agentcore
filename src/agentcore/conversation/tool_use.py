@@ -178,12 +178,15 @@ class ConversationToolRunner:
                  logger: StructuredLogger | None = None) -> None:
         self.executor = executor
         self.registry = registry
-        # The policy is read for the pre-execution approval check. It is the
-        # *same* object the executor gates with, never a second copy.
-        self.policy = policy if policy is not None else getattr(
-            executor, "policy", None)
+        # Retain the keyword for callers, but never retain a policy snapshot.
+        if policy is not None and policy is not getattr(executor, "policy", None):
+            raise ValueError("conversation policy must be the executor policy")
         self.max_result_chars = max(1, int(max_result_chars))
         self._log = logger or get_logger("conversation.tools")
+
+    @property
+    def policy(self) -> Any:
+        return getattr(self.executor, "policy", None)
 
     # -- catalogue ---------------------------------------------------------
     def catalogue(self) -> list[dict[str, Any]]:
@@ -287,9 +290,10 @@ class ConversationToolRunner:
 
     def _approval_required(self, tool_name: str) -> Any | None:
         """The decision when a capability needs a human, else None."""
-        if self.policy is None:
+        policy = self.policy
+        if policy is None:
             return None
-        evaluate = getattr(self.policy, "evaluate", None)
+        evaluate = getattr(policy, "evaluate", None)
         if not callable(evaluate):
             return None
         try:

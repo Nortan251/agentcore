@@ -869,6 +869,49 @@ def test_runner_defaults_policy_from_the_executor():
     assert runner.policy is policy
 
 
+def test_conversation_cannot_install_a_second_policy_authority():
+    _, registry, executor, _ = build_runner([EchoTest()])
+    with pytest.raises(ValueError):
+        ConversationToolRunner(executor, registry, policy=PermissionPolicy())
+
+
+@pytest.mark.parametrize("initial, replacement, status", [
+    (PermissionLevel.AUTONOMOUS, PermissionLevel.CONFIRM, "approval_required"),
+    (PermissionLevel.CONFIRM, PermissionLevel.AUTONOMOUS, "ok"),
+    (PermissionLevel.CONFIRM, PermissionLevel.OBSERVE, "denied"),
+])
+def test_existing_conversation_runner_observes_policy_replacement(initial, replacement, status):
+    tool = MutatingTool()
+    runner, _, executor, _ = build_runner([tool], level=initial)
+    executor.policy = PermissionPolicy(PermConfig(level=replacement))
+    [outcome] = runner.run_calls([call(tool.name)]).outcomes
+    assert outcome.status == status
+    assert tool.runs == int(status == "ok")
+    assert runner.policy is executor.policy
+
+
+def test_agent_policy_and_existing_conversation_share_current_executor_policy(tmp_path):
+    tool = MutatingTool()
+    agent = Agent(AgentConfig(
+        workspace_dir=str(tmp_path),
+        permissions=PermissionConfig(level=PermissionLevel.CONFIRM),
+        conversation=ConversationConfig(tools_enabled=True),
+        logging=LoggingConfig(level="CRITICAL"),
+    ), AgentDependencies(tools=[tool], **journal_for_tools([tool])))
+    runner = agent._build_tool_runner()
+    agent.executor.policy = PermissionPolicy(PermConfig(level=PermissionLevel.AUTONOMOUS))
+    [outcome] = runner.run_calls([call(tool.name)]).outcomes
+    assert outcome.status == "ok"
+    assert agent.policy is runner.policy is agent.runner.executor.policy
+    assert agent.runner.executor.invoke(tool.name).ok
+    assert tool.runs == 2
+    # The compatibility property delegates updates to the same authority too.
+    agent.policy = PermissionPolicy(PermConfig(level=PermissionLevel.OBSERVE))
+    assert not agent.runner.executor.invoke(tool.name).ok
+    assert runner.run_calls([call(tool.name)]).outcomes[0].status == "denied"
+    assert tool.runs == 2
+
+
 def test_a_custom_executor_is_used():
     class RecordingExecutor:
         policy = None

@@ -174,9 +174,9 @@ class Agent:
         self.log = get_logger("core.agent", agent=self.config.agent_name,
                               environment=self.config.environment)
 
-        self.policy = PermissionPolicy(self.config.permissions,
-                                       approval_gate=deps.approval_gate,
-                                       allow_authenticated_reads=deps.allow_authenticated_reads)
+        policy = PermissionPolicy(self.config.permissions,
+                                  approval_gate=deps.approval_gate,
+                                  allow_authenticated_reads=deps.allow_authenticated_reads)
         self.registry = ToolRegistry(self.config.tools)
         self.registry.register_all(list(
             default_tools() if deps.tools is None else deps.tools))
@@ -204,7 +204,7 @@ class Agent:
             )
 
         self.executor = ToolExecutor(
-            self.registry, self.policy,
+            self.registry, policy,
             workspace=self.workspace,
             tool_settings=self.config.tools.settings,
             action_store=deps.action_store,
@@ -274,6 +274,15 @@ class Agent:
                       tools=self.registry.names(),
                       planner=type(self.planner).__name__,
                       features=self.config.features.enabled_flags())
+
+    @property
+    def policy(self) -> PermissionPolicy:
+        """Compatibility view of the executor's single current policy."""
+        return self.executor.policy
+
+    @policy.setter
+    def policy(self, policy: PermissionPolicy) -> None:
+        self.executor.policy = policy
 
     # -- realtime turns ----------------------------------------------------
     def _build_turn_bridge(self) -> Any | None:
@@ -595,7 +604,7 @@ class Agent:
         from agentcore.conversation.tool_use import ConversationToolRunner
 
         return ConversationToolRunner(
-            self.executor, self.registry, policy=self.policy,
+            self.executor, self.registry,
             max_result_chars=self.config.conversation.max_tool_result_chars,
             logger=get_logger("conversation.tools"))
 
