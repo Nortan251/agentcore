@@ -6,12 +6,11 @@ These rules apply to repository work performed or reviewed by Codex.
 
 - Never push implementation work directly to `main`.
 - Work on a task branch and open a pull request into `main`.
-- Prefer branch names under `codex/` for work intended to use the repository's verified auto-merge path.
-- Do not bypass, disable, weaken, or mark required CI as non-gating to obtain a merge.
-- Ordinary Codex/task work must never force-push, squash, rebase, or amend an already-audited repair unless the task explicitly requires history rewriting.
-- The trusted `.github/automation` auto-merge gate has one narrow exception: it may use `--force-with-lease=refs/heads/main:<verified-main-sha>` only as an atomic compare-and-swap that refuses a stale `main`. Before that push it must construct and verify a merge commit whose first parent is the exact CI-verified `main` SHA and whose second parent is the exact reviewed PR head SHA. This exception is not permission to rewrite `main` or bypass review/CI.
-- Do not merge a PR yourself. The repository auto-merge gate is responsible for merging eligible `codex/**` PRs after the exact current head has passed review and CI.
-- Changes to `AGENTS.md`, `.github/workflows/**`, or `.github/automation/**` are governance changes and intentionally require a manually reviewed merge; they are never eligible for the automatic merge path.
+- Prefer branch names under `codex/` for Codex implementation work.
+- Do not bypass, disable, weaken, rename away, or mark CI as non-gating to obtain a merge.
+- Do not force-push, squash, rebase, or amend an already-audited repair unless the task explicitly requires history rewriting.
+- Treat `AGENTS.md` and `.github/workflows/**` as governance. Changes to them require explicit review and must not be bundled casually into unrelated implementation work.
+- Do not recommend or perform a merge while required Linux or Windows verification is failing, missing, stale, or still running.
 
 ## Required verification before handoff
 
@@ -25,7 +24,7 @@ At minimum before declaring a branch ready:
 - Report the exact final commit SHA and its parent.
 - Report changed files and the exact test results.
 
-GitHub remains the merge authority. A local test pass does not replace the repository's Linux and Windows CI runs on the PR.
+GitHub remains the merge authority. A local test pass does not replace the repository's Linux and Windows CI runs on the pull request.
 
 ## Code review priorities
 
@@ -42,7 +41,7 @@ Treat the following as merge-blocking P0/P1 concerns when reviewing AgentCore:
 8. Provider-idempotency logic that infers `not applied` from a generic exception instead of trusted provider evidence.
 9. Tests that pass by weakening assertions instead of fixing the underlying invariant.
 10. CI/platform-specific behavior that is skipped or hidden rather than handled safely.
-11. Any PR-controlled change that can weaken the CI or review policy used as merge authority for that same PR.
+11. Any change that weakens the CI or review mechanism being relied on to validate that same change.
 
 When a P0/P1 is found, identify the exact invariant violated and require a focused regression test that fails before the repair and passes after it.
 
@@ -50,13 +49,7 @@ When a P0/P1 is found, identify the exact invariant violated and require a focus
 
 - Review the exact current PR head, not an earlier commit.
 - Re-review after every repair commit that changes behavior relevant to a finding.
-- Never treat a reaction timestamp as proof that a particular SHA was reviewed.
-- If the exact current head has any P0/P1 finding, do **not** emit the clean marker below.
-- If the exact current head is clean with no P0/P1 findings, submit a GitHub review whose body contains these two lines, using the full 40-character commit SHA:
-
-  `AGENTCORE_AUTOMERGE: CLEAN`
-
-  `Reviewed commit: <full-current-head-sha>`
-
-  This structured verdict is required because a generic 👍 reaction cannot be bound safely to a specific commit.
-- Do not approve or recommend merging when required Linux or Windows CI is failing, missing, stale, still running, or was tested against an older `main`.
+- Treat findings on an older SHA as stale evidence once the PR head changes; verify the repair on the new exact head.
+- If a current-head P0/P1 exists, do not recommend merging.
+- A clean review never substitutes for CI, and green CI never substitutes for review on high-risk runtime changes.
+- Do not approve or recommend merging when required Linux or Windows CI was tested against an older PR head or an older relevant base state.
