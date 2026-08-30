@@ -37,8 +37,8 @@ class AuthenticatedReadTool(Tool):
     def validate_contract(self) -> None:
         spec = self.spec
         if type(spec) is not ToolSpec or spec.read_only is not True or (
-            Capability.NET_READ not in spec.capabilities
-            or not spec.capabilities <= READ_ONLY_CAPABILITIES
+            not {Capability.NET_READ, Capability.CREDENTIAL_ACCESS} <= spec.capabilities
+            or not spec.capabilities - {Capability.CREDENTIAL_ACCESS} <= READ_ONLY_CAPABILITIES
         ):
             raise CredentialError(CredentialFailure.UNSUPPORTED)
         if any(reserved_credential_key(parameter.name) for parameter in spec.parameters):

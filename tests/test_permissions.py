@@ -3,7 +3,12 @@ from __future__ import annotations
 import pytest
 
 from agentcore.config.schema import PermissionConfig
-from agentcore.permissions.levels import Capability, PermissionLevel
+from agentcore.permissions.levels import (
+    DEFAULT_BLOCKED_CAPABILITIES,
+    READ_ONLY_CAPABILITIES,
+    Capability,
+    PermissionLevel,
+)
 from agentcore.permissions.policy import (
     AlwaysApproveGate,
     DenyAllApprovalGate,
@@ -108,3 +113,86 @@ def test_no_capabilities_is_allowed():
 def test_read_only_capabilities_allowed_at_every_level(level):
     policy = PermissionPolicy(PermissionConfig(level=level))
     assert policy.evaluate(Capability.FS_READ).outcome is Outcome.ALLOW
+
+
+@pytest.mark.parametrize("level", list(PermissionLevel))
+@pytest.mark.parametrize("opt_in", [False, True])
+def test_bound_credential_reads_require_host_opt_in_at_every_level(level, opt_in):
+    policy = PermissionPolicy(PermissionConfig(level=level),
+                              allow_authenticated_reads=opt_in,
+                              approval_gate=AlwaysApproveGate())
+    capabilities = {Capability.NET_READ, Capability.CREDENTIAL_ACCESS}
+    assert policy.check(capabilities, authenticated_read=True).allowed is opt_in
+    # The same vocabulary still denies generic/raw access at any posture.
+    assert policy.evaluate(Capability.CREDENTIAL_ACCESS).outcome is Outcome.DENY
+    assert policy.check(capabilities).outcome is Outcome.DENY
+    for blocked in (Capability.EMAIL_SEND, Capability.PAYMENT, Capability.SYSTEM_ADMIN):
+        assert policy.check({blocked}).outcome is Outcome.DENY
+        assert policy.check(capabilities | {blocked}, authenticated_read=True).outcome is Outcome.DENY
+    assert DEFAULT_BLOCKED_CAPABILITIES == {
+        Capability.EMAIL_SEND, Capability.PAYMENT,
+        Capability.CREDENTIAL_ACCESS, Capability.SYSTEM_ADMIN,
+    }
+    assert Capability.CREDENTIAL_ACCESS not in READ_ONLY_CAPABILITIES
+
+
+@pytest.mark.parametrize("blocked", [Capability.NET_READ, Capability.CREDENTIAL_ACCESS])
+def test_explicit_blocks_beat_bound_credential_read_opt_in(blocked):
+    policy = PermissionPolicy(PermissionConfig(
+        level=PermissionLevel.AUTONOMOUS, blocked_capabilities=(str(blocked),),
+        capability_overrides={str(blocked): PermissionLevel.OBSERVE},
+    ), allow_authenticated_reads=True, approval_gate=AlwaysApproveGate())
+    decision = policy.check({Capability.NET_READ, Capability.CREDENTIAL_ACCESS},
+                            authenticated_read=True)
+    assert decision.outcome is Outcome.DENY and decision.capability is blocked
+
+
+@pytest.mark.parametrize("capabilities", [
+    (), (Capability.NET_READ,), (Capability.CREDENTIAL_ACCESS,),
+    (Capability.NET_READ, Capability.CREDENTIAL_ACCESS, Capability.NET_WRITE),
+    (Capability.NET_READ, Capability.CREDENTIAL_ACCESS, Capability.FS_WRITE),
+])
+def test_bound_credential_context_never_widens_other_capability_contracts(capabilities):
+    policy = PermissionPolicy(PermissionConfig(level=PermissionLevel.AUTONOMOUS),
+                              allow_authenticated_reads=True)
+    assert policy.check(capabilities, authenticated_read=True).outcome is Outcome.DENY
+
+
+def test_overrides_and_human_approval_cannot_create_credential_read_authority():
+    capabilities = {Capability.NET_READ, Capability.CREDENTIAL_ACCESS}
+    without_opt_in = PermissionPolicy(PermissionConfig(
+        level=PermissionLevel.AUTONOMOUS,
+        capability_overrides={"credential.access": PermissionLevel.OBSERVE},
+    ), approval_gate=AlwaysApproveGate())
+    assert not without_opt_in.check(capabilities, authenticated_read=True).allowed
+    restricted = PermissionPolicy(PermissionConfig(
+        level=PermissionLevel.CONFIRM,
+        capability_overrides={"credential.access": PermissionLevel.AUTONOMOUS},
+    ), allow_authenticated_reads=True, approval_gate=AlwaysApproveGate())
+    assert restricted.check(capabilities, authenticated_read=True).outcome is Outcome.DENY
+
+
+def test_published_permission_snapshot_cannot_change_through_configuration_aliases():
+    overrides = {"credential.access": PermissionLevel.AUTONOMOUS}
+    config = PermissionConfig(capability_overrides=overrides)
+    policy = PermissionPolicy(config, allow_authenticated_reads=True)
+    overrides["credential.access"] = PermissionLevel.OBSERVE
+    capabilities = {Capability.NET_READ, Capability.CREDENTIAL_ACCESS}
+    assert not policy.check(capabilities, authenticated_read=True).allowed
+    with pytest.raises(TypeError):
+        policy.config.capability_overrides["credential.access"] = PermissionLevel.OBSERVE
+    with pytest.raises(AttributeError):
+        policy.config = PermissionConfig()
+    with pytest.raises(AttributeError):
+        policy.allow_authenticated_reads = False
+    # Configuration used by AgentConfig remains an ordinary serializable value.
+    from dataclasses import asdict
+    assert asdict(config)["capability_overrides"] == overrides
+
+
+@pytest.mark.parametrize("flag", [1, "true", object()])
+def test_credential_opt_in_requires_an_explicit_boolean(flag):
+    with pytest.raises(TypeError):
+        PermissionPolicy(allow_authenticated_reads=flag)
+    with pytest.raises(TypeError):
+        PermissionPolicy().check({Capability.NET_READ}, authenticated_read=flag)

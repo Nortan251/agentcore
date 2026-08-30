@@ -89,7 +89,7 @@ def read_tool(name="account_read", *, parameter_type=ParamType.STRING):
     return AuthenticatedReadTool(tool_spec(
         name, "Read items from the explicitly connected test account.",
         parameters=(ToolParameter("query", parameter_type),),
-        capabilities=(Capability.NET_READ,),
+        capabilities=(Capability.NET_READ, Capability.CREDENTIAL_ACCESS),
     ))
 
 
@@ -106,10 +106,11 @@ def setup_runtime(callback=None, *, parameter_type=ParamType.STRING):
                            provider=provider, registry=registry)
 
 
-def executor_for(bundle, *, blocked=(), policy=None, logger=None):
+def executor_for(bundle, *, blocked=(), policy=None, logger=None, allow_authenticated_reads=True):
     executor = ToolExecutor(
         bundle.registry,
-        policy or PermissionPolicy(PermissionConfig(blocked_capabilities=tuple(blocked))),
+        policy or PermissionPolicy(PermissionConfig(blocked_capabilities=tuple(blocked)),
+                                   allow_authenticated_reads=allow_authenticated_reads),
         credential_runtime=bundle.runtime,
         logger=logger,
     )
@@ -150,7 +151,7 @@ def test_execution_preserves_validation_policy_run_and_current_resolution_order(
 
     monkeypatch.setattr(bundle.tool, "validate_args", validate)
     monkeypatch.setattr(bundle.tool, "run", run)
-    executor_for(bundle, policy=Policy())
+    executor_for(bundle, policy=Policy(allow_authenticated_reads=True))
     result = invoke(bundle, checkpoint=lambda: events.append("checkpoint"))
     assert result.ok and result.decision.allowed
     assert events == ["validate", "checkpoint", "permission", "checkpoint",
@@ -173,6 +174,200 @@ def test_existing_connection_or_historical_approval_does_not_grant_permission():
                               approval_gate=AlwaysApproveGate())
     assert not policy.check({Capability.CREDENTIAL_ACCESS}).allowed
     assert not policy.check({Capability.EMAIL_SEND}).allowed
+
+
+@pytest.mark.parametrize("level", list(PermissionLevel))
+@pytest.mark.parametrize("blocked", [(), (Capability.CREDENTIAL_ACCESS,)])
+def test_net_read_without_credential_authority_never_resolves_or_calls_provider(level, blocked):
+    bundle = setup_runtime()
+    policy = PermissionPolicy(PermissionConfig(level=level, blocked_capabilities=blocked),
+                              approval_gate=AlwaysApproveGate())
+    assert policy.check({Capability.NET_READ}).allowed
+    assert not policy.check({Capability.CREDENTIAL_ACCESS}).allowed
+    executor_for(bundle, policy=policy)
+    result = invoke(bundle, approval_context=ApprovalInvocationContext("apr_" + "1" * 12))
+    assert not result.ok and result.result.metadata["kind"] == "permission_denied"
+    assert bundle.vault.resolutions == 0 and bundle.provider.calls == 0
+    assert bundle.provider.lease is None
+
+
+@pytest.mark.parametrize("level", list(PermissionLevel))
+def test_explicit_host_permission_allows_only_the_bound_pure_read(level):
+    bundle = setup_runtime()
+    policy = PermissionPolicy(PermissionConfig(level=level), allow_authenticated_reads=True)
+    executor_for(bundle, policy=policy)
+    result = invoke(bundle)
+    assert result.ok and result.decision.allowed
+    assert bundle.provider.calls == 1 and bundle.vault.resolutions == 1
+    assert bundle.tool.spec.read_only is True
+    assert bundle.tool.capabilities == {Capability.NET_READ, Capability.CREDENTIAL_ACCESS}
+    assert result.action_id is None and result.attempt_id is None
+    assert not policy.check({Capability.CREDENTIAL_ACCESS}).allowed
+
+
+@pytest.mark.parametrize("opt_in", [False, True])
+def test_ordinary_net_reads_keep_working_without_credential_services(opt_in):
+    calls = []
+    ordinary = FunctionTool(tool_spec("public_read", "Read public data",
+                                     capabilities=(Capability.NET_READ,)),
+                            lambda args, context: calls.append(context) or "public data")
+    registry = ToolRegistry()
+    registry.register(ordinary)
+    executor = ToolExecutor(registry, PermissionPolicy(allow_authenticated_reads=opt_in))
+    result = executor.invoke(ordinary.name)
+    assert result.ok and result.result.output == "public data"
+    assert len(calls) == 1 and calls[0].credential_execution is None
+
+
+def test_generic_read_tool_cannot_claim_the_bound_credential_context():
+    calls = []
+    generic = FunctionTool(tool_spec("generic_secret", "Unreviewed secret reader",
+                                    capabilities=(Capability.NET_READ, Capability.CREDENTIAL_ACCESS)),
+                           lambda args, context: calls.append(context))
+    registry = ToolRegistry()
+    registry.register(generic)
+    executor = ToolExecutor(registry, PermissionPolicy(allow_authenticated_reads=True))
+    result = executor.invoke(generic.name, authenticated_read=True, allow_authenticated_reads=True)
+    assert not result.ok and result.result.metadata["kind"] == "permission_denied"
+    assert calls == []
+
+
+def test_model_metadata_cannot_enable_the_host_credential_opt_in():
+    bundle = setup_runtime()
+    executor_for(bundle, allow_authenticated_reads=False)
+    result = invoke(bundle, authenticated_read=True, allow_authenticated_reads=True,
+                    capabilities=["net.read", "credential.access"], approved=True)
+    assert not result.ok and result.result.metadata["kind"] == "permission_denied"
+    assert bundle.vault.resolutions == 0 and bundle.provider.calls == 0
+
+
+@pytest.mark.parametrize("restore_previous", [False, True])
+@pytest.mark.parametrize("check_number", [2, 3])
+def test_policy_replacement_after_evaluation_invalidates_dispatch(
+    monkeypatch, restore_previous, check_number,
+):
+    bundle = setup_runtime()
+    executor_for(bundle)
+    original_policy = bundle.executor.policy
+    original_check = original_policy.check
+    checked, release = threading.Event(), threading.Event()
+    calls = 0
+    results = []
+
+    def gated_check(*args, **kwargs):
+        nonlocal calls
+        decision = original_check(*args, **kwargs)
+        calls += 1
+        if calls == check_number:
+            assert decision.allowed
+            checked.set()
+            assert release.wait(5)
+        return decision
+
+    monkeypatch.setattr(original_policy, "check", gated_check)
+    worker = threading.Thread(target=lambda: results.append(invoke(bundle)), daemon=True)
+    worker.start()
+    try:
+        assert checked.wait(2)
+        bundle.executor.policy = PermissionPolicy(PermissionConfig(
+            blocked_capabilities=(Capability.NET_READ,)))
+        if restore_previous:
+            bundle.executor.policy = original_policy
+    finally:
+        release.set()
+        worker.join(3)
+    assert not worker.is_alive()
+    assert results[0].result.metadata["kind"] == "permission_denied"
+    assert bundle.provider.calls == 0 and bundle.provider.lease is None
+
+
+@pytest.mark.parametrize("seam", ["provider_identity", "credential_expiry"])
+def test_policy_replacement_after_final_check_is_busy_until_dispatch_finishes(monkeypatch, seam):
+    from agentcore.credentials import runtime as credential_runtime
+    from agentcore.credentials.vault import CredentialLease
+
+    bundle = setup_runtime()
+    executor_for(bundle)
+    original_policy = bundle.executor.policy
+    target, name, final_check = (
+        (credential_runtime, "_provider_identity", 3) if seam == "provider_identity"
+        else (CredentialLease, "_check_current", 2)
+    )
+    original_check = getattr(target, name)
+    checked, release = threading.Event(), threading.Event()
+    calls = 0
+    results = []
+
+    def gated_check(value):
+        nonlocal calls
+        result = original_check(value)
+        calls += 1
+        if calls == final_check:
+            checked.set()
+            assert release.wait(5)
+        return result
+
+    monkeypatch.setattr(target, name, gated_check)
+    worker = threading.Thread(target=lambda: results.append(invoke(bundle)), daemon=True)
+    worker.start()
+    try:
+        assert checked.wait(2)
+        assert bundle.provider.calls == 0
+        with pytest.raises(CredentialError) as error:
+            bundle.executor.policy = PermissionPolicy(PermissionConfig(
+                blocked_capabilities=(Capability.NET_READ,)))
+        assert error.value.reason is CredentialFailure.BUSY
+        assert bundle.executor.policy is original_policy
+    finally:
+        release.set()
+        worker.join(3)
+    assert not worker.is_alive() and results[0].ok
+    assert bundle.provider.calls == 1
+    bundle.executor.policy = PermissionPolicy(PermissionConfig(
+        blocked_capabilities=(Capability.NET_READ,)))
+    assert invoke(bundle).result.metadata["kind"] == "permission_denied"
+    assert bundle.provider.calls == 1
+
+
+@pytest.mark.parametrize("failure", ["provider", "unsafe_result", "identity", "expiry"])
+def test_policy_dispatch_lease_is_released_after_failure(failure, monkeypatch):
+    def provider(args, lease):
+        if failure == "provider":
+            raise RuntimeError(lease.reveal())
+        return ToolResult.success(lease.reveal())
+
+    bundle = setup_runtime(provider)
+    executor_for(bundle)
+    if failure in {"identity", "expiry"}:
+        from agentcore.credentials import runtime as credential_runtime
+        expiring = bundle.vault.rotate(
+            bundle.info.reference, IDENTITY, SecretMaterial(ROTATED), scopes=SCOPES,
+            expires_at=NOW + timedelta(seconds=1),
+        )
+        bundle.info = expiring
+        bundle.runtime.bind(bundle.tool, reference=expiring.reference, provider=bundle.provider,
+                            required_scopes=SCOPES, replace_existing=True)
+        original_identity = credential_runtime._provider_identity
+        calls = 0
+
+        def fail_last_identity(provider):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                if failure == "identity":
+                    provider.provider_id = "changed"
+                else:
+                    bundle.vault._clock.advance(1)
+            return original_identity(provider)
+
+        monkeypatch.setattr(credential_runtime, "_provider_identity", fail_last_identity)
+    result = invoke(bundle)
+    assert not result.ok
+    assert bundle.provider.calls == int(failure in {"provider", "unsafe_result"})
+    assert SECRET not in json.dumps(result.to_dict())
+    bundle.executor.policy = PermissionPolicy()
+    bundle.vault.revoke(bundle.info.reference)
+    bundle.registry.unregister(bundle.tool.name)
 
 
 def test_permission_revoked_at_last_checkpoint_blocks_plaintext_resolution():
@@ -276,6 +471,7 @@ def test_host_cancellation_after_lookup_propagates_and_releases_both_leases():
     with pytest.raises(CancellationRequested):
         invoke(bundle, checkpoint=checkpoint)
     assert bundle.vault.resolutions == 1 and bundle.provider.calls == 0
+    bundle.executor.policy = PermissionPolicy()
     bundle.vault.revoke(bundle.info.reference)
     bundle.registry.unregister(bundle.tool.name)
 
@@ -442,7 +638,8 @@ def test_missing_or_unavailable_services_fail_closed_without_fallback(missing):
 
 
 @pytest.mark.parametrize("key", ["credential_ref", "access_token", "connection_id", "account_id",
-                               "scope", "provider", SECRET])
+                               "scope", "provider", "capability", "capabilities", "credential_use",
+                               "authenticated_read", "allow_authenticated_reads", SECRET])
 def test_model_cannot_supply_credential_or_account_authority_through_arguments(key, caplog):
     bundle = setup_runtime()
     executor_for(bundle)
@@ -455,20 +652,25 @@ def test_model_cannot_supply_credential_or_account_authority_through_arguments(k
     assert SECRET not in repr([record.__dict__ for record in caplog.records])
 
 
-def test_nested_credential_fields_are_rejected_before_permission_or_provider():
+@pytest.mark.parametrize("key", ["access_token", "capabilities", "credential_use",
+                               "authenticated_read", "allow_authenticated_reads"])
+def test_nested_credential_fields_are_rejected_before_permission_or_provider(key):
     bundle = setup_runtime(parameter_type=ParamType.OBJECT)
     executor_for(bundle)
-    result = bundle.executor.invoke(bundle.tool.name, {"query": {"access_token": SECRET}})
+    result = bundle.executor.invoke(bundle.tool.name, {"query": {key: SECRET}})
     assert result.result.metadata["kind"] == "validation"
     assert bundle.provider.calls == 0
 
 
 @pytest.mark.parametrize("spec", [
-    tool_spec("bad", "bad", capabilities=(Capability.NET_READ,), read_only=False),
-    tool_spec("bad", "bad", capabilities=(Capability.NET_READ, Capability.NET_WRITE)),
-    tool_spec("bad", "bad", capabilities=(Capability.NET_READ, Capability.CREDENTIAL_ACCESS)),
+    tool_spec("bad", "bad", capabilities=(Capability.NET_READ, Capability.CREDENTIAL_ACCESS),
+              read_only=False),
+    tool_spec("bad", "bad", capabilities=(Capability.NET_READ, Capability.CREDENTIAL_ACCESS,
+                                          Capability.NET_WRITE)),
+    tool_spec("bad", "bad", capabilities=(Capability.NET_READ,)),
+    tool_spec("bad", "bad", capabilities=(Capability.CREDENTIAL_ACCESS,)),
     tool_spec("bad", "bad", capabilities=()),
-    tool_spec("bad", "bad", capabilities=(Capability.NET_READ,),
+    tool_spec("bad", "bad", capabilities=(Capability.NET_READ, Capability.CREDENTIAL_ACCESS),
               parameters=(ToolParameter("credential_ref"),)),
 ])
 def test_unreviewed_authenticated_mutation_or_secret_schemas_are_unavailable(spec):
@@ -629,6 +831,7 @@ def test_provider_interruptions_preserve_control_flow_without_secret_text(interr
     assert SECRET not in "".join(traceback.format_exception(error.value))
     assert error.value.__context__ is None and error.value.__cause__ is None
     # Cleanup still releases both the credential and registry leases.
+    bundle.executor.policy = PermissionPolicy()
     bundle.vault.revoke(bundle.info.reference)
     bundle.registry.unregister(bundle.tool.name)
 
@@ -726,6 +929,12 @@ def test_active_provider_keeps_metadata_locks_free_but_blocks_binding_and_creden
 
     def mutate():
         try:
+            assert bundle.executor.policy.check({Capability.NET_READ}).allowed
+            public = FunctionTool(tool_spec("public_read", "Public data",
+                                            capabilities=(Capability.NET_READ,)),
+                                  lambda args, context: "public data")
+            bundle.registry.register(public)
+            assert bundle.executor.invoke(public.name).ok
             other = bundle.vault.register(replace(IDENTITY, subject="other"),
                                           SecretMaterial(ROTATED), scopes=SCOPES)
             other_tool = read_tool("other_read")
@@ -733,6 +942,7 @@ def test_active_provider_keeps_metadata_locks_free_but_blocks_binding_and_creden
                                 provider=Provider(), required_scopes=SCOPES)
             bundle.registry.register(other_tool)
             for operation in (
+                lambda: setattr(bundle.executor, "policy", PermissionPolicy()),
                 lambda: bundle.vault.revoke(bundle.info.reference),
                 lambda: bundle.vault.rotate(bundle.info.reference, IDENTITY,
                                            SecretMaterial(ROTATED), scopes=SCOPES),
@@ -769,6 +979,30 @@ def test_active_provider_keeps_metadata_locks_free_but_blocks_binding_and_creden
     assert bundle.provider.calls == 1
     bundle.vault.revoke(bundle.info.reference)
     assert invoke(bundle).result.metadata["kind"] == CredentialFailure.REVOKED.value
+
+
+def test_policy_pid_fence_precedes_inherited_mutex_and_dispatch_cleanup(monkeypatch):
+    bundle = setup_runtime()
+    executor = executor_for(bundle)
+    authority = executor._check_credential_authority(bundle.tool, bundle.tool.spec, None)
+    authority.__enter__()
+
+    class PoisonLock:
+        def __enter__(self):
+            pytest.fail("inherited policy lock acquired")
+
+    pid = os.getpid()
+    monkeypatch.setattr(executor, "_policy_lock", PoisonLock())
+    monkeypatch.setattr(os, "getpid", lambda: pid + 1)
+    for operation in (
+        lambda: executor.policy,
+        lambda: setattr(executor, "policy", PermissionPolicy()),
+        executor._policy_snapshot,
+        lambda: authority.__exit__(None, None, None),
+    ):
+        with pytest.raises(CredentialError) as error:
+            operation()
+        assert error.value.reason is CredentialFailure.OWNERSHIP
 
 
 def test_runtime_pid_fence_precedes_inherited_lock_and_executor_permit_cleanup(monkeypatch):
@@ -811,9 +1045,11 @@ def test_real_fork_cannot_use_inherited_runtime_or_permit_and_cannot_hang(monkey
 
     def run(args, context):
         locked, release = threading.Event(), threading.Event()
+        authority = bundle.executor._check_credential_authority(bundle.tool, bundle.tool.spec, None)
+        authority.__enter__()
 
         def hold_lock():
-            with bundle.runtime._lock:
+            with bundle.runtime._lock, bundle.executor._policy_lock:
                 locked.set()
                 release.wait(10)
 
@@ -829,6 +1065,9 @@ def test_real_fork_cannot_use_inherited_runtime_or_permit_and_cannot_hang(monkey
                 lambda: bundle.runtime._snapshot(bundle.tool),
                 lambda: context.credential_execution.invoke(bundle.tool, args),
                 context.credential_execution._finish,
+                lambda: bundle.executor.policy,
+                lambda: setattr(bundle.executor, "policy", PermissionPolicy()),
+                lambda: authority.__exit__(None, None, None),
             ):
                 try:
                     operation()
@@ -839,8 +1078,8 @@ def test_real_fork_cannot_use_inherited_runtime_or_permit_and_cannot_hang(monkey
         os.close(write_fd)
         reaped = False
         try:
-            assert select.select([read_fd], [], [], 5)[0], "inherited runtime lock was touched"
-            assert os.read(read_fd, 16) == b"3"
+            assert select.select([read_fd], [], [], 5)[0], "inherited metadata lock was touched"
+            assert os.read(read_fd, 16) == b"6"
             assert os.waitpid(child, 0)[1] == 0
             reaped = True
         finally:
@@ -850,6 +1089,7 @@ def test_real_fork_cannot_use_inherited_runtime_or_permit_and_cannot_hang(monkey
             os.close(read_fd)
             release.set()
             worker.join(2)
+            authority.__exit__(None, None, None)
         return original(args, context)
 
     monkeypatch.setattr(bundle.tool, "run", run)
@@ -857,7 +1097,10 @@ def test_real_fork_cannot_use_inherited_runtime_or_permit_and_cannot_hang(monkey
 
 
 @pytest.mark.parametrize("leak", [False, True])
-def test_agent_conversation_run_journal_and_json_history_never_contain_credentials(tmp_path, leak):
+@pytest.mark.parametrize("authorized", [False, True])
+def test_agent_conversation_run_journal_and_json_history_never_contain_credentials(
+    tmp_path, leak, authorized,
+):
     bundle = setup_runtime(
         (lambda args, lease: ToolResult.success(lease.reveal())) if leak else None)
     model = SimpleNamespace(requests=[], replies=[
@@ -886,7 +1129,8 @@ def test_agent_conversation_run_journal_and_json_history_never_contain_credentia
     )
     agent = Agent(config, AgentDependencies(
         tools=[bundle.tool, mutator], model=model, state_store=state_store,
-        credential_runtime=bundle.runtime, approval_gate=AlwaysApproveGate(), **journal,
+        credential_runtime=bundle.runtime, allow_authenticated_reads=authorized,
+        approval_gate=AlwaysApproveGate(), **journal,
     ))
     runtime = agent.conversation(sessions=session_store)
     assert runtime.tools.executor is agent.executor is agent.runner.executor
@@ -898,9 +1142,9 @@ def test_agent_conversation_run_journal_and_json_history_never_contain_credentia
     assert len(approval_ids) == 1
     approval = approval_store.load(approval_ids[0]).to_dict()
     response = runtime.send("Read the connected account items.")
-    assert response.tools_executed == int(not leak)
-    assert bundle.provider.calls == 1
-    assert response.tool_outcomes[0].invocation.ok is not leak
+    assert response.tools_executed == int(authorized and not leak)
+    assert bundle.provider.calls == int(authorized)
+    assert response.tool_outcomes[0].invocation.ok is (authorized and not leak)
     assert any(message.role is Role.TOOL for message in model.requests[1].messages)
     task = Task(objective="Read account items", subtasks=[Subtask(
         description="Read items", tool_name=bundle.tool.name,
@@ -911,7 +1155,7 @@ def test_agent_conversation_run_journal_and_json_history_never_contain_credentia
     persisted = state_store.load(agent.state.run_id)
     assert persisted.tool_calls
     assert journal["action_store"].load(mutation.action_id).to_dict() == before
-    assert bundle.provider.calls == 2
+    assert bundle.provider.calls == 2 * int(authorized)
     public = json.dumps([
         agent.registry.describe(), agent.state.to_dict(), before, approval,
         [request.to_dict() for request in model.requests],
@@ -923,6 +1167,15 @@ def test_agent_conversation_run_journal_and_json_history_never_contain_credentia
             public += path.read_text(encoding="utf-8")
     assert SECRET not in public and "verified-subject" not in public
     assert bundle.info.reference not in public
+    # Live credentials plus saved sessions/state and a consumed approval still
+    # cannot replace the host's current credential-use authorization.
+    agent.executor.policy = PermissionPolicy(config.permissions,
+                                             approval_gate=AlwaysApproveGate())
+    blocked = agent.executor.invoke(bundle.tool.name, {"query": "safe"},
+                                    approval_context=ApprovalInvocationContext(approval_ids[0]))
+    assert blocked.result.metadata["kind"] == "permission_denied"
+    assert bundle.provider.calls == 2 * int(authorized)
+    assert journal["action_store"].load(mutation.action_id).to_dict() == before
     # Loaded state, an existing action, and a historical read result provide
     # no live credential runtime to a new executor.
     without_runtime = ToolExecutor(agent.registry, agent.policy)

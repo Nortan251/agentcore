@@ -154,6 +154,10 @@ class AgentDependencies:
     #: model config. Conversation and autonomous execution share this runtime
     #: through their one ToolExecutor.
     credential_runtime: CredentialRuntime | None = None
+    #: Explicit host permission for the bounded authenticated-read context.
+    #: A runtime/connection alone grants nothing; this is never restored from
+    #: AgentConfig, a session, approval, or journal record.
+    allow_authenticated_reads: bool = False
 
 
 class Agent:
@@ -171,7 +175,8 @@ class Agent:
                               environment=self.config.environment)
 
         self.policy = PermissionPolicy(self.config.permissions,
-                                       approval_gate=deps.approval_gate)
+                                       approval_gate=deps.approval_gate,
+                                       allow_authenticated_reads=deps.allow_authenticated_reads)
         self.registry = ToolRegistry(self.config.tools)
         self.registry.register_all(list(
             default_tools() if deps.tools is None else deps.tools))

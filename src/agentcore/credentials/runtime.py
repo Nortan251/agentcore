@@ -13,7 +13,7 @@ import math
 import os
 import threading
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from typing import TYPE_CHECKING, Any, Protocol
 
 from agentcore.credentials.errors import CredentialError, CredentialFailure
@@ -41,6 +41,7 @@ _RESERVED_KEYS = frozenset({
     "clientsecret", "password", "authorization", "auth", "cookie", "cookies",
     "provider", "providerid", "scope", "scopes", "capability", "capabilities",
     "oauth", "oauthtoken", "bearer", "xapikey", "setcookie",
+    "allowauthenticatedreads", "authenticatedread", "credentialuse",
 })
 
 
@@ -184,7 +185,7 @@ class CredentialExecution(RuntimeOnly):
         runtime: CredentialRuntime,
         binding: _Binding,
         arguments: dict[str, Any],
-        authorize: Callable[[], None],
+        authorize: Callable[[], AbstractContextManager[None]],
         *,
         authority: object,
     ) -> None:
@@ -192,7 +193,7 @@ class CredentialExecution(RuntimeOnly):
         self._runtime = runtime
         self._binding = binding
         self._arguments = detached_public_json(arguments)
-        self._authorize: Callable[[], None] | None = authorize
+        self._authorize: Callable[[], AbstractContextManager[None]] | None = authorize
         self._owner_pid = os.getpid()
         self._thread_id = threading.get_ident()
         self._active = True
@@ -327,7 +328,7 @@ class CredentialRuntime(RuntimeOnly):
         tool: AuthenticatedReadTool,
         binding: _Binding,
         args: dict[str, Any],
-        authorize: Callable[[], None],
+        authorize: Callable[[], AbstractContextManager[None]],
         *,
         authority: object,
     ) -> Iterator[CredentialExecution]:
@@ -361,7 +362,8 @@ class CredentialRuntime(RuntimeOnly):
         assert permit._authorize is not None
         # No plaintext exists at either current permission/checkpoint check.
         # Even the private dispatch seam cannot bypass or replay this check.
-        permit._authorize()
+        with permit._authorize():
+            pass
         permit._require_owner()
         if self._snapshot(binding.tool) is not binding or binding.active <= 0:
             raise CredentialError(CredentialFailure.BINDING)
@@ -384,46 +386,47 @@ class CredentialRuntime(RuntimeOnly):
                 if _provider_identity(binding.provider) != binding.info.provider:
                     raise CredentialError(CredentialFailure.IDENTITY_MISMATCH)
                 permit._require_owner()
-                try:
-                    permit._authorize()
-                except CancellationRequested as exc:
-                    host_cancellation = exc
-                    raise
-                permit._require_owner()
-                # The last host callback can itself wait or change state.
-                # Nothing may retarget the recipient or admit an expired
-                # credential between that callback and provider dispatch.
-                if _provider_identity(binding.provider) != binding.info.provider:
-                    raise CredentialError(CredentialFailure.IDENTITY_MISMATCH)
-                lease._check_current()
-                # Only this registered pure-read provider sees the live lease.
-                # Never let a provider exception (including its context/chain)
-                # reach the legacy fast-path exception logger.
-                try:
-                    raw = binding.read(detached_public_json(args), lease)
-                except BaseException as exc:
-                    interruption = _interruption_type(exc)
-                    failure = CredentialFailure.PROVIDER
-                else:
-                    if type(raw) is not ToolResult or type(raw.ok) is not bool:
-                        failure = CredentialFailure.UNSAFE_RESULT
-                    elif not raw.ok:
+                with ExitStack() as dispatch_authority:
+                    try:
+                        dispatch_authority.enter_context(permit._authorize())
+                    except CancellationRequested as exc:
+                        host_cancellation = exc
+                        raise
+                    permit._require_owner()
+                    # The current policy generation is leased until dispatch
+                    # and scrubbing finish, without a policy/runtime/vault
+                    # metadata mutex spanning this provider boundary.
+                    if _provider_identity(binding.provider) != binding.info.provider:
+                        raise CredentialError(CredentialFailure.IDENTITY_MISMATCH)
+                    lease._check_current()
+                    # Only this registered pure-read provider sees the live lease.
+                    # Never let a provider exception (including its context/chain)
+                    # reach the legacy fast-path exception logger.
+                    try:
+                        raw = binding.read(detached_public_json(args), lease)
+                    except BaseException as exc:
+                        interruption = _interruption_type(exc)
                         failure = CredentialFailure.PROVIDER
-                    elif raw.error is not None or type(raw.metadata) is not dict:
-                        failure = CredentialFailure.UNSAFE_RESULT
                     else:
-                        public = detached_public_json(
-                            {"output": raw.output, "metadata": raw.metadata},
-                            # Inert binding IDs stay host-side in this slice.
-                            # Use the pinned binding, not provider-owned data.
-                            secrets=lease._redaction_variants((
-                                binding.info.reference,
-                                binding.info.account_id,
-                                binding.info.connection_id,
-                            )),
-                        )
-                        safe_result = ToolResult(
-                            ok=True, output=public["output"], metadata=public["metadata"])
+                        if type(raw) is not ToolResult or type(raw.ok) is not bool:
+                            failure = CredentialFailure.UNSAFE_RESULT
+                        elif not raw.ok:
+                            failure = CredentialFailure.PROVIDER
+                        elif raw.error is not None or type(raw.metadata) is not dict:
+                            failure = CredentialFailure.UNSAFE_RESULT
+                        else:
+                            public = detached_public_json(
+                                {"output": raw.output, "metadata": raw.metadata},
+                                # Inert binding IDs stay host-side in this slice.
+                                # Use the pinned binding, not provider-owned data.
+                                secrets=lease._redaction_variants((
+                                    binding.info.reference,
+                                    binding.info.account_id,
+                                    binding.info.connection_id,
+                                )),
+                            )
+                            safe_result = ToolResult(
+                                ok=True, output=public["output"], metadata=public["metadata"])
         except CancellationRequested as exc:
             # Only the exact exception from our host callback may propagate.
             # Backend enter/exit errors can use the same exception class with

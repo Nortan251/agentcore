@@ -16,13 +16,15 @@ ToolRegistry lookup
   -> AuthenticatedReadTool argument validation
   -> exact ToolRegistry execution lease
   -> capture trusted account/provider binding (metadata only)
-  -> checkpoint -> PermissionPolicy.check -> checkpoint
+  -> checkpoint -> PermissionPolicy.check(authenticated_read=True) -> checkpoint
   -> executor-created CredentialExecution in ToolContext
   -> Tool.run -> consume the one-use permit
   -> checkpoint + current registry/spec/PermissionPolicy checks
   -> current credential state, exact reference/identity, expiry and scope checks
   -> short-lived CredentialLease
-  -> checkpoint + current permission/registry/provider identity checks after lookup
+  -> checkpoint + current permission/registry checks after lookup
+  -> lease the exact evaluated policy generation
+  -> final provider identity + credential current/expiry checks
   -> registered provider.read
   -> bounded, detached, secret-checked result -> ToolInvocation
 ```
@@ -50,10 +52,49 @@ environment-key lookup is a separate, unchanged facility.
 
 An `AuthenticatedReadTool` holds only its public ToolSpec. Its provider, account,
 credential reference, and required provider scopes are registered out of band.
-The tool must require `NET_READ`, have only read capabilities, and have
-`read_only=True`. `CREDENTIAL_ACCESS`, `EMAIL_SEND`, and other default blocked
-capabilities remain blocked. Token scopes restrict credential use; they never
-add or override PermissionPolicy capabilities.
+The tool must require **both `NET_READ` and `CREDENTIAL_ACCESS`**, have no other
+capabilities outside `READ_ONLY_CAPABILITIES`, and have `read_only=True`. Token
+scopes restrict credential use; they never add or override policy capabilities.
+
+## Credential capability decision (PR #22 authority audit)
+
+`CREDENTIAL_ACCESS` covers **any live secret use**, including a trusted bound
+provider calling `CredentialLease.reveal()`. The vocabulary and master handoff
+did not establish a narrower export-only meaning. Authentication must therefore
+declare this existing capability rather than hide it behind `NET_READ`.
+
+`DEFAULT_BLOCKED_CAPABILITIES` is unchanged. `evaluate(CREDENTIAL_ACCESS)` and
+ordinary `check` requests for it still deny at every permission level, including
+AUTONOMOUS and with an approving gate. `CREDENTIAL_ACCESS` is not added to the
+global `READ_ONLY_CAPABILITIES` set. `EMAIL_SEND`, `PAYMENT`, `SYSTEM_ADMIN`, and
+other mutation gates have no new path or relaxed default.
+
+The sole exception is the reviewed bound pure-read context:
+
+1. The host explicitly constructs `PermissionPolicy(...,
+   allow_authenticated_reads=True)` or supplies
+   `AgentDependencies(allow_authenticated_reads=True, credential_runtime=...)`.
+   The opt-in defaults to false. It is not a `PermissionConfig`/config-loader
+   field, a tool argument, a token scope, or restored session/journal data.
+2. ToolExecutor supplies `authenticated_read=True` to `PermissionPolicy.check`
+   only for the exact, validated final `AuthenticatedReadTool` class. A generic
+   tool claiming the same capability names or read-only flag cannot opt in.
+   This classification parameter supplies no authority by itself.
+3. Policy requires the host opt-in, both declared capabilities, and no mutating
+   capability. Explicit blocks still win for credential use and network reads.
+   A capability override can further restrict the credential read's level but
+   cannot create its opt-in; approval cannot substitute for it. Host-authorized
+   pure reads are otherwise available at OBSERVE.
+4. All declared read capabilities pass their ordinary current policy checks.
+   The executor and credential runtime additionally enforce the exact current
+   tool, provider, account, connection, generation, scope, and expiry binding.
+
+This context permits no raw credential export/management tool, authenticated
+mutation, ephemeral-control escape, or reconciliation probe. ActionJournal's
+adapter and reconciliation-capability rules are unchanged. Authenticated reads
+remain non-journaled by their validated effect classification. The host opt-in
+does not change Stage 5 mutation policy fingerprints or historical approval
+semantics, because it cannot authorize any such action.
 
 ## Identity and lifecycle
 
@@ -90,6 +131,37 @@ tool bindings at 256. Exhaustion fails closed. Durable archival and compaction
 are future backend concerns, not silent deletion/reuse of identities.
 
 ## Concurrency, revocation, and process ownership
+
+Concurrent **whole-policy replacement** through `executor.policy = new_policy`
+is supported. Existing tests already treat replacement from another thread as
+current revocation; the audit therefore classified the post-check dispatch race
+as **P1**, not a documentation-only P2.
+
+PermissionPolicy takes a detached immutable configuration snapshot and exposes
+a read-only host opt-in. Mutating a published policy's authority in place is not
+a supported update operation. Caller-owned override dictionaries are copied,
+and the published mapping/configuration cannot be edited through the public
+surface. Custom trusted policies must retain these snapshot semantics rather
+than mutate their authority or depend on uncoordinated external state.
+
+The executor owns a monotonically increasing policy generation and a short
+metadata mutex. Evaluation and checkpoints run outside that mutex. It then
+atomically verifies that the evaluated policy object **and generation** are
+still current and acquires a dispatch lease. Replacing a policy and replacing
+it back (ABA) does not validate the earlier decision. A completed replacement
+before this admission fails the call closed. The preliminary permission lease
+is released before vault lookup, so revocation while lookup waits still works.
+
+The final lease spans provider-identity/current-expiry checks, provider I/O, and
+result scrubbing. Until it exits, whole-policy replacement fails categorically
+with `credential_busy` and changes nothing; it is not a successful revocation
+or queued update. The host may explicitly retry after dispatch returns. This
+applies to any replacement on that executor while a credential dispatch is
+leased. Ordinary policy evaluations, public reads, unrelated registry/vault
+metadata, and other executors remain available. No permission mutex is held
+across callbacks or network I/O. PID checks precede the new mutex and its lease
+cleanup; cleanup also verifies the creating thread. This does not introduce a
+new concurrency promise for existing Stage 5 mutation/approval paths.
 
 One credential generation/connection permits at most one active synchronous
 provider call. Concurrent use fails busy. Successful revocation, rotation, or
@@ -206,4 +278,14 @@ injection, result/exception leak attempts, one-use/escaped permits, concurrent
 metadata mutation during provider I/O, and process ownership. Real Agent
 conversation/autonomous tests serialize JSON state/sessions and inspect a
 nonempty ActionJournal plus a consumed approval record, including the rejected
-secret-output path. POSIX tests skip explicitly on Windows and require Linux CI.
+secret-output path and the default-denied host opt-in. Additional deterministic
+Events pause after policy evaluation and at the final provider-identity and
+credential-expiry boundaries. They prove stale-generation/ABA rejection, busy
+replacement during dispatch, exception/cancellation cleanup, and policy metadata
+progress during provider I/O. Poisoned-lock and real-fork tests cover inherited
+policy access and cleanup alongside the existing runtime ownership fences.
+
+`tests/test_permissions.py` covers the bounded context at every level, unchanged
+default blocks, immutable policy snapshots, explicit block/override precedence,
+and rejection of generic or widened credential authority. POSIX tests skip
+explicitly on Windows and require Linux CI.
