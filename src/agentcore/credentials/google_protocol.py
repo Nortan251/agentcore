@@ -15,6 +15,7 @@ import re
 import ssl
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from types import SimpleNamespace
 from typing import Any, Protocol
 from urllib.parse import urlencode
@@ -29,9 +30,24 @@ GOOGLE_ISSUER = "https://accounts.google.com"
 GOOGLE_AUTHORIZATION_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_CERTIFICATES_ENDPOINT = "https://www.googleapis.com/oauth2/v1/certs"
 GOOGLE_IDENTITY_SCOPES = frozenset({"openid", "email", "profile"})
+GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+GOOGLE_GMAIL_READONLY_SCOPES = GOOGLE_IDENTITY_SCOPES | {GMAIL_READONLY_SCOPE}
 _SCOPE_ALIASES = {"openid": "openid", "email": "email", "profile": "profile",
                   "https://www.googleapis.com/auth/userinfo.email": "email",
-                  "https://www.googleapis.com/auth/userinfo.profile": "profile"}
+                  "https://www.googleapis.com/auth/userinfo.profile": "profile",
+                  GMAIL_READONLY_SCOPE: GMAIL_READONLY_SCOPE}
+
+
+class GoogleAccessProfile(Enum):
+    """Reviewed host consent choices, never model-selected scope strings."""
+
+    IDENTITY = "identity"
+    GMAIL_READONLY = "gmail_readonly"
+
+    @property
+    def scopes(self) -> frozenset[str]:
+        return (GOOGLE_GMAIL_READONLY_SCOPES if self is GoogleAccessProfile.GMAIL_READONLY
+                else GOOGLE_IDENTITY_SCOPES)
 
 
 class GoogleOAuthConfig(RuntimeOnly):

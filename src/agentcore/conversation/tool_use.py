@@ -80,10 +80,9 @@ class ToolCallOutcome:
                        name=self.call.name)
 
     def describe(self) -> dict[str, Any]:
-        """Log-safe: identity and status, never arguments or output."""
+        """Log-safe: registered tool and status, never model call IDs or data."""
         return {
             "tool": self.call.name,
-            "call_id": self.call.id,
             "status": self.status,
             "executed": self.executed,
             "duration_ms": round(self.duration_ms, 3),
@@ -241,8 +240,10 @@ class ConversationToolRunner:
 
     def _run_one(self, call: ToolCall, *,
                  session_id: str | None) -> ToolCallOutcome:
-        log = self._log.bind(tool=call.name, call_id=call.id,
-                             session_id=session_id)
+        # Model-selected call IDs can repeat private argument values (for
+        # example a Gmail search query). Keep them in protocol messages only,
+        # never generic logs or log-safe outcome descriptions.
+        log = self._log.bind(tool=call.name, session_id=session_id)
         log.info(Events.CONVERSATION_TOOL_REQUESTED,
                  argument_count=len(call.arguments))
 

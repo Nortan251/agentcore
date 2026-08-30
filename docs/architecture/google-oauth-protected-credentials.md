@@ -5,8 +5,10 @@ Official protocol guidance checked on 2026-08-30.
 
 This stage adds an explicit **host** service for establishing, verifying,
 persisting, restoring, refreshing, and locally disconnecting a Google identity.
-It adds no model-facing connection tool, Gmail API call, email capability,
-remote revocation, default credential discovery, or paid infrastructure.
+PR #23 added no model-facing connection tool, Gmail API call, email capability,
+remote revocation, default credential discovery, or paid infrastructure. The
+subsequent [Gmail read-only integration](gmail-readonly-integration.md) extends
+this service with a separate reviewed host consent profile and two pure reads.
 The [credential foundation](credential-identity-foundation.md) remains the
 execution authority contract. Stage 5 action and approval schemas are unchanged.
 
@@ -136,9 +138,13 @@ refresh retry, and no claim of distributed exactly-once behavior.
 The host supplies `GoogleOAuthConfig`, never model arguments. Client ID is
 required; the installed-app client secret is optional `SecretMaterial` and stays
 outside generic configuration serialization. Provider, issuer, endpoints and
-requested scopes are fixed by this implementation. Only `openid email profile`
-is requested, with `access_type=offline` and explicit `prompt=consent` when the
-host deliberately connects/reconnects. Gmail scopes are not requested.
+requested scope profiles are fixed by this implementation. The default
+`GoogleAccessProfile.IDENTITY` requests only `openid email profile`, with
+`access_type=offline` and explicit `prompt=consent` when the host deliberately
+connects/reconnects. The separately reviewed `GMAIL_READONLY` profile requests
+fresh full consent for identity plus Gmail read-only; no scope list is accepted
+from model arguments. See the Gmail integration document for its exact grant
+checks and stable-account upgrade behavior.
 
 The protocol follows Google's current
 [installed-app guidance](https://developers.google.com/identity/protocols/oauth2/native-app):
@@ -206,7 +212,9 @@ omit nonce; if present it must match the stored original nonce, as specified by
 Google's `userinfo.email`/`userinfo.profile` grant spellings normalize to the
 requested identity scopes. Granted scopes may shrink, never expand. An omitted
 refresh scope means unchanged under the OAuth response contract; explicit null
-is invalid. `openid` is required for this identity-only lifecycle.
+is invalid. `openid` is required for the identity-only lifecycle. The Gmail
+profile additionally requires its complete exact reviewed scope set on initial
+consent and refresh; an identity-only refresh cannot expand into that profile.
 
 ## Refresh concurrency and generation publication
 
@@ -309,13 +317,12 @@ actual loopback sockets, process crashes, process exclusion and Event-controlled
 races. POSIX fork/fsync coverage must be confirmed by Linux CI, not inferred
 from Windows skips. No automated test uses a Google account or real token.
 
-The future Gmail read-only stage can request deliberately expanded consent in
-a separately reviewed design, select a verified connection in trusted host
-composition, obtain its current access generation, and bind a pure-read provider
-through `CredentialRuntime`. Gmail scopes are intentionally rejected here.
-`NET_READ + CREDENTIAL_ACCESS + allow_authenticated_reads=True` remain required;
-`EMAIL_SEND`, `PAYMENT` and `SYSTEM_ADMIN` remain blocked. No Gmail work begins
-until this stage's PR is independently reviewed and merged.
+The subsequent Gmail read-only integration uses a separate exact host consent
+profile, obtains the current verified connection's access generation, and binds
+pure-read providers through `CredentialRuntime`. `NET_READ + CREDENTIAL_ACCESS
++ allow_authenticated_reads=True` remain required; `EMAIL_SEND`, `PAYMENT` and
+`SYSTEM_ADMIN` remain blocked. Gmail mutations and broader Google scopes remain
+unsupported. PR #23's original identity-only manual procedure below is unchanged.
 
 The P2 policy-view repair makes `Agent.policy` a compatibility property over
 `ToolExecutor.policy`. Conversation prechecks resolve that same current policy
