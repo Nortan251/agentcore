@@ -9,6 +9,7 @@ aggregates, not the other way round. It is re-exported from
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Mapping
 
 from agentcore.errors import ConfigError
 from agentcore.permissions.levels import PermissionLevel
@@ -20,7 +21,7 @@ class PermissionConfig:
 
     level: PermissionLevel = PermissionLevel.OBSERVE
     # capability name -> minimum level required to run it unattended
-    capability_overrides: dict[str, PermissionLevel] = field(default_factory=dict)
+    capability_overrides: Mapping[str, PermissionLevel] = field(default_factory=dict)
     # capabilities that are hard-blocked regardless of level
     blocked_capabilities: tuple[str, ...] = ()
 

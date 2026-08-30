@@ -10,6 +10,7 @@ from agentcore.tools.base import (
 )
 from agentcore.tools.executor import ToolExecutor, ToolInvocation
 from agentcore.tools.registry import ToolRegistry
+from agentcore.tools.authenticated import AuthenticatedReadTool
 
 __all__ = [
     "Tool",
@@ -23,4 +24,5 @@ __all__ = [
     "ToolRegistry",
     "ToolExecutor",
     "ToolInvocation",
+    "AuthenticatedReadTool",
 ]

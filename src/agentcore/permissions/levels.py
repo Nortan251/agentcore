@@ -78,6 +78,9 @@ class Capability(str, Enum):
     # high-risk; blocked by default policy in this foundation
     EMAIL_SEND = "email.send"
     PAYMENT = "payment"
+    # Any live secret use, including a bound provider's authentication. The
+    # sole contextual exception is host-authorized authenticated pure reads;
+    # this is never an ordinary read capability or a model-selected grant.
     CREDENTIAL_ACCESS = "credential.access"
     SYSTEM_ADMIN = "system.admin"
 
@@ -92,8 +95,9 @@ READ_ONLY_CAPABILITIES: frozenset[Capability] = frozenset({
     Capability.SCREEN_OBSERVE,
 })
 
-#: Capabilities this foundation refuses outright. Later tasks that need one of
-#: these must remove it deliberately and add its own review/audit path.
+#: Ordinary requests for these capabilities are refused at every level. Only
+#: CREDENTIAL_ACCESS has a reviewed, explicitly host-enabled pure-read context
+#: in PermissionPolicy.check; the generic block and other capabilities remain.
 DEFAULT_BLOCKED_CAPABILITIES: frozenset[Capability] = frozenset({
     Capability.EMAIL_SEND,
     Capability.PAYMENT,

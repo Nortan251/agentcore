@@ -14,8 +14,8 @@ import os
 import hmac
 import threading
 import time
-from collections.abc import Callable, Mapping
-from contextlib import nullcontext
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -79,6 +79,8 @@ from agentcore.errors import (
     PermissionDeniedError,
     ToolValidationError,
 )
+from agentcore.credentials import CredentialError, CredentialFailure, CredentialRuntime
+from agentcore.credentials.runtime import CredentialExecution
 from agentcore.fs.sensitive import DEFAULT_SENSITIVE_POLICY
 from agentcore.observability.events import Events
 from agentcore.observability.logging import StructuredLogger, get_logger
@@ -86,6 +88,7 @@ from agentcore.permissions.levels import READ_ONLY_CAPABILITIES, Capability
 from agentcore.permissions.policy import Decision, Outcome, PermissionPolicy
 from agentcore.realtime.errors import CancellationRequested
 from agentcore.tools.base import ToolContext, ToolResult, ToolSpec
+from agentcore.tools.authenticated import AuthenticatedReadTool
 from agentcore.tools.registry import ToolRegistry, ToolRegistryLeaseError
 from agentcore.util.clock import Clock, SystemClock
 from agentcore.util.ids import new_id
@@ -223,8 +226,13 @@ class ToolExecutor:
         action_owner_id: str | None = None,
         action_owner_epoch: int = 1,
         approval_authority: DurableApprovalAuthority | None = None,
+        credential_runtime: CredentialRuntime | None = None,
     ) -> None:
         self.registry = registry
+        self._policy_owner_pid = os.getpid()
+        self._policy_lock = threading.Lock()
+        self._policy_generation = 0
+        self._credential_policy_leases = 0
         self.policy = policy
         self.workspace = workspace
         self.workspace_dir = (str(workspace.root) if workspace is not None
@@ -244,12 +252,48 @@ class ToolExecutor:
         self._action_owner_id = action_owner_id or f"process:{os.getpid()}"
         self._action_owner_epoch = action_owner_epoch
         self._approval_authority = approval_authority
+        self._credential_runtime = credential_runtime
+        self._credential_authority = object()
+        if credential_runtime is not None:
+            credential_runtime._attach_executor(self._credential_authority)
         self._action_domain_health_lock = threading.Lock()
         self._action_domain_health = (
             ActionDomainHealth.validation_pending()
             if action_store is not None
             else ActionDomainHealth.healthy()
         )
+
+    def _require_policy_owner(self) -> None:
+        if self._policy_owner_pid != os.getpid():
+            raise CredentialError(CredentialFailure.OWNERSHIP)
+
+    def _policy_snapshot(self) -> tuple[PermissionPolicy, int]:
+        self._require_policy_owner()
+        with self._policy_lock:
+            self._require_policy_owner()
+            return self._policy, self._policy_generation
+
+    @property
+    def policy(self) -> PermissionPolicy:
+        return self._policy_snapshot()[0]
+
+    @policy.setter
+    def policy(self, policy: PermissionPolicy) -> None:
+        """Replace a complete host policy, or fail busy without changing it.
+
+        Replacement from another thread is supported. Once an authenticated
+        dispatch leases its evaluated generation, replacement cannot complete
+        until that dispatch exits. No policy mutex is held across callbacks or
+        I/O. In-place changes to published policy authority are unsupported.
+        This lease does not change Stage 5 mutation/approval ownership.
+        """
+        self._require_policy_owner()
+        with self._policy_lock:
+            self._require_policy_owner()
+            if self._credential_policy_leases:
+                raise CredentialError(CredentialFailure.BUSY)
+            self._policy = policy
+            self._policy_generation += 1
 
     @property
     def action_domain_health(self) -> ActionDomainHealth:
@@ -389,6 +433,7 @@ class ToolExecutor:
         tool_name: str,
         *,
         action_execution_permit: ActionExecutionPermit | None = None,
+        credential_execution: CredentialExecution | None = None,
     ) -> ToolContext:
         return ToolContext(
             config=dict(self._tool_settings.get(tool_name, {})),
@@ -396,6 +441,7 @@ class ToolExecutor:
             workspace_dir=self.workspace_dir,
             workspace=self.workspace,
             action_execution_permit=action_execution_permit,
+            credential_execution=credential_execution,
         )
 
     def invoke(
@@ -425,11 +471,12 @@ class ToolExecutor:
             )
         tool_spec = tool.spec
         mutation = not tool_spec.read_only
-        log = (self._log.bind(tool=tool_name) if mutation
+        private = mutation or type(tool) is AuthenticatedReadTool
+        log = (self._log.bind(tool=tool_name) if private
                else self._log.bind(tool=tool_name, **context_meta))
-        logged_args = (_redacted_declared_args(supplied, tool_spec) if mutation
+        logged_args = (_redacted_declared_args(supplied, tool_spec) if private
                        else _safe_args_for_log(supplied))
-        if mutation:
+        if private:
             log.info(
                 Events.TOOL_INVOKED,
                 args=logged_args,
@@ -450,27 +497,29 @@ class ToolExecutor:
             log.warning(
                 Events.TOOL_FAILED,
                 reason="validation",
-                error=("invalid mutation arguments" if mutation else exc.message),
-                details=({} if mutation else exc.details),
+                error=("invalid mutation arguments" if mutation else
+                       "invalid authenticated arguments" if private else exc.message),
+                details=({} if private else exc.details),
             )
             return ToolInvocation(
                 tool_name,
                 (_redacted_declared_args(supplied, tool_spec)
-                 if mutation else supplied),
+                 if private else supplied),
                 ToolResult.failure(
-                    "Tool arguments were invalid." if mutation else exc.message,
+                    "Tool arguments were invalid." if private else exc.message,
                     kind="validation",
-                    **({} if mutation else exc.details),
+                    **({} if private else exc.details),
                 ),
                 elapsed(),
             )
         except Exception:
-            if not mutation:
+            if not private:
                 raise
             log.warning(
                 Events.TOOL_FAILED,
                 reason="validation",
-                error="mutation argument validation failed",
+                error=("mutation argument validation failed" if mutation else
+                       "authenticated argument validation failed"),
             )
             return ToolInvocation(
                 tool_name,
@@ -1087,6 +1136,11 @@ class ToolExecutor:
                     log,
                     elapsed,
                 )
+        except CredentialError as exc:
+            return self._safe_pre_action_failure(
+                tool_spec.name, cleaned, elapsed(), log, exc.reason.value,
+                CredentialError(exc.reason).message,
+            )
         except ToolRegistryLeaseError:
             log.warning(
                 Events.TOOL_FAILED,
@@ -1095,7 +1149,8 @@ class ToolExecutor:
             )
             return ToolInvocation(
                 tool_spec.name,
-                cleaned,
+                (_redacted_declared_args(cleaned, tool_spec)
+                 if type(tool) is AuthenticatedReadTool else cleaned),
                 ToolResult.failure(
                     "The registered tool changed before execution.",
                     kind="tool_registration_changed",
@@ -1113,10 +1168,24 @@ class ToolExecutor:
         elapsed: Callable[[], float],
     ) -> ToolInvocation:
         """Validation/checkpoint/policy/checkpoint/run with a live lease."""
+        authenticated = type(tool) is AuthenticatedReadTool
+        safe_args = (_redacted_declared_args(cleaned, tool_spec)
+                     if authenticated else cleaned)
+        binding = None
+        if authenticated:
+            tool.validate_contract()
+            if self._credential_runtime is None:
+                raise CredentialError(CredentialFailure.UNAVAILABLE)
+            # Capture account/provider identity before permission or callbacks.
+            # Rotation/rebinding during those callbacks cannot substitute it.
+            binding = self._credential_runtime._snapshot(tool)
         if checkpoint is not None:
             checkpoint()
-        decision = self.policy.check(
-            tool_spec.capabilities, description=tool_spec.description)
+        decision = (self.policy.check(
+            tool_spec.capabilities, description=tool_spec.description,
+            authenticated_read=True,
+        ) if authenticated else self.policy.check(
+            tool_spec.capabilities, description=tool_spec.description))
         log.debug(Events.PERMISSION_CHECKED, **decision.to_dict())
         if not decision.allowed:
             log.warning(Events.TOOL_DENIED, **decision.to_dict())
@@ -1128,7 +1197,7 @@ class ToolExecutor:
             )
             return ToolInvocation(
                 tool_spec.name,
-                cleaned,
+                safe_args,
                 ToolResult.failure(
                     denial.message,
                     kind="permission_denied",
@@ -1140,18 +1209,46 @@ class ToolExecutor:
         if checkpoint is not None:
             checkpoint()
         try:
-            result = tool.run(cleaned, self._context(tool_spec.name))
+            if authenticated:
+                assert self._credential_runtime is not None and binding is not None
+                with self._credential_runtime._execution(
+                    tool, binding, cleaned,
+                    lambda: self._check_credential_authority(tool, tool_spec, checkpoint),
+                    authority=self._credential_authority,
+                ) as permit:
+                    result = tool.run(cleaned, self._context(
+                        tool_spec.name, credential_execution=permit,
+                    ))
+            else:
+                result = tool.run(cleaned, self._context(tool_spec.name))
             if not isinstance(result, ToolResult):
                 result = ToolResult.success(result)
         except CancellationRequested:
             raise
+        except CredentialError as exc:
+            result = ToolResult.failure(
+                CredentialError(exc.reason).message, kind=exc.reason.value,
+            )
         except AgentError as exc:
+            if authenticated:
+                return self._safe_pre_action_failure(
+                    tool_spec.name, safe_args, elapsed(), log,
+                    CredentialFailure.PROVIDER.value,
+                    CredentialError(CredentialFailure.PROVIDER).message,
+                )
             log.warning(Events.TOOL_FAILED, reason="agent_error",
                         error=exc.message, details=exc.details)
             result = ToolResult.failure(
                 exc.message, kind=type(exc).__name__,
                 retryable=exc.retryable, **exc.details)
         except Exception as exc:  # noqa: BLE001 - legacy fast-path envelope
+            if authenticated:
+                # Never stringify provider/runtime exceptions or log traceback.
+                return self._safe_pre_action_failure(
+                    tool_spec.name, safe_args, elapsed(), log,
+                    CredentialFailure.PROVIDER.value,
+                    CredentialError(CredentialFailure.PROVIDER).message,
+                )
             log.exception(Events.TOOL_FAILED, reason="unhandled_exception",
                           error=str(exc))
             result = ToolResult.failure(
@@ -1169,7 +1266,48 @@ class ToolExecutor:
                 log.warning(Events.TOOL_FAILED, error=result.error,
                             duration_ms=round(duration, 3))
         return ToolInvocation(
-            tool_spec.name, cleaned, result, duration, decision)
+            tool_spec.name, safe_args, result, duration, decision)
+
+    @contextmanager
+    def _check_credential_authority(
+        self,
+        tool: AuthenticatedReadTool,
+        tool_spec: ToolSpec,
+        checkpoint: Callable[[], None] | None,
+    ) -> Iterator[None]:
+        """Lease one currently allowed generation, with no mutex across use.
+
+        The runtime releases the first lease before vault lookup and holds the
+        final lease through identity/expiry checks, provider I/O and scrubbing.
+        A completed replacement (including ABA) invalidates an earlier check.
+        """
+        if checkpoint is not None:
+            checkpoint()
+        if self.registry.get(tool_spec.name) is not tool or tool.spec != tool_spec:
+            raise CredentialError(CredentialFailure.BINDING)
+        tool.validate_contract()
+        policy, generation = self._policy_snapshot()
+        decision = policy.check(
+            tool_spec.capabilities, description=tool_spec.description,
+            authenticated_read=True)
+        if not isinstance(decision, Decision) or not decision.allowed:
+            raise CredentialError(CredentialFailure.PERMISSION)
+        self._require_policy_owner()
+        thread_id = threading.get_ident()
+        with self._policy_lock:
+            self._require_policy_owner()
+            if self._policy is not policy or self._policy_generation != generation:
+                raise CredentialError(CredentialFailure.PERMISSION)
+            self._credential_policy_leases += 1
+        try:
+            yield
+        finally:
+            self._require_policy_owner()
+            if thread_id != threading.get_ident():
+                raise CredentialError(CredentialFailure.OWNERSHIP)
+            with self._policy_lock:
+                self._require_policy_owner()
+                self._credential_policy_leases -= 1
 
     def _current_policy_decision(
         self,

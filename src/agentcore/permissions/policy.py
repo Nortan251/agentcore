@@ -7,8 +7,9 @@ keeps the rule set testable in isolation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
+from types import MappingProxyType
 from typing import Iterable, Protocol
 
 from agentcore.permissions.config import PermissionConfig
@@ -90,16 +91,39 @@ class AlwaysApproveGate:
 
 
 class PermissionPolicy:
-    """Evaluates capability requests against the configured posture."""
+    """Evaluates requests against a detached, immutable permission snapshot.
+
+    Change authority by replacing the executor's policy, not by mutating a
+    published policy/configuration. Custom policies must honor that contract.
+    The authenticated-read opt-in is trusted composition only, never loaded
+    from model arguments, generic state, approvals, or PermissionConfig.
+    """
 
     def __init__(
         self,
         config: PermissionConfig | None = None,
         *,
         approval_gate: ApprovalGate | None = None,
+        allow_authenticated_reads: bool = False,
     ) -> None:
-        self.config = config or PermissionConfig()
+        if type(allow_authenticated_reads) is not bool:
+            raise TypeError("authenticated-read authorization must be a bool")
+        source = config or PermissionConfig()
+        self._config = replace(
+            source,
+            capability_overrides=MappingProxyType(dict(source.capability_overrides)),
+            blocked_capabilities=tuple(source.blocked_capabilities),
+        )
+        self._allow_authenticated_reads = allow_authenticated_reads
         self.approval_gate = approval_gate or DenyAllApprovalGate()
+
+    @property
+    def config(self) -> PermissionConfig:
+        return self._config
+
+    @property
+    def allow_authenticated_reads(self) -> bool:
+        return self._allow_authenticated_reads
 
     @property
     def level(self) -> PermissionLevel:
@@ -152,12 +176,28 @@ class PermissionPolicy:
         capabilities: Iterable[Capability],
         *,
         description: str = "",
+        authenticated_read: bool = False,
     ) -> Decision:
         """Evaluate every capability; the most restrictive outcome wins.
 
         REQUIRE_APPROVAL is resolved through the approval gate, turning into
         ALLOW or DENY so callers only ever see a terminal answer.
+
+        ``authenticated_read`` is an executor-supplied classification for an
+        exact AuthenticatedReadTool with a live host binding. It is not a grant:
+        the separate host opt-in and all current capability gates still apply.
+        Generic CREDENTIAL_ACCESS, raw secret export/management, mutations and
+        reconciliation cannot use this context.
         """
+        if type(authenticated_read) is not bool:
+            raise TypeError("authenticated-read classification must be a bool")
+        if authenticated_read:
+            capabilities = tuple(capabilities)
+            credential = self._authenticated_read_decision(capabilities)
+            if not credential.allowed:
+                return credential
+            capabilities = tuple(cap for cap in capabilities
+                                 if cap is not Capability.CREDENTIAL_ACCESS)
         evaluation = self.evaluate_all(capabilities)
         if not evaluation.capabilities:
             return Decision(Outcome.ALLOW, "no capabilities requested")
@@ -185,6 +225,33 @@ class PermissionPolicy:
                             required_level=required)
         return Decision(Outcome.DENY, "approval was not granted", capability=cap,
                         required_level=required)
+
+    def _authenticated_read_decision(
+        self, capabilities: tuple[Capability, ...],
+    ) -> Decision:
+        if any(not isinstance(cap, Capability) for cap in capabilities):
+            raise TypeError("capabilities must contain Capability values")
+        requested = frozenset(capabilities)
+        credential = Capability.CREDENTIAL_ACCESS
+        if not {Capability.NET_READ, credential} <= requested or not (
+            requested - {credential} <= READ_ONLY_CAPABILITIES
+        ):
+            return Decision(Outcome.DENY, "authenticated read capability contract is invalid",
+                            capability=credential)
+        # The host opt-in is narrower than unblocking the capability. Explicit
+        # blocks win; neither level overrides nor any approval can create it.
+        if not self.allow_authenticated_reads or str(credential) in (
+            self.config.blocked_capabilities
+        ):
+            return Decision(Outcome.DENY, "bound credential reads are blocked by policy",
+                            capability=credential)
+        required = self.config.capability_overrides.get(
+            str(credential), PermissionLevel.OBSERVE)
+        if self.level < required:
+            return Decision(Outcome.DENY, "bound credential read level is not permitted",
+                            capability=credential, required_level=required)
+        return Decision(Outcome.ALLOW, "host-authorized bound credential read",
+                        capability=credential, required_level=required)
 
     def evaluate_all(
         self,
