@@ -416,8 +416,8 @@ class CredentialRuntime(RuntimeOnly):
                             {"output": raw.output, "metadata": raw.metadata},
                             secrets=lease._secret_variants(),
                         )
-                        safe_result = ToolResult.success(
-                            public["output"], **public["metadata"])
+                        safe_result = ToolResult(
+                            ok=True, output=public["output"], metadata=public["metadata"])
         except CancellationRequested as exc:
             # Only the exact exception from our host callback may propagate.
             # Backend enter/exit errors can use the same exception class with

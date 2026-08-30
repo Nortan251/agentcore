@@ -540,6 +540,55 @@ def test_numeric_credential_cannot_escape_as_a_json_number():
     assert "68472915402858327" not in json.dumps(result.to_dict())
 
 
+@pytest.mark.parametrize(("credential", "normalize"), [
+    ("00012345", int),
+    ("+00012345", int),
+    ("-00012345", int),
+    ("00012345", float),
+    ("00123.4500", float),
+    ("0001.2345e4", float),
+    ("00012345", lambda value: str(int(value))),
+    ("00012345", lambda value: str(float(value))),
+    ("9007199254740993", float),
+    ("0001.2345e4", lambda value: int(float(value))),
+])
+def test_normalized_numeric_credential_is_withheld_from_public_result(credential, normalize, caplog):
+    bundle = setup_runtime(lambda args, lease: ToolResult.success(
+        {"items": [{"value": normalize(lease.reveal())}]}))
+    rotated = bundle.vault.rotate(bundle.info.reference, IDENTITY,
+                                  SecretMaterial(credential), scopes=SCOPES)
+    bundle.runtime.bind(bundle.tool, reference=rotated.reference,
+                        provider=bundle.provider, required_scopes=SCOPES, replace_existing=True)
+    executor_for(bundle)
+    result = invoke(bundle)
+    assert not result.ok
+    assert result.result.metadata["kind"] == CredentialFailure.UNSAFE_RESULT.value
+    public = json.dumps(result.to_dict()) + caplog.text
+    assert credential not in public
+    assert str(normalize(credential)) not in public
+    bundle.vault.revoke(rotated.reference)
+
+
+def test_unrelated_numeric_result_is_still_supported():
+    bundle = setup_runtime(lambda args, lease: ToolResult.success({"count": 12345, "ratio": 12.5}))
+    executor_for(bundle)
+    result = invoke(bundle)
+    assert result.ok and result.result.output == {"count": 12345, "ratio": 12.5}
+
+
+@pytest.mark.parametrize("key", ["output", "cls"])
+def test_valid_metadata_keys_are_preserved_without_keyword_binding(key):
+    metadata = {key: {"items": ["safe"]}}
+    bundle = setup_runtime(lambda args, lease: ToolResult(
+        ok=True, output={"items": []}, metadata=metadata))
+    executor_for(bundle)
+    result = invoke(bundle)
+    assert result.ok
+    assert result.result.metadata == {key: {"items": ["safe"]}}
+    metadata[key]["items"][0] = SECRET
+    assert result.result.metadata == {key: {"items": ["safe"]}}
+
+
 @pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
 def test_provider_interruptions_preserve_control_flow_without_secret_text(interruption):
     def provider(args, lease):

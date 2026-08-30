@@ -134,7 +134,11 @@ object repr, serializer, iterator, non-finite number, or unbounded tree is used.
 Results are detached, credential-shaped fields are rejected, and literal/common
 JSON, URL and base64 encodings of the leased token are checked in both strings
 and the complete serialized result (including numeric values). Unsafe output
-is withheld. Provider failure bodies, exception messages, chains and notes are
+is withheld. Numeric credential text also contributes canonical integer/finite
+float forms, so leading zeros, signs, exponent formatting, or float rounding
+cannot bypass this check through ordinary decimal casts. Valid metadata stays
+in its detached dictionary instead of being expanded into constructor keywords.
+Provider failure bodies, exception messages, chains and notes are
 discarded. KeyboardInterrupt/SystemExit retain their control-flow class with
 empty content after safe cleanup. Logs contain categorical failures only.
 Only cancellation originating from the trusted host checkpoint propagates;

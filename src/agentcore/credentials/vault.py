@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import secrets
 import threading
@@ -87,14 +88,31 @@ class CredentialLease(RuntimeOnly):
             raise CredentialError(CredentialFailure.AUTHORITY)
         value = self._material._read()
         encoded = value.encode("utf-8")
-        return tuple(set((
+        variants = {
             value,
             json.dumps(value, ensure_ascii=True)[1:-1],
             quote(value, safe=""),
             quote_plus(value, safe=""),
             base64.b64encode(encoded).decode("ascii"),
             base64.urlsafe_b64encode(encoded).decode("ascii").rstrip("="),
-        )))
+        }
+        # A provider may accidentally coerce opaque text to a JSON number.
+        # Include canonical decimal casts, which lose signs/leading zeros,
+        # exponent formatting, or precision. These are redaction-only values.
+        try:
+            variants.add(str(int(value)))
+        except ValueError:
+            pass
+        try:
+            numeric = float(value)
+        except ValueError:
+            pass
+        else:
+            if math.isfinite(numeric):
+                variants.add(str(numeric))
+                if numeric.is_integer():
+                    variants.add(str(int(numeric)))
+        return tuple(variants)
 
     def _finish(self) -> None:
         self._require_owner()
