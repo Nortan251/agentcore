@@ -16,6 +16,7 @@ import secrets
 import threading
 
 from agentcore.config.schema import AgentConfig
+from agentcore.credentials import CredentialRuntime
 from agentcore.approvals import (
     ApprovalInvocationContext,
     DurableApprovalAuthority,
@@ -149,6 +150,10 @@ class AgentDependencies:
     #: Host-owned durable human authority. It is never constructed from model
     #: or provider state and remains independent of ActionJournal.
     approval_authority: DurableApprovalAuthority | None = None
+    #: Host-injected authenticated-read foundation, never loaded from state or
+    #: model config. Conversation and autonomous execution share this runtime
+    #: through their one ToolExecutor.
+    credential_runtime: CredentialRuntime | None = None
 
 
 class Agent:
@@ -202,6 +207,7 @@ class Agent:
             protected_payload_store=deps.protected_payload_store,
             evidence_store=deps.evidence_store,
             approval_authority=approval_authority,
+            credential_runtime=deps.credential_runtime,
         )
         self.action_recovery: ActionRecoveryCoordinator | None = None
         self.action_recovery_startup: (

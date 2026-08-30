@@ -26,6 +26,7 @@ from agentcore.permissions.levels import Capability
 
 if TYPE_CHECKING:
     from agentcore.action_journal.idempotency import ActionExecutionPermit
+    from agentcore.credentials.runtime import CredentialExecution
 
 
 class ParamType(str, Enum):
@@ -151,6 +152,9 @@ class ToolContext:
     #: Present only at the trusted external-idempotency effect seam. It is
     #: executor-created and never derived from model-visible tool arguments.
     action_execution_permit: ActionExecutionPermit | None = None
+    #: One-use, non-serializable access supplied only by ToolExecutor for an
+    #: explicitly bound authenticated read. This field never contains tokens.
+    credential_execution: CredentialExecution | None = field(default=None, repr=False)
 
 
 class Tool(ABC):
