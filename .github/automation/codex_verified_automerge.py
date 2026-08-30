@@ -1,7 +1,7 @@
 """Verified auto-merge policy for same-repository Codex pull requests.
 
 This file is executed only from the trusted ``main`` branch by the
-``codex-verified-automerge`` workflow.  Eligible PRs may not modify this file,
+``codex-verified-automerge`` workflow. Eligible PRs may not modify this file,
 the merge workflow, the required CI workflows, or the root Codex policy.
 """
 
@@ -22,9 +22,7 @@ REQUIRED_WORKFLOWS = frozenset({
     "filesystem-linux",
     "filesystem-windows",
 })
-GOVERNANCE_PATHS = frozenset({
-    "AGENTS.md",
-})
+GOVERNANCE_PATHS = frozenset({"AGENTS.md"})
 GOVERNANCE_PREFIXES = (
     ".github/workflows/",
     ".github/automation/",
@@ -47,6 +45,40 @@ def api(
             cmd += ["-f", f"{key}={value}"]
     raw = subprocess.check_output(cmd, text=True)
     return json.loads(raw)
+
+
+def flatten_pages(pages: Sequence[Any]) -> list[Any]:
+    """Flatten list-valued GitHub pagination pages and reject odd payloads."""
+    flattened: list[Any] = []
+    for page in pages:
+        if not isinstance(page, list):
+            raise TypeError("paginated GitHub response page is not a list")
+        flattened.extend(page)
+    return flattened
+
+
+def api_paginated(path: str) -> list[Any]:
+    raw = subprocess.check_output(
+        ["gh", "api", "--paginate", "--slurp", path],
+        text=True,
+    )
+    pages = json.loads(raw)
+    if not isinstance(pages, list):
+        raise TypeError("paginated GitHub response is not a list")
+    return flatten_pages(pages)
+
+
+def run_git(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        check=check,
+        text=True,
+        capture_output=True,
+    )
+
+
+def git_output(*args: str) -> str:
+    return run_git(*args).stdout.strip()
 
 
 def current_main_sha() -> str:
@@ -131,12 +163,8 @@ def ci_is_green(
             main_sha=main_sha,
         ):
             run_pr = _matching_run_pr(run, pr_number)
-            tested_head = (
-                run_pr.get("head", {}).get("sha") if run_pr else None
-            )
-            tested_base = (
-                run_pr.get("base", {}).get("sha") if run_pr else None
-            )
+            tested_head = run_pr.get("head", {}).get("sha") if run_pr else None
+            tested_base = run_pr.get("base", {}).get("sha") if run_pr else None
             return False, (
                 f"{name} is not a successful exact-head/current-main run "
                 f"(head={tested_head}, base={tested_base}, "
@@ -151,10 +179,11 @@ def _is_codex(user: Mapping[str, Any] | None) -> bool:
 
 def review_body_is_exact_clean(body: str | None, head_sha: str) -> bool:
     """Bind clean-review authority to an explicit exact SHA in the review."""
-    if not body or CLEAN_MARKER not in body:
-        return False
-    lowered = body.lower()
-    return head_sha.lower() in lowered
+    return bool(
+        body
+        and CLEAN_MARKER in body
+        and head_sha.lower() in body.lower()
+    )
 
 
 def codex_review_state_from_payloads(
@@ -177,7 +206,6 @@ def codex_review_state_from_payloads(
 
     if exact_comments:
         return False, "Codex posted inline findings for current head"
-
     if not exact_reviews:
         return False, "waiting for exact-head Codex review"
 
@@ -195,8 +223,12 @@ def codex_review_state_from_payloads(
 
 
 def codex_review_is_clean(pr_number: int, head_sha: str) -> tuple[bool, str]:
-    reviews = api(f"repos/{REPO}/pulls/{pr_number}/reviews?per_page=100")
-    comments = api(f"repos/{REPO}/pulls/{pr_number}/comments?per_page=100")
+    reviews = api_paginated(
+        f"repos/{REPO}/pulls/{pr_number}/reviews?per_page=100"
+    )
+    comments = api_paginated(
+        f"repos/{REPO}/pulls/{pr_number}/comments?per_page=100"
+    )
     return codex_review_state_from_payloads(
         reviews=reviews,
         comments=comments,
@@ -221,6 +253,19 @@ def changed_paths_are_auto_merge_safe(
     return True, "PR does not modify auto-merge governance"
 
 
+def file_evidence_paths(files: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
+    """Include both sides of renames so governance files cannot be renamed away."""
+    paths: list[str] = []
+    for item in files:
+        filename = item.get("filename")
+        previous = item.get("previous_filename")
+        if filename:
+            paths.append(str(filename))
+        if previous:
+            paths.append(str(previous))
+    return tuple(paths)
+
+
 def pr_changes_are_auto_merge_safe(pr: Mapping[str, Any]) -> tuple[bool, str]:
     changed_count = int(pr.get("changed_files") or 0)
     if changed_count > MAX_AUTO_MERGE_FILES:
@@ -228,10 +273,8 @@ def pr_changes_are_auto_merge_safe(pr: Mapping[str, Any]) -> tuple[bool, str]:
             f"PR changes {changed_count} files; automatic merge limit is "
             f"{MAX_AUTO_MERGE_FILES}"
         )
-    files = api(f"repos/{REPO}/pulls/{pr['number']}/files?per_page=100")
-    return changed_paths_are_auto_merge_safe(
-        str(item.get("filename", "")) for item in files
-    )
+    files = api_paginated(f"repos/{REPO}/pulls/{pr['number']}/files?per_page=100")
+    return changed_paths_are_auto_merge_safe(file_evidence_paths(files))
 
 
 def eligible_prs() -> list[dict[str, Any]]:
@@ -245,9 +288,85 @@ def eligible_prs() -> list[dict[str, Any]]:
     ]
 
 
+def push_merge_with_expected_main(merge_sha: str, main_sha: str) -> bool:
+    """Atomically update main only if the remote ref is still exactly main_sha."""
+    lease = f"--force-with-lease=refs/heads/main:{main_sha}"
+    result = run_git(
+        "push",
+        lease,
+        "origin",
+        f"{merge_sha}:refs/heads/main",
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def create_and_push_merge_commit(
+    *,
+    pr_number: int,
+    head_ref: str,
+    head_sha: str,
+    main_sha: str,
+) -> str | None:
+    """Create (main_sha, head_sha) merge and CAS-push it to main."""
+    run_git("config", "user.name", "github-actions[bot]")
+    run_git(
+        "config",
+        "user.email",
+        "41898282+github-actions[bot]@users.noreply.github.com",
+    )
+
+    run_git("fetch", "--no-tags", "origin", "refs/heads/main")
+    fetched_main = git_output("rev-parse", "FETCH_HEAD")
+    if fetched_main != main_sha:
+        print(f"  skip: remote main moved to {fetched_main} before merge creation")
+        return None
+
+    run_git("fetch", "--no-tags", "origin", f"refs/heads/{head_ref}")
+    fetched_head = git_output("rev-parse", "FETCH_HEAD")
+    if fetched_head != head_sha:
+        print(f"  skip: remote PR head moved to {fetched_head}")
+        return None
+
+    run_git("switch", "--detach", main_sha)
+    merge_message = (
+        f"Merge pull request #{pr_number} from {head_ref}\n\n"
+        "Verified Codex auto-merge"
+    )
+    merged = run_git(
+        "merge",
+        "--no-ff",
+        "--no-edit",
+        "-m",
+        merge_message,
+        head_sha,
+        check=False,
+    )
+    if merged.returncode != 0:
+        print("  skip: local merge did not complete cleanly")
+        run_git("merge", "--abort", check=False)
+        return None
+
+    merge_sha = git_output("rev-parse", "HEAD")
+    first_parent = git_output("rev-parse", "HEAD^1")
+    second_parent = git_output("rev-parse", "HEAD^2")
+    if first_parent != main_sha or second_parent != head_sha:
+        raise RuntimeError(
+            "constructed merge commit parents do not match verified refs"
+        )
+
+    if not push_merge_with_expected_main(merge_sha, main_sha):
+        print("  skip: atomic main lease failed; main changed before push")
+        return None
+    if current_main_sha() != merge_sha:
+        raise RuntimeError("main did not resolve to the pushed merge commit")
+    return merge_sha
+
+
 def try_merge_pr(pr: Mapping[str, Any], main_sha: str) -> str:
     number = int(pr["number"])
     head_sha = str(pr["head"]["sha"])
+    head_ref = str(pr["head"]["ref"])
     base_sha = str(pr["base"]["sha"])
     print(f"PR #{number}: head={head_sha} base={base_sha}")
 
@@ -270,8 +389,6 @@ def try_merge_pr(pr: Mapping[str, Any], main_sha: str) -> str:
     if not review_ok:
         return main_sha
 
-    # Re-read every mutable authority immediately before the merge. A new
-    # head, a new main, or a new governance change invalidates this decision.
     fresh_pr = api(f"repos/{REPO}/pulls/{number}")
     fresh_main = current_main_sha()
     if fresh_pr.get("state") != "open" or fresh_pr.get("draft"):
@@ -288,22 +405,20 @@ def try_merge_pr(pr: Mapping[str, Any], main_sha: str) -> str:
     if not fresh_changes_ok:
         print(f"  skip: {fresh_changes_reason}")
         return fresh_main
-
     if fresh_pr.get("mergeable") is not True:
         print(f"  skip: GitHub mergeable={fresh_pr.get('mergeable')}")
         return fresh_main
 
-    result = api(
-        f"repos/{REPO}/pulls/{number}/merge",
-        method="PUT",
-        fields={"sha": head_sha, "merge_method": "merge"},
+    merge_sha = create_and_push_merge_commit(
+        pr_number=number,
+        head_ref=head_ref,
+        head_sha=head_sha,
+        main_sha=main_sha,
     )
-    if result.get("merged"):
-        merged_sha = str(result["sha"])
-        print(f"  merged PR #{number}: {merged_sha}")
-        return merged_sha
-    print(f"  merge declined by GitHub: {result.get('message')}")
-    return fresh_main
+    if merge_sha is None:
+        return current_main_sha()
+    print(f"  merged PR #{number}: {merge_sha}")
+    return merge_sha
 
 
 def main() -> None:
