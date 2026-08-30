@@ -8,7 +8,8 @@ These rules apply to repository work performed or reviewed by Codex.
 - Work on a task branch and open a pull request into `main`.
 - Prefer branch names under `codex/` for work intended to use the repository's verified auto-merge path.
 - Do not bypass, disable, weaken, or mark required CI as non-gating to obtain a merge.
-- Do not force-push, squash, rebase, or amend an already-audited repair unless the task explicitly requires history rewriting.
+- Ordinary Codex/task work must never force-push, squash, rebase, or amend an already-audited repair unless the task explicitly requires history rewriting.
+- The trusted `.github/automation` auto-merge gate has one narrow exception: it may use `--force-with-lease=refs/heads/main:<verified-main-sha>` only as an atomic compare-and-swap that refuses a stale `main`. Before that push it must construct and verify a merge commit whose first parent is the exact CI-verified `main` SHA and whose second parent is the exact reviewed PR head SHA. This exception is not permission to rewrite `main` or bypass review/CI.
 - Do not merge a PR yourself. The repository auto-merge gate is responsible for merging eligible `codex/**` PRs after the exact current head has passed review and CI.
 - Changes to `AGENTS.md`, `.github/workflows/**`, or `.github/automation/**` are governance changes and intentionally require a manually reviewed merge; they are never eligible for the automatic merge path.
 
