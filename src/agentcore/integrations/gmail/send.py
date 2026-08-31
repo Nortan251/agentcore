@@ -1,8 +1,8 @@
-"""Non-network Gmail send foundation. No production send/probe transport.
+"""Gmail send foundation with an unavailable default transport.
 
 The host prepares private intent and supplies ordinary Stage 5 services. This
 module does not grant permission, consume approval, claim attempts, or recover
-actions. Tests explicitly inject a test-only transport; defaults fail closed.
+actions. Live HTTP requires explicit trusted-host composition; defaults fail closed.
 """
 
 from __future__ import annotations
@@ -103,7 +103,7 @@ class GmailSendSubmission(RuntimeOnly):
 
 
 class GmailProbeRequest(GmailSendSubmission):
-    """Structured future read probe; the transport cannot choose an account."""
+    """Structured private read probe; the transport cannot choose an account."""
 
     user_id = "me"
     label_ids = ("SENT",)
@@ -111,7 +111,9 @@ class GmailProbeRequest(GmailSendSubmission):
 
     @property
     def query(self) -> str:
-        return "rfc822msgid:" + self.message_id
+        # Gmail Help documents the value without RFC header angle brackets.
+        # Header comparison still uses the exact bracketed protected marker.
+        return "rfc822msgid:" + self.message_id[1:-1]
 
 
 @dataclass(frozen=True, repr=False)
@@ -130,11 +132,7 @@ class GmailProbeResponse:
 
 
 class GmailMutationTransport(Protocol):
-    """No implementation ships here. Inject only deterministic test fakes.
-
-    Future send implements one fixed request without retry. Probe performs
-    bounded reads only and must report incomplete/truncated candidate truth.
-    """
+    """Test-only foundation seam. Live HTTP is accepted by exact class below."""
 
     test_only: bool
 
@@ -154,9 +152,20 @@ class UnavailableGmailMutationTransport(RuntimeOnly):
 
 class _SendProvider(RuntimeOnly):
     def __init__(self, sender: str, transport: GmailMutationTransport | None) -> None:
+        from agentcore.integrations.gmail.mutation_http import GmailMutationHttp
+
         self._owner_pid, self._sender = os.getpid(), normalize_address(sender)
         self._available = transport is not None
         self._transport = transport if transport is not None else UnavailableGmailMutationTransport()
+        self._live = type(transport) is GmailMutationHttp
+        self.send_preflight_capabilities = frozenset({Capability.NET_READ}) if self._live else frozenset()
+
+    def normalize_arguments(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        self._owner()
+        normalized = normalize_send_arguments(arguments)
+        if self._live and normalized["bcc"]:
+            raise ValueError("Bcc live delivery disabled pending controlled Gmail validation.")
+        return normalized
 
     def _owner(self) -> None:
         if self._owner_pid != os.getpid():
@@ -176,15 +185,25 @@ class _SendProvider(RuntimeOnly):
             raise CredentialError(CredentialFailure.IDENTITY_MISMATCH)
         if info.scopes != GOOGLE_GMAIL_SEND_SCOPES:
             raise CredentialError(CredentialFailure.SCOPE_MISMATCH)
+        if self._live and not reconcile:
+            self.normalize_arguments(value["message"])
         if not self._available:
             raise CredentialError(CredentialFailure.UNSUPPORTED)
 
+    def preflight_send(self, payload: Mapping[str, Any], credential: CredentialLease,
+                       identity: CredentialActionIdentity) -> object:
+        self.validate_intent(payload, credential.info, reconcile=False)
+        if self._live:
+            return self._transport.verify_sender(GmailSendSubmission(payload, identity), credential)
+        return None
+
     def send(self, payload: Mapping[str, Any], credential: CredentialLease,
-             identity: CredentialActionIdentity) -> ToolResult:
+             identity: CredentialActionIdentity, *, preflight: object = None) -> ToolResult:
         self.validate_intent(payload, credential.info, reconcile=False)
         credential._check_current()
         submission = GmailSendSubmission(payload, identity)
-        raw = self._transport.send(submission, credential)
+        raw = (self._transport.send(submission, credential, verification=preflight) if self._live
+               else self._transport.send(submission, credential))
         self._owner()
         if type(raw) is not dict or not {"id", "threadId"} <= set(raw) or not set(raw) <= {"id", "threadId", "labelIds"}:
             raise SendIntentError()
@@ -268,7 +287,7 @@ class GmailSendActionAdapter(RuntimeOnly):
 
     def prepare_intent(self, cleaned, context) -> PreparedActionIntent:
         payload, handle = self._foundation._load_preparation(context.intent_preparation_id)
-        if normalize_send_arguments(cleaned) != payload["message"]:
+        if self._foundation._provider.normalize_arguments(cleaned) != payload["message"]:
             raise SendIntentError()
         return PreparedActionIntent(
             intent_digest=handle.intent_digest, target_category="gmail.mailbox",
@@ -321,7 +340,10 @@ class GmailSendFoundation(RuntimeOnly):
     def __init__(self, payload_store: ProtectedActionPayloadStore, *, sender: str,
                  transport: GmailMutationTransport | None = None, test_only: bool = False,
                  clock: Clock | None = None) -> None:
-        if type(test_only) is not bool or (transport is not None and
+        from agentcore.integrations.gmail.mutation_http import GmailMutationHttp
+
+        live = type(transport) is GmailMutationHttp
+        if type(test_only) is not bool or (live and test_only) or (transport is not None and not live and
                 (not test_only or getattr(transport, "test_only", None) is not True)):
             raise CredentialError(CredentialFailure.UNSUPPORTED)
         self._owner_pid = os.getpid()
@@ -331,16 +353,16 @@ class GmailSendFoundation(RuntimeOnly):
         self._preparations: dict[str, GmailSendPreparation] = {}
         self._lock = threading.RLock()
         self.tool = AuthenticatedActionTool(tool_spec(
-            "gmail_send_message", "Propose one plain-text email for protected host review and durable approval. Live sending is unavailable.",
+            "gmail_send_message", "Propose one plain-text email for protected host review and durable approval.",
             parameters=(
                 ToolParameter("to", ParamType.ARRAY, "Bare mailboxes; at least one. At most 20 total To/Cc/Bcc recipients."),
                 ToolParameter("cc", ParamType.ARRAY, "Optional bare mailboxes.", required=False),
-                ToolParameter("bcc", ParamType.ARRAY, "Optional blind recipients, privately submitted to Gmail.", required=False),
+                ToolParameter("bcc", ParamType.ARRAY, "Foundation-only blind recipients; non-empty Bcc is disabled in live v1.", required=False),
                 ToolParameter("subject", ParamType.STRING, "At most 1024 UTF-8 bytes; no header controls.", max_length=MAX_SUBJECT_BYTES),
                 ToolParameter("body", ParamType.STRING, "Plain text only; at most 65536 normalized UTF-8 bytes.", max_length=MAX_BODY_BYTES),
             ), capabilities=(Capability.EMAIL_SEND, Capability.NET_WRITE, Capability.CREDENTIAL_ACCESS),
-            read_only=False, tags=("gmail", "authenticated-action", "foundation-only")),
-            normalize_send_arguments, preparation_scope=PREPARATION_SCOPE,
+            read_only=False, tags=("gmail", "authenticated-action")),
+            self._provider.normalize_arguments, preparation_scope=PREPARATION_SCOPE,
         )
         self.adapter = GmailSendActionAdapter(self)
         self.reconciler = GmailSendReconciler()
@@ -366,7 +388,8 @@ class GmailSendFoundation(RuntimeOnly):
             if len(self._preparations) >= MAX_PREPARATIONS:
                 raise CredentialError(CredentialFailure.CAPACITY)
         info = self._runtime.action_info(self.tool)
-        payload = make_send_payload(arguments, info, sender=self._provider._sender, now=self._clock.now())
+        payload = make_send_payload(self._provider.normalize_arguments(arguments), info,
+                                    sender=self._provider._sender, now=self._clock.now())
         stored = self._store.create(new_id("act"), payload)
         handle = GmailSendPreparation(payload["preparation_id"], stored.action_id, stored.reference, stored.intent_digest)
         self.restore(handle)
