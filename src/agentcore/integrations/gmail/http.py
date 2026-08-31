@@ -21,7 +21,13 @@ from agentcore.integrations.gmail.limits import (
 
 _HOST = "gmail.googleapis.com"
 _MESSAGES = "/gmail/v1/users/me/messages"
+# Match the reviewed mutation transport's framing budgets without changing it.
+MAX_HTTP_HEADER_BYTES = 16_384
+MAX_HTTP_HEADER_LINE = 4096
+MAX_HTTP_HEADER_LINES = 66  # status/interim headers, chunk-size lines, trailers
 _JSON_TYPE = re.compile(r'application/json(?:\s*;\s*charset\s*=\s*(?:utf-8|"utf-8"))?', re.IGNORECASE)
+_HEADER_NAME = re.compile(rb"[A-Za-z0-9!#$%&'*+.^_`|~-]{1,128}")
+_FRAMING_FIELDS = {b"content-length", b"transfer-encoding", b"content-type", b"content-encoding"}
 _STATUS_FAILURES = {
     401: CredentialFailure.READ_AUTHENTICATION,
     # A 403 does not prove which scope, Workspace restriction, or quota
@@ -30,6 +36,127 @@ _STATUS_FAILURES = {
     404: CredentialFailure.READ_NOT_FOUND,
     429: CredentialFailure.READ_RATE_LIMIT,
 }
+
+
+def _header_name(line: bytes) -> bytes:
+    name, separator, value = line[:-2].partition(b":")
+    if not separator or _HEADER_NAME.fullmatch(name) is None or any(
+            byte < 32 and byte != 9 or byte == 127 for byte in value):
+        raise CredentialError(CredentialFailure.READ_RESPONSE)
+    return name.lower()
+
+
+class _FramingReader:
+    """Bound every stream call and share one budget across HTTP framing lines."""
+
+    def __init__(self, stream) -> None:
+        self.stream, self.remaining, self.lines = stream, MAX_HTTP_HEADER_BYTES, 0
+        self.headers, self.status_line = True, True
+
+    def readline(self, limit=-1):
+        maximum = min(MAX_HTTP_HEADER_LINE + 1, self.remaining + 1)
+        if limit >= 0:
+            maximum = min(maximum, limit)
+        line = self.stream.readline(maximum)
+        self.remaining -= len(line)
+        self.lines += 1
+        if self.remaining < 0 or len(line) > MAX_HTTP_HEADER_LINE or self.lines > MAX_HTTP_HEADER_LINES or (
+                not line.endswith(b"\r\n")):
+            raise CredentialError(CredentialFailure.READ_RESPONSE)
+        if self.headers:
+            if self.status_line:
+                self.status_line = False
+            elif line == b"\r\n":
+                self.status_line = True  # another status line after an interim response
+            else:
+                _header_name(line)
+        return line
+
+    def read(self, size=-1):
+        # Defense at the final stream seam even if a stdlib parser asks for an
+        # unexpected size. No omitted, negative or oversized read can escape.
+        if type(size) is not int or not 0 <= size <= MAX_JSON_BYTES + 1:
+            raise CredentialError(CredentialFailure.READ_RESPONSE)
+        return self.stream.read(size)
+
+    def close(self):
+        self.stream.close()
+
+    def flush(self):
+        self.stream.flush()
+
+
+class _GmailReadResponse(http.client.HTTPResponse):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fp = self._framing_reader = _FramingReader(self.fp)
+        self._remaining_body = MAX_JSON_BYTES
+
+    def begin(self):
+        self.debuglevel = 0
+        super().begin()
+        self._framing_reader.headers = False
+
+    def _read_next_chunk_size(self):
+        line = self.fp.readline()
+        # int(line, 16) alone accepts signs. Extensions are outside this contract.
+        if re.fullmatch(rb"[0-9A-Fa-f]{1,8}\r\n", line) is None:
+            raise CredentialError(CredentialFailure.READ_RESPONSE)
+        size = int(line[:-2], 16)
+        if size > self._remaining_body:
+            raise CredentialError(CredentialFailure.READ_TOO_LARGE)
+        self._remaining_body -= size
+        return size
+
+    def _get_chunk_left(self):
+        # stdlib discards two bytes without checking CRLF. Validate and charge
+        # that delimiter to the same framing-byte budget before reading it.
+        if self.chunk_left == 0:
+            self._framing_reader.remaining -= 2
+            if self._framing_reader.remaining < 0 or self._safe_read(2) != b"\r\n":
+                raise CredentialError(CredentialFailure.READ_RESPONSE)
+            self.chunk_left = None
+        return super()._get_chunk_left()
+
+    def _read_and_discard_trailer(self):
+        while True:
+            line = self.fp.readline()
+            if line == b"\r\n":
+                return
+            # EOF, bare LF, folding and malformed fields fail closed; trailers
+            # cannot override the already-validated response framing/type.
+            if _header_name(line) in _FRAMING_FIELDS:
+                raise CredentialError(CredentialFailure.READ_RESPONSE)
+
+
+def _response_length(response: http.client.HTTPResponse) -> int | None:
+    if response.headers.defects:
+        raise CredentialError(CredentialFailure.READ_RESPONSE)
+    headers: dict[str, list[str]] = {}
+    for name, value in response.getheaders():
+        headers.setdefault(name.lower(), []).append(value)
+
+    def one(name, default=None):
+        values = headers.get(name, [])
+        if len(values) > 1:
+            raise CredentialError(CredentialFailure.READ_RESPONSE)
+        return values[0] if values else default
+
+    content_type = one("content-type", "")
+    if type(content_type) is not str or len(content_type) > 100 or _JSON_TYPE.fullmatch(content_type.strip()) is None:
+        raise CredentialError(CredentialFailure.READ_RESPONSE)
+    if one("content-encoding", "identity").lower() != "identity":
+        raise CredentialError(CredentialFailure.READ_RESPONSE)
+    length, transfer = one("content-length"), one("transfer-encoding")
+    if transfer is not None and (transfer.lower() != "chunked" or length is not None):
+        raise CredentialError(CredentialFailure.READ_RESPONSE)
+    if length is None:
+        return None
+    if type(length) is not str or re.fullmatch(r"[0-9]{1,20}", length) is None:
+        raise CredentialError(CredentialFailure.READ_RESPONSE)
+    if int(length) > MAX_JSON_BYTES:
+        raise CredentialError(CredentialFailure.READ_TOO_LARGE)
+    return int(length)
 
 
 def decode_json(raw: bytes) -> dict[str, Any]:
@@ -155,6 +282,8 @@ class GmailReadHttp(RuntimeOnly):
         try:
             connection = http.client.HTTPSConnection(_HOST, timeout=10, context=_oauth_tls_context())
             connection.debuglevel = 0  # override class-wide debug settings
+            connection.response_class = _GmailReadResponse
+            response = None
             try:
                 self._owner()
                 token = credential.reveal()
@@ -172,27 +301,21 @@ class GmailReadHttp(RuntimeOnly):
                 if response.status != 200:
                     # Do not even read error bodies or Location headers.
                     raise CredentialError(_STATUS_FAILURES.get(response.status, CredentialFailure.PROVIDER))
-                content_type = response.getheader("Content-Type", "")
-                if type(content_type) is not str or len(content_type) > 100 or _JSON_TYPE.fullmatch(content_type.strip()) is None:
-                    raise CredentialError(CredentialFailure.READ_RESPONSE)
-                if response.getheader("Content-Encoding", "identity").lower() != "identity":
-                    raise CredentialError(CredentialFailure.READ_RESPONSE)
-                length = response.getheader("Content-Length")
-                if length is not None:
-                    if type(length) is not str or re.fullmatch(r"[0-9]{1,20}", length) is None:
-                        raise CredentialError(CredentialFailure.READ_RESPONSE)
-                    if int(length) > MAX_JSON_BYTES:
-                        raise CredentialError(CredentialFailure.READ_TOO_LARGE)
+                length = _response_length(response)
                 raw = response.read(MAX_JSON_BYTES + 1)
                 self._owner()
                 if type(raw) is not bytes or len(raw) > MAX_JSON_BYTES:
                     raise CredentialError(CredentialFailure.READ_TOO_LARGE)
-                if length is not None and len(raw) != int(length):
+                if length is not None and len(raw) != length:
                     raise CredentialError(CredentialFailure.READ_RESPONSE)
                 result = decode_json(raw)
             finally:
                 self._owner()  # never touch an inherited socket in a child
-                connection.close()
+                try:
+                    if response is not None:
+                        response.close()
+                finally:
+                    connection.close()
         except CredentialError as exc:
             failure = exc.reason
         except BaseException as exc:

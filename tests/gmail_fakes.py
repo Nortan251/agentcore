@@ -143,7 +143,8 @@ class Wire:
                     wire.reads.append(maximum)
                     return encoded[:maximum]
                 return SimpleNamespace(
-                    status=wire.status, read=read,
+                    status=wire.status, read=read, close=lambda: None,
+                    headers=SimpleNamespace(defects=[]), getheaders=lambda: list(wire.headers.items()),
                     getheader=lambda name, default=None: wire.headers.get(name, default))
             def close(self):
                 wire.closed += 1
