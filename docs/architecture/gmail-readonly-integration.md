@@ -250,6 +250,36 @@ timeout is per socket I/O, not a hard total response deadline. Response type mus
 be JSON with optional UTF-8 charset, content encoding must be identity, and an
 announced Content-Length must be valid, bounded, and consistent with bytes read.
 
+Read HTTP framing now uses a narrow local response class with the same budgets
+and unsigned chunk grammar as the reviewed PR #26 mutation transport. Keeping
+it local avoids changing send/reconciliation parsing or semantics. Status lines,
+interim headers, chunk-size lines and trailers share a 16,384-byte framing budget,
+4,096-byte line limit and 66-line limit; chunk CRLF delimiters also consume the
+byte budget. A rejected line may consume one extra byte to detect overflow.
+Malformed fields, obsolete folding, bare LF, missing terminators and framing or
+content-type/encoding overrides in trailers are rejected. Response debug output
+is disabled, and both response streams and connections are closed.
+
+Content-Length is a strict nonnegative decimal of at most 20 digits, no larger
+than the existing 1,048,576-byte JSON maximum, and must match the bytes returned.
+Duplicate Content-Length, Transfer-Encoding, Content-Type and Content-Encoding
+fields are rejected. Only a single `chunked` Transfer-Encoding (case-insensitive)
+is accepted, and only without Content-Length. Chunk sizes require 1 through 8
+unsigned hexadecimal digits and CRLF, with no extensions, signs or whitespace.
+Each declared chunk must fit the remaining decoded-body budget before any body
+read; the chunk delimiter must be exactly CRLF. Trailer bytes and chunk overhead
+cannot reset the framing budget. Length-delimited, bounded chunked and
+connection-close-delimited JSON retain their existing public read results.
+
+The previous **negative-chunk unbounded-read P2 is closed**: `-1\r\n` is rejected
+before stdlib integer parsing can lead to `read(-1)`. An additional stream wrapper
+rejects omitted, negative or oversized body-read requests; every underlying
+`read` is at most 1,048,577 bytes and every `readline` at most 4,097 bytes, including
+overflow detection. Deterministic memory-socket tests observe these calls and
+verify that malformed provider bytes never reach exceptions, logs, ToolResult,
+model requests, sessions or ordinary state. Error and redirect bodies remain
+unread; no real account or Gmail network test is involved.
+
 | Failure | Public category |
 | --- | --- |
 | Invalid tool arguments | Existing `validation` before dispatch; defensive provider checks use `authenticated_read_invalid_arguments` |
