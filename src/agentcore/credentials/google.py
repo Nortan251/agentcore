@@ -17,7 +17,8 @@ from urllib.parse import urlencode
 
 from agentcore.credentials.errors import CredentialError, CredentialFailure
 from agentcore.credentials.google_protocol import (
-    GOOGLE_AUTHORIZATION_ENDPOINT, GOOGLE_IDENTITY_SCOPES, GoogleIdentityVerifier,
+    GOOGLE_AUTHORIZATION_ENDPOINT, GOOGLE_IDENTITY_SCOPES, GOOGLE_GMAIL_READONLY_SCOPES,
+    GMAIL_READONLY_SCOPE, GoogleAccessProfile, GoogleIdentityVerifier,
     GoogleOAuthConfig, GoogleOAuthHttp, GoogleTokenTransport, IdentityTokenVerifier,
     OAuthTokenResponse, validate_google_claims,
 )
@@ -67,16 +68,24 @@ class GoogleConnectionService(RuntimeOnly):
         self._owner()
         return _metadata_call(self._vault.status)
 
-    def connect(self) -> CredentialInfo:
-        """Explicit connect/reconnect with the system browser and new consent."""
+    def connect(self, *, profile: GoogleAccessProfile = GoogleAccessProfile.IDENTITY) -> CredentialInfo:
+        """Host-only fresh consent for one reviewed profile.
+
+        Installed apps cannot incrementally authorize. Upgrading to Gmail is
+        a new full consent/reconnection, preserving the vault's exact account
+        identity and durable publication order. A new connection needs new
+        concrete tool bindings; this method never registers or invokes tools.
+        """
         self._owner()
-        return _metadata_call(self._connect)
+        if type(profile) is not GoogleAccessProfile:
+            raise CredentialError(CredentialFailure.INVALID)
+        return _metadata_call(lambda: self._connect(profile))
 
-    def _connect(self) -> CredentialInfo:
+    def _connect(self, profile: GoogleAccessProfile) -> CredentialInfo:
         operation = self._vault._begin("authorize", None, authority=self._authority)
-        return self._run(operation, lambda: self._authorize(operation))
+        return self._run(operation, lambda: self._authorize(operation, profile))
 
-    def _authorize(self, operation: _Operation) -> CredentialInfo:
+    def _authorize(self, operation: _Operation, profile: GoogleAccessProfile) -> CredentialInfo:
         state, verifier, nonce = [SecretMaterial(secrets.token_urlsafe(length)) for length in (32, 64, 32)]
         code = None
         try:
@@ -88,7 +97,7 @@ class GoogleConnectionService(RuntimeOnly):
                 redirect = callback.redirect_uri
                 parameters = {
                     "client_id": self._config.client_id, "redirect_uri": redirect,
-                    "response_type": "code", "scope": "openid email profile",
+                    "response_type": "code", "scope": " ".join(sorted(profile.scopes)),
                     "code_challenge": challenge, "code_challenge_method": "S256",
                     "state": state._read(), "nonce": nonce._read(),
                     "access_type": "offline", "prompt": "consent",
@@ -100,7 +109,7 @@ class GoogleConnectionService(RuntimeOnly):
                 self._vault._check_operation(operation, authority=self._authority)
                 started, mono = self._vault._time()
                 response = self._transport.exchange(self._config, code, verifier, redirect)
-            return self._accept_tokens(operation, response, started, mono, nonce._read())
+            return self._accept_tokens(operation, response, started, mono, nonce._read(), profile=profile)
         finally:
             self._process_owner()
             for material in (state, verifier, nonce, code):
@@ -142,7 +151,7 @@ class GoogleConnectionService(RuntimeOnly):
         return self.refresh(reference)
 
     def _accept_tokens(self, operation: _Operation, response: OAuthTokenResponse, started,
-                       mono: float, nonce: str) -> CredentialInfo:
+                       mono: float, nonce: str, *, profile: GoogleAccessProfile | None = None) -> CredentialInfo:
         self._owner()
         if type(response) is not OAuthTokenResponse:
             raise CredentialError(CredentialFailure.INVALID)
@@ -156,9 +165,15 @@ class GoogleConnectionService(RuntimeOnly):
             scopes = response.scopes
             if scopes is None and not initial and operation.expected is not None:
                 scopes = operation.expected.scopes
-            if scopes is None or "openid" not in scopes or not scopes <= GOOGLE_IDENTITY_SCOPES or (
+            # Profile is captured by this host operation, not mutable service
+            # state. On refresh the protected current grant is the ceiling;
+            # neither a response nor old identity-only metadata can widen it.
+            gmail = (profile is GoogleAccessProfile.GMAIL_READONLY if initial else
+                     operation.expected is not None and GMAIL_READONLY_SCOPE in operation.expected.scopes)
+            allowed = GOOGLE_GMAIL_READONLY_SCOPES if gmail else GOOGLE_IDENTITY_SCOPES
+            if scopes is None or "openid" not in scopes or not scopes <= allowed or (
                 not initial and operation.expected is not None and not scopes <= operation.expected.scopes
-            ):
+            ) or (gmail and scopes != GOOGLE_GMAIL_READONLY_SCOPES):
                 raise CredentialError(CredentialFailure.SCOPE_MISMATCH)
             if initial and response.refresh is None:
                 raise CredentialError(CredentialFailure.RECONNECT)

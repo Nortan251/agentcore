@@ -19,6 +19,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
+import re
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
 from agentcore.errors import ToolValidationError
@@ -59,6 +60,11 @@ class ToolParameter:
     required: bool = True
     default: Any = None
     choices: tuple[Any, ...] | None = None
+    # Static host declarations, also enforced before permission/dispatch.
+    max_length: int | None = None
+    pattern: str | None = None
+    minimum: int | float | None = None
+    maximum: int | float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -71,6 +77,9 @@ class ToolParameter:
             payload["default"] = self.default
         if self.choices:
             payload["choices"] = list(self.choices)
+        for key in ("max_length", "pattern", "minimum", "maximum"):
+            if getattr(self, key) is not None:
+                payload[key] = getattr(self, key)
         return payload
 
 
@@ -211,6 +220,16 @@ class Tool(ABC):
                 raise ToolValidationError("argument not among allowed choices",
                                           tool=spec.name, argument=name,
                                           choices=list(param.choices))
+            if param.type is ParamType.STRING and (
+                (param.max_length is not None and len(value) > param.max_length)
+                or (param.pattern is not None and re.fullmatch(param.pattern, value) is None)
+            ):
+                raise ToolValidationError("argument violates text bounds", tool=spec.name, argument=name)
+            if param.type in {ParamType.INTEGER, ParamType.NUMBER} and (
+                (param.minimum is not None and not value >= param.minimum)
+                or (param.maximum is not None and not value <= param.maximum)
+            ):
+                raise ToolValidationError("argument violates numeric bounds", tool=spec.name, argument=name)
             cleaned[name] = value
         return cleaned
 

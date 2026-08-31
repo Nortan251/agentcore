@@ -16,7 +16,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from typing import TYPE_CHECKING, Any, Protocol
 
-from agentcore.credentials.errors import CredentialError, CredentialFailure
+from agentcore.credentials.errors import CredentialError, CredentialFailure, READ_PROVIDER_FAILURES
 from agentcore.credentials.models import (
     CredentialInfo,
     CredentialState,
@@ -406,7 +406,10 @@ class CredentialRuntime(RuntimeOnly):
                         raw = binding.read(detached_public_json(args), lease)
                     except BaseException as exc:
                         interruption = _interruption_type(exc)
-                        failure = CredentialFailure.PROVIDER
+                        failure = (exc.reason if type(exc) is CredentialError
+                                   and type(exc.reason) is CredentialFailure
+                                   and exc.reason in READ_PROVIDER_FAILURES
+                                   else CredentialFailure.PROVIDER)
                     else:
                         if type(raw) is not ToolResult or type(raw.ok) is not bool:
                             failure = CredentialFailure.UNSAFE_RESULT

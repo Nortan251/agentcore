@@ -35,6 +35,28 @@ class CredentialFailure(str, Enum):
     OAUTH_UNCERTAIN = "oauth_exchange_uncertain"
     IDENTITY_TOKEN = "oauth_identity_invalid"
     RECONNECT = "oauth_reconnect_required"
+    READ_ARGUMENTS = "authenticated_read_invalid_arguments"
+    READ_AUTHENTICATION = "authenticated_read_authentication_rejected"
+    READ_PERMISSION = "authenticated_read_access_denied"
+    READ_NOT_FOUND = "authenticated_read_not_found"
+    READ_RATE_LIMIT = "authenticated_read_rate_limited"
+    READ_RESPONSE = "authenticated_read_malformed_response"
+    READ_TOO_LARGE = "authenticated_read_response_too_large"
+    READ_CONTENT = "authenticated_read_unsafe_content"
+    READ_DISCLOSURE = "authenticated_read_disclosure_required"
+
+
+# Only these content-free failures may cross a registered read provider's
+# exception boundary. Provider messages, details, notes and chains never do.
+READ_PROVIDER_FAILURES = frozenset({
+    CredentialFailure.READ_ARGUMENTS, CredentialFailure.READ_AUTHENTICATION,
+    CredentialFailure.READ_PERMISSION, CredentialFailure.READ_NOT_FOUND,
+    CredentialFailure.READ_RATE_LIMIT, CredentialFailure.READ_RESPONSE,
+    CredentialFailure.READ_TOO_LARGE, CredentialFailure.READ_CONTENT,
+    CredentialFailure.READ_DISCLOSURE,
+    CredentialFailure.SCOPE_MISMATCH, CredentialFailure.OWNERSHIP,
+    CredentialFailure.EXPIRED, CredentialFailure.AUTHORITY,
+})
 
 
 _MESSAGES = {
@@ -67,6 +89,15 @@ _MESSAGES = {
     CredentialFailure.OAUTH_UNCERTAIN: "The token exchange outcome is uncertain.",
     CredentialFailure.IDENTITY_TOKEN: "The Google identity proof could not be verified.",
     CredentialFailure.RECONNECT: "A new Google authorization is required.",
+    CredentialFailure.READ_ARGUMENTS: "Authenticated read arguments are invalid.",
+    CredentialFailure.READ_AUTHENTICATION: "The service rejected authentication for this read.",
+    CredentialFailure.READ_PERMISSION: "The service denied access to this read.",
+    CredentialFailure.READ_NOT_FOUND: "The requested message was not found.",
+    CredentialFailure.READ_RATE_LIMIT: "The service rate or quota limit was reached.",
+    CredentialFailure.READ_RESPONSE: "The read response was malformed and was withheld.",
+    CredentialFailure.READ_TOO_LARGE: "The read response exceeded the byte limit and was withheld.",
+    CredentialFailure.READ_CONTENT: "The message content exceeded safe parsing bounds or was invalid.",
+    CredentialFailure.READ_DISCLOSURE: "Message content requires explicit trusted-host disclosure opt-in.",
 }
 
 
