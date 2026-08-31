@@ -68,7 +68,12 @@ def _windows_private_directory(path: Path) -> None:
 class ProtectedFile(RuntimeOnly):
     """Keep ownership handles open until close; PID fencing precedes all I/O."""
 
-    def __init__(self, directory: Path) -> None:
+    def __init__(self, directory: Path, *, record_name: str = RECORD_NAME) -> None:
+        # The host reuses the same pinned, private atomic-file boundary for
+        # its inert continuity record. Never accept a path or the owner file.
+        if type(record_name) is not str or record_name not in {RECORD_NAME, "gmail-host.json"}:
+            raise CredentialError(CredentialFailure.INVALID)
+        self._record_name = record_name
         self._owner_pid = os.getpid()
         self._closed = False
         self.poisoned = False
@@ -161,7 +166,7 @@ class ProtectedFile(RuntimeOnly):
 
     def _read(self) -> bytes | None:
         self._check_paths()
-        path = self.directory / RECORD_NAME
+        path = self.directory / self._record_name
         try:
             fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0))
         except FileNotFoundError:
@@ -200,7 +205,7 @@ class ProtectedFile(RuntimeOnly):
                 os.fsync(handle.fileno())
             self._owner()
             self.read_current()
-            os.replace(temporary, self.directory / RECORD_NAME)
+            os.replace(temporary, self.directory / self._record_name)
             replaced = True
             if os.name != "nt":
                 directory_fd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)

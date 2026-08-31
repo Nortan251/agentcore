@@ -61,9 +61,13 @@ executor = ToolExecutor(
 The host must use the existing prepare/review/approval/invoke flow: persist the
 preparation handle, show `foundation.review(handle)` only in a private human UI,
 and invoke through `ToolExecutor` with that handle's action context. Continuation
-retains the exact preparation, action and approval request; recovery uses
+retains the exact preparation and action; the operator CLI obtains fresh durable
+approval for any never-attempted continuation. Recovery uses
 `ActionRecoveryCoordinator`, never direct transport or `Tool.run`. Production
-host UX/consent setup is a separate task. Protected action/evidence files are
+host UX/consent setup is now supplied by the explicit
+[private Gmail host CLI](../operations/gmail-production-host-setup.md), with
+separate prepare, live-send and reconciliation modes. No Agent is auto-wired.
+Protected action/evidence files are
 authenticated **plaintext**, not encrypted; private host storage and ACLs remain
 required. Refresh storage is separately protected by the reviewed Google vault.
 
@@ -107,6 +111,12 @@ It contains the already-encoded exact send body. It is neither persisted nor
 serialized; no cached mailbox-address grant or new durable metadata is added.
 Thus the approved durable sender is the value verified at the live attempt,
 without treating an email string as a substitute for signed identity.
+
+Host composition also reuses this bounded read via `primary_address` to prepare
+a self-addressed test. Its private authenticated-read tool returns a categorical
+boolean and keeps the address in a one-use private host result. It grants no
+send verification object: each send still repeats the same-lease preflight.
+Model-visible Gmail read tools retain their existing exact read-only profile.
 
 The additional read needs current `NET_READ` permission. Send still requires
 EMAIL_SEND + NET_WRITE + CREDENTIAL_ACCESS, explicit send opt-in and durable
@@ -308,5 +318,6 @@ must not be run until independent audit and merge plus explicit human approval
 of that future task. No live sender, recipient delivery, Gmail transformation
 or Bcc recipient-isolation behavior is claimed from these synthetic tests.
 Drafts, replies, forwards, HTML, attachments, send-as aliases and live Bcc remain
-unsupported. The next task is controlled real-account send/reconciliation
-validation plus explicit host UX/composition wiring, not broader Gmail mutation.
+unsupported. Host wiring is documented separately. After its independent audit
+and merge, the next step is one human-controlled self-send and Sent/Message-ID/
+duplicate/reconciliation verification, not broader Gmail mutation.
