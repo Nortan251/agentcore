@@ -43,6 +43,7 @@ class CredentialFailure(str, Enum):
     READ_RESPONSE = "authenticated_read_malformed_response"
     READ_TOO_LARGE = "authenticated_read_response_too_large"
     READ_CONTENT = "authenticated_read_unsafe_content"
+    READ_DISCLOSURE = "authenticated_read_disclosure_required"
 
 
 # Only these content-free failures may cross a registered read provider's
@@ -52,6 +53,7 @@ READ_PROVIDER_FAILURES = frozenset({
     CredentialFailure.READ_PERMISSION, CredentialFailure.READ_NOT_FOUND,
     CredentialFailure.READ_RATE_LIMIT, CredentialFailure.READ_RESPONSE,
     CredentialFailure.READ_TOO_LARGE, CredentialFailure.READ_CONTENT,
+    CredentialFailure.READ_DISCLOSURE,
     CredentialFailure.SCOPE_MISMATCH, CredentialFailure.OWNERSHIP,
     CredentialFailure.EXPIRED, CredentialFailure.AUTHORITY,
 })
@@ -95,6 +97,7 @@ _MESSAGES = {
     CredentialFailure.READ_RESPONSE: "The read response was malformed and was withheld.",
     CredentialFailure.READ_TOO_LARGE: "The read response exceeded the byte limit and was withheld.",
     CredentialFailure.READ_CONTENT: "The message content exceeded safe parsing bounds or was invalid.",
+    CredentialFailure.READ_DISCLOSURE: "Message content requires explicit trusted-host disclosure opt-in.",
 }
 
 

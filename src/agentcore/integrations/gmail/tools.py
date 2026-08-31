@@ -58,11 +58,20 @@ class _Search(_Provider):
 
 
 class _Read(_Provider):
+    def __init__(self, transport: GmailReadTransport, *, allow_message_content: bool) -> None:
+        super().__init__(transport)
+        self._allow_message_content = allow_message_content
+
     def read(self, args: Mapping[str, Any], credential: CredentialLease) -> ToolResult:
         self._credential(credential)
         if type(args) is not dict or set(args) != {"message_id"}:
             raise CredentialError(CredentialFailure.READ_ARGUMENTS)
         message_id = reference(args["message_id"])
+        # OAuth grants and the generic authenticated-read opt-in do not by
+        # themselves choose to disclose private mail to a model/session. Only
+        # trusted host composition can enable this output, before any get.
+        if not self._allow_message_content:
+            raise CredentialError(CredentialFailure.READ_DISCLOSURE)
         raw = self._transport.read_message(credential, message_id)
         self._owner()
         return ToolResult.success(normalize_message(raw, message_id))
@@ -75,12 +84,17 @@ class GmailReadonlyTools(RuntimeOnly):
     registers tools on its normal registry (or supplies AgentDependencies).
     Reuse this object to rebind after refresh. Reconnect creates a different
     connection and requires a new instance plus explicit registry replacement.
+    Message content is withheld unless the host explicitly opts into disclosure
+    to the normal model/session path; this never grants executor permission.
     """
 
-    def __init__(self, *, transport: GmailReadTransport | None = None) -> None:
+    def __init__(self, *, transport: GmailReadTransport | None = None,
+                 allow_message_content: bool = False) -> None:
         self._owner_pid = os.getpid()
+        if type(allow_message_content) is not bool:
+            raise CredentialError(CredentialFailure.INVALID)
         transport = transport if transport is not None else GmailReadHttp()
-        self._providers = (_Search(transport), _Read(transport))
+        self._providers = (_Search(transport), _Read(transport, allow_message_content=allow_message_content))
         capabilities = (Capability.NET_READ, Capability.CREDENTIAL_ACCESS)
         self._tools = (
             AuthenticatedReadTool(tool_spec(

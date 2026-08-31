@@ -39,6 +39,13 @@ def ready(tmp_path):
     value.vault.close()
 
 
+@pytest.mark.parametrize("value", ["true", 1, None, []])
+def test_message_disclosure_requires_a_literal_host_boolean(value):
+    with pytest.raises(CredentialError) as error:
+        GmailReadonlyTools(allow_message_content=value)
+    assert error.value.reason is CredentialFailure.INVALID
+
+
 @pytest.mark.parametrize("name, args", [
     (SEARCH, {"q": "x" * 1025}), (SEARCH, {"q": "x\nprivate"}), (SEARCH, {"q": "x\rprivate"}),
     (SEARCH, {"q": "\x00"}), (SEARCH, {"q": "\x7f"}), (SEARCH, {"q": "\x85"}),
@@ -62,7 +69,7 @@ def test_arguments_are_bounded_before_permission_vault_or_provider(ready, monkey
 @pytest.mark.parametrize("selector", [
     "account", "userId", "email", "provider", "issuer", "subject", "scope", "scopes",
     "profile", "access_profile", "client_id", "redirect_uri", "url", "path", "format",
-    "access_token", "credential_reference", "allow_authenticated_reads",
+    "access_token", "credential_reference", "allow_authenticated_reads", "allow_message_content",
 ])
 @pytest.mark.parametrize("name", [SEARCH, READ])
 def test_model_cannot_select_account_endpoint_credentials_or_consent(ready, selector, name):

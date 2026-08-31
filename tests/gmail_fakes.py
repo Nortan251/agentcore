@@ -89,7 +89,9 @@ class FakeGmail:
 
 def setup(value, *, transport=None, allow=True, policy=None, journal=None):
     transport = transport if transport is not None else FakeGmail()
-    gmail = GmailReadonlyTools(transport=transport)
+    # Positive read tests explicitly disclose synthetic mail. Default-denial
+    # and saved-state isolation are tested through the real Agent separately.
+    gmail = GmailReadonlyTools(transport=transport, allow_message_content=True)
     runtime = CredentialRuntime(value.vault)
     gmail.bind(runtime, value.info.reference)
     registry = ToolRegistry()

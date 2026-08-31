@@ -40,12 +40,65 @@ def wants(name=READ, **arguments):
                                                       arguments=arguments or {"message_id": MESSAGE_ID})])
 
 
+@pytest.mark.parametrize("explicit_false", [False, True])
+def test_message_content_is_withheld_by_default_from_models_and_sessions(tmp_path, explicit_false):
+    value = connected(tmp_path / "protected")
+    transport = FakeGmail()
+    transport.message_result = message(text_part("PRIVATE-BODY-SENTINEL"))
+    transport.message_result["snippet"] = "PRIVATE-SNIPPET-SENTINEL"
+    transport.message_result["payload"]["headers"].append({"name": "Subject", "value": "PRIVATE-HEADER-SENTINEL"})
+    disclosure = {"allow_message_content": False} if explicit_false else {}
+    gmail, runtime = GmailReadonlyTools(transport=transport, **disclosure), CredentialRuntime(value.vault)
+    gmail.bind(runtime, value.info.reference)
+    sessions, states = JsonFileSessionStore(tmp_path / "sessions"), JsonFileStateStore(tmp_path / "states")
+    model = scripted(wants(), ModelResponse(text="Content disclosure is unavailable."))
+    agent = Agent(AgentConfig(workspace_dir=str(tmp_path), conversation=ConversationConfig(tools_enabled=True),
+                              logging=LoggingConfig(level="CRITICAL")),
+                  AgentDependencies(tools=list(gmail.tools), model=model, credential_runtime=runtime,
+                                    allow_authenticated_reads=True, state_store=states))
+    try:
+        conversation = agent.conversation(sessions=sessions)
+        result = conversation.send("Read the selected synthetic message.")
+        agent.checkpoint()
+        public = json.dumps([request.to_dict() for request in model.requests])
+        public += "".join(path.read_text(encoding="utf-8") for path in tmp_path.rglob("*.json"))
+        for sentinel in ("PRIVATE-BODY-SENTINEL", "PRIVATE-SNIPPET-SENTINEL", "PRIVATE-HEADER-SENTINEL"):
+            assert sentinel not in public
+        assert result.tools_executed == 0 and not transport.calls
+        assert result.tool_outcomes[0].invocation.result.metadata["kind"] == "authenticated_read_disclosure_required"
+
+        # A saved session or a model argument cannot enable host disclosure.
+        loaded = sessions.load(result.session.id)
+        loaded.metadata["allow_message_content"] = True
+        model.responses.extend([wants(), ModelResponse(text="Still unavailable.")])
+        assert conversation.send("Try again.", session=loaded).tools_executed == 0
+        refused = agent.executor.invoke(READ, {"message_id": MESSAGE_ID, "allow_message_content": True})
+        assert refused.result.metadata["kind"] == "validation" and not transport.calls
+        assert agent.executor.invoke(SEARCH).ok
+        assert len(transport.calls) == 1 and transport.calls[0][0] == "list"
+
+        # Only new explicit host composition changes disclosure. It neither
+        # reconnects the account nor replaces the executor's permission policy.
+        policy = agent.executor.policy
+        disclosed = GmailReadonlyTools(transport=transport, allow_message_content=True)
+        disclosed.bind(runtime, value.info.reference, replace_existing=True)
+        agent.registry.register_all(list(disclosed.tools), replace=True)
+        model.responses.extend([wants(), ModelResponse(text="Explicitly disclosed synthetic mail.")])
+        assert conversation.send("Read with host disclosure enabled.", session=loaded).tools_executed == 1
+        assert len(transport.calls) == 2 and transport.calls[-1][0] == "read"
+        assert any("PRIVATE-BODY-SENTINEL" in item.content for item in model.requests[-1].messages
+                   if item.role is Role.TOOL)
+        assert agent.executor.policy is policy and value.service.restore().credential == value.info
+    finally:
+        value.vault.close()
+
+
 @pytest.mark.parametrize("allow", [False, True])
 def test_email_injection_is_only_tool_data_and_cannot_change_live_or_historical_authority(tmp_path, allow):
     value = connected(tmp_path / "protected")
     transport = FakeGmail()
     transport.message_result = message(text_part(MALICIOUS))
-    gmail = GmailReadonlyTools(transport=transport)
+    gmail = GmailReadonlyTools(transport=transport, allow_message_content=True)
     runtime = CredentialRuntime(value.vault)
     gmail.bind(runtime, value.info.reference)
     model = scripted(wants(), ModelResponse(text="The selected message was handled."))
@@ -151,7 +204,7 @@ def test_model_followups_after_malicious_email_still_require_normal_tool_validat
     value = connected(tmp_path / "protected")
     transport = FakeGmail()
     transport.message_result = message(text_part(MALICIOUS))
-    gmail, runtime = GmailReadonlyTools(transport=transport), CredentialRuntime(value.vault)
+    gmail, runtime = GmailReadonlyTools(transport=transport, allow_message_content=True), CredentialRuntime(value.vault)
     gmail.bind(runtime, value.info.reference)
     name, args = followup
     model = scripted(wants(), wants(name, **args), ModelResponse(text="Unsafe follow-up refused."))

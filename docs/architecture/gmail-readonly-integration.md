@@ -72,6 +72,16 @@ through `AgentDependencies.tools`, along with `credential_runtime` and
 default registry. The existing Agent conversation and autonomous runner share
 the same executor; Gmail adds no alternate execution path.
 
+Message disclosure is an additional explicit **host output choice**:
+`GmailReadonlyTools(allow_message_content=True)`. It defaults to false. Without
+that choice, search can still return references, but `gmail_read_message` returns
+`authenticated_read_disclosure_required` before any Gmail GET or body/header/
+snippet processing. This opt-in determines whether private mail may enter the
+configured model and session path; it cannot grant executor capabilities. Only
+a literal host boolean is accepted. No tool argument, OAuth response, saved
+session, or historical approval can enable it. Changing this choice requires
+explicit new tool/provider composition and binding, not an in-flight toggle.
+
 Both tools require `NET_READ` **and** `CREDENTIAL_ACCESS`, plus explicit host
 authenticated-read opt-in. Current policy can deny either capability. Public
 `NET_READ` is unchanged. `EMAIL_SEND`, `PAYMENT`, and `SYSTEM_ADMIN` remain blocked.
@@ -168,8 +178,8 @@ a message read or changes labels.
 | --- | --- |
 | HTTPS JSON response | 1,048,576 bytes; reject oversized responses before parsing |
 | JSON structure | Lexical depth 32, 16,384 nodes including keys; duplicate keys, invalid UTF-8/surrogates, floats and nonfinite values rejected |
-| MIME tree | Depth 8 with root at depth 0; 100 total parts including containers |
-| Input headers | 200 across all parts; name 128 characters; value 4,096 characters |
+| Inspected MIME tree | Depth 8 with root at depth 0; 100 parts including containers and attachment metadata nodes |
+| Input headers | 200 across inspected parts; name 128 characters; value 4,096 characters |
 | Decoded text | 65,536 bytes per part; 131,072 across all decoded text parts, including alternatives not selected |
 | HTML parser | 8,192 events; 64 nested suppressed elements; no renderer or resource loader |
 | Public headers / snippet | 512 characters per allowlisted header / 256 characters |
@@ -205,6 +215,10 @@ without being decoded into message bodies or used as filesystem paths.
 
 Binary parts, named text attachments, explicit attachment dispositions, and
 attached messages are metadata only. Their base64 is not decoded or exposed.
+Once a part is withheld, its subtree is not inspected: complex forwarded-message
+attachments cannot exhaust the visible body's MIME budget. The HTTP byte limit
+and JSON depth/node limits still bound the **entire** response, including those
+opaque attachment subtrees. The MIME limits above apply only to inspected nodes.
 Google's `full` representation can include inline attachment data in the bounded
 JSON wire response; this implementation discards it, rather than claiming it can
 prevent Google from including it. No attachment-specific request is made. A body
@@ -242,6 +256,7 @@ announced Content-Length must be valid, bounded, and consistent with bytes read.
 | Missing Gmail grant | `credential_scope_mismatch`; no provider request |
 | Stale / expired / disconnected | Existing `credential_stale`, `credential_expired`, `credential_revoked` |
 | No opt-in/current permission | Existing `permission_denied` |
+| No host message-disclosure opt-in | `authenticated_read_disclosure_required`; no message GET |
 | HTTP 401 | `authenticated_read_authentication_rejected` |
 | HTTP 403 | `authenticated_read_access_denied` |
 | HTTP 404 | `authenticated_read_not_found` |
@@ -277,8 +292,10 @@ its detached JSON validation and access-token disclosure guard. No refresh token
 is given to the provider. DPAPI/DACL protection, no plaintext fallback, volatile
 access tokens, and all prior protected credential invariants are unchanged.
 
-Normalized email is intentionally model-visible and can be stored in configured
-conversation sessions and ordinary run state, like other tool results. Hosts
+After explicit host message-disclosure opt-in, normalized email is intentionally
+model-visible and can be stored in configured conversation sessions and ordinary
+run state, like other tool results. Without that opt-in, headers, snippets, and
+bodies are withheld before fetching; only reference search is available. Hosts
 must choose model providers, retention, and access controls accordingly. This is
 not a general email DLP filter, encrypted conversation store, or defense against
 malicious same-process Python, debuggers, memory dumps, or OS administrators.
@@ -306,8 +323,9 @@ For an optional trusted Windows developer test:
    model-visible config, and logs. Use the existing current-user DPAPI directory
    outside workspaces. Do not copy quickstart plaintext `token.json` persistence.
 4. Present a deliberate host Gmail consent action; selecting a different account
-   must fail while preserving the previous local identity. No Cloud Console
-   changes are automated by this integration.
+   must fail while preserving the previous local identity. Separately opt into
+   message-content disclosure only for the intended model/session destination.
+   No Cloud Console changes are automated by this integration.
 
 See Google's [setup guide](https://developers.google.com/workspace/gmail/api/quickstart/python)
 and [OAuth scope classification](https://developers.google.com/workspace/gmail/api/auth/scopes).
@@ -336,7 +354,8 @@ with ProtectedCredentialVault(Path(host_private_credential_directory)) as vault:
     google = GoogleConnectionService(vault, config)
     current = google.connect(profile=GoogleAccessProfile.GMAIL_READONLY)
     runtime = CredentialRuntime(vault)
-    gmail = GmailReadonlyTools()
+    # Explicitly allow bounded private mail in the configured model/session path.
+    gmail = GmailReadonlyTools(allow_message_content=True)
     gmail.bind(runtime, current.reference)
     registry = ToolRegistry()
     registry.register_all(list(gmail.tools))
@@ -356,8 +375,9 @@ with ProtectedCredentialVault(Path(host_private_credential_directory)) as vault:
 For model use, compose the same tools/runtime into `AgentDependencies` with
 `allow_authenticated_reads=True` and `ConversationConfig(tools_enabled=True)`;
 let Agent create the single executor instead of creating a second one. Test that
-search returns only references, explicit read returns inert bounded text, refresh
-requires rebinding, and successful local disconnect blocks further Gmail reads.
+search returns only references, default message disclosure is refused, explicit
+host disclosure plus explicit read returns inert bounded text, refresh requires
+rebinding, and successful local disconnect blocks further Gmail reads.
 No real Gmail smoke test is claimed by the automated suite.
 
 ## Deliberately unsupported and next boundary

@@ -204,6 +204,26 @@ def test_attached_message_cannot_smuggle_nested_body_into_parent(reader):
     assert "nested-attachment-body" not in json.dumps(result.result.output)
 
 
+@pytest.mark.parametrize("complexity", ["deep", "many", "unsupported"])
+def test_withheld_attachment_subtrees_do_not_block_visible_parent_text(reader, complexity):
+    child = text_part("withheld-nested-content")
+    if complexity == "deep":
+        for _ in range(9):
+            child = multipart(child)
+        children = [child]
+    elif complexity == "many":
+        children = [child] * 101
+    else:
+        children = [{"mimeType": "unsupported child structure", "body": {"data": "invalid base64"}}]
+    attached = {"mimeType": "message/rfc822", "filename": "forward.eml", "body": {"size": 999},
+                "parts": children}
+    result = read(reader, multipart(text_part("visible parent"), attached))
+    assert result.ok and result.result.output["body"] == "visible parent"
+    assert result.result.output["attachments"] == [{"filename": "forward.eml", "mime_type": "message/rfc822", "size": 999}]
+    assert "withheld-nested-content" not in json.dumps(result.result.output)
+    assert len(reader.transport.calls) == 1
+
+
 @pytest.mark.parametrize("header", [
     {"name": "Content-Disposition", "value": 'inline; filename="synthetic.txt"'},
     {"name": "Content-Type", "value": 'text/plain; name="synthetic.txt"'},

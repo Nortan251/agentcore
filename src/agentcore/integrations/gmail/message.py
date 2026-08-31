@@ -146,7 +146,7 @@ class _Mime:
         self.attachments: list[dict[str, Any]] = []
         self.message_headers: dict[str, list[str]] = {}
 
-    def walk(self, part: Any, depth: int = 0, *, include: bool = True) -> _Body:
+    def walk(self, part: Any, depth: int = 0) -> _Body:
         self.parts += 1
         if type(part) is not dict or depth > MAX_MIME_DEPTH or self.parts > MAX_MIME_PARTS:
             _unsafe()
@@ -173,8 +173,7 @@ class _Mime:
                     _unsafe()
                 control[name] = value
         body = part.get("body", {})
-        children = part.get("parts", [])
-        if type(body) is not dict or type(children) is not list or len(children) > MAX_MIME_PARTS:
+        if type(body) is not dict:
             _unsafe()
         size = _size(body.get("size", 0))
         if "data" in body and type(body["data"]) is not str:
@@ -190,14 +189,18 @@ class _Mime:
         attached = bool(filename) or named_part or control.get_content_disposition() == "attachment" or (
             not multipart and mime not in {"text/plain", "text/html"})
         external_body = bool(body.get("attachmentId")) and not body.get("data")
-        if include and (attached or external_body):
+        if attached or external_body:
             self.attachments.append({"filename": filename, "mime_type": mime, "size": size})
             if external_body and not attached:
                 self.omitted += 1
-        results = [self.walk(child, depth + 1, include=include and not attached)
-                   for child in children]
-        if not include or attached or external_body:
+            # The entire subtree is withheld. Do not decode or inspect nested
+            # attached messages merely to return this part's metadata. Global
+            # HTTP/JSON bounds still apply to all bytes, including this subtree.
             return _Body()
+        children = part.get("parts", [])
+        if type(children) is not list or len(children) > MAX_MIME_PARTS:
+            _unsafe()
+        results = [self.walk(child, depth + 1) for child in children]
         if multipart:
             if body.get("data"):
                 _unsafe()  # never decode a container as a leaf
