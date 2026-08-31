@@ -1,9 +1,9 @@
 """Exact tool/account bindings and executor-issued, one-use credential access.
 
 The host registers a provider operation; the model never selects a provider,
-credential, account, scope, or callable. This first slice admits only pure read
-tools. Mutation approvals and reconciliation need a separately reviewed durable
-account binding and are intentionally unsupported here.
+credential, account, scope, or callable. The pure-read path remains isolated.
+Journaled authenticated actions use the separate action module beneath the
+same attached executor and vault, with durable account-bound intent.
 """
 
 from __future__ import annotations
@@ -231,7 +231,7 @@ class CredentialRuntime(RuntimeOnly):
     """
 
     __slots__ = ("_owner_pid", "_vault", "_vault_authority", "_authority",
-                 "_lock", "_bindings", "_closed")
+                 "_lock", "_bindings", "_action_bindings", "_closed")
 
     def __init__(self, vault: CredentialVault) -> None:
         self._owner_pid = os.getpid()
@@ -240,6 +240,7 @@ class CredentialRuntime(RuntimeOnly):
         self._authority: object | None = None
         self._lock = threading.RLock()
         self._bindings: dict[str, _Binding] = {}
+        self._action_bindings: dict[str, Any] = {}
         self._closed = False
         _metadata_call(lambda: vault._bind_runtime(self._vault_authority))
 
@@ -294,6 +295,8 @@ class CredentialRuntime(RuntimeOnly):
         self._require_owner()
         with self._lock:
             self._require_owner()
+            if tool.spec.name in self._action_bindings:
+                raise CredentialError(CredentialFailure.BINDING)
             current = self._bindings.get(tool.spec.name)
             if current is not None:
                 if not replace_existing:
@@ -308,7 +311,7 @@ class CredentialRuntime(RuntimeOnly):
                     or current.spec != tool.spec
                 ):
                     raise CredentialError(CredentialFailure.IDENTITY_MISMATCH)
-            elif len(self._bindings) >= MAX_BINDINGS:
+            elif len(self._bindings) + len(self._action_bindings) >= MAX_BINDINGS:
                 raise CredentialError(CredentialFailure.CAPACITY)
             self._bindings[tool.spec.name] = binding
         return info
@@ -452,11 +455,28 @@ class CredentialRuntime(RuntimeOnly):
             raise CredentialError(CredentialFailure.PROVIDER)
         return safe_result
 
+    def bind_action(self, tool, *, reference: str, provider,
+                    required_scopes: frozenset[str], replace_existing: bool = False) -> CredentialInfo:
+        """Explicit trusted-host binding; this is not action authority."""
+        from agentcore.credentials.action import bind_action
+        return bind_action(self, tool, reference=reference, provider=provider,
+                           required_scopes=required_scopes, replace_existing=replace_existing)
+
+    def action_info(self, tool) -> CredentialInfo:
+        """Current local metadata for staging; no credential lease or refresh."""
+        from agentcore.credentials.action import action_snapshot
+        binding = action_snapshot(self, tool)
+        info = _metadata_call(lambda: self._vault.describe(binding.info.reference))
+        if info != binding.info:
+            raise CredentialError(CredentialFailure.STALE)
+        return info
+
     def close(self) -> None:
         self._require_owner()
         with self._lock:
             self._require_owner()
-            if any(binding.active for binding in self._bindings.values()):
+            if any(binding.active for binding in (*self._bindings.values(), *self._action_bindings.values())):
                 raise CredentialError(CredentialFailure.BUSY)
             self._bindings.clear()
+            self._action_bindings.clear()
             self._closed = True

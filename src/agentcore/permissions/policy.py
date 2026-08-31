@@ -105,9 +105,13 @@ class PermissionPolicy:
         *,
         approval_gate: ApprovalGate | None = None,
         allow_authenticated_reads: bool = False,
+        allow_email_send: bool = False,
+        allow_authenticated_reconciliation: bool = False,
     ) -> None:
         if type(allow_authenticated_reads) is not bool:
             raise TypeError("authenticated-read authorization must be a bool")
+        if type(allow_email_send) is not bool or type(allow_authenticated_reconciliation) is not bool:
+            raise TypeError("authenticated-action authorization must be a bool")
         source = config or PermissionConfig()
         self._config = replace(
             source,
@@ -115,6 +119,8 @@ class PermissionPolicy:
             blocked_capabilities=tuple(source.blocked_capabilities),
         )
         self._allow_authenticated_reads = allow_authenticated_reads
+        self._allow_email_send = allow_email_send
+        self._allow_authenticated_reconciliation = allow_authenticated_reconciliation
         self.approval_gate = approval_gate or DenyAllApprovalGate()
 
     @property
@@ -124,6 +130,56 @@ class PermissionPolicy:
     @property
     def allow_authenticated_reads(self) -> bool:
         return self._allow_authenticated_reads
+
+    @property
+    def allow_email_send(self) -> bool:
+        return self._allow_email_send
+
+    @property
+    def allow_authenticated_reconciliation(self) -> bool:
+        return self._allow_authenticated_reconciliation
+
+    def evaluate_authenticated_send(self, capabilities: Iterable[Capability]) -> Decision:
+        """Executor context for an exact journaled authenticated send tool.
+
+        This never consults a boolean gate and never returns ALLOW. The
+        executor must obtain and revalidate durable one-shot approval.
+        Ordinary evaluate/check remain default-denied for EMAIL_SEND.
+        """
+        requested = frozenset(capabilities)
+        required = frozenset({Capability.EMAIL_SEND, Capability.NET_WRITE,
+                              Capability.CREDENTIAL_ACCESS})
+        if requested != required or not self.allow_email_send:
+            return Decision(Outcome.DENY, "bound email sends are blocked by policy",
+                            capability=Capability.EMAIL_SEND)
+        for capability in required:
+            if str(capability) in self.config.blocked_capabilities:
+                return Decision(Outcome.DENY, "send capability is explicitly blocked",
+                                capability=capability)
+        for capability in (Capability.EMAIL_SEND, Capability.CREDENTIAL_ACCESS):
+            minimum = max(PermissionLevel.CONFIRM, self.config.capability_overrides.get(
+                str(capability), PermissionLevel.CONFIRM))
+            if self.level < minimum:
+                return Decision(Outcome.DENY, "bound email send level is not permitted",
+                                capability=capability, required_level=minimum)
+        network = self.evaluate(Capability.NET_WRITE)
+        if network.outcome is Outcome.DENY:
+            return network
+        return Decision(Outcome.REQUIRE_APPROVAL, "durable email approval is required",
+                        capability=Capability.EMAIL_SEND, required_level=PermissionLevel.CONFIRM)
+
+    def check_authenticated_reconciliation(self, capabilities: Iterable[Capability]) -> Decision:
+        """Read-only, exact registered action-probe context; never a resend."""
+        required = frozenset({Capability.NET_READ, Capability.CREDENTIAL_ACCESS})
+        if frozenset(capabilities) != required or not self.allow_authenticated_reconciliation:
+            return Decision(Outcome.DENY, "bound reconciliation is blocked by policy",
+                            capability=Capability.CREDENTIAL_ACCESS)
+        credential = Capability.CREDENTIAL_ACCESS
+        minimum = self.config.capability_overrides.get(str(credential), PermissionLevel.OBSERVE)
+        if str(credential) in self.config.blocked_capabilities or self.level < minimum:
+            return Decision(Outcome.DENY, "reconciliation credential use is blocked",
+                            capability=credential)
+        return self.check((Capability.NET_READ,), description="Read-only action reconciliation")
 
     @property
     def level(self) -> PermissionLevel:
