@@ -209,9 +209,40 @@ def test_foreign_reconnected_account_binding_cannot_probe_old_action(harness, bo
         old_connection = host.services.google.restore().credential.connection_id
         new = host.services.google.connect(profile=GoogleAccessProfile.GMAIL_SEND)
         assert old_connection != new.connection_id
-        result = host.reconcile(slot.action_id)
-        assert result.action_state is ActionState.RECONCILE_REQUIRED
+        with pytest.raises(GmailHostError, match=HostFailure.CONNECTION.value):
+            host.reconcile(slot.action_id)
+        assert host.action_status().state == "RECONCILE_REQUIRED"
         assert host.action_status().probe_count == 0
+    assert len(boundary.requests) == count
+
+
+@pytest.mark.parametrize("mode", [GmailHostMode.LIVE_SEND, GmailHostMode.RECONCILE])
+def test_reconnected_restart_rejects_old_action_before_any_credential_io(harness, boundary, mode):
+    slot, _, _ = (unknown_send(harness, boundary) if mode is GmailHostMode.RECONCILE
+                  else prepare(harness, boundary))
+    with harness.services() as services:
+        old = services.google.restore().credential.connection_id
+        replacement = services.google.connect(profile=GoogleAccessProfile.GMAIL_SEND)
+        assert replacement.connection_id != old
+    count = len(boundary.requests)
+    with harness.host(mode, operator=FakeOperator("CHALLENGE")) as host:
+        assert host.services.google.restore().state.value == "refresh_required"
+        failure = None
+        try:
+            if mode is GmailHostMode.LIVE_SEND:
+                host.send_smoke_test(slot.action_id)
+            else:
+                host.reconcile(slot.action_id)
+        except GmailHostError as error:
+            failure = error.reason
+        # Even OAuth refresh is too late: this action does not own the new
+        # connection. No replacement-account profile or Sent query may occur.
+        assert len(harness.last_google.transport.refreshes) == 0
+        assert failure is HostFailure.CONNECTION
+        assert not host.operator.private
+        assert host.action_status().state == (
+            "RECONCILE_REQUIRED" if mode is GmailHostMode.RECONCILE else "PREPARED"
+        )
     assert len(boundary.requests) == count
 
 
@@ -237,6 +268,38 @@ def test_missing_journal_after_consumed_approval_cannot_recreate_send(harness, b
     code, output = harness.cli(["send-smoke-test", slot.action_id, "--live-send"], operator=FakeOperator("CHALLENGE"))
     assert code == 2 and "host_storage_unavailable" in output and "DO NOT SEND AGAIN" in output
     assert len(boundary.requests) == count and len(boundary.posts) == 1
+
+
+@pytest.mark.parametrize("cut", ["save_failure", "process_crash", "process_temp"])
+def test_orphaned_preparation_blocks_reopen_and_any_second_proposal(harness, boundary, cut):
+    if cut == "save_failure":
+        with harness.host(GmailHostMode.PREPARE, operator=FakeOperator(SUBJECT, BODY)) as host:
+            def fail_save(slot):
+                raise OSError("synthetic host publication failure")
+            host.services.storage.save_once = fail_save
+            with pytest.raises(OSError):
+                host.prepare_smoke_test()
+    else:
+        worker = Path(__file__).with_name("gmail_host_crash_worker.py")
+        crashed = subprocess.run([sys.executable, str(worker), str(harness.directory),
+                                  "act_123456789abc", "preparation_temp" if cut == "process_temp" else "preparation"],
+                                 capture_output=True, text=True, timeout=30)
+        assert crashed.returncode == 71, crashed.stderr
+    state = json.loads((harness.directory / "gmail-host.json").read_text())
+    assert state["slot"] is None
+
+    def private_files():
+        directory = harness.directory / "payloads"
+        return set(directory.glob("*.json")) | set(directory.glob("*.tmp"))
+
+    payloads = private_files()
+    assert len(payloads) == 1
+    assert not list((harness.directory / "actions").glob("*.json"))
+    count = len(boundary.requests)
+    code, output = harness.cli(["prepare-smoke-test"], operator=FakeOperator(SUBJECT, BODY))
+    assert code == 2 and "host_storage_unavailable" in output
+    assert private_files() == payloads
+    assert len(boundary.requests) == count and not boundary.posts
 
 
 @pytest.mark.parametrize("cut", ["preflight", "post", "publication"])

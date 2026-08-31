@@ -136,6 +136,8 @@ class GmailHostStorage(RuntimeOnly):
                     raise GmailHostError(HostFailure.STORAGE)
                 guard = ProtectedFile(path)
                 self._stack.callback(guard.close)
+                if name == "payloads":
+                    self._payload_guard = guard
                 # Existing stores are ACL-dependent authenticated plaintext.
                 # Bound this installation check; never recurse into links.
                 entries = list(islice(path.iterdir(), 4097))
@@ -150,7 +152,8 @@ class GmailHostStorage(RuntimeOnly):
                 raise GmailHostError(HostFailure.STORAGE)
             else:
                 _secure_file(self.directory / _STATE_FILE)
-            self.load_slot()
+            if self.load_slot() is None:
+                self.require_no_preparation_payloads()
         except BaseException:
             self._stack.close()
             raise
@@ -201,6 +204,17 @@ class GmailHostStorage(RuntimeOnly):
         self._write(slot.validate())
         if self.load_slot() != slot:
             raise GmailHostError(HostFailure.STORAGE)
+
+    def require_no_preparation_payloads(self) -> None:
+        self._owner()
+        self._payload_guard._check_paths()
+        # A committed payload or abandoned temporary file proves this is no
+        # longer an unused domain even if host slot publication was interrupted.
+        # Preserve it for private investigation; never create a second proposal.
+        metadata = {".credential-owner", ".agentcore-protected-payload-store.lock"}
+        with os.scandir(self._payload_guard.directory) as entries:
+            if any(entry.name not in metadata for entry in entries):
+                raise GmailHostError(HostFailure.STORAGE)
 
     def oauth_config(self) -> GoogleOAuthConfig:
         self._owner()

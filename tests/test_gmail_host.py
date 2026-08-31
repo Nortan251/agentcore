@@ -147,6 +147,8 @@ def test_actual_cli_prepares_without_any_content_arguments(harness, boundary, ca
     {"html": "<p>test</p>"}, {"body": "<html><body>test</body></html>"},
     {"attachments": []}, {"reply_to": "thread"}, {"thread_id": "thread"},
     {"forward": True}, {"subject": "Re: old message"}, {"subject": "Fwd: old message"},
+    {"subject": " Re: old message"}, {"subject": "  fW: old message"},
+    {"subject": "\u00a0Fwd: old message"},
     {"subject": "x" * 161}, {"body": "x" * 1025},
     {"subject": ""}, {"body": ""}, {"body": "x\n" * 9},
     {"subject": "header\r\nBcc: outside@sample.invalid"}, {"body": "\x1b[2Jhidden"},

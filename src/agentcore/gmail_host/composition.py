@@ -66,7 +66,7 @@ def smoke_arguments(arguments: dict, primary: str) -> dict:
         or len(message["body"].encode("utf-8")) > MAX_SMOKE_BODY_BYTES
         or message["body"].count("\n") > 8
         or re.search(r"<[/!A-Za-z][^>]*>", message["body"])
-        or message["subject"].lower().startswith(("re:", "fw:", "fwd:"))
+        or message["subject"].strip().lower().startswith(("re:", "fw:", "fwd:"))
     ):
         raise GmailHostError(HostFailure.INVALID_INPUT)
     return message
@@ -93,6 +93,7 @@ class GmailHostServices(RuntimeOnly):
         # Reconnect cannot repair an old intent's exact connection binding.
         if self.storage.load_slot() is not None:
             raise GmailHostError(HostFailure.EXISTING)
+        self.storage.require_no_preparation_payloads()
         self.google.connect(profile=GoogleAccessProfile.GMAIL_SEND)
 
     def disconnect(self) -> None:
@@ -283,6 +284,16 @@ class GmailHostComposition(RuntimeOnly):
             status.credential.scopes != GOOGLE_GMAIL_SEND_SCOPES
         ):
             raise GmailHostError(HostFailure.CONNECTION)
+        slot = self.services.storage.load_slot()
+        if slot is not None:
+            if self.foundation is None:
+                raise GmailHostError(HostFailure.MISSING)
+            account = self.foundation.review(slot.preparation)["account"]
+            # A replacement connection cannot be used for an old action,
+            # including OAuth refresh or the host's preliminary profile GET.
+            if any(account[field] != getattr(status.credential, field)
+                   for field in ("provider", "account_id", "connection_id")):
+                raise GmailHostError(HostFailure.CONNECTION)
         # Explicit host lifecycle work before binding, never a provider retry.
         self.info = self.services.google.ensure_current(status.credential.reference)
         if verify_primary:
@@ -365,6 +376,7 @@ class GmailHostComposition(RuntimeOnly):
             raise GmailHostError(HostFailure.DISABLED)
         if self.services.storage.load_slot() is not None or self.services.actions.list_actions():
             raise GmailHostError(HostFailure.EXISTING)
+        self.services.storage.require_no_preparation_payloads()
         self.operator.require_interactive()
         self._activate(verify_primary=True)
         if arguments is None:

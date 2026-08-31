@@ -88,6 +88,12 @@ Initialization creates the key once and an empty authenticated slot. Opening an
 existing domain never regenerates missing keys or missing/corrupt correlation.
 Partial initialization requires private investigation; never reset a used
 domain or delete history to make it appear unused.
+If payload creation commits but host slot publication fails or the process
+crashes, the orphaned payload makes the domain unavailable. Reopen and another
+preparation fail closed, including abandoned temporary payload files. Preserve
+the private files for investigation; no automatic cleanup or second proposal
+is allowed. The two existing ownership-lock filenames are the only ignored
+entries in an otherwise unused payload directory.
 
 The host reuses the existing pinned-directory/atomic-file backend with a separate
 closed `gmail-host.json` filename. Ownership excludes another open host process.
@@ -191,6 +197,9 @@ Google lifecycle. Callback receipt is not connection success: only verified
 identity and confirmed durable credential commit produce CURRENT.
 Connect/scope presence does not enable mutation. The narrow CLI refuses
 reconnect once a preparation exists because a new connection cannot adopt it.
+An old preparation's provider/account/connection binding is checked before any
+OAuth refresh or profile/probe I/O, including after a trusted external reconnect
+and process restart. A replacement connection is rejected without contacting it.
 
 Preparation may refresh the **same** connection through the host lifecycle.
 It then obtains the primary Gmail address through the private executor read and
