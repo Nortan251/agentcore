@@ -219,16 +219,32 @@ class GmailMutationHttp(RuntimeOnly):
         body = json.dumps({"raw": base64.urlsafe_b64encode(mime).decode("ascii").rstrip("=")},
                           separators=(",", ":"), ensure_ascii=True).encode("ascii")
         _withhold_secret_echo(body.decode("ascii"), credential)
+        sender = self.primary_address(credential)
+        if sender != submission.semantics["sender"]:
+            raise CredentialError(CredentialFailure.IDENTITY_MISMATCH)
+        credential._check_current()
+        return _VerifiedSend(self, submission, credential, body)
+
+    def primary_address(self, credential: CredentialLease) -> str:
+        """Private host profile read under an executor-issued access lease.
+
+        This read supplies no send verification object or send authority. The
+        normal send preflight always repeats it using that attempt's own lease.
+        """
+        self._owner()
+        if type(credential) is not CredentialLease:
+            raise CredentialError(CredentialFailure.AUTHORITY)
+        credential._check_current()
+        if credential.info.provider != "google" or credential.info.scopes != GOOGLE_GMAIL_SEND_SCOPES:
+            raise CredentialError(CredentialFailure.SCOPE_MISMATCH)
         profile = self._exchange(credential, _Operation.PROFILE)
         # The projection excludes mailbox counters/history. Reject unexpected
         # keys rather than letting provider metadata become action authority.
         if set(profile) != {"emailAddress"}:
             raise CredentialError(CredentialFailure.READ_RESPONSE)
         sender = normalize_address(profile["emailAddress"])
-        if sender != submission.semantics["sender"]:
-            raise CredentialError(CredentialFailure.IDENTITY_MISMATCH)
         credential._check_current()
-        return _VerifiedSend(self, submission, credential, body)
+        return sender
 
     def send(self, submission: GmailSendSubmission, credential: CredentialLease, *, verification=None) -> dict[str, Any]:
         self._check(submission, credential)
