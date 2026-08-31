@@ -91,7 +91,7 @@ class FakeGmailMutation:
     def probe(self, request, credential):
         assert credential.reveal() in {ACCESS, "replacement-" + ACCESS}
         assert request.user_id == "me" and request.label_ids == ("SENT",)
-        assert request.query == "rfc822msgid:" + request.message_id
+        assert request.query == "rfc822msgid:" + request.message_id[1:-1]
         self.probes.append(request.identity)
         if self.probe_hook:
             return self.probe_hook(request, credential)
@@ -109,7 +109,7 @@ def send_policy(*, level=PermissionLevel.CONFIRM, send=True, probe=True, blocked
 class Harness:
     def __init__(self, directory: Path, *, gate=None, policy=None, production=False,
                  no_journal=False, no_approval=False, no_evidence=False, as_agent=False,
-                 account_subject=None, google_directory=None, model=None):
+                 account_subject=None, google_directory=None, model=None, live_transport=None):
         self.directory = directory
         self.google = bundle(google_directory or directory / "google", protector=TestProtector(PROTECTOR_KEY))
         if account_subject is not None:
@@ -127,7 +127,9 @@ class Harness:
         self.approvals = JsonFileApprovalStore(directory / "approvals")
         self.fake = FakeGmailMutation()
         self.foundation = GmailSendFoundation(self.payloads, sender=SENDER, clock=self.clock,
-                                              transport=None if production else self.fake, test_only=not production)
+                                              transport=(live_transport if live_transport is not None else
+                                                         None if production else self.fake),
+                                              test_only=not production and live_transport is None)
         self.foundation.bind(self.runtime, self.info.reference)
         self.registry = ToolRegistry()
         self.registry.register(self.foundation.tool)

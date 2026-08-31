@@ -4,11 +4,14 @@ Baseline: `0d6665d2c444b674d7c24a5dd4b58d4d1ebde0f8` (PR #24).
 Official contracts checked on 2026-08-31. Stage 5's
 [ActionJournal contract](task-43.1-action-journal.md) remains authoritative.
 
-This foundation has **no production Gmail mutation or reconciliation transport**.
-The production transport is unavailable. Explicit test-only transports exercise
-the real executor, credential leases, approvals, protected stores, journal and
-recovery coordinator. Nothing registers a send tool by default. No real account,
-consent, message, or Gmail network test is needed or claimed.
+This document records the PR #25 non-network foundation. The subsequent
+[production direct-send transport](gmail-send-live-transport.md) supplies explicit
+host composition, a separate primary-sender profile preflight, and bounded Sent
+reconciliation. Its live-v1 composition rejects Bcc. The default transport remains
+unavailable; nothing registers or enables a send tool automatically. References
+below to future transport work describe the original foundation boundary and
+are superseded by that companion. No real account, consent, message, or Gmail
+network test is needed or claimed by either implementation stage.
 
 ## Scope and consent
 
@@ -249,8 +252,10 @@ without itself blocking an independently permitted probe. Current account,
 connection and credentials still have to match. Read-tool content-disclosure
 opt-in neither grants probe authority nor exposes reconciliation content.
 
-The future probe must use authenticated `me`, label `SENT`, and the exact
-`rfc822msgid:<marker>` query supported by Google's
+The production probe uses authenticated `me`, label `SENT`, and the exact
+`rfc822msgid:marker@agentcore.invalid` query (without RFC angle brackets), while
+comparing the retrieved Message-ID header including its brackets. See the
+[live query contract](gmail-send-live-transport.md#private-reconciliation) and Google's
 [messages.list contract](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/list).
 It must retrieve bounded candidate evidence, detect pagination/truncation,
 compare exact marker, sender/recipient roles, subject, body and content version,

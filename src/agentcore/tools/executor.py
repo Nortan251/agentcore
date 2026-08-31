@@ -135,9 +135,11 @@ class _ExternalContractBlocked(Exception):
 class _CredentialActionNotInvoked(Exception):
     """The same live owner proved that the credential provider was not entered."""
 
-    def __init__(self, *, cancellation: CancellationRequested | None = None) -> None:
+    def __init__(self, *, cancellation: CancellationRequested | None = None,
+                 interruption: type[BaseException] | None = None) -> None:
         super().__init__("Authenticated action stopped before the provider seam.")
         self.cancellation = cancellation
+        self.interruption = interruption
 
 
 class _CurrentAuthorityBlocked(Exception):
@@ -1411,6 +1413,12 @@ class ToolExecutor:
             self._validate_current_execution_authority(
                 record=claimed, tool=tool, tool_spec=tool_spec, adapter=adapter,
                 spec=spec, prepared=prepared, current_approval_receipt=current_approval_receipt)
+            # Sender verification is a read under current authority, not a
+            # consequence of possessing a send grant or historical approval.
+            if binding.preflight_capabilities:
+                decision = self.policy.check(binding.preflight_capabilities)
+                if not isinstance(decision, Decision) or not decision.allowed:
+                    raise CredentialError(CredentialFailure.PERMISSION)
             if claimed.duplicate_risk_acknowledgement is not None and len(claimed.attempts) == 1:
                 self._validate_current_duplicate_risk_permission(
                     record=claimed, tool_spec=tool_spec, prepared=prepared,
@@ -1444,6 +1452,10 @@ class ToolExecutor:
             if entered:
                 return self._unknown_effect(spec, "gmail.send.cancelled"), exc
             raise _CredentialActionNotInvoked(cancellation=exc) from None
+        except (KeyboardInterrupt, SystemExit) as exc:
+            if entered:
+                return self._unknown_effect(spec, "gmail.send.interrupted"), type(exc)()
+            raise _CredentialActionNotInvoked(interruption=type(exc)) from None
         except Exception:
             if entered:
                 return self._unknown_effect(spec, "gmail.send.uncertain"), None
@@ -3353,6 +3365,8 @@ class ToolExecutor:
                 store, claimed, attempt_status=ActionAttemptStatus.NOT_INVOKED,
                 result_class="gmail.send.not_invoked",
                 summary="The authenticated send provider was not entered.")
+            if exc.interruption is not None:
+                raise exc.interruption() from None
             return self._published_or_uncertain(
                 tool_spec.name, redacted, published, decision, invocation_id, attempt_id,
                 elapsed(), log, fallback_kind="action_credential_unavailable",
@@ -3483,7 +3497,7 @@ class ToolExecutor:
         checkpoint: Callable[[], None] | None = None,
     ) -> tuple[
         NormalizedActionEffect,
-        CancellationRequested | None,
+        BaseException | None,
         Decision,
     ]:
         """Perform final trusted checks and enter one physical effect seam.
@@ -3546,7 +3560,7 @@ class ToolExecutor:
                         prepared=prepared,
                     )
 
-                cancellation: CancellationRequested | None = None
+                cancellation: BaseException | None = None
                 if type(tool) is AuthenticatedActionTool:
                     normalized, cancellation = self._run_authenticated_action(
                         store=store, claimed=claimed, tool=tool, tool_spec=tool_spec,

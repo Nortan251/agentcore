@@ -24,6 +24,7 @@ from agentcore.credentials.runtime import (
     _provider_identity, detached_public_json,
 )
 from agentcore.credentials.vault import CredentialLease
+from agentcore.permissions.levels import Capability
 from agentcore.realtime.errors import CancellationRequested
 from agentcore.tools.authenticated_action import AuthenticatedActionTool
 from agentcore.tools.base import ToolResult
@@ -58,14 +59,19 @@ class JournaledCredentialProvider(Protocol):
 
     validate_intent is pure/local, checks the durable account and exact scope,
     and rejects unavailable transport before the conservative send seam.
+    preflight_send may perform only declared read-only checks, with no send,
+    under the same current credential/policy lease. Its result is runtime-only.
     Results are private inputs to the registered effect/reconciliation adapter.
     """
 
     provider_id: str
+    send_preflight_capabilities: frozenset[Capability]
 
     def validate_intent(self, payload: Mapping[str, Any], info: CredentialInfo, *, reconcile: bool) -> None: ...
+    def preflight_send(self, payload: Mapping[str, Any], credential: CredentialLease,
+                       identity: CredentialActionIdentity) -> object: ...
     def send(self, payload: Mapping[str, Any], credential: CredentialLease,
-             identity: CredentialActionIdentity) -> ToolResult: ...
+             identity: CredentialActionIdentity, *, preflight: object) -> ToolResult: ...
     def reconcile(self, payload: Mapping[str, Any], credential: CredentialLease,
                   identity: CredentialActionIdentity) -> ToolResult: ...
 
@@ -75,9 +81,14 @@ class _ActionBinding(RuntimeOnly):
         self.tool, self.spec, self.provider, self.info, self.scopes = tool, tool.spec, provider, info, scopes
         # Capture exact bound operations, not mutable callable attributes at I/O.
         self.validate = _metadata_call(lambda: provider.validate_intent)
+        self.preflight = _metadata_call(lambda: provider.preflight_send)
+        self.preflight_capabilities = _metadata_call(lambda: provider.send_preflight_capabilities)
+        if type(self.preflight_capabilities) is not frozenset or not (
+                self.preflight_capabilities <= {Capability.NET_READ}):
+            raise CredentialError(CredentialFailure.UNSUPPORTED)
         self.send = _metadata_call(lambda: provider.send)
         self.reconcile = _metadata_call(lambda: provider.reconcile)
-        if not all(callable(method) for method in (self.validate, self.send, self.reconcile)):
+        if not all(callable(method) for method in (self.validate, self.preflight, self.send, self.reconcile)):
             raise CredentialError(CredentialFailure.INVALID)
         self.active = 0
 
@@ -207,12 +218,28 @@ class CredentialActionExecution(RuntimeOnly):
                         if _provider_identity(binding.provider) != binding.info.provider:
                             raise CredentialError(CredentialFailure.IDENTITY_MISMATCH)
                         lease._check_current()
-                        operation = binding.reconcile if reconcile else binding.send
-                        # No provider byte can cross before this bit. Once set,
-                        # exceptions and cancellation never imply no effect.
+                        # A separately authorized read may verify immutable send
+                        # preconditions. Its failure cannot imply a send occurred.
+                        # Keep the same credential/policy leases through POST.
+                        preflight = None
+                        if not reconcile:
+                            preflight = binding.preflight(_detach(self._payload), lease, self._identity)
+                            # Profile I/O may outlive an approval or cancellation
+                            # deadline. Reload current claim/authority after it.
+                            with self._authorize():
+                                pass
+                            self._owner()
+                            if _provider_identity(binding.provider) != binding.info.provider:
+                                raise CredentialError(CredentialFailure.IDENTITY_MISMATCH)
+                            lease._check_current()
+                        # No mutation byte can precede this bit. Once set,
+                        # exceptions/cancellation never imply no effect. The
+                        # read-only preflight does not enter the send seam.
                         self._entered = True
                         try:
-                            raw = operation(_detach(self._payload), lease, self._identity)
+                            raw = (binding.reconcile(_detach(self._payload), lease, self._identity)
+                                   if reconcile else binding.send(
+                                       _detach(self._payload), lease, self._identity, preflight=preflight))
                         except BaseException as exc:
                             interruption = _interruption_type(exc)
                             failure = CredentialFailure.PROVIDER
