@@ -119,8 +119,10 @@ class ActionAdapterSpec:
                 for capability in self.reconciliation_capabilities):
             raise ActionAdapterRegistrationError(
                 "reconciliation capabilities must be a capability frozenset")
-        if any(capability not in READ_ONLY_CAPABILITIES
-               for capability in self.reconciliation_capabilities):
+        authenticated_probe = self.reconciliation_capabilities == frozenset({
+            Capability.NET_READ, Capability.CREDENTIAL_ACCESS})
+        if not authenticated_probe and any(capability not in READ_ONLY_CAPABILITIES
+                                            for capability in self.reconciliation_capabilities):
             raise ActionAdapterRegistrationError(
                 "reconciliation capabilities must be read-only")
         if self.eligibility.requires_journal:
@@ -274,6 +276,9 @@ class ActionInvocationContext:
     schedule_occurrence_id: str | None = None
     deduplication_scope: str | None = None
     deduplication_key: str | None = None
+    # Opaque host preparation continuity, never restored from model arguments.
+    # It grants no permission and is not part of the persisted journal schema.
+    intent_preparation_id: str | None = None
 
     def validate(self) -> ActionInvocationContext:
         # ActionProvenance owns exact identity validation.  The placeholder is
@@ -281,6 +286,8 @@ class ActionInvocationContext:
         self.to_provenance("inv_000000000000")
         if self.action_id is not None:
             require_action_id(self.action_id)
+        if self.intent_preparation_id is not None:
+            _reference(self.intent_preparation_id, 128, "intent preparation")
         if (self.deduplication_scope is None) != (
                 self.deduplication_key is None):
             raise ActionValidationError(
@@ -374,6 +381,7 @@ class _RegisteredAdapter:
     validates_external_contract: Callable[..., Any] | None
     executes_external_effect_if_current: Callable[..., Any] | None
     allows_indefinite_retention: bool
+    repeat_intent_equivalent: Callable[..., bool] | None
 
     def prepare_intent(
         self,
@@ -445,6 +453,16 @@ class ActionAdapterRegistry:
         if Capability.PAYMENT in capabilities:
             raise ActionAdapterRegistrationError(
                 "financial actions are outside AgentCore authority")
+        from agentcore.tools.authenticated_action import AuthenticatedActionTool
+        if type(tool) is AuthenticatedActionTool or Capability.CREDENTIAL_ACCESS in adapter_spec.reconciliation_capabilities:
+            if type(tool) is not AuthenticatedActionTool:
+                raise ActionAdapterRegistrationError(
+                    "credential probes require an exact authenticated action tool")
+            tool.validate_contract()
+            if adapter_spec.eligibility is not ActionJournalEligibility.EXTERNAL_ACCOUNT_MUTATION or (
+                    adapter_spec.effect_class is not ActionEffectClass.NON_IDEMPOTENT_OR_EXTERNALLY_AMBIGUOUS
+                    or adapter_spec.reconciliation_capabilities != frozenset({Capability.NET_READ, Capability.CREDENTIAL_ACCESS})):
+                raise ActionAdapterRegistrationError("authenticated send classification is invalid")
         if adapter_spec.eligibility is (
                 ActionJournalEligibility.EPHEMERAL_CONTROL) and (
                     capabilities & _EPHEMERAL_INCOMPATIBLE_CAPABILITIES):
@@ -496,6 +514,9 @@ class ActionAdapterRegistry:
             raise ActionAdapterRegistrationError(
                 "action reconciler lacks registered probe capabilities")
         key = (adapter_spec.tool_name, adapter_spec.tool_version)
+        repeat_equivalent = getattr(adapter, "repeat_intent_equivalent", None)
+        if repeat_equivalent is not None and not callable(repeat_equivalent):
+            raise ActionAdapterRegistrationError("repeat intent comparison is invalid")
         binding = _RegisteredAdapter(
             adapter=adapter,
             spec=adapter_spec,
@@ -510,6 +531,7 @@ class ActionAdapterRegistry:
             validates_external_contract=validate,
             executes_external_effect_if_current=execute_if_current,
             allows_indefinite_retention=indefinite,
+            repeat_intent_equivalent=repeat_equivalent,
         )
         with self._lock:
             if key in self._by_tool:
@@ -668,12 +690,17 @@ def permission_policy_fingerprint(policy: Any) -> str:
     if any(not isinstance(value, str) for value in blocked):
         raise ActionValidationError(
             "permission policy blocked capability is invalid")
-    return _canonical_digest({
+    payload = {
         "domain": "agentcore.permission-policy.v1",
         "level": level.value,
         "capability_overrides": sorted(normalized_overrides),
         "blocked_capabilities": sorted(set(blocked)),
-    })
+    }
+    # Preserve historical fingerprints when the new opt-in is absent/false.
+    # Read/probe opt-ins do not grant mutation authority.
+    if getattr(policy, "allow_email_send", False):
+        payload["allow_email_send"] = True
+    return _canonical_digest(payload)
 
 
 def authority_binding_digest(

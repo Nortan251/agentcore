@@ -32,10 +32,13 @@ GOOGLE_CERTIFICATES_ENDPOINT = "https://www.googleapis.com/oauth2/v1/certs"
 GOOGLE_IDENTITY_SCOPES = frozenset({"openid", "email", "profile"})
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 GOOGLE_GMAIL_READONLY_SCOPES = GOOGLE_IDENTITY_SCOPES | {GMAIL_READONLY_SCOPE}
+GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
+GOOGLE_GMAIL_SEND_SCOPES = GOOGLE_GMAIL_READONLY_SCOPES | {GMAIL_SEND_SCOPE}
 _SCOPE_ALIASES = {"openid": "openid", "email": "email", "profile": "profile",
                   "https://www.googleapis.com/auth/userinfo.email": "email",
                   "https://www.googleapis.com/auth/userinfo.profile": "profile",
-                  GMAIL_READONLY_SCOPE: GMAIL_READONLY_SCOPE}
+                  GMAIL_READONLY_SCOPE: GMAIL_READONLY_SCOPE,
+                  GMAIL_SEND_SCOPE: GMAIL_SEND_SCOPE}
 
 
 class GoogleAccessProfile(Enum):
@@ -43,11 +46,15 @@ class GoogleAccessProfile(Enum):
 
     IDENTITY = "identity"
     GMAIL_READONLY = "gmail_readonly"
+    GMAIL_SEND = "gmail_send"
 
     @property
     def scopes(self) -> frozenset[str]:
-        return (GOOGLE_GMAIL_READONLY_SCOPES if self is GoogleAccessProfile.GMAIL_READONLY
-                else GOOGLE_IDENTITY_SCOPES)
+        return {
+            GoogleAccessProfile.IDENTITY: GOOGLE_IDENTITY_SCOPES,
+            GoogleAccessProfile.GMAIL_READONLY: GOOGLE_GMAIL_READONLY_SCOPES,
+            GoogleAccessProfile.GMAIL_SEND: GOOGLE_GMAIL_SEND_SCOPES,
+        }[self]
 
 
 class GoogleOAuthConfig(RuntimeOnly):

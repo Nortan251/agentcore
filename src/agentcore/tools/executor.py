@@ -81,6 +81,9 @@ from agentcore.errors import (
 )
 from agentcore.credentials import CredentialError, CredentialFailure, CredentialRuntime
 from agentcore.credentials.runtime import CredentialExecution
+from agentcore.credentials.action import (
+    CredentialActionExecution, CredentialActionIdentity, action_execution, action_snapshot,
+)
 from agentcore.fs.sensitive import DEFAULT_SENSITIVE_POLICY
 from agentcore.observability.events import Events
 from agentcore.observability.logging import StructuredLogger, get_logger
@@ -89,6 +92,7 @@ from agentcore.permissions.policy import Decision, Outcome, PermissionPolicy
 from agentcore.realtime.errors import CancellationRequested
 from agentcore.tools.base import ToolContext, ToolResult, ToolSpec
 from agentcore.tools.authenticated import AuthenticatedReadTool
+from agentcore.tools.authenticated_action import AuthenticatedActionTool
 from agentcore.tools.registry import ToolRegistry, ToolRegistryLeaseError
 from agentcore.util.clock import Clock, SystemClock
 from agentcore.util.ids import new_id
@@ -126,6 +130,14 @@ class _DuplicateRiskBlocked(Exception):
 
 class _ExternalContractBlocked(Exception):
     """Internal marker for a final provider-contract pre-seam stop."""
+
+
+class _CredentialActionNotInvoked(Exception):
+    """The same live owner proved that the credential provider was not entered."""
+
+    def __init__(self, *, cancellation: CancellationRequested | None = None) -> None:
+        super().__init__("Authenticated action stopped before the provider seam.")
+        self.cancellation = cancellation
 
 
 class _CurrentAuthorityBlocked(Exception):
@@ -433,7 +445,7 @@ class ToolExecutor:
         tool_name: str,
         *,
         action_execution_permit: ActionExecutionPermit | None = None,
-        credential_execution: CredentialExecution | None = None,
+        credential_execution: CredentialExecution | CredentialActionExecution | None = None,
     ) -> ToolContext:
         return ToolContext(
             config=dict(self._tool_settings.get(tool_name, {})),
@@ -709,10 +721,9 @@ class ToolExecutor:
                 Capability(value)
                 for value in current.reconciliation_capabilities
             )
-            decision = self.policy.check(
-                probe_capabilities,
-                description=f"Reconcile {current.action_kind}",
-            )
+            decision = (self.policy.check_authenticated_reconciliation(probe_capabilities)
+                        if type(tool) is AuthenticatedActionTool else self.policy.check(
+                            probe_capabilities, description=f"Reconcile {current.action_kind}"))
         except Exception:
             return self._release_recovery_claim(
                 store,
@@ -749,7 +760,11 @@ class ToolExecutor:
                 protected_payload=protected_payload,
                 protected_evidence=protected_evidence,
             ).validate()
-            result = reconciler.probe(context)
+            if type(tool) is AuthenticatedActionTool:
+                result = self._probe_authenticated_action(
+                    store, current, claim, tool, tool_spec, adapter, reconciler, context, checkpoint)
+            else:
+                result = reconciler.probe(context)
             if not isinstance(result, ActionReconciliationResult):
                 raise TypeError("reconciliation result type is invalid")
             result.validate()
@@ -1309,6 +1324,121 @@ class ToolExecutor:
                 self._require_policy_owner()
                 self._credential_policy_leases -= 1
 
+    @contextmanager
+    def _journal_credential_authority(self, tool, tool_spec, checkpoint, validate) -> Iterator[None]:
+        """Pin current policy through the actual credential provider seam.
+
+        Validation includes exact current registration and the live consumed
+        approval (send) or exact recovery claim (probe). No metadata mutex
+        spans those callbacks, the credential provider or result scrubbing.
+        """
+        self._require_policy_owner()
+        if checkpoint is not None:
+            checkpoint()
+        policy, generation = self._policy_snapshot()
+        if self.registry.get(tool_spec.name) is not tool or tool.spec != tool_spec:
+            raise CredentialError(CredentialFailure.BINDING)
+        tool.validate_contract()
+        validate()
+        thread_id = threading.get_ident()
+        with self._policy_lock:
+            self._require_policy_owner()
+            if self._policy is not policy or self._policy_generation != generation:
+                raise CredentialError(CredentialFailure.PERMISSION)
+            self._credential_policy_leases += 1
+        try:
+            yield
+        finally:
+            self._require_policy_owner()
+            if thread_id != threading.get_ident():
+                raise CredentialError(CredentialFailure.OWNERSHIP)
+            with self._policy_lock:
+                self._require_policy_owner()
+                self._credential_policy_leases -= 1
+
+    def _probe_authenticated_action(self, store, current, claim, tool, tool_spec,
+                                    adapter, reconciler, context, checkpoint):
+        runtime = self._credential_runtime
+        if runtime is None or context.protected_payload is None or not current.attempts:
+            raise CredentialError(CredentialFailure.UNAVAILABLE)
+
+        def validate():
+            if self._load_exact_recovery_claim(store, claim) != current or (
+                    self._action_adapters.resolve(tool, tool_spec=tool_spec) is not adapter
+                    or self._action_adapters.resolve_reconciler(tool, tool_spec=tool_spec) is not reconciler
+                    or not self._registration_matches_record(current, adapter.spec, tool_spec)):
+                raise CredentialError(CredentialFailure.BINDING)
+            decision = self.policy.check_authenticated_reconciliation(
+                frozenset(Capability(cap) for cap in current.reconciliation_capabilities))
+            if not isinstance(decision, Decision) or not decision.allowed:
+                raise CredentialError(CredentialFailure.PERMISSION)
+
+        with self.registry.execution_lease(tool_spec.name, tool):
+            binding = action_snapshot(runtime, tool)
+            identity = CredentialActionIdentity(current.action_id, current.attempts[-1].attempt_id,
+                                                current.intent_digest, claim.claim_epoch)
+            with action_execution(
+                runtime, tool, binding, {}, context.protected_payload, identity,
+                lambda: self._journal_credential_authority(tool, tool_spec, checkpoint, validate),
+                authority=self._credential_authority, reconciler=reconciler,
+            ) as permit:
+                return reconciler.probe(replace(context, credential_execution=permit))
+
+    def _run_authenticated_action(self, *, store, claimed, tool, tool_spec, cleaned,
+                                  adapter, spec, prepared, current_approval_receipt, checkpoint):
+        runtime = self._credential_runtime
+        entered = False
+
+        def validate():
+            # Credential resolution can run callbacks or take time. The exact
+            # durable claim must still exist after that interval; the earlier
+            # claimed snapshot alone is not current execution authority.
+            current = store.load(claimed.action_id)
+            current.validate()
+            if current != claimed or current.state is not ActionState.IN_FLIGHT:
+                raise CredentialError(CredentialFailure.AUTHORITY)
+            self._validate_current_execution_authority(
+                record=claimed, tool=tool, tool_spec=tool_spec, adapter=adapter,
+                spec=spec, prepared=prepared, current_approval_receipt=current_approval_receipt)
+            if claimed.duplicate_risk_acknowledgement is not None and len(claimed.attempts) == 1:
+                self._validate_current_duplicate_risk_permission(
+                    record=claimed, tool_spec=tool_spec, prepared=prepared,
+                    current_approval_receipt=current_approval_receipt)
+                self._validate_duplicate_risk_record(store=store, record=claimed, tool=tool,
+                                                     tool_spec=tool_spec, spec=spec, prepared=prepared)
+
+        try:
+            if runtime is None:
+                raise CredentialError(CredentialFailure.UNAVAILABLE)
+            payload, _ = self._resolve_action_protected_storage(claimed)
+            if payload is None:
+                raise CredentialError(CredentialFailure.BINDING)
+            binding = action_snapshot(runtime, tool)
+            identity = CredentialActionIdentity(claimed.action_id, claimed.attempts[-1].attempt_id,
+                                                claimed.intent_digest)
+            with action_execution(
+                runtime, tool, binding, cleaned, payload, identity,
+                lambda: self._journal_credential_authority(tool, tool_spec, checkpoint, validate),
+                authority=self._credential_authority,
+            ) as permit:
+                try:
+                    result = tool.run(cleaned, self._context(tool_spec.name, credential_execution=permit))
+                finally:
+                    entered = permit.provider_entered
+                normalized = adapter.normalize_effect(result)
+                if not isinstance(normalized, NormalizedActionEffect):
+                    raise TypeError("action normalization type is invalid")
+                return normalized.validate(spec), None
+        except CancellationRequested as exc:
+            if entered:
+                return self._unknown_effect(spec, "gmail.send.cancelled"), exc
+            raise _CredentialActionNotInvoked(cancellation=exc) from None
+        except Exception:
+            if entered:
+                return self._unknown_effect(spec, "gmail.send.uncertain"), None
+        # No provider exception or secret-bearing context leaves this method.
+        raise _CredentialActionNotInvoked()
+
     def _current_policy_decision(
         self,
         tool_spec: ToolSpec,
@@ -1316,6 +1446,21 @@ class ToolExecutor:
         description: str,
     ) -> tuple[Decision, bool]:
         """Return current aggregate policy truth without boolean approval."""
+        authenticated_send_caps = frozenset({Capability.EMAIL_SEND, Capability.NET_WRITE, Capability.CREDENTIAL_ACCESS})
+        current_tool = self.registry.get(tool_spec.name) if tool_spec.capabilities == authenticated_send_caps else None
+        if type(current_tool) is AuthenticatedActionTool:
+            if current_tool.spec != tool_spec:
+                raise CredentialError(CredentialFailure.BINDING)
+            current_tool.validate_contract()
+            decision = self.policy.evaluate_authenticated_send(tool_spec.capabilities)
+            # Durable approval is intrinsic to this composition, even for a
+            # custom host policy. ALLOW is not a valid send-context result.
+            if not isinstance(decision, Decision) or (
+                    decision.outcome is not Outcome.DENY
+                    and decision.outcome is not Outcome.REQUIRE_APPROVAL):
+                return Decision(Outcome.DENY, "authenticated sends require durable approval",
+                                capability=Capability.EMAIL_SEND), False
+            return decision, decision.outcome is Outcome.REQUIRE_APPROVAL
         if type(self.policy).check is not PermissionPolicy.check:
             decision = self.policy.check(
                 tool_spec.capabilities, description=description)
@@ -1824,6 +1969,20 @@ class ToolExecutor:
                 "The earlier action still has an authoritative reconciliation "
                 "path; resolve that truth before creating a risky repeat.",
             )
+        equivalent_intent = (
+            hmac.compare_digest(predecessor.intent_digest, successor_intent_digest)
+            and self._protected_intent_matches(predecessor, prepared)
+        )
+        registered = self._action_adapters.resolve(tool, tool_spec=tool_spec)
+        compare_repeat = getattr(registered, "repeat_intent_equivalent", None)
+        if compare_repeat is not None:
+            try:
+                old_payload, _ = self._resolve_action_protected_storage(predecessor)
+                if old_payload is None or prepared.protected_payload is None:
+                    raise ValueError("protected repeat comparison lacks exact payloads")
+                equivalent_intent = compare_repeat(old_payload, prepared.protected_payload) is True
+            except Exception:
+                equivalent_intent = False
         same_intent = (
             predecessor.action_kind == spec.action_kind
             and predecessor.tool_name == tool_spec.name
@@ -1833,12 +1992,10 @@ class ToolExecutor:
             and predecessor.mutation_capabilities == mutation_capabilities
             and predecessor.reconciliation_capabilities == (
                 reconciliation_capabilities)
-            and hmac.compare_digest(
-                predecessor.intent_digest, successor_intent_digest)
+            and equivalent_intent
             and predecessor.target_category == successor_target_category
             and predecessor.target_fingerprint == (
                 successor_target_fingerprint)
-            and self._protected_intent_matches(predecessor, prepared)
         )
         if not same_intent:
             raise _DuplicateRiskBlocked(
@@ -2226,6 +2383,8 @@ class ToolExecutor:
                 log=log, invocation_id=invocation_id)
 
         try:
+            if type(tool) is AuthenticatedActionTool:
+                tool.validate_action_context(trusted_context, repeat=duplicate_risk_context is not None)
             prepared = adapter.prepare_intent(cleaned, trusted_context)
             if not isinstance(prepared, PreparedActionIntent):
                 raise TypeError("adapter preflight type")
@@ -3171,10 +3330,32 @@ class ToolExecutor:
                     prepared=prepared,
                     attempt_id=attempt_id,
                     current_approval_receipt=current_approval_receipt,
+                    checkpoint=checkpoint,
                 )
             )
             decision = final_decision
+        except _CredentialActionNotInvoked as exc:
+            if exc.cancellation is not None:
+                self._publish_claimed_cancellation(store, claimed)
+                raise exc.cancellation
+            published = self._publish_confirmed_no_effect(
+                store, claimed, attempt_status=ActionAttemptStatus.NOT_INVOKED,
+                result_class="gmail.send.not_invoked",
+                summary="The authenticated send provider was not entered.")
+            return self._published_or_uncertain(
+                tool_spec.name, redacted, published, decision, invocation_id, attempt_id,
+                elapsed(), log, fallback_kind="action_credential_unavailable",
+                fallback_action_id=claimed.action_id)
         except _CurrentAuthorityBlocked as exc:
+            if type(tool) is AuthenticatedActionTool:
+                published = self._publish_confirmed_no_effect(
+                    store, claimed, attempt_status=ActionAttemptStatus.NOT_INVOKED,
+                    result_class="gmail.send.authority_denied",
+                    summary="Current authority prevented entry to the send provider.")
+                return self._published_or_uncertain(
+                    tool_spec.name, redacted, published, exc.decision or decision,
+                    invocation_id, attempt_id, elapsed(), log, fallback_kind=exc.kind,
+                    fallback_action_id=claimed.action_id)
             return self._journal_failure(
                 tool_spec.name, redacted, elapsed(),
                 kind=exc.kind,
@@ -3288,6 +3469,7 @@ class ToolExecutor:
         prepared: PreparedActionIntent,
         attempt_id: str,
         current_approval_receipt: DurableApprovalReceipt | None,
+        checkpoint: Callable[[], None] | None = None,
     ) -> tuple[
         NormalizedActionEffect,
         CancellationRequested | None,
@@ -3354,6 +3536,12 @@ class ToolExecutor:
                     )
 
                 cancellation: CancellationRequested | None = None
+                if type(tool) is AuthenticatedActionTool:
+                    normalized, cancellation = self._run_authenticated_action(
+                        store=store, claimed=claimed, tool=tool, tool_spec=tool_spec,
+                        cleaned=cleaned, adapter=adapter, spec=spec, prepared=prepared,
+                        current_approval_receipt=current_approval_receipt, checkpoint=checkpoint)
+                    return normalized, cancellation, final_decision
                 try:
                     # Conservative physical mutation seam. It is entered once.
                     if spec.effect_class is (
@@ -3413,6 +3601,7 @@ class ToolExecutor:
             _CurrentAuthorityBlocked,
             _DuplicateRiskBlocked,
             _ExternalContractBlocked,
+            _CredentialActionNotInvoked,
         ):
             raise
         except Exception as exc:
@@ -4152,6 +4341,7 @@ class ToolExecutor:
         log: Any,
         *,
         fallback_kind: str,
+        fallback_action_id: str | None = None,
     ) -> ToolInvocation:
         if published is not None:
             return self._durable_invocation(
@@ -4163,7 +4353,7 @@ class ToolExecutor:
             kind="action_result_publication_uncertain",
             message="Durable no-effect publication is uncertain.",
             log=log, decision=decision, invocation_id=invocation_id,
-            attempt_id=attempt_id)
+            action_id=fallback_action_id, attempt_id=attempt_id)
 
     @staticmethod
     def _safe_pre_action_failure(

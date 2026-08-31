@@ -132,6 +132,8 @@ class ActionReconciliationContext:
         default=None, repr=False, compare=False)
     protected_evidence: tuple[ProtectedEvidenceView, ...] = field(
         default=(), repr=False, compare=False)
+    # Live executor-only permit. Not a persisted field or a CredentialLease.
+    credential_execution: object | None = field(default=None, repr=False, compare=False)
 
     @classmethod
     def from_record(cls, record: ActionRecord) -> ActionReconciliationContext:

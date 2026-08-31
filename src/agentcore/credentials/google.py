@@ -18,6 +18,7 @@ from urllib.parse import urlencode
 from agentcore.credentials.errors import CredentialError, CredentialFailure
 from agentcore.credentials.google_protocol import (
     GOOGLE_AUTHORIZATION_ENDPOINT, GOOGLE_IDENTITY_SCOPES, GOOGLE_GMAIL_READONLY_SCOPES,
+    GOOGLE_GMAIL_SEND_SCOPES, GMAIL_SEND_SCOPE,
     GMAIL_READONLY_SCOPE, GoogleAccessProfile, GoogleIdentityVerifier,
     GoogleOAuthConfig, GoogleOAuthHttp, GoogleTokenTransport, IdentityTokenVerifier,
     OAuthTokenResponse, validate_google_claims,
@@ -168,12 +169,19 @@ class GoogleConnectionService(RuntimeOnly):
             # Profile is captured by this host operation, not mutable service
             # state. On refresh the protected current grant is the ceiling;
             # neither a response nor old identity-only metadata can widen it.
-            gmail = (profile is GoogleAccessProfile.GMAIL_READONLY if initial else
-                     operation.expected is not None and GMAIL_READONLY_SCOPE in operation.expected.scopes)
-            allowed = GOOGLE_GMAIL_READONLY_SCOPES if gmail else GOOGLE_IDENTITY_SCOPES
+            if initial:
+                assert profile is not None
+                allowed = profile.scopes
+            elif operation.expected is not None and GMAIL_SEND_SCOPE in operation.expected.scopes:
+                allowed = GOOGLE_GMAIL_SEND_SCOPES
+            elif operation.expected is not None and GMAIL_READONLY_SCOPE in operation.expected.scopes:
+                allowed = GOOGLE_GMAIL_READONLY_SCOPES
+            else:
+                allowed = GOOGLE_IDENTITY_SCOPES
+            gmail = allowed != GOOGLE_IDENTITY_SCOPES
             if scopes is None or "openid" not in scopes or not scopes <= allowed or (
                 not initial and operation.expected is not None and not scopes <= operation.expected.scopes
-            ) or (gmail and scopes != GOOGLE_GMAIL_READONLY_SCOPES):
+            ) or (gmail and scopes != allowed):
                 raise CredentialError(CredentialFailure.SCOPE_MISMATCH)
             if initial and response.refresh is None:
                 raise CredentialError(CredentialFailure.RECONNECT)
