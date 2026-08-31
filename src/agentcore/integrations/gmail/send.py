@@ -390,6 +390,25 @@ class GmailSendFoundation(RuntimeOnly):
                 raise CredentialError(CredentialFailure.CAPACITY)
             self._preparations[handle.preparation_id] = handle
 
+    def release(self, handle: GmailSendPreparation) -> bool:
+        """Forget an exact host handle and reclaim its in-process slot.
+
+        This does not cancel admitted work, revoke approval, or delete durable
+        intent. Retain the handle and restore it to resume the same action.
+        """
+        self._owner()
+        if type(handle) is not GmailSendPreparation:
+            raise SendIntentError()
+        with self._lock:
+            self._owner()
+            existing = self._preparations.get(handle.preparation_id)
+            if existing is None:
+                return False
+            if existing != handle:
+                raise SendIntentError()
+            del self._preparations[handle.preparation_id]
+            return True
+
     def _load_preparation(self, preparation_id: str) -> tuple[dict[str, Any], GmailSendPreparation]:
         self._owner()
         with self._lock:

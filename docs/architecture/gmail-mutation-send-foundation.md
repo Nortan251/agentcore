@@ -97,6 +97,15 @@ also retains the original preparation and actual journal action ID. Stage 5
 copies and authenticates the complete protected intent under the actual action
 ID; preparation storage is inert pre-approval data, not an AUTHORIZED journal.
 
+The composition admits at most 256 in-process preparation handles. The trusted
+host calls `release(handle)` when it no longer needs a handle loaded, reclaiming
+that slot without restarting. Release checks the exact handle, never evicts a
+different proposal, and never deletes protected storage, revokes approval, or
+cancels an already admitted action. Retain any handle needed for continuation
+and explicitly `restore(handle)` before resuming; its original Message-ID,
+MIME, approval binding and deduplication context remain unchanged. Releasing a
+handle is separate from cancellation and from durable data retention policy.
+
 ## Account binding and credentials
 
 Protected intent binds `provider=google`, the vault's stable `account_id`, and
@@ -255,6 +264,13 @@ retain RECONCILE_REQUIRED. Zero is never a definitive absence proof. Multiple
 matches retain categorical duplicate evidence; none is chosen arbitrarily.
 Protected evidence is detached, bounded and linked by the executor to intent,
 action, attempt/claim epoch. It grants neither send nor credential permission.
+
+The existing 64-probe quota counts entry into the credential provider seam.
+Missing runtime services, stale credentials, denied permission and cancellation
+before provider entry release the claim without consuming a probe. Provider
+failures and cancellation after entry still count. This preserves the ability
+to reconcile after valid same-connection credentials are restored, without
+raising the quota or converting uncertainty into retry permission.
 
 `ActionRecoveryCoordinator` audits/reclassifies/claims; only `ToolExecutor` probes.
 Recovery restores no token or permission, never calls send automatically, and

@@ -751,6 +751,7 @@ class ToolExecutor:
         if checkpoint_report is not None:
             return checkpoint_report
 
+        probe_entered = False
         try:
             protected_payload, protected_evidence = (
                 self._resolve_action_protected_storage(current)
@@ -761,9 +762,18 @@ class ToolExecutor:
                 protected_evidence=protected_evidence,
             ).validate()
             if type(tool) is AuthenticatedActionTool:
-                result = self._probe_authenticated_action(
-                    store, current, claim, tool, tool_spec, adapter, reconciler, context, checkpoint)
+                with self._authenticated_probe_context(
+                    store, current, claim, tool, tool_spec, adapter, reconciler, context, checkpoint,
+                ) as probe_context:
+                    try:
+                        result = reconciler.probe(probe_context)
+                    finally:
+                        # Read the live permit before its context retires it.
+                        # Local resolution/authorization failures consume no
+                        # provider quota, including pre-I/O cancellation.
+                        probe_entered = probe_context.credential_execution.provider_entered
             else:
+                probe_entered = True
                 result = reconciler.probe(context)
             if not isinstance(result, ActionReconciliationResult):
                 raise TypeError("reconciliation result type is invalid")
@@ -774,7 +784,7 @@ class ToolExecutor:
                 current,
                 claim,
                 status=ActionReconciliationStatus.UNRESOLVED,
-                probe_entered=True,
+                probe_entered=probe_entered,
             )
             raise
         except Exception:
@@ -783,7 +793,7 @@ class ToolExecutor:
                 current,
                 claim,
                 status=ActionReconciliationStatus.PROBE_FAILED,
-                probe_entered=True,
+                probe_entered=probe_entered,
             )
 
         checkpoint_report = self._reconciliation_checkpoint(
@@ -791,7 +801,7 @@ class ToolExecutor:
             current,
             claim,
             checkpoint,
-            probe_entered=True,
+            probe_entered=probe_entered,
         )
         if checkpoint_report is not None:
             return checkpoint_report
@@ -810,7 +820,7 @@ class ToolExecutor:
                 current,
                 claim,
                 status=ActionReconciliationStatus.PROBE_FAILED,
-                probe_entered=True,
+                probe_entered=probe_entered,
             )
         return self._publish_reconciliation_candidate(
             store,
@@ -1356,8 +1366,9 @@ class ToolExecutor:
                 self._require_policy_owner()
                 self._credential_policy_leases -= 1
 
-    def _probe_authenticated_action(self, store, current, claim, tool, tool_spec,
-                                    adapter, reconciler, context, checkpoint):
+    @contextmanager
+    def _authenticated_probe_context(self, store, current, claim, tool, tool_spec,
+                                     adapter, reconciler, context, checkpoint) -> Iterator[ActionReconciliationContext]:
         runtime = self._credential_runtime
         if runtime is None or context.protected_payload is None or not current.attempts:
             raise CredentialError(CredentialFailure.UNAVAILABLE)
@@ -1382,7 +1393,7 @@ class ToolExecutor:
                 lambda: self._journal_credential_authority(tool, tool_spec, checkpoint, validate),
                 authority=self._credential_authority, reconciler=reconciler,
             ) as permit:
-                return reconciler.probe(replace(context, credential_execution=permit))
+                yield replace(context, credential_execution=permit)
 
     def _run_authenticated_action(self, *, store, claimed, tool, tool_spec, cleaned,
                                   adapter, spec, prepared, current_approval_receipt, checkpoint):

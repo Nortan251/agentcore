@@ -2,16 +2,18 @@
 
 import copy
 import json
+from contextlib import contextmanager
 from dataclasses import asdict, replace
 
 import pytest
 
 from agentcore.action_journal import (
-    ActionReconciliationContext, ActionReconciliationStatus, ActionState, ReconciliationDisposition,
+    MAX_RECONCILIATION_PROBES, ActionReconciliationContext, ActionReconciliationStatus, ActionState, ReconciliationDisposition,
 )
 from agentcore.credentials import CredentialError, GoogleAccessProfile
 from agentcore.integrations.gmail.send import GmailProbeCandidate, GmailProbeResponse
 from agentcore.permissions.levels import Capability
+from agentcore.realtime.errors import CancellationRequested
 from gmail_send_fakes import ACCESS, ARGS, REFRESH, Harness, send_policy
 
 
@@ -119,6 +121,7 @@ def test_malformed_or_secret_bearing_probe_never_settles_or_discloses(uncertain,
     report = h.reconcile(h.first.action_id)
     assert report.status is ActionReconciliationStatus.PROBE_FAILED
     assert h.actions.load(h.first.action_id).state is ActionState.RECONCILE_REQUIRED
+    assert h.actions.load(h.first.action_id).reconciliation.probe_count == 1
     assert len(h.fake.sends) == len(h.fake.probes) == 1
     assert ACCESS not in json.dumps(asdict(report)) + h.ordinary_json()
 
@@ -142,7 +145,70 @@ def test_probe_requires_current_credential_and_independent_current_read_authorit
     report = h.reconcile(h.first.action_id)
     assert report.status in {ActionReconciliationStatus.PROBE_DENIED, ActionReconciliationStatus.PROBE_FAILED}
     assert h.actions.load(h.first.action_id).state is ActionState.RECONCILE_REQUIRED
+    assert h.actions.load(h.first.action_id).reconciliation.probe_count == 0
     assert not h.fake.probes and len(h.fake.sends) == 1
+
+
+@pytest.mark.parametrize("failure", ["missing_runtime", "stale_binding"])
+def test_pretransport_failures_preserve_probe_quota_until_credentials_are_restored(uncertain, monkeypatch, failure):
+    h = uncertain
+    if failure == "missing_runtime":
+        monkeypatch.setattr(h.executor, "_credential_runtime", None)
+    else:
+        refreshed = h.google.service.refresh(h.info.reference)
+
+    # Exercise the actual frozen limit: failed local resolution must not make
+    # this uncertain send permanently unclaimable once credentials are usable.
+    for _ in range(MAX_RECONCILIATION_PROBES):
+        assert h.reconcile(h.first.action_id).status is ActionReconciliationStatus.PROBE_FAILED
+    record = h.actions.load(h.first.action_id)
+    assert record.state is ActionState.RECONCILE_REQUIRED and len(record.attempts) == 1
+    assert not h.fake.probes and len(h.fake.sends) == 1
+    assert record.reconciliation.probe_count == 0
+    assert record.reconciliation.claim_owner_id is None
+    if failure == "missing_runtime":
+        monkeypatch.setattr(h.executor, "_credential_runtime", h.runtime)
+    else:
+        h.foundation.bind(h.runtime, refreshed.reference, replace_existing=True)
+    assert h.reconcile(record.action_id).status is ActionReconciliationStatus.SETTLED_SUCCEEDED
+    assert h.actions.load(record.action_id).state is ActionState.SUCCEEDED
+    assert len(h.fake.probes) == len(h.fake.sends) == 1
+
+
+@pytest.mark.parametrize("cancel_at", ["credential_lookup", "after_provider"])
+def test_cancelled_reconciliation_counts_only_an_entered_provider_probe(uncertain, monkeypatch, cancel_at):
+    h = uncertain
+    cancel = False
+    original_lease = h.google.vault._lease
+
+    @contextmanager
+    def lookup(*args, **kwargs):
+        nonlocal cancel
+        with original_lease(*args, **kwargs) as lease:
+            cancel = cancel_at == "credential_lookup"
+            yield lease
+
+    def probe(request, credential):
+        nonlocal cancel
+        cancel = cancel_at == "after_provider"
+        return GmailProbeResponse((GmailProbeCandidate("one", "thread", True, True, request.semantics),), True)
+
+    def checkpoint():
+        if cancel:
+            raise CancellationRequested("synthetic host cancellation")
+
+    monkeypatch.setattr(h.google.vault, "_lease", lookup)
+    h.fake.probe_hook = probe
+    with pytest.raises(CancellationRequested):
+        h.reconcile(h.first.action_id, checkpoint=checkpoint)
+    record = h.actions.load(h.first.action_id)
+    entered = int(cancel_at == "after_provider")
+    assert record.state is ActionState.RECONCILE_REQUIRED
+    assert record.reconciliation.claim_owner_id is None
+    assert record.reconciliation.probe_count == len(h.fake.probes) == entered
+    assert len(record.attempts) == len(h.fake.sends) == 1
+    assert h.reconcile(record.action_id).status is ActionReconciliationStatus.SETTLED_SUCCEEDED
+    assert len(h.fake.probes) == entered + 1 and len(h.fake.sends) == 1
 
 
 def test_revoking_send_can_still_allow_readonly_reconciliation_but_cannot_send_again(uncertain):

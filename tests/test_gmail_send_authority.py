@@ -86,6 +86,7 @@ def test_policy_replacement_after_final_evaluation_before_lease_cannot_dispatch(
         assert record.state is ActionState.FAILED and record.attempts[-1].status is ActionAttemptStatus.NOT_INVOKED
     else:
         assert results[0].status is ActionReconciliationStatus.PROBE_FAILED and not h.fake.probes
+        assert h.actions.load(first.action_id).reconciliation.probe_count == 0
         assert len(h.fake.sends) == 1
 
 
@@ -275,6 +276,7 @@ def test_real_fork_rejects_inherited_send_permit_and_provider_before_poisoned_lo
             operations = (
                 lambda: action_snapshot(h.runtime, h.foundation.tool),
                 lambda: h.foundation.prepare(args),
+                lambda: h.foundation.release(h.preparation),
                 lambda: context.credential_execution.invoke(h.foundation.tool, args),
                 context.credential_execution._finish,
                 lambda: h.foundation._provider.validate_intent(payload, h.info, reconcile=False),
@@ -293,7 +295,7 @@ def test_real_fork_rejects_inherited_send_permit_and_provider_before_poisoned_lo
         reaped = False
         try:
             assert select.select([read_fd], [], [], 5)[0], "child touched an inherited lock"
-            assert os.read(read_fd, 16) == b"8"
+            assert os.read(read_fd, 16) == b"9"
             assert os.waitpid(child, 0)[1] == 0
             reaped = True
         finally:

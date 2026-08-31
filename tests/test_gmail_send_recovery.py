@@ -4,14 +4,70 @@ import base64
 import json
 import subprocess
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 import pytest
 
 from agentcore.action_journal import ActionReconciliationStatus, ActionState
 from agentcore.approvals import HumanApprovalDecision
-from agentcore.integrations.gmail.send import GmailProbeCandidate, GmailSendPreparation
+from agentcore.credentials import CredentialError, CredentialFailure
+from agentcore.integrations.gmail.send import MAX_PREPARATIONS, GmailProbeCandidate, GmailSendPreparation
+from agentcore.integrations.gmail.send_intent import SendIntentError
 from gmail_send_fakes import ARGS, DecisionGate, Harness, send_policy
+
+
+def test_releasing_preparations_reclaims_capacity_and_preserves_exact_pending_approval(tmp_path):
+    h = Harness(tmp_path, gate=DecisionGate(HumanApprovalDecision.PENDING))
+    try:
+        handle = h.prepare()
+        payload = h.foundation._load_preparation(handle.preparation_id)[0]
+        pending = h.invoke()
+        assert pending.approval_request_id and not h.fake.sends
+        for _ in range(MAX_PREPARATIONS - 1):
+            h.foundation.prepare(ARGS)
+        with pytest.raises(CredentialError) as error:
+            h.foundation.prepare(ARGS)
+        assert error.value.reason is CredentialFailure.CAPACITY
+        with pytest.raises(SendIntentError):
+            h.foundation.release(replace(handle, intent_digest="0" * 64))
+        assert h.foundation.review(handle)["message_id"] == payload["message_id"]
+        assert h.foundation.release(handle) is True
+        assert h.foundation.release(handle) is False
+        assert not h.invoke(preparation=handle).ok and not h.fake.sends
+
+        # A new preparation can use the freed slot, but cannot replace or
+        # silently evict the old approval's exact durable message.
+        another = h.foundation.prepare(ARGS)
+        assert another.preparation_id != handle.preparation_id
+        with pytest.raises(CredentialError) as error:
+            h.foundation.restore(handle)
+        assert error.value.reason is CredentialFailure.CAPACITY
+        assert h.foundation.release(another) is True
+        h.foundation.restore(handle)
+        assert h.foundation._load_preparation(handle.preparation_id)[0] == payload
+        h.authority.record_decision(pending.approval_request_id, HumanApprovalDecision.APPROVE)
+        sent = h.invoke(preparation=handle, action_id=pending.action_id, approval=pending.approval_request_id)
+        assert sent.ok and len(h.fake.sends) == 1
+        assert h.fake.sends[0]["marker"] == payload["message_id"]
+        assert h.fake.sends[0]["mime"] == base64.b64decode(payload["mime_base64"])
+    finally:
+        h.close()
+
+
+def test_releasing_preparation_during_dispatch_does_not_cancel_or_allow_a_second_send(tmp_path):
+    h = Harness(tmp_path)
+    try:
+        handle = h.prepare()
+        h.fake.before_effect = lambda _: h.foundation.release(handle)
+        sent = h.invoke(preparation=handle)
+        assert sent.ok and h.actions.load(sent.action_id).state is ActionState.SUCCEEDED
+        assert h.foundation.release(handle) is False
+        assert not h.invoke(preparation=handle, action_id=sent.action_id).ok
+        h.foundation.restore(handle)
+        assert h.invoke(preparation=handle, action_id=sent.action_id).ok
+        assert len(h.fake.sends) == 1
+    finally:
+        h.close()
 
 
 def test_pending_exact_approval_survives_restart_with_identical_mime_and_fresh_credentials(tmp_path):
