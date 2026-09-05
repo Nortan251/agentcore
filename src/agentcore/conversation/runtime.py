@@ -751,11 +751,21 @@ class ConversationRuntime:
             # A superseded turn stops here, before any tool is asked to run,
             # so supersession can never cause a duplicate tool execution.
             fence.enter_tool_round()
-            round_result = self.tools.run_calls(tool_calls,
-                                                session_id=session_log_id)
+            try:
+                try:
+                    round_result = self.tools.run_calls(
+                        tool_calls, session_id=session_log_id)
+                except ValueError:
+                    # Model-produced call metadata is untrusted. No raw value
+                    # is reflected, and the runner validates the full batch
+                    # before executing its first call.
+                    raise ResponseGenerationError(
+                        "the model requested tools outside safe bounds",
+                        error_type="ToolCallBounds") from None
+            finally:
+                fence.leave_tool_round()
             # A result that arrives after supersession stays truthful
             # invocation evidence, but it may not re-enter the conversation.
-            fence.leave_tool_round()
             if result is not None:
                 result.tool_rounds.append(round_result)
             for outcome in round_result.outcomes:

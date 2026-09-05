@@ -976,6 +976,26 @@ def test_oversized_message_leaves_no_nonterminal_turn(tmp_path):
     assert _records(store)[0].phase is TurnPhase.FAILED
 
 
+def test_oversized_tool_batch_runs_nothing_and_releases_realtime_stage(
+        tmp_path):
+    counter = CountingTool()
+    calls = [
+        ToolCall(f"call-{index}", "counter", {}) for index in range(33)
+    ]
+    model = ScriptedModel(_reply("", tool_calls=calls))
+    agent, runtime, store, _ = _opted_in(
+        tmp_path, model, tools_enabled=True, tools=[counter])
+
+    result = runtime.send("run too many tools")
+
+    assert not result.ok
+    assert result.error == "the model requested tools outside safe bounds"
+    assert counter.runs == 0
+    record = _records(store)[0]
+    assert record.phase is TurnPhase.FAILED
+    assert record.final_terminal is TurnPhase.FAILED
+
+
 def test_unexpected_exception_cannot_strand_a_nonterminal_turn(tmp_path):
     model = ScriptedModel()
     model.raises[1] = KeyboardInterrupt()

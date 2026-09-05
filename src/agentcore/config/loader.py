@@ -275,6 +275,10 @@ def _build_conversation(data: Mapping[str, Any]) -> ConversationConfig:
         max_tool_rounds=_coerce(
             int, data.get("max_tool_rounds", d.max_tool_rounds),
             "conversation.max_tool_rounds"),
+        max_tool_calls_per_round=_coerce(
+            int, data.get("max_tool_calls_per_round",
+                          d.max_tool_calls_per_round),
+            "conversation.max_tool_calls_per_round"),
         max_tool_result_chars=_coerce(
             int, data.get("max_tool_result_chars", d.max_tool_result_chars),
             "conversation.max_tool_result_chars"),

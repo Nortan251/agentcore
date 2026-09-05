@@ -46,6 +46,10 @@ class ConversationConfig:
     #: Hard ceiling on tool -> model -> tool rounds in a single turn. Bounds
     #: the loop so a model cannot call tools forever.
     max_tool_rounds: int = 3
+    #: Hard ceiling on calls accepted in one model response. Validation occurs
+    #: before the first call in that response, preventing partial execution of
+    #: an oversized batch. The streaming boundary has the same absolute cap.
+    max_tool_calls_per_round: int = 32
     #: Characters of a single tool result placed into model context. Truncation
     #: is deterministic and explicitly marked.
     max_tool_result_chars: int = 2000
@@ -60,10 +64,15 @@ class ConversationConfig:
         for name in ("max_context_messages", "max_context_chars",
                      "max_message_chars", "max_session_messages",
                      "max_memories", "max_memory_chars",
-                     "max_tool_rounds", "max_tool_result_chars"):
+                     "max_tool_rounds", "max_tool_calls_per_round",
+                     "max_tool_result_chars"):
             if getattr(self, name) < 1:
                 raise ConfigError(f"conversation.{name} must be at least 1",
                                   value=getattr(self, name))
+        if self.max_tool_calls_per_round > 32:
+            raise ConfigError(
+                "conversation.max_tool_calls_per_round must be at most 32",
+                value=self.max_tool_calls_per_round)
         deadline = self.turn_deadline_seconds
         if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) \
                 or not math.isfinite(deadline):

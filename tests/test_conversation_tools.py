@@ -215,23 +215,70 @@ def test_tools_are_off_by_default():
 def test_tool_bounds_defaults():
     config = ConversationConfig()
     assert config.max_tool_rounds == 3
+    assert config.max_tool_calls_per_round == 32
     assert config.max_tool_result_chars == 2000
 
 
-@pytest.mark.parametrize("field", ["max_tool_rounds", "max_tool_result_chars"])
+@pytest.mark.parametrize("field", [
+    "max_tool_rounds", "max_tool_calls_per_round", "max_tool_result_chars",
+])
 def test_invalid_tool_bounds_rejected(field):
     with pytest.raises(ConfigError) as exc:
         ConversationConfig(**{field: 0}).validate()
     assert field in str(exc.value)
 
 
+def test_tool_call_bound_cannot_exceed_streaming_absolute_limit():
+    with pytest.raises(ConfigError) as exc:
+        ConversationConfig(max_tool_calls_per_round=33).validate()
+    assert "max_tool_calls_per_round" in str(exc.value)
+
+
 def test_tool_config_loads_from_env():
     from agentcore.config.loader import load_config
 
     cfg = load_config(env={"AGENTCORE_CONVERSATION__TOOLS_ENABLED": "true",
-                           "AGENTCORE_CONVERSATION__MAX_TOOL_ROUNDS": "5"})
+                           "AGENTCORE_CONVERSATION__MAX_TOOL_ROUNDS": "5",
+                           "AGENTCORE_CONVERSATION__MAX_TOOL_CALLS_PER_ROUND":
+                               "7"})
     assert cfg.conversation.tools_enabled is True
     assert cfg.conversation.max_tool_rounds == 5
+    assert cfg.conversation.max_tool_calls_per_round == 7
+
+
+def test_tool_batch_bound_is_checked_before_first_invocation(monkeypatch):
+    runner, _, executor, _ = build_runner(
+        [EchoTest()], max_calls_per_round=2)
+    invoked = []
+    original = executor.invoke
+    monkeypatch.setattr(
+        executor, "invoke",
+        lambda *args, **kwargs: invoked.append(args[0])
+        or original(*args, **kwargs))
+
+    with pytest.raises(ValueError, match="call count"):
+        runner.run_calls([
+            call("echo_test", call_id=f"call-{index}")
+            for index in range(3)
+        ])
+    assert invoked == []
+
+
+@pytest.mark.parametrize("tool_call", [
+    ToolCall("i" * 257, "echo_test", {}),
+    ToolCall("call-one", "n" * 257, {}),
+])
+def test_tool_metadata_bound_is_checked_before_first_invocation(
+        monkeypatch, tool_call):
+    runner, _, executor, _ = build_runner([EchoTest()])
+    invoked = []
+    monkeypatch.setattr(
+        executor, "invoke",
+        lambda *args, **kwargs: invoked.append(args[0]))
+
+    with pytest.raises(ValueError, match="metadata"):
+        runner.run_calls([tool_call])
+    assert invoked == []
 
 
 # ===========================================================================
@@ -697,7 +744,7 @@ def test_large_output_is_truncated_with_a_marker():
                            max_result_chars=200).send("go")
     content = result.tool_outcomes[0].content
     assert TRUNCATION_MARKER in content
-    assert len(content) < 1000
+    assert len(content) == 200
 
 
 def test_truncation_is_deterministic():
