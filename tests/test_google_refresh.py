@@ -92,6 +92,7 @@ def test_verified_refresh_publishes_new_access_only_generation_and_requires_rebi
     runtime = runtime_for(connected)
     assert invoke(runtime).ok
     refreshed = connected.service.refresh(connected.info.reference)
+    assert connected.verifier.calls == 2  # initial authorization and refresh proof
     assert refreshed.generation == 2 and refreshed.connection_id == connected.info.connection_id
     assert refreshed.account_id == connected.info.account_id
     assert connected.vault.describe(connected.info.reference).state is CredentialState.REPLACED
@@ -102,7 +103,9 @@ def test_verified_refresh_publishes_new_access_only_generation_and_requires_rebi
     assert runtime.provider.calls == [ACCESS, "replacement-" + ACCESS]
 
 
-@pytest.mark.parametrize("change", ["subject", "issuer", "audience", "expired", "scope", "missing_identity"])
+@pytest.mark.parametrize("change", [
+    "subject", "issuer", "audience", "expired", "invalid_token", "invalid_verifier_result", "scope",
+])
 def test_refresh_cannot_change_account_audience_scope_or_publish_invalid_proof(connected, change):
     runtime = runtime_for(connected)
     if change == "subject":
@@ -113,17 +116,42 @@ def test_refresh_cannot_change_account_audience_scope_or_publish_invalid_proof(c
         connected.verifier.changes["aud"] = "wrong-client"
     elif change == "expired":
         connected.verifier.changes["exp"] = int(connected.clock.now().timestamp())
-    elif change == "scope":
-        connected.transport.refreshed["scope"] = "openid https://www.googleapis.com/auth/gmail.readonly"
+    elif change == "invalid_token":
+        connected.verifier.error = CredentialError(CredentialFailure.IDENTITY_TOKEN)
+    elif change == "invalid_verifier_result":
+        connected.verifier.verify = lambda *_: None
     else:
-        del connected.transport.refreshed["id_token"]
-    with pytest.raises(CredentialError):
+        connected.transport.refreshed["scope"] = "openid https://www.googleapis.com/auth/gmail.readonly"
+    with pytest.raises(CredentialError) as error:
         connected.service.refresh(connected.info.reference)
+    expected = CredentialFailure.SCOPE_MISMATCH if change == "scope" else (
+        CredentialFailure.IDENTITY_MISMATCH if change == "subject" else CredentialFailure.IDENTITY_TOKEN
+    )
+    assert error.value.reason is expected
     assert connected.vault.describe(connected.info.reference) == connected.info
     assert connected.vault._data.identity.subject == SUBJECT
     assert connected.vault.status().state is ConnectionState.CURRENT
     assert not connected.vault.status().can_refresh
     assert invoke(runtime).ok and runtime.provider.calls == [ACCESS]
+
+
+def test_refresh_without_id_token_preserves_established_identity_without_reverification(connected):
+    original = connected.info
+    identity = connected.vault._data.identity
+    verifier_calls = connected.verifier.calls
+    connected.transport.refreshed["expires_in"] = 1800
+    del connected.transport.refreshed["id_token"]
+
+    refreshed = connected.service.refresh(original.reference)
+
+    assert connected.verifier.calls == verifier_calls
+    assert connected.vault._data.identity == identity
+    assert refreshed.account_id == original.account_id
+    assert refreshed.connection_id == original.connection_id
+    assert refreshed.generation == original.generation + 1
+    assert refreshed.reference != original.reference
+    assert refreshed.scopes == original.scopes
+    assert refreshed.expires_at == connected.clock.now() + timedelta(seconds=1800)
 
 
 def test_refresh_scope_omission_means_unchanged_and_reduction_does_not_broaden(connected):

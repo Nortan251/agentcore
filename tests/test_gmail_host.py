@@ -132,6 +132,31 @@ def test_prepare_uses_production_graph_and_private_output_only(harness, boundary
     assert all(value not in ordinary for value in (SENDER, SUBJECT, BODY, ACCESS, REFRESH, review["message_id"]))
 
 
+def test_process_reopen_prepare_refresh_without_id_token_reaches_prepared(harness, boundary):
+    with harness.services() as services:
+        original = services.google.restore()
+        assert original.state.value == "current"
+        identity = harness.last_google.vault._data.identity
+
+    operator = FakeOperator(SUBJECT, BODY)
+    with harness.host(GmailHostMode.PREPARE, operator=operator) as host:
+        reopened = host.services.google.restore()
+        assert reopened.state.value == "refresh_required"
+        assert reopened.credential == original.credential
+        del harness.last_google.transport.refreshed["id_token"]
+
+        slot = host.prepare_smoke_test()
+
+        assert host.action_status(slot.action_id).state == "PREPARED"
+        assert host.info.account_id == original.credential.account_id
+        assert host.info.connection_id == original.credential.connection_id
+        assert host.info.generation == original.credential.generation + 1
+        assert harness.last_google.vault._data.identity == identity
+        assert harness.last_google.verifier.calls == 0
+    assert [request.method for request in boundary.requests] == ["GET"]
+    assert not boundary.posts
+
+
 def test_actual_cli_prepares_without_any_content_arguments(harness, boundary, capsys):
     operator = FakeOperator(SUBJECT, BODY)
     code, output = harness.cli(["prepare-smoke-test"], operator=operator)

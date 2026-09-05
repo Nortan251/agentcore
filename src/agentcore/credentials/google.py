@@ -158,9 +158,9 @@ class GoogleConnectionService(RuntimeOnly):
             raise CredentialError(CredentialFailure.INVALID)
         try:
             self._vault._check_operation(operation, authority=self._authority)
-            if response.id_token is None:
-                raise CredentialError(CredentialFailure.IDENTITY_TOKEN)
             initial = operation.kind == "authorize"
+            if initial and response.id_token is None:
+                raise CredentialError(CredentialFailure.IDENTITY_TOKEN)
             # RFC 6749 permits omitted scope only when unchanged; Google uses
             # that on refresh. Initial grants must enumerate their scopes.
             scopes = response.scopes
@@ -185,14 +185,37 @@ class GoogleConnectionService(RuntimeOnly):
                 raise CredentialError(CredentialFailure.SCOPE_MISMATCH)
             if initial and response.refresh is None:
                 raise CredentialError(CredentialFailure.RECONNECT)
-            claims = self._verifier.verify(response.id_token, self._config.client_id)
+
+            # Fresh authorization establishes identity from cryptographic OIDC
+            # proof. A refresh is already bound to the protected token and the
+            # exact durable identity captured by its operation. Google may omit
+            # an ID token there; absence preserves identity and never creates or
+            # reinterprets one. If proof is returned, verify it independently
+            # and require it to match that captured identity exactly.
+            claims = None
+            has_identity_token = response.id_token is not None
+            if has_identity_token:
+                claims = self._verifier.verify(response.id_token, self._config.client_id)
             self._owner()
             now, current_mono = self._vault._time()
-            identity = validate_google_claims(
-                claims, client_id=self._config.client_id, nonce=nonce, access=response.access,
-                now=now, initial=initial, expected=operation.identity, auth_time=operation.auth_time)
-            expires_at = min(started + timedelta(seconds=response.expires_in), identity.expires_at)
-            deadline = min(mono + response.expires_in, current_mono + (identity.expires_at - now).total_seconds())
+            identity = operation.identity
+            identity_expires_at = None
+            auth_time = operation.auth_time
+            if has_identity_token:
+                verified = validate_google_claims(
+                    claims, client_id=self._config.client_id, nonce=nonce, access=response.access,
+                    now=now, initial=initial, expected=operation.identity,
+                    auth_time=operation.auth_time)
+                identity = verified.identity
+                identity_expires_at = verified.expires_at
+                auth_time = verified.auth_time
+            elif identity is None:
+                raise CredentialError(CredentialFailure.IDENTITY_TOKEN)
+            expires_at = started + timedelta(seconds=response.expires_in)
+            deadline = mono + response.expires_in
+            if identity_expires_at is not None:
+                expires_at = min(expires_at, identity_expires_at)
+                deadline = min(deadline, current_mono + (identity_expires_at - now).total_seconds())
             refresh_expires = operation.refresh_expires
             if initial:
                 refresh_expires = None
@@ -201,9 +224,9 @@ class GoogleConnectionService(RuntimeOnly):
             # If a replacement omits expiry, retaining the previous bound is
             # conservative. The service never invents a longer refresh life.
             return self._vault._publish(
-                operation, identity=identity.identity, access=response.access, refresh=response.refresh,
+                operation, identity=identity, access=response.access, refresh=response.refresh,
                 scopes=scopes, expires_at=expires_at, deadline=deadline, refresh_expires=refresh_expires,
-                nonce=nonce, auth_time=identity.auth_time, authority=self._authority)
+                nonce=nonce, auth_time=auth_time, authority=self._authority)
         finally:
             self._process_owner()
             response.discard()
