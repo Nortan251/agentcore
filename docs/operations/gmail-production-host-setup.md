@@ -205,6 +205,15 @@ Preparation may refresh the **same** connection through the host lifecycle.
 It then obtains the primary Gmail address through the private executor read and
 sets the sole To recipient to that exact verified address. There is no recipient
 flag/prompt. Subject/body use hidden console input, never command-line arguments.
+
+Compatibility note: a connection that already encountered the pre-repair
+`oauth_identity_invalid` result for a refresh response without `id_token` has
+durably disabled unattended refresh. The protected record deliberately stores
+only the conservative `refresh_usable` decision, not a provider failure reason,
+so an upgrade cannot safely distinguish that historical result from a genuine
+identity mismatch or uncertain refresh and must not clear it. After deploying
+the repair, deliberately run `connect` again before preparation for an affected
+connection. Do not edit or delete the protected credential record manually.
 Bounds are 160 UTF-8 subject bytes and 1,024 normalized body bytes, at most eight
 lines; the console requests a harmless single-line body. Empty content,
 HTML-looking markup, reply/forward prefixes, Cc/Bcc, attachments and unsupported

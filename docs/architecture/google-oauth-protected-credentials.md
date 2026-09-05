@@ -205,8 +205,15 @@ account. This follows Google's
 [OIDC identity contract](https://developers.google.com/identity/openid-connect/openid-connect).
 
 Initial authorization requires an ID token, refresh token and explicit granted
-scopes. Refresh also requires a newly verified ID token; missing proof requires
-reconnection rather than publishing unverified access. A refresh ID token may
+scopes. That ID token is cryptographically verified and establishes the durable
+exact `(provider, issuer, subject)` identity. Refresh operates only inside that
+already verified protected identity/connection: the protected refresh token,
+captured current credential and durable identity are its continuity anchor. If a
+refresh response omits `id_token`, the service preserves that exact identity; it
+does not establish, replace or reinterpret identity from the access token,
+scopes, email, profile data or response metadata. If refresh returns an ID token,
+the service independently verifies its signature and claims and requires its
+identity to match the captured durable identity exactly. A refresh ID token may
 omit nonce; if present it must match the stored original nonce, as specified by
 [OIDC refresh validation](https://openid.net/specs/openid-connect-core-1_0.html#RefreshTokenResponse).
 Google's `userinfo.email`/`userinfo.profile` grant spellings normalize to the
@@ -244,10 +251,12 @@ lease cannot silently adopt a newly published generation. Hosts must explicitly
 rebind the same tool/provider/scopes to the returned access reference; reconnect
 with a new connection requires the foundation's new concrete tool binding.
 
-Expiry is checked after remote verification, again before commit, and after
-local persistence before volatile publication. Conservative deadlines count
-remote time from before the token request and bound access by both UTC and
-monotonic time. Wall-clock rollback cannot extend a live access generation.
+Expiry is checked after token acceptance, again before commit, and after local
+persistence before volatile publication. Conservative deadlines count remote
+time from before the token request and bound access by both UTC and monotonic
+time. When refresh returns an ID token, its verified expiry is an additional
+ceiling; when it omits one, the bounded refresh `expires_in` governs the renewed
+access lifetime. Wall-clock rollback cannot extend a live access generation.
 If a durable commit consumes the remaining access lifetime, the refresh record
 survives but no expired access secret is published.
 

@@ -11,6 +11,7 @@ import sys
 import threading
 import traceback
 from dataclasses import asdict, dataclass
+from datetime import timedelta
 
 import pytest
 
@@ -32,7 +33,7 @@ def connected(tmp_path):
     value.vault.close()
 
 
-def test_protected_roundtrip_reopen_keeps_exact_identity_and_generations(connected, tmp_path):
+def test_protected_roundtrip_reopen_refresh_without_id_token_keeps_identity_and_generations(connected, tmp_path):
     original = connected.info
     assert connected.vault.status().state is ConnectionState.CURRENT
     assert connected.vault._data.identity.subject == SUBJECT
@@ -42,11 +43,18 @@ def test_protected_roundtrip_reopen_keeps_exact_identity_and_generations(connect
         assert reopened.service.restore().state is ConnectionState.REFRESH_REQUIRED
         assert reopened.vault.describe(original.reference) == original
         assert reopened.vault._data.identity.subject == SUBJECT
+        identity = reopened.vault._data.identity
+        del reopened.transport.refreshed["id_token"]
+        reopened.transport.refreshed["expires_in"] = 1800
         refreshed = reopened.service.refresh(original.reference)
+        assert reopened.verifier.calls == 0
+        assert reopened.vault._data.identity == identity
         assert refreshed.connection_id == original.connection_id
         assert refreshed.account_id == original.account_id
         assert refreshed.generation == original.generation + 1
         assert refreshed.reference != original.reference
+        assert refreshed.scopes == original.scopes
+        assert refreshed.expires_at == reopened.clock.now() + timedelta(seconds=1800)
         assert reopened.vault.describe(original.reference).state is CredentialState.REPLACED
         assert reopened.transport.refreshes == [REFRESH]
     finally:
