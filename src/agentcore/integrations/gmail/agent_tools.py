@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import os
+import threading
+from collections import OrderedDict
 from collections.abc import Mapping
-from typing import Any
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any, Iterator
 
 from agentcore.credentials.errors import CredentialError, CredentialFailure
 from agentcore.credentials.google_protocol import GOOGLE_GMAIL_READONLY_SCOPES
@@ -24,10 +28,96 @@ from agentcore.tools.authenticated import AuthenticatedReadTool
 from agentcore.tools.base import ParamType, ToolParameter, ToolResult, tool_spec
 
 
+MAX_PROVENANCE_SESSIONS = 128
+
+
+class _SearchProvenance(RuntimeOnly):
+    """Runtime-only, session-bound authority for IDs returned by search."""
+
+    __slots__ = ("_owner_pid", "_active_session", "_lock", "_sessions")
+
+    def __init__(self) -> None:
+        self._owner_pid = os.getpid()
+        self._active_session: ContextVar[str | None] = ContextVar(
+            "gmail_agent_session", default=None)
+        self._lock = threading.RLock()
+        self._sessions: OrderedDict[
+            str, tuple[object, frozenset[str]]
+        ] = OrderedDict()
+
+    def _owner(self) -> None:
+        if self._owner_pid != os.getpid():
+            raise CredentialError(CredentialFailure.OWNERSHIP)
+
+    def _session(self) -> str:
+        self._owner()
+        session_id = self._active_session.get()
+        if type(session_id) is not str or not session_id:
+            raise CredentialError(CredentialFailure.READ_ARGUMENTS)
+        return session_id
+
+    @contextmanager
+    def session(self, session_id: str | None) -> Iterator[None]:
+        self._owner()
+        if type(session_id) is not str or not session_id:
+            raise ValueError("Gmail agent reads require a conversation session")
+        token = self._active_session.set(session_id)
+        try:
+            yield
+        finally:
+            self._active_session.reset(token)
+
+    def begin_search(self) -> tuple[str, object]:
+        """Invalidate older results before the provider search begins."""
+        session_id = self._session()
+        generation = object()
+        with self._lock:
+            self._owner()
+            self._sessions[session_id] = (generation, frozenset())
+            self._sessions.move_to_end(session_id)
+            while len(self._sessions) > MAX_PROVENANCE_SESSIONS:
+                self._sessions.popitem(last=False)
+        return session_id, generation
+
+    def publish(self, grant: tuple[str, object], identifiers: list[str]) -> None:
+        """Publish only the IDs from the current completed search."""
+        session_id = self._session()
+        if grant[0] != session_id:
+            raise CredentialError(CredentialFailure.READ_ARGUMENTS)
+        with self._lock:
+            self._owner()
+            current = self._sessions.get(session_id)
+            if current is None or current[0] is not grant[1]:
+                raise CredentialError(CredentialFailure.READ_ARGUMENTS)
+            allowed = frozenset(identifiers)
+            if allowed:
+                self._sessions[session_id] = (grant[1], allowed)
+                self._sessions.move_to_end(session_id)
+            else:
+                self._sessions.pop(session_id, None)
+
+    def consume(self, message_id: str) -> None:
+        """Consume one same-session search result before Gmail I/O."""
+        session_id = self._session()
+        with self._lock:
+            self._owner()
+            current = self._sessions.get(session_id)
+            if current is None or message_id not in current[1]:
+                raise CredentialError(CredentialFailure.READ_ARGUMENTS)
+            remaining = current[1] - {message_id}
+            if remaining:
+                self._sessions[session_id] = (current[0], remaining)
+                self._sessions.move_to_end(session_id)
+            else:
+                self._sessions.pop(session_id, None)
+
+
 class _Provider(RuntimeOnly):
-    def __init__(self, transport: GmailReadTransport) -> None:
+    def __init__(self, transport: GmailReadTransport,
+                 provenance: _SearchProvenance) -> None:
         self._owner_pid = os.getpid()
         self._transport = transport
+        self._provenance = provenance
 
     def _owner(self) -> None:
         if self._owner_pid != os.getpid():
@@ -53,9 +143,12 @@ class _Search(_Provider):
              credential: CredentialLease) -> ToolResult:
         self._credential(credential)
         cleaned = semantic_search_arguments(dict(args))
+        grant = self._provenance.begin_search()
         raw = self._transport.list_messages(credential, cleaned)
         self._owner()
-        return ToolResult.success(project_search(raw, cleaned["max_results"]))
+        projected = project_search(raw, cleaned["max_results"])
+        self._provenance.publish(grant, projected["message_ids"])
+        return ToolResult.success(projected)
 
 
 class _Read(_Provider):
@@ -65,23 +158,58 @@ class _Read(_Provider):
         if type(args) is not dict or set(args) != {"message_id"}:
             raise CredentialError(CredentialFailure.READ_ARGUMENTS)
         message_id = reference(args["message_id"])
+        self._provenance.consume(message_id)
         raw = self._transport.read_message(credential, message_id)
         self._owner()
         return ToolResult.success(project_message(raw, message_id))
 
 
+class _ConversationRunner(RuntimeOnly):
+    """Activate Gmail provenance only around the canonical runner path."""
+
+    __slots__ = ("_owner_pid", "_runner", "_provenance")
+
+    def __init__(self, runner: Any, provenance: _SearchProvenance) -> None:
+        self._owner_pid = os.getpid()
+        self._runner = runner
+        self._provenance = provenance
+
+    def _owner(self) -> None:
+        if self._owner_pid != os.getpid():
+            raise CredentialError(CredentialFailure.OWNERSHIP)
+
+    def catalogue(self) -> list[dict[str, Any]]:
+        self._owner()
+        return self._runner.catalogue()
+
+    def available(self) -> bool:
+        self._owner()
+        return self._runner.available()
+
+    def run_calls(self, calls: Any, *, session_id: str | None = None) -> Any:
+        self._owner()
+        with self._provenance.session(session_id):
+            return self._runner.run_calls(calls, session_id=session_id)
+
+
 class GmailAgentReadTools(RuntimeOnly):
     """Exactly two semantic read tools for trusted Agent composition."""
+
+    __slots__ = ("_owner_pid", "_provenance", "_providers", "_tools")
 
     def __init__(self, *, transport: GmailReadTransport | None = None) -> None:
         self._owner_pid = os.getpid()
         transport = transport if transport is not None else GmailReadHttp()
-        self._providers = (_Search(transport), _Read(transport))
+        self._provenance = _SearchProvenance()
+        self._providers = (
+            _Search(transport, self._provenance),
+            _Read(transport, self._provenance),
+        )
         capabilities = (Capability.NET_READ, Capability.CREDENTIAL_ACCESS)
         self._tools = (
             AuthenticatedReadTool(tool_spec(
                 "gmail_search_messages",
-                "Search recent mail in the bound Gmail mailbox using bounded semantic filters. Returns message ids only.",
+                "Search recent mail in the bound Gmail mailbox using bounded semantic filters. Returns message ids only; they replace this session's pending one-use read ids.",
                 parameters=(
                     ToolParameter(
                         "recent_days", ParamType.INTEGER,
@@ -112,10 +240,10 @@ class GmailAgentReadTools(RuntimeOnly):
                 tags=("gmail", "gmail-agent", "authenticated-read"))),
             AuthenticatedReadTool(tool_spec(
                 "gmail_read_message",
-                "Read one selected Gmail message as bounded untrusted text. Attachment content and metadata are excluded.",
+                "Read one selected Gmail message as bounded untrusted text. The id must be unused from this session's latest successful search. Attachment content and metadata are excluded.",
                 parameters=(ToolParameter(
                     "message_id", ParamType.STRING,
-                    "One message id returned by Gmail search: 1 to 128 ASCII letters, digits, underscore or hyphen.",
+                    "One unused message id from the latest successful Gmail search in this conversation session: 1 to 128 ASCII letters, digits, underscore or hyphen.",
                     max_length=MAX_ID_CHARS, pattern=ID_PATTERN),),
                 capabilities=capabilities,
                 tags=("gmail", "gmail-agent", "authenticated-read"))),
@@ -129,6 +257,15 @@ class GmailAgentReadTools(RuntimeOnly):
     def tools(self) -> tuple[AuthenticatedReadTool, AuthenticatedReadTool]:
         self._owner()
         return self._tools
+
+    def conversation_runner(self, runner: Any) -> Any:
+        """Scope search provenance around one canonical conversation runner."""
+        self._owner()
+        from agentcore.conversation.tool_use import ConversationToolRunner
+
+        if type(runner) is not ConversationToolRunner:
+            raise CredentialError(CredentialFailure.BINDING)
+        return _ConversationRunner(runner, self._provenance)
 
     def bind(self, runtime: CredentialRuntime, reference: str) -> None:
         """Bind exact host-selected authority; never refresh or register."""

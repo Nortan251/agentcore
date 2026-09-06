@@ -31,8 +31,10 @@ steps that must happen before those values reach that seam:
 3. restore and, if necessary, refresh the host-selected Google connection;
 4. require provider `google` and the exact reviewed `GMAIL_READONLY` scope set;
 5. bind newly constructed agent-facing tools to the current opaque connection
-   reference; and
-6. construct one ordinary `Agent` with those tools and that runtime.
+   reference;
+6. construct one ordinary `Agent` with those tools and that runtime; and
+7. wrap its canonical conversation runner with runtime-only, same-session
+   search provenance before exposing `conversation()`.
 
 The model never supplies or discovers provider, account, connection/reference,
 OAuth profile, scope set, vault, endpoint, or host configuration. The protected
@@ -53,6 +55,7 @@ There is no Gmail-specific execution shortcut:
 ```text
 user message
   -> model proposes gmail_search_messages / gmail_read_message
+  -> Gmail composition activates the current conversation-session scope
   -> ConversationToolRunner
   -> ToolRegistry identity lookup
   -> complete tool-argument validation
@@ -73,8 +76,11 @@ policy already has a narrow authenticated-read classification that only the
 executor can assert for an exact `AuthenticatedReadTool` with a live binding.
 The composition supplies the separate host opt-in. Explicit policy blocks and
 permission-level overrides still win; generic `credential.access` remains
-blocked. Model output, an approval, journal state, a session, or a credential
-on disk cannot manufacture this context.
+blocked. Model output, an approval, journal state, a session identifier, or a
+credential on disk cannot manufacture this context. The session scope is
+activated only by `GmailAgentComposition.conversation()` around the canonical
+runner; using the contained Agent or executor directly provides no read
+provenance and therefore reaches no Gmail transport.
 
 `ToolExecutor` performs argument validation before permission evaluation,
 rechecks current registration and policy generation at the final credential
@@ -96,8 +102,8 @@ The composition registers exactly two tools when ready:
 
 | Tool | Model arguments | Model-visible result |
 | --- | --- | --- |
-| `gmail_search_messages` | `recent_days`, optional literal `sender`, optional literal `subject_terms`, optional literal `search_text`, `max_results` | unique `message_ids`, `returned`, and `more_available` |
-| `gmail_read_message` | one validated `message_id` returned by search | selected headers, snippet, bounded body, body source, attachment-presence boolean, and truncation boolean |
+| `gmail_search_messages` | `recent_days`, optional literal `sender`, optional literal `subject_terms`, optional literal `search_text`, `max_results` | unique `message_ids`, `returned`, and `more_available`; these replace the current session's pending read set |
+| `gmail_read_message` | one unused validated `message_id` from the latest successful search in this session | selected headers, snippet, bounded body, body source, attachment-presence boolean, and truncation boolean |
 
 The lower-level `GmailReadonlyTools` remains available for reviewed trusted
 hosts that already own raw Gmail-query policy, but it is not the approved
@@ -116,6 +122,17 @@ Search is one page only. The model cannot provide or receive a page token.
 `more_available` truthfully indicates that additional results may exist
 without creating authority to fetch them. Provider thread IDs, estimates, and
 unexpected response fields are not returned.
+
+Search results also form the narrow read-provenance boundary. Immediately
+before a search GET, any older pending IDs for that session are invalidated.
+Only after the response passes all structural and projection checks are its at
+most ten IDs published into a runtime-only session entry. Reading atomically
+consumes one matching ID before the message GET. A direct ID, an ID copied from
+another session, a replayed ID, an ID from an older search, or an ID left over
+after a failed replacement search fails closed before Gmail message I/O. The
+grant is never serialized, logged, placed in session metadata, or restored
+after process restart. At most 128 sessions with pending results are retained;
+capacity eviction only removes authority.
 
 ## Read-only endpoint contract
 
@@ -144,6 +161,7 @@ or full-mail profile is rejected rather than treated as sufficient.
 | --- | --- |
 | Search time range | 1–30 recent days; default 7 |
 | Search count | 1–10 IDs; default 5; exactly one page |
+| Search provenance | latest successful search only; at most 10 pending IDs per session; each ID is one-use; at most 128 pending sessions |
 | Semantic sender input | 254 characters |
 | Subject/search-text input | 256 characters each |
 | Generated provider query | independently capped at 1,024 characters |
@@ -157,7 +175,7 @@ or full-mail profile is rejected rather than treated as sufficient.
 | Attachment data | no content, IDs, filenames, MIME types, sizes, or download handle; boolean presence only |
 | Detached agent result | at most 24,000 ASCII-JSON bytes |
 | One complete `Role.TOOL` message | at most 4,096 characters, including its trust frame |
-| Calls per model response | at most 12; whole metadata batch checked before call 1 |
+| Calls per model response | at most 12; the runtime enforces its own cap before invoking even an injected runner, then the runner validates the whole metadata batch before call 1 |
 | Tool rounds per user turn | at most 2 |
 | Total tool-result context per turn | at most `2 * 12 * 4,096 = 98,304` characters |
 | Gmail socket timeout | 10 seconds per socket operation, not a whole-turn deadline |
@@ -279,7 +297,9 @@ cover absence under ordinary composition, explicit registration, canonical
 conversation execution, exact credential/scope binding, host-only refresh,
 fixed GET endpoints, semantic-query injection rejection, malformed and
 oversized results, duplicate IDs, attachment exclusion, prompt injection,
-logging/state/memory/journal privacy, stale/revoked credentials, and aggregate
+same-session one-use search provenance, cross-session/direct/replay rejection,
+failed-search invalidation, logging/state/memory/journal privacy,
+stale/revoked credentials, injected-runner call-cap mismatch, and aggregate
 model-context bounds. No test may use a real Google account, OAuth browser,
 DPAPI record, mailbox, or external Gmail network.
 
@@ -288,14 +308,19 @@ environment and isolated `--basetemp` directories:
 
 | Gate | Result |
 | --- | --- |
-| `pytest -o addopts= -q tests/test_gmail_agent_integration.py tests/test_conversation_tools.py tests/test_realtime_conversation_integration.py::test_oversized_tool_batch_runs_nothing_and_releases_realtime_stage` | 113 passed |
-| conversation and realtime test files | 737 passed, 3 skipped |
+| `pytest -o addopts= -q tests/test_gmail_agent_integration.py tests/test_conversation_tools.py tests/test_realtime_conversation_integration.py::test_oversized_tool_batch_runs_nothing_and_releases_realtime_stage` | 116 passed |
+| conversation and realtime test files | 738 passed, 3 skipped |
 | credential and Google OAuth/refresh test files | 295 passed, 5 skipped |
-| every `tests/test_gmail_*.py` file | 911 passed, 4 skipped |
+| every `tests/test_gmail_*.py` file | 913 passed, 4 skipped |
 | `tests/test_permissions.py`, `tests/test_tools.py`, and `tests/test_task_43_2b_tool_executor_action_boundary.py` | 129 passed, 3 skipped |
-| `pytest -o addopts= -q tests` | 5,350 passed, 154 skipped |
+| `pytest -o addopts= -q tests` | 5,353 passed, 154 skipped |
 
 The final gate also includes `python -m compileall -q src tests` and
-`git diff --check`. The app-backed security diff scan reviewed all ten changed
-source/config surfaces with complete coverage and produced no candidate or
-reportable finding. No validation used a live Google or Gmail boundary.
+`git diff --check`. The initial app-backed security diff scan reviewed all ten
+source/config surfaces with complete coverage and produced no candidate. The
+first exact-head Codex PR review nevertheless found two gaps: missing
+same-session search provenance for reads (P1) and a runtime/injected-runner cap
+mismatch (P2). Focused tests reproduced both on that reviewed commit before
+the repairs above were applied. Exact-head CI, a new security scan, and a fresh
+Codex review remain PR gates and are reported with the pull request rather than
+predicted here. No validation used a live Google or Gmail boundary.

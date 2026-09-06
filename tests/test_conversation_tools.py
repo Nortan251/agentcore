@@ -264,6 +264,30 @@ def test_tool_batch_bound_is_checked_before_first_invocation(monkeypatch):
     assert invoked == []
 
 
+def test_runtime_call_bound_precedes_an_injected_runners_larger_bound(
+        monkeypatch):
+    """Runtime configuration remains authoritative for injected runners."""
+    model = ScriptedModel(ModelResponse(
+        text="", tool_calls=[
+            call("echo_test", {"text": "first"}, "call-one"),
+            call("echo_test", {"text": "second"}, "call-two"),
+        ]))
+    runtime = build_runtime(
+        [EchoTest()], model, max_tool_calls_per_round=1)
+    invoked = []
+    original = runtime.tools.executor.invoke
+    monkeypatch.setattr(
+        runtime.tools.executor, "invoke",
+        lambda *args, **kwargs: invoked.append(args[0])
+        or original(*args, **kwargs))
+
+    result = runtime.send("Run no more than one tool.")
+
+    assert not result.ok
+    assert result.error == "the model requested tools outside safe bounds"
+    assert invoked == []
+
+
 @pytest.mark.parametrize("tool_call", [
     ToolCall("i" * 257, "echo_test", {}),
     ToolCall("call-one", "n" * 257, {}),

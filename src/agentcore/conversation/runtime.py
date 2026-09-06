@@ -742,6 +742,15 @@ class ConversationRuntime:
             if not tool_calls:
                 break
 
+            # The runtime configuration is authoritative even when a caller
+            # injects a runner with a larger independent ceiling.  Provider
+            # output is already materialized above, so reject the complete
+            # batch before entering the tool stage or invoking that runner.
+            if len(tool_calls) > self.config.max_tool_calls_per_round:
+                raise ResponseGenerationError(
+                    "the model requested tools outside safe bounds",
+                    error_type="ToolCallBounds")
+
             if not offer_tools:
                 # Budget spent but the model still wants tools: stop asking.
                 self._log.warning(Events.CONVERSATION_TOOL_ROUNDS_EXHAUSTED,

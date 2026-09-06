@@ -93,6 +93,20 @@ def tool_call(name, arguments, identifier="call-one") -> ModelResponse:
         text="", tool_calls=[ToolCall(identifier, name, arguments)])
 
 
+def scoped_invoke(composition, name, arguments=None, *,
+                  session_id="conv_test_session"):
+    """Invoke through the production conversation runner's trusted scope."""
+    assert composition.gmail is not None
+    runner = composition.gmail.conversation_runner(
+        composition.agent._build_tool_runner())
+    outcome = runner.run_calls(
+        [ToolCall("test-call", name, dict(arguments or {}))],
+        session_id=session_id,
+    ).outcomes[0]
+    assert outcome.invocation is not None
+    return outcome.invocation
+
+
 def test_ordinary_agent_and_ambient_protected_connection_never_register_gmail(
         tmp_path):
     value = connected(tmp_path / "protected")
@@ -234,7 +248,7 @@ def test_host_refreshes_before_binding_but_gmail_transport_never_refreshes(
             deps=AgentDependencies(tools=[]), transport=gmail)
         assert composition.availability.ready
         assert len(value.transport.refreshes) == 1
-        assert composition.agent.executor.invoke(GMAIL_SEARCH_TOOL).ok
+        assert scoped_invoke(composition, GMAIL_SEARCH_TOOL).ok
         assert gmail.calls[0][-1] == "replacement-" + ACCESS
         assert not hasattr(gmail, "refresh")
     finally:
@@ -311,7 +325,8 @@ def test_semantic_search_generates_one_query_and_projects_unique_ids(tmp_path):
     gmail.list_result["unexpected"] = "provider-private"
     built = compose(tmp_path, transport=gmail)
     try:
-        result = built.composition.agent.executor.invoke(
+        result = scoped_invoke(
+            built.composition,
             GMAIL_SEARCH_TOOL,
             {"recent_days": 3, "sender": "Jonathan Example",
              "subject_terms": "project update", "search_text": "Tuesday",
@@ -331,10 +346,82 @@ def test_semantic_search_generates_one_query_and_projects_unique_ids(tmp_path):
         assert "provider-private" not in json.dumps(result.to_dict())
 
         gmail.list_result["messages"] *= 2
-        duplicate = built.composition.agent.executor.invoke(
+        duplicate = scoped_invoke(
+            built.composition,
             GMAIL_SEARCH_TOOL, {"max_results": 2})
         assert duplicate.result.metadata["kind"] == (
             CredentialFailure.READ_RESPONSE.value)
+    finally:
+        built.value.vault.close()
+
+
+def test_read_requires_one_use_search_provenance_in_the_same_session(tmp_path):
+    built = compose(tmp_path)
+    try:
+        unscoped_search = built.composition.agent.executor.invoke(
+            GMAIL_SEARCH_TOOL, {"max_results": 1})
+        assert not unscoped_search.ok
+        assert unscoped_search.result.metadata["kind"] == (
+            CredentialFailure.READ_ARGUMENTS.value)
+        direct = built.composition.agent.executor.invoke(
+            GMAIL_READ_TOOL, {"message_id": MESSAGE_ID})
+        assert not direct.ok
+        assert direct.result.metadata["kind"] == (
+            CredentialFailure.READ_ARGUMENTS.value)
+        assert not built.transport.calls
+
+        searched = scoped_invoke(
+            built.composition, GMAIL_SEARCH_TOOL, {"max_results": 1},
+            session_id="session-one")
+        assert searched.ok
+
+        cross_session = scoped_invoke(
+            built.composition, GMAIL_READ_TOOL, {"message_id": MESSAGE_ID},
+            session_id="session-two")
+        assert not cross_session.ok
+        assert cross_session.result.metadata["kind"] == (
+            CredentialFailure.READ_ARGUMENTS.value)
+        assert [call[0] for call in built.transport.calls] == ["list"]
+
+        allowed = scoped_invoke(
+            built.composition, GMAIL_READ_TOOL, {"message_id": MESSAGE_ID},
+            session_id="session-one")
+        assert allowed.ok
+        assert [call[0] for call in built.transport.calls] == ["list", "read"]
+
+        replay = scoped_invoke(
+            built.composition, GMAIL_READ_TOOL, {"message_id": MESSAGE_ID},
+            session_id="session-one")
+        assert not replay.ok
+        assert replay.result.metadata["kind"] == (
+            CredentialFailure.READ_ARGUMENTS.value)
+        assert [call[0] for call in built.transport.calls] == ["list", "read"]
+    finally:
+        built.value.vault.close()
+
+
+def test_failed_new_search_invalidates_older_session_provenance(tmp_path):
+    built = compose(tmp_path)
+    try:
+        assert scoped_invoke(
+            built.composition, GMAIL_SEARCH_TOOL, {"max_results": 1},
+            session_id="session-one").ok
+        built.transport.list_result = {"messages": "malformed"}
+
+        failed = scoped_invoke(
+            built.composition, GMAIL_SEARCH_TOOL, {"max_results": 1},
+            session_id="session-one")
+        assert not failed.ok
+        assert failed.result.metadata["kind"] == (
+            CredentialFailure.READ_RESPONSE.value)
+
+        stale = scoped_invoke(
+            built.composition, GMAIL_READ_TOOL, {"message_id": MESSAGE_ID},
+            session_id="session-one")
+        assert not stale.ok
+        assert stale.result.metadata["kind"] == (
+            CredentialFailure.READ_ARGUMENTS.value)
+        assert [call[0] for call in built.transport.calls] == ["list", "list"]
     finally:
         built.value.vault.close()
 
@@ -351,7 +438,8 @@ def test_malformed_or_oversized_search_results_fail_closed(tmp_path, raw):
     gmail.list_result = raw
     built = compose(tmp_path, transport=gmail)
     try:
-        result = built.composition.agent.executor.invoke(
+        result = scoped_invoke(
+            built.composition,
             GMAIL_SEARCH_TOOL, {"max_results": 10})
         assert result.result.metadata["kind"] == (
             CredentialFailure.READ_RESPONSE.value)
@@ -373,7 +461,11 @@ def test_read_projection_bounds_content_and_excludes_attachment_metadata(
             header["value"] = "S" * 500
     built = compose(tmp_path, transport=gmail)
     try:
-        result = built.composition.agent.executor.invoke(
+        assert scoped_invoke(
+            built.composition, GMAIL_SEARCH_TOOL,
+            {"max_results": 1}).ok
+        result = scoped_invoke(
+            built.composition,
             GMAIL_READ_TOOL, {"message_id": MESSAGE_ID})
         assert result.ok
         output = result.result.output
@@ -393,7 +485,11 @@ def test_read_projection_bounds_content_and_excludes_attachment_metadata(
         assert '"attachments":' not in public
 
         gmail.message_result = message(text_part("X" * 65_537))
-        oversized = built.composition.agent.executor.invoke(
+        assert scoped_invoke(
+            built.composition, GMAIL_SEARCH_TOOL,
+            {"max_results": 1}).ok
+        oversized = scoped_invoke(
+            built.composition,
             GMAIL_READ_TOOL, {"message_id": MESSAGE_ID})
         assert oversized.result.metadata["kind"] == (
             CredentialFailure.READ_CONTENT.value)
@@ -516,10 +612,12 @@ def test_agent_composition_uses_only_fixed_get_endpoints(tmp_path, monkeypatch):
             config(tmp_path), google=value.service, runtime=runtime,
             deps=AgentDependencies(tools=[]), transport=GmailReadHttp())
         wire.body = {"messages": [{"id": MESSAGE_ID, "threadId": "thread"}]}
-        assert composition.agent.executor.invoke(
+        assert scoped_invoke(
+            composition,
             GMAIL_SEARCH_TOOL, {"recent_days": 2, "max_results": 1}).ok
         wire.body = message()
-        assert composition.agent.executor.invoke(
+        assert scoped_invoke(
+            composition,
             GMAIL_READ_TOOL, {"message_id": MESSAGE_ID}).ok
         assert len(wire.requests) == 2
         search_method, search_path, search_body, _ = wire.requests[0]
@@ -546,11 +644,13 @@ def test_agent_composition_uses_only_fixed_get_endpoints(tmp_path, monkeypatch):
 
 def test_model_visible_result_and_per_turn_totals_are_hard_bounded(tmp_path):
     gmail = FakeGmail()
-    gmail.message_result = message(text_part("Z" * 8000))
-    batch_one = [ToolCall(f"first-{index}", GMAIL_READ_TOOL,
-                          {"message_id": MESSAGE_ID}) for index in range(12)]
-    batch_two = [ToolCall(f"second-{index}", GMAIL_READ_TOOL,
-                          {"message_id": MESSAGE_ID}) for index in range(12)]
+    large = FunctionTool(
+        tool_spec("large_safe_read", "Return a large synthetic read."),
+        lambda *_: "Z" * 8000)
+    batch_one = [ToolCall(f"first-{index}", "large_safe_read", {})
+                 for index in range(12)]
+    batch_two = [ToolCall(f"second-{index}", "large_safe_read", {})
+                 for index in range(12)]
     model = ScriptedModel(
         ModelResponse(text="", tool_calls=batch_one),
         ModelResponse(text="", tool_calls=batch_two),
@@ -558,6 +658,7 @@ def test_model_visible_result_and_per_turn_totals_are_hard_bounded(tmp_path):
     )
     built = compose(
         tmp_path, model=model, transport=gmail,
+        deps=AgentDependencies(tools=[large], model=model),
         conversation={
             "max_tool_rounds": 20,
             "max_tool_calls_per_round": 32,
@@ -573,6 +674,7 @@ def test_model_visible_result_and_per_turn_totals_are_hard_bounded(tmp_path):
         assert len(visible) == 24
         assert all(len(item) <= 4096 for item in visible)
         assert sum(map(len, visible)) <= 2 * 12 * 4096
+        assert not gmail.calls
     finally:
         built.value.vault.close()
 

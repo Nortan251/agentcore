@@ -203,5 +203,9 @@ class GmailAgentComposition(RuntimeOnly):
                 "connection before Gmail tools can appear."
             )
         base = system_prompt or SYSTEM_PROMPT
+        runner = self.agent._build_tool_runner()
+        if self.gmail is not None:
+            runner = self.gmail.conversation_runner(runner)
         return self.agent.conversation(
-            sessions=sessions, system_prompt=f"{base}\n\n{status}")
+            sessions=sessions, tools=runner,
+            system_prompt=f"{base}\n\n{status}")
