@@ -18,7 +18,6 @@ from agentcore.credentials.google_protocol import GOOGLE_GMAIL_READONLY_SCOPES
 from agentcore.credentials.models import RuntimeOnly
 from agentcore.integrations.gmail.agent_tools import GmailAgentReadTools
 from agentcore.integrations.gmail.http import GmailReadTransport
-from agentcore.permissions.levels import Capability
 
 
 GMAIL_SEARCH_TOOL = "gmail_search_messages"
@@ -67,19 +66,15 @@ def _state_for_failure(reason: CredentialFailure) -> GmailAgentState:
 
 
 def _base_tools(deps: AgentDependencies) -> list[Any]:
-    # Gmail-only is the safe default for this composition. Other ordinary
-    # tools remain available only when the trusted host supplies them
-    # explicitly; opting into mail must not implicitly expose workspace data.
+    # This first authenticated-data composition is deliberately tool-isolated.
+    # Mail is adversarial once it reaches the model, so even an explicitly
+    # supplied ordinary tool would create an unreviewed cross-capability and
+    # logging path. A future mixed-tool host needs its own information-flow
+    # design; it must not emerge as an option on this narrow constructor.
     tools = list(() if deps.tools is None else deps.tools)
-    for tool in tools:
-        tags = set(getattr(tool.spec, "tags", ()))
-        if (tool.name.startswith("gmail_") or "gmail" in tags
-                or Capability.CREDENTIAL_ACCESS in tool.capabilities):
-            # This composition owns the complete authenticated surface.  It
-            # will not silently mix caller-provided credential or Gmail tools
-            # under its narrow policy opt-in.
-            raise CredentialError(CredentialFailure.BINDING)
-    return tools
+    if tools:
+        raise CredentialError(CredentialFailure.BINDING)
+    return []
 
 
 class GmailAgentComposition(RuntimeOnly):

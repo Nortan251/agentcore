@@ -873,6 +873,20 @@ def test_arguments_and_output_are_not_logged(caplog_json):
     assert SECRET not in json.dumps(entry)
 
 
+def test_untrusted_tool_name_and_call_id_are_not_logged(caplog_json):
+    runner, *_ = build_runner([EchoTest()])
+    unknown = runner.run_calls([
+        call(SECRET, call_id="safe-id"),
+    ], session_id="safe-session").outcomes[0]
+    runner.run_calls([
+        call("echo_test", {"text": "safe"}, call_id=SECRET),
+    ], session_id="safe-session")
+
+    logs = caplog_json.getvalue()
+    assert SECRET not in logs
+    assert SECRET not in json.dumps(unknown.describe())
+
+
 def test_denial_is_logged(caplog_json):
     model = ScriptedModel(wants("danger_write"), ModelResponse(text="no"))
     build_runtime([MutatingTool()], model,

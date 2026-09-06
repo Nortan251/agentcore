@@ -168,12 +168,18 @@ def test_composition_with_default_dependencies_is_gmail_only(tmp_path):
         value.vault.close()
 
 
-@pytest.mark.parametrize("kind", ["legacy_read", "send", "prebound"])
-def test_composition_rejects_ambiguous_or_pre_enabled_authenticated_surfaces(
+@pytest.mark.parametrize(
+    "kind", ["ordinary", "legacy_read", "send", "prebound"])
+def test_composition_rejects_caller_tools_or_pre_enabled_authenticated_surfaces(
         tmp_path, kind):
     value = connected(tmp_path / "protected")
     runtime = CredentialRuntime(value.vault)
-    if kind == "legacy_read":
+    if kind == "ordinary":
+        ordinary = FunctionTool(
+            tool_spec("ordinary_read", "Synthetic ordinary read."),
+            lambda *_: "never")
+        deps = AgentDependencies(tools=[ordinary])
+    elif kind == "legacy_read":
         tools = list(GmailReadonlyTools(transport=FakeGmail()).tools)
         deps = AgentDependencies(tools=tools)
     elif kind == "send":
@@ -575,6 +581,49 @@ def test_real_conversation_chain_preserves_authority_privacy_and_memory_boundary
         configure_logging(LoggingConfig(level="CRITICAL"))
 
 
+def test_mail_injection_cannot_enter_unregistered_tool_logs(tmp_path):
+    gmail = FakeGmail()
+    gmail.message_result = message(text_part(MALICIOUS))
+    injected_name = "EMAIL-INJECTION-SENTINEL"
+    model = ScriptedModel(
+        ModelResponse(text="", tool_calls=[
+            ToolCall("search", GMAIL_SEARCH_TOOL, {"max_results": 1}),
+            ToolCall("read", GMAIL_READ_TOOL, {"message_id": MESSAGE_ID}),
+        ]),
+        tool_call(injected_name, {}, "injected"),
+        ModelResponse(text="Mail remained untrusted data."),
+    )
+    log_path = tmp_path / "agent.log"
+    value = connected(tmp_path / "protected")
+    try:
+        composition = GmailAgentComposition.build(
+            AgentConfig(
+                workspace_dir=str(tmp_path / "workspace"),
+                conversation=ConversationConfig(),
+                logging=LoggingConfig(level="DEBUG", file_path=str(log_path)),
+            ),
+            google=value.service,
+            runtime=CredentialRuntime(value.vault),
+            deps=AgentDependencies(tools=[], model=model),
+            transport=gmail,
+        )
+        result = composition.conversation(
+            sessions=InMemorySessionStore()).send("Check bounded mail.")
+
+        assert result.ok and result.tools_executed == 2
+        assert [item.status for item in result.tool_outcomes] == [
+            "ok", "ok", "failed"]
+        assert [call[0] for call in gmail.calls] == ["list", "read"]
+        for handler in logging.getLogger("agentcore").handlers:
+            handler.flush()
+        assert injected_name not in log_path.read_text(encoding="utf-8")
+        assert injected_name not in json.dumps(
+            result.tool_outcomes[-1].describe())
+    finally:
+        value.vault.close()
+        configure_logging(LoggingConfig(level="CRITICAL"))
+
+
 def test_stale_disconnect_and_unavailable_send_followup_fail_categorically(
         tmp_path):
     gmail = FakeGmail()
@@ -644,12 +693,11 @@ def test_agent_composition_uses_only_fixed_get_endpoints(tmp_path, monkeypatch):
 
 def test_model_visible_result_and_per_turn_totals_are_hard_bounded(tmp_path):
     gmail = FakeGmail()
-    large = FunctionTool(
-        tool_spec("large_safe_read", "Return a large synthetic read."),
-        lambda *_: "Z" * 8000)
-    batch_one = [ToolCall(f"first-{index}", "large_safe_read", {})
+    batch_one = [ToolCall(
+        f"first-{index}", GMAIL_SEARCH_TOOL, {"max_results": 1})
                  for index in range(12)]
-    batch_two = [ToolCall(f"second-{index}", "large_safe_read", {})
+    batch_two = [ToolCall(
+        f"second-{index}", GMAIL_SEARCH_TOOL, {"max_results": 1})
                  for index in range(12)]
     model = ScriptedModel(
         ModelResponse(text="", tool_calls=batch_one),
@@ -658,7 +706,6 @@ def test_model_visible_result_and_per_turn_totals_are_hard_bounded(tmp_path):
     )
     built = compose(
         tmp_path, model=model, transport=gmail,
-        deps=AgentDependencies(tools=[large], model=model),
         conversation={
             "max_tool_rounds": 20,
             "max_tool_calls_per_round": 32,
@@ -674,7 +721,8 @@ def test_model_visible_result_and_per_turn_totals_are_hard_bounded(tmp_path):
         assert len(visible) == 24
         assert all(len(item) <= 4096 for item in visible)
         assert sum(map(len, visible)) <= 2 * 12 * 4096
-        assert not gmail.calls
+        assert len(gmail.calls) == 24
+        assert all(call[0] == "list" for call in gmail.calls)
     finally:
         built.value.vault.close()
 

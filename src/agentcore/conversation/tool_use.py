@@ -43,6 +43,7 @@ TRUNCATION_MARKER = "… [truncated]"
 
 #: Prefix identifying a call the model made without supplying an id.
 _FALLBACK_CALL_PREFIX = "call_"
+_UNREGISTERED_TOOL_LOG_NAME = "unregistered"
 MAX_TOOL_CALLS_PER_ROUND = 32
 MAX_TOOL_CALL_ID_CHARS = 256
 MAX_TOOL_NAME_CHARS = 256
@@ -85,8 +86,15 @@ class ToolCallOutcome:
 
     def describe(self) -> dict[str, Any]:
         """Log-safe: registered tool and status, never model call IDs or data."""
+        # A raw call name is model output until the canonical executor returns
+        # an invocation for it. Unknown names can repeat prompt/tool data, so a
+        # log-safe description uses only a categorical label in that case.
+        trusted_name = getattr(self.invocation, "tool_name", None)
+        if type(trusted_name) is not str or not trusted_name:
+            trusted_name = ("registered" if self.needs_approval
+                            else _UNREGISTERED_TOOL_LOG_NAME)
         return {
-            "tool": self.call.name,
+            "tool": trusted_name,
             "status": self.status,
             "executed": self.executed,
             "duration_ms": round(self.duration_ms, 3),
@@ -262,10 +270,13 @@ class ConversationToolRunner:
 
     def _run_one(self, call: ToolCall, *,
                  session_id: str | None) -> ToolCallOutcome:
-        # Model-selected call IDs can repeat private argument values (for
-        # example a Gmail search query). Keep them in protocol messages only,
-        # never generic logs or log-safe outcome descriptions.
-        log = self._log.bind(tool=call.name, session_id=session_id)
+        # Model-selected names and call IDs can repeat private prompt/tool data.
+        # A name becomes log-safe only after it matches the trusted registry;
+        # call IDs remain protocol-only and never enter executor log context.
+        registered = bool(call.name) and call.name in self.registry
+        log = self._log.bind(
+            tool=(call.name if registered else _UNREGISTERED_TOOL_LOG_NAME),
+            session_id=session_id)
         log.info(Events.CONVERSATION_TOOL_REQUESTED,
                  argument_count=len(call.arguments))
 
@@ -274,7 +285,7 @@ class ConversationToolRunner:
                                 "the tool call did not name a tool", log)
 
         # 1. Unknown tools never reach the executor.
-        if call.name not in self.registry:
+        if not registered:
             log.warning(Events.CONVERSATION_TOOL_FAILED, reason="unknown_tool")
             return self._refuse(
                 call, "failed",
@@ -299,8 +310,7 @@ class ConversationToolRunner:
         # 3. The one authoritative path: validation, permission, run, logging.
         log.info(Events.CONVERSATION_TOOL_STARTED)
         try:
-            invocation = self.executor.invoke(
-                call.name, call.arguments, call_id=call.id)
+            invocation = self.executor.invoke(call.name, call.arguments)
         except Exception as exc:  # noqa: BLE001 - never kill the conversation
             log.warning(Events.CONVERSATION_TOOL_FAILED,
                         reason="executor_error", error=type(exc).__name__)

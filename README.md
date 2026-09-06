@@ -360,9 +360,11 @@ others.
 the complete framed message is bounded by `max_tool_result_chars` with an
 explicit `… [truncated]` marker. The system prompt states the boundary before
 any tool output can appear. Tool
-arguments and results are **never** written to durable memory, and logs carry
-tool name, argument count, status and duration only — never arguments, call
-ids or output.
+arguments and results are **never** written to durable memory. Conversation
+logs carry a registry-established tool name (or the categorical
+`unregistered` label), argument count, status and duration — never raw model
+tool names, arguments, call ids or output. The executor retains its existing
+per-tool logging contract; authenticated and mutating arguments are redacted.
 
 ### Provider tool-call parsing
 

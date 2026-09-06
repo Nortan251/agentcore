@@ -41,12 +41,15 @@ OAuth profile, scope set, vault, endpoint, or host configuration. The protected
 record is not itself enablement. Construction is the explicit host enablement
 event; a disconnected or disabled composition publishes no Gmail tools.
 
-The composition is Gmail-only when the host does not explicitly provide other
-ordinary tools. If the host supplies tools, the composition rejects every
-caller-provided Gmail or credential-bearing tool. This prevents mixing the
-legacy raw-query read primitive or a send foundation into this reviewed
-surface. Binding failures abort construction so a partially bound runtime is
-discarded rather than presented as merely offline.
+The composition is always tool-isolated: it rejects every caller-provided tool
+and exposes exactly the two reviewed authenticated Gmail reads. Mail becomes
+adversarial model input after a read, so even an explicitly supplied ordinary
+tool would create an unreviewed cross-capability and logging path. A future
+mixed-tool host requires a separate information-flow design; it cannot emerge
+from this narrow constructor. This also prevents mixing the legacy raw-query
+read primitive or a send foundation into the reviewed surface. Binding
+failures abort construction so a partially bound runtime is discarded rather
+than presented as merely offline.
 
 ## Canonical execution and permission path
 
@@ -245,8 +248,11 @@ tool result.
 ## Logging and persisted-state contract
 
 The canonical tool layers log categorical request/start/completion/failure,
-tool name, argument count, duration, and safe status. They do not log tool
-arguments or results. The Gmail transport has no request/response debug log.
+registry-established tool name, argument count, duration, and safe status.
+Unregistered model-produced names use one categorical `unregistered` label,
+and model call IDs remain protocol-only rather than entering executor log
+context. The two authenticated Gmail tools redact every declared argument and
+do not log results. The Gmail transport has no request/response debug log.
 OAuth/access/refresh/ID tokens, authorization headers, Gmail addresses,
 subjects, message bodies, provider response bodies, credential references,
 account/connection IDs, and mail text are excluded from ordinary logs,
@@ -293,12 +299,14 @@ those decisions is inferred here.
 
 All Gmail-agent tests use synthetic credentials, protected temporary stores,
 scripted model responses, fake transports, or intercepted HTTPS sockets. They
-cover absence under ordinary composition, explicit registration, canonical
-conversation execution, exact credential/scope binding, host-only refresh,
+cover absence under ordinary composition, exact two-tool registration,
+caller-tool isolation, canonical conversation execution, exact
+credential/scope binding, host-only refresh,
 fixed GET endpoints, semantic-query injection rejection, malformed and
 oversized results, duplicate IDs, attachment exclusion, prompt injection,
 same-session one-use search provenance, cross-session/direct/replay rejection,
-failed-search invalidation, logging/state/memory/journal privacy,
+failed-search invalidation, unregistered-name/call-id log privacy,
+logging/state/memory/journal privacy,
 stale/revoked credentials, injected-runner call-cap mismatch, and aggregate
 model-context bounds. No test may use a real Google account, OAuth browser,
 DPAPI record, mailbox, or external Gmail network.
@@ -308,19 +316,25 @@ environment and isolated `--basetemp` directories:
 
 | Gate | Result |
 | --- | --- |
-| `pytest -o addopts= -q tests/test_gmail_agent_integration.py tests/test_conversation_tools.py tests/test_realtime_conversation_integration.py::test_oversized_tool_batch_runs_nothing_and_releases_realtime_stage` | 116 passed |
-| conversation and realtime test files | 738 passed, 3 skipped |
+| `pytest -o addopts= -q tests/test_gmail_agent_integration.py tests/test_conversation_tools.py tests/test_realtime_conversation_integration.py::test_oversized_tool_batch_runs_nothing_and_releases_realtime_stage` | 119 passed |
+| conversation and realtime test files | 739 passed, 3 skipped |
 | credential and Google OAuth/refresh test files | 295 passed, 5 skipped |
-| every `tests/test_gmail_*.py` file | 913 passed, 4 skipped |
+| every `tests/test_gmail_*.py` file | 915 passed, 4 skipped |
 | `tests/test_permissions.py`, `tests/test_tools.py`, and `tests/test_task_43_2b_tool_executor_action_boundary.py` | 129 passed, 3 skipped |
-| `pytest -o addopts= -q tests` | 5,353 passed, 154 skipped |
+| `pytest -o addopts= -q tests` | 5,356 passed, 154 skipped |
 
 The final gate also includes `python -m compileall -q src tests` and
 `git diff --check`. The initial app-backed security diff scan reviewed all ten
 source/config surfaces with complete coverage and produced no candidate. The
 first exact-head Codex PR review nevertheless found two gaps: missing
 same-session search provenance for reads (P1) and a runtime/injected-runner cap
-mismatch (P2). Focused tests reproduced both on that reviewed commit before
-the repairs above were applied. Exact-head CI, a new security scan, and a fresh
-Codex review remain PR gates and are reported with the pull request rather than
-predicted here. No validation used a live Google or Gmail boundary.
+mismatch (P2). A second complete security scan of that repaired commit found a
+mail-to-log and co-tool information-flow path (High/P1): adversarial mail could
+be copied into a caller-supplied ordinary tool argument or an unregistered raw
+tool name. Focused tests reproduced all three issues on their reviewed commits
+before repair. The final repair isolates this composition to exactly the two
+Gmail tools, replaces unregistered model names with a categorical log label,
+and keeps model call IDs out of executor log context. Exact-head CI, a final
+security scan, and a fresh Codex review remain PR gates and are reported with
+the pull request rather than predicted here. No validation used a live Google
+or Gmail boundary.
