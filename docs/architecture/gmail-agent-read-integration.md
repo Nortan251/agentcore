@@ -32,7 +32,8 @@ steps that must happen before those values reach that seam:
 4. require provider `google` and the exact reviewed `GMAIL_READONLY` scope set;
 5. bind newly constructed agent-facing tools to the current opaque connection
    reference;
-6. construct one ordinary `Agent` with those tools and that runtime;
+6. construct one Gmail-specific `Agent` subtype with those tools and that
+   runtime;
 7. wrap its canonical conversation runner in a model-facing registry view that
    exposes only the two exact originally bound Gmail tool objects; and
 8. lease both exact registry bindings and activate runtime-only, same-session
@@ -46,12 +47,14 @@ event; a disconnected or disabled composition publishes no Gmail tools.
 
 The composition is always tool-isolated: it rejects every caller-provided tool
 and exposes exactly the two reviewed authenticated Gmail reads. The contained
-public `Agent` remains normally extensible for non-Gmail uses, but a tool
-registered on it after construction is absent from this composition's model
-catalogue and is treated as unavailable by its conversation runner. Replacing
-or removing either Gmail binding disables the scoped catalogue and execution;
-an exact registry lease closes replacement races between catalogue validation
-and executor dispatch. Mail becomes adversarial model input after a read, so
+public `Agent` remains normally extensible for non-Gmail uses, but every one of
+its public conversation entry points constructs the same fixed Gmail-only
+runner and refuses a caller-supplied alternate runner. A tool registered on it
+after construction is therefore absent from the model catalogue even when a
+mail-derived session is resumed through `composition.agent.conversation()`.
+Replacing or removing either Gmail binding disables the scoped catalogue and
+execution; an exact registry lease closes replacement races between catalogue
+validation and executor dispatch. Mail becomes adversarial model input after a read, so
 an ordinary tool in the same model-facing runner would create an unreviewed
 cross-capability and logging path. A future mixed-tool host requires a separate
 information-flow design; it cannot emerge from constructor injection or later
@@ -97,9 +100,10 @@ mutable but never enter this conversation. Explicit policy blocks and
 permission-level overrides still win; generic `credential.access` remains
 blocked. Model output, an approval, journal state, a session identifier, or a
 credential on disk cannot manufacture this context. The session scope is
-activated only by `GmailAgentComposition.conversation()` around the canonical
-runner; using the contained Agent or executor directly provides no read
-provenance and therefore reaches no Gmail transport.
+activated by the Gmail-specific contained Agent around every canonical
+conversation runner, whether reached through `GmailAgentComposition` or its
+public `agent`. Direct executor use provides no read provenance and therefore
+reaches no Gmail transport.
 
 `ToolExecutor` performs argument validation before permission evaluation,
 rechecks current registration and policy generation at the final credential
@@ -224,7 +228,9 @@ Gmail reads, and then traverses the current permission checks. An ordinary tool
 registered on the underlying Agent before or during that conversation is not
 advertised, invoked, or given the mail-derived argument. Same-name replacement
 is refused while a batch is active and makes later scoped conversations fail
-closed.
+closed. Resuming a mail-derived session through the contained Agent cannot
+rebuild an unscoped runner, and an alternate caller runner is rejected before
+session, model, executor, or provider work.
 
 Gmail arguments and results are not captured as durable memory. Only the
 ordinary user message reaches the existing explicit memory-capture policy.
@@ -329,8 +335,9 @@ fixed GET endpoints, semantic-query injection rejection, malformed and
 oversized results, duplicate IDs, attachment exclusion, prompt injection,
 same-session one-use search provenance, cross-session/direct/replay rejection,
 failed-search invalidation, unregistered-name/call-id log privacy,
-post-construction ordinary-tool isolation, same-name replacement fail-closure,
-and a deterministic replacement race at the scoped-check-to-executor seam,
+post-construction ordinary-tool isolation, direct-Agent same-session resume
+isolation, injected-runner rejection, same-name replacement fail-closure, and a
+deterministic replacement race at the scoped-check-to-executor seam,
 logging/state/memory/journal privacy,
 stale/revoked credentials, injected-runner call-cap mismatch, and aggregate
 model-context bounds. No test may use a real Google account, OAuth browser,
@@ -341,13 +348,13 @@ environment and isolated `--basetemp` directories:
 
 | Gate | Result |
 | --- | --- |
-| three focused post-registration, replacement, and lease-race regressions | 3 passed |
-| `tests/test_gmail_agent_integration.py` | 38 passed |
+| five focused post-registration, direct-resume, runner-injection, replacement, and lease-race regressions | 5 passed |
+| `tests/test_gmail_agent_integration.py` | 40 passed |
 | conversation and realtime test files | 698 passed, 3 skipped |
 | `tests/test_credentials.py`, `tests/test_credential_execution.py`, `tests/test_google_oauth.py`, and `tests/test_google_refresh.py` | 250 passed, 2 skipped |
-| every `tests/test_gmail_*.py` file | 918 passed, 4 skipped |
+| every `tests/test_gmail_*.py` file | 920 passed, 4 skipped |
 | `tests/test_permissions.py`, `tests/test_tools.py`, and `tests/test_task_43_2b_tool_executor_action_boundary.py` | 129 passed, 3 skipped |
-| `pytest tests` | 5,359 passed, 154 skipped |
+| `pytest tests` | 5,361 passed, 154 skipped |
 
 The final gate also includes `python -m compileall -q src tests` and
 `git diff --check`. The initial app-backed security diff scan reviewed all ten
@@ -366,6 +373,11 @@ callback and ordinary argument log on `5c5705d`. The current repair uses a fixed
 two-object registry view plus exact outer execution leases, so later ordinary
 registration is harmless to Gmail conversations and replacement fails closed.
 It retains the earlier categorical unknown-name logging and keeps model call IDs
-out of executor log context. Exact-head CI, a final security scan, and a fresh
-Codex review remain PR gates and are reported with the pull request rather than
-predicted here. No validation used a live Google or Gmail boundary.
+out of executor log context. A fourth complete scan then found that the public
+contained Agent could resume the same mail-derived session while rebuilding a
+runner over its full mutable registry. The final repair makes every conversation
+entry point on a ready Gmail Agent construct the exact scoped runner, appends the
+trusted Gmail status there, and rejects a caller-supplied runner before session,
+model, executor, or provider work. Exact-head CI, a final security scan, and a
+fresh Codex review remain PR gates and are reported with the pull request rather
+than predicted here. No validation used a live Google or Gmail boundary.

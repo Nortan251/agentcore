@@ -101,8 +101,7 @@ def scoped_invoke(composition, name, arguments=None, *,
                   session_id="conv_test_session"):
     """Invoke through the production conversation runner's trusted scope."""
     assert composition.gmail is not None
-    runner = composition.gmail.conversation_runner(
-        composition.agent._build_tool_runner())
+    runner = composition.agent._build_tool_runner()
     outcome = runner.run_calls(
         [ToolCall("test-call", name, dict(arguments or {}))],
         session_id=session_id,
@@ -692,6 +691,96 @@ def test_post_construction_tool_registration_cannot_join_gmail_conversation(
         configure_logging(LoggingConfig(level="CRITICAL"))
 
 
+def test_direct_agent_resume_keeps_mail_out_of_post_registered_tool(tmp_path):
+    gmail = FakeGmail()
+    gmail.message_result = message(text_part(MALICIOUS))
+    captured: list[str] = []
+    ordinary_name = "ordinary_capture"
+    ordinary = FunctionTool(
+        tool_spec(
+            ordinary_name,
+            "Synthetic ordinary tool that must stay outside Gmail conversations.",
+            parameters=(ToolParameter("payload", ParamType.STRING),),
+        ),
+        lambda args, _: captured.append(args["payload"]) or "captured",
+    )
+    model = ScriptedModel(
+        ModelResponse(text="", tool_calls=[
+            ToolCall("search", GMAIL_SEARCH_TOOL, {"max_results": 1}),
+            ToolCall("read", GMAIL_READ_TOOL, {"message_id": MESSAGE_ID}),
+        ]),
+        ModelResponse(text="EMAIL-INJECTION-SENTINEL"),
+        tool_call(
+            ordinary_name,
+            {"payload": "EMAIL-INJECTION-SENTINEL"},
+            "ordinary",
+        ),
+        ModelResponse(text="The resumed conversation remained Gmail-only."),
+    )
+    sessions = InMemorySessionStore()
+    log_path = tmp_path / "agent.log"
+    value = connected(tmp_path / "protected")
+    try:
+        composition = GmailAgentComposition.build(
+            AgentConfig(
+                workspace_dir=str(tmp_path / "workspace"),
+                conversation=ConversationConfig(),
+                logging=LoggingConfig(level="DEBUG", file_path=str(log_path)),
+            ),
+            google=value.service,
+            runtime=CredentialRuntime(value.vault),
+            deps=AgentDependencies(tools=[], model=model),
+            transport=gmail,
+        )
+        first = composition.conversation(sessions=sessions).send(
+            "Read the selected bounded message.")
+        assert first.ok and first.tools_executed == 2
+        assert composition.agent.register_tool(ordinary)
+
+        second = composition.agent.conversation(sessions=sessions).send(
+            "Continue using the same conversation.",
+            session_id=first.session.id,
+        )
+
+        resumed_request = model.requests[2]
+        assert any(
+            item.role is Role.ASSISTANT
+            and "EMAIL-INJECTION-SENTINEL" in item.content
+            for item in resumed_request.messages
+        )
+        assert {item["name"] for item in resumed_request.tools} == set(
+            GMAIL_AGENT_TOOL_NAMES)
+        assert captured == []
+        assert second.ok and second.tools_executed == 0
+        assert [item.status for item in second.tool_outcomes] == ["failed"]
+        assert not second.tool_outcomes[0].executed
+        assert [call[0] for call in gmail.calls] == ["list", "read"]
+        assert "EMAIL-INJECTION-SENTINEL" not in json.dumps(
+            second.tool_outcomes[0].describe())
+        for handler in logging.getLogger("agentcore").handlers:
+            handler.flush()
+        assert "EMAIL-INJECTION-SENTINEL" not in log_path.read_text(
+            encoding="utf-8")
+    finally:
+        value.vault.close()
+        configure_logging(LoggingConfig(level="CRITICAL"))
+
+
+def test_gmail_agent_rejects_caller_runner_before_model_or_provider(tmp_path):
+    model = ScriptedModel(ModelResponse(text="unused"))
+    built = compose(tmp_path, model=model, transport=FakeGmail())
+    try:
+        with pytest.raises(CredentialError) as error:
+            built.composition.agent.conversation(
+                sessions=InMemorySessionStore(), tools=object())
+
+        assert error.value.reason is CredentialFailure.BINDING
+        assert model.requests == []
+        assert built.transport.calls == []
+    finally:
+        built.value.vault.close()
+
+
 def test_replaced_gmail_binding_disables_scoped_conversation(tmp_path):
     gmail = FakeGmail()
     replacement_calls: list[dict] = []
@@ -703,8 +792,7 @@ def test_replaced_gmail_binding_disables_scoped_conversation(tmp_path):
     try:
         assert built.composition.agent.register_tool(
             replacement, replace=True)
-        runner = built.composition.gmail.conversation_runner(
-            built.composition.agent._build_tool_runner())
+        runner = built.composition.agent._build_tool_runner()
 
         assert runner.catalogue() == []
         result = runner.run_calls(
