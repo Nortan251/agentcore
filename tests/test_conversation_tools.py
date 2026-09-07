@@ -234,6 +234,16 @@ def test_tool_call_bound_cannot_exceed_streaming_absolute_limit():
     assert "max_tool_calls_per_round" in str(exc.value)
 
 
+@pytest.mark.parametrize("value", [
+    True, False, 1.5, float("nan"), float("inf"), "4", None,
+])
+def test_tool_call_bound_requires_an_exact_integer(value):
+    with pytest.raises(ConfigError) as exc:
+        AgentConfig(conversation=ConversationConfig(
+            max_tool_calls_per_round=value)).validate()
+    assert "max_tool_calls_per_round" in str(exc.value)
+
+
 def test_tool_config_loads_from_env():
     from agentcore.config.loader import load_config
 

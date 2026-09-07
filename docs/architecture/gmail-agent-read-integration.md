@@ -339,9 +339,10 @@ post-construction ordinary-tool isolation, direct-Agent same-session resume
 isolation, injected-runner rejection, same-name replacement fail-closure, and a
 deterministic replacement race at the scoped-check-to-executor seam,
 logging/state/memory/journal privacy,
-stale/revoked credentials, injected-runner call-cap mismatch, and aggregate
-model-context bounds. No test may use a real Google account, OAuth browser,
-DPAPI record, mailbox, or external Gmail network.
+stale/revoked credentials, exact-integer conversation tool-call bounds,
+injected-runner call-cap mismatch, and aggregate model-context bounds. No test
+may use a real Google account, OAuth browser, DPAPI record, mailbox, or external
+Gmail network.
 
 Final Windows validation from this branch used the checkout-local virtual
 environment and isolated `--basetemp` directories:
@@ -349,12 +350,13 @@ environment and isolated `--basetemp` directories:
 | Gate | Result |
 | --- | --- |
 | five focused post-registration, direct-resume, runner-injection, replacement, and lease-race regressions | 5 passed |
+| focused conversation tool-call bound validation | 8 passed |
 | `tests/test_gmail_agent_integration.py` | 40 passed |
-| conversation and realtime test files | 698 passed, 3 skipped |
+| conversation and realtime test files | 705 passed, 3 skipped |
 | `tests/test_credentials.py`, `tests/test_credential_execution.py`, `tests/test_google_oauth.py`, and `tests/test_google_refresh.py` | 250 passed, 2 skipped |
 | every `tests/test_gmail_*.py` file | 920 passed, 4 skipped |
 | `tests/test_permissions.py`, `tests/test_tools.py`, and `tests/test_task_43_2b_tool_executor_action_boundary.py` | 129 passed, 3 skipped |
-| `pytest tests` | 5,361 passed, 154 skipped |
+| full repository suite | 5,368 passed, 154 skipped |
 
 The final gate also includes `python -m compileall -q src tests` and
 `git diff --check`. The initial app-backed security diff scan reviewed all ten
@@ -380,4 +382,10 @@ entry point on a ready Gmail Agent construct the exact scoped runner, appends th
 trusted Gmail status there, and rejects a caller-supplied runner before session,
 model, executor, or provider work. Exact-head CI, a final security scan, and a
 fresh Codex review remain PR gates and are reported with the pull request rather
-than predicted here. No validation used a live Google or Gmail boundary.
+than predicted here. A second Codex review submitted against the original
+implementation head also identified a configuration-validation gap (P2):
+booleans, floats, non-finite floats, strings, and `None` could pass the early
+`max_tool_calls_per_round` checks and fail only when the conversation runner was
+constructed. Configuration validation now requires an exact integer before any
+numeric comparison, and direct regressions cover each rejected type. No
+validation used a live Google or Gmail boundary.

@@ -61,6 +61,10 @@ class ConversationConfig:
     turn_deadline_seconds: float = 120.0
 
     def validate(self) -> None:
+        if type(self.max_tool_calls_per_round) is not int:
+            raise ConfigError(
+                "conversation.max_tool_calls_per_round must be an integer",
+                value=self.max_tool_calls_per_round)
         for name in ("max_context_messages", "max_context_chars",
                      "max_message_chars", "max_session_messages",
                      "max_memories", "max_memory_chars",
