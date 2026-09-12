@@ -414,5 +414,7 @@ class ConversationToolRunner:
         """Deterministic truncation with an explicit marker."""
         if len(text) <= self.max_result_chars:
             return text
-        keep = max(0, self.max_result_chars - len(TRUNCATION_MARKER))
+        if self.max_result_chars <= len(TRUNCATION_MARKER):
+            return TRUNCATION_MARKER[:self.max_result_chars]
+        keep = self.max_result_chars - len(TRUNCATION_MARKER)
         return text[:keep] + TRUNCATION_MARKER

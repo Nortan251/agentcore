@@ -788,6 +788,23 @@ def test_truncation_is_deterministic():
     assert first == second
 
 
+@pytest.mark.parametrize("bound", range(1, len(TRUNCATION_MARKER) + 1))
+def test_truncation_marker_respects_small_rendered_result_bounds(bound):
+    runner, *_ = build_runner([HugeTool()], max_result_chars=bound)
+    first = runner.run_calls([call("huge")]).outcomes[0].content
+    second = runner.run_calls([call("huge")]).outcomes[0].content
+    assert first == second == TRUNCATION_MARKER[:bound]
+    assert len(first) == bound
+    assert first.startswith("…")
+
+
+@pytest.mark.parametrize("bound", range(1, len(TRUNCATION_MARKER) + 2))
+def test_truncation_leaves_text_at_or_below_bound_unchanged(bound):
+    runner, *_ = build_runner([HugeTool()], max_result_chars=bound)
+    for text in ("", "x" * (bound - 1), "x" * bound):
+        assert runner._truncate(text) == text
+
+
 def test_small_output_is_not_truncated():
     model = ScriptedModel(wants("echo_test", {"text": "hi"}),
                           ModelResponse(text="done"))
