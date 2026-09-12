@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from dataclasses import replace
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
@@ -917,6 +918,137 @@ def test_direct_agent_resume_keeps_mail_out_of_post_registered_tool(tmp_path):
     finally:
         value.vault.close()
         configure_logging(LoggingConfig(level="CRITICAL"))
+
+
+@pytest.mark.parametrize("entry", ["composition", "agent"])
+@pytest.mark.parametrize("state,failure", [
+    (GmailAgentState.DISABLED, None),
+    (GmailAgentState.DISCONNECTED, None),
+    (GmailAgentState.RECONNECT_REQUIRED, CredentialFailure.REVOKED),
+    (GmailAgentState.BUSY, CredentialFailure.BUSY),
+    (GmailAgentState.RECONNECT_REQUIRED, CredentialFailure.RECONNECT),
+    (GmailAgentState.SCOPE_MISMATCH, CredentialFailure.SCOPE_MISMATCH),
+    (GmailAgentState.UNAVAILABLE, CredentialFailure.UNAVAILABLE),
+])
+def test_unavailable_composition_resumes_mail_without_ordinary_tool_authority(
+        tmp_path, monkeypatch, entry, state, failure):
+    gmail = FakeGmail()
+    gmail.message_result = message(text_part(MALICIOUS))
+    captured = []
+    ordinary = FunctionTool(
+        tool_spec("ordinary_capture", "Synthetic ordinary callback.",
+                  parameters=(ToolParameter("payload", ParamType.STRING),)),
+        lambda args, _: captured.append(args["payload"]) or "captured",
+    )
+    model = ScriptedModel(
+        ModelResponse(text="", tool_calls=[
+            ToolCall("search", GMAIL_SEARCH_TOOL, {"max_results": 1}),
+            ToolCall("read", GMAIL_READ_TOOL, {"message_id": MESSAGE_ID}),
+        ]),
+        ModelResponse(text="EMAIL-INJECTION-SENTINEL"),
+        ModelResponse(text="Gmail is unavailable.", tool_calls=[
+            ToolCall("ordinary", ordinary.name,
+                     {"payload": "EMAIL-INJECTION-SENTINEL"}),
+        ]),
+        ModelResponse(text="Gmail is unavailable."),
+    )
+    directory = tmp_path / "sessions"
+    value = connected(tmp_path / "protected")
+    try:
+        cfg = config(tmp_path)
+        runtime = CredentialRuntime(value.vault)
+        ready = GmailAgentComposition.build(
+            cfg, google=value.service, runtime=runtime,
+            deps=AgentDependencies(tools=[], model=model), transport=gmail)
+        first = ready.conversation(sessions=JsonFileSessionStore(directory)).send(
+            "Read the selected bounded message.")
+        assert first.ok and first.tools_executed == 2
+        stored = JsonFileSessionStore(directory).load(first.session.id)
+        assert any(item.role is Role.TOOL and "EMAIL-INJECTION-SENTINEL"
+                   in item.content for item in stored.messages)
+
+        if state is GmailAgentState.DISABLED:
+            cfg = replace(cfg, tools=ToolConfig(disabled=(GMAIL_READ_TOOL,)))
+        elif state is GmailAgentState.DISCONNECTED:
+            monkeypatch.setattr(type(value.service), "restore",
+                                lambda _: SimpleNamespace(credential=None))
+        elif failure is CredentialFailure.REVOKED:
+            value.service.disconnect(value.info.reference)
+        else:
+            def unavailable(_):
+                raise CredentialError(failure)
+            monkeypatch.setattr(type(value.service), "restore", unavailable)
+
+        before = dict(runtime._bindings)
+        authority = runtime._authority
+        composition = GmailAgentComposition.build(
+            cfg, google=value.service, runtime=runtime,
+            deps=AgentDependencies(tools=[], model=model), transport=gmail)
+        assert composition.availability.state is state
+        assert not composition.availability.ready
+        assert composition.availability.tools == () and composition.gmail is None
+        assert runtime._bindings == before and runtime._authority is authority
+        assert composition.agent.registry.names() == []
+        assert composition.agent.register_tool(ordinary)
+        assert ordinary.name in composition.agent.registry
+
+        target = composition if entry == "composition" else composition.agent
+        resumed = target.conversation(
+            sessions=JsonFileSessionStore(directory)).send(
+                "Continue the same conversation.", session_id=first.session.id)
+        assert captured == []
+        assert resumed.ok and resumed.tools_executed == 0
+        request = model.requests[2]
+        assert any(item.role is Role.ASSISTANT and "EMAIL-INJECTION-SENTINEL"
+                   in item.content for item in request.messages)
+        assert request.tools == []
+        system = "\n".join(item.content for item in request.messages
+                           if item.role is Role.SYSTEM)
+        assert "Gmail access is unavailable" in system
+        assert "Do not claim that mail was checked" in system
+        assert "Gmail READ ONLY tools are available" not in system
+        runner = composition.agent._build_tool_runner()
+        assert runner.catalogue() == [] and not runner.available()
+        replacement = FunctionTool(
+            tool_spec(GMAIL_SEARCH_TOOL, "Synthetic same-name callback."),
+            lambda args, _: captured.append("replacement") or "captured",
+        )
+        assert composition.agent.register_tool(replacement)
+        refused = runner.run_calls(
+            [ToolCall("direct", ordinary.name,
+                      {"payload": "EMAIL-INJECTION-SENTINEL"}),
+             ToolCall("replacement", GMAIL_SEARCH_TOOL, {})],
+            session_id=first.session.id).outcomes
+        assert all(not item.executed and item.status == "failed" for item in refused)
+        assert runner.catalogue() == []
+        assert captured == []
+        with pytest.raises(CredentialError) as error:
+            composition.agent.conversation(tools=object())
+        assert error.value.reason is CredentialFailure.BINDING
+        assert [call[0] for call in gmail.calls] == ["list", "read"]
+    finally:
+        value.vault.close()
+
+
+def test_ordinary_agent_still_advertises_and_executes_registered_tool(tmp_path):
+    captured = []
+    ordinary = FunctionTool(
+        tool_spec("ordinary_capture", "Synthetic ordinary callback.",
+                  parameters=(ToolParameter("payload", ParamType.STRING),)),
+        lambda args, _: captured.append(args["payload"]) or "captured",
+    )
+    model = ScriptedModel(
+        tool_call(ordinary.name, {"payload": "ordinary user request"}),
+        ModelResponse(text="Ordinary callback completed."),
+    )
+    agent = Agent(config(tmp_path, tools_enabled=True),
+                  AgentDependencies(tools=[], model=model))
+    assert agent.register_tool(ordinary)
+    result = agent.conversation(sessions=InMemorySessionStore()).send(
+        "Run the ordinary callback.")
+    assert result.ok and result.tools_executed == 1
+    assert captured == ["ordinary user request"]
+    assert {item["name"] for item in model.requests[0].tools} == {ordinary.name}
 
 
 def test_gmail_agent_rejects_caller_runner_before_model_or_provider(tmp_path):

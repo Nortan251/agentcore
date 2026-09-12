@@ -46,7 +46,13 @@ record is not itself enablement. Construction is the explicit host enablement
 event; a disconnected or disabled composition publishes no Gmail tools.
 
 The composition is always tool-isolated: it rejects every caller-provided tool
-and exposes exactly the two reviewed authenticated Gmail reads. The contained
+and exposes exactly the two reviewed authenticated Gmail reads only when ready.
+Every unavailable state retains the same Gmail-specific Agent and scoped runner.
+Its private isolation tools are unbound and unregistered, so their exact registry
+leases fail and the catalogue and dispatch remain empty; no credential authority
+or provider I/O is activated by these objects. Public `gmail` remains `None`.
+Unavailability reduces authority rather than exposing ordinary tools to a
+persisted mail-derived conversation. The contained
 public `Agent` remains normally extensible for non-Gmail uses, but every one of
 its public conversation entry points constructs the same fixed Gmail-only
 runner and refuses a caller-supplied alternate runner. A tool registered on it
@@ -352,7 +358,7 @@ injected-runner call-cap mismatch, and aggregate model-context bounds. No test
 may use a real Google account, OAuth browser, DPAPI record, mailbox, or external
 Gmail network.
 
-Final Windows validation from this branch used the checkout-local virtual
+Earlier Windows validation for the repairs in `97d2a97` used the checkout-local virtual
 environment and isolated `--basetemp` directories:
 
 | Gate | Result |
@@ -409,3 +415,31 @@ Successful, denied, and failed registered calls retain that trusted name;
 pre-executor unknown calls stay categorically `unregistered`, and model-owned
 call text never supplies trusted observability identity. The focused gate
 includes eleven new cases plus the existing description privacy regression.
+
+The exact-head Codex review of `13a99803a9d52cffcee106f068bc14ce2f2b07d9`
+found a P1 in unavailable compositions: they returned a plain Agent that could
+advertise and execute a later ordinary tool while resuming mail-derived history.
+The unavailable-state repair above reuses the same isolated Agent and runner,
+owns truthful status at both conversation entry points, and rejects injected
+runners. The original production path was reproduced with the mail sentinel
+reaching an ordinary callback. Fourteen deterministic persisted-session cases
+cover both entry points across all unavailable categories and a real disconnect;
+they prove no advertisement, no ordinary or same-name callback execution, no
+new runtime publication, and unchanged availability categories. One ordinary
+Agent control still advertises and executes its registered callback.
+
+Validation of this repair used Windows Python 3.12.14 and checkout-local temps:
+
+| Gate | Result |
+| --- | --- |
+| focused unavailable-session isolation and ordinary-Agent control | 15 passed, 46 deselected |
+| Gmail agent integration | 61 passed |
+| conversation, realtime, and conversation streaming | 771 passed, 3 skipped |
+| credential/OAuth | 250 passed, 2 skipped |
+| permission/executor boundary | 129 passed, 3 skipped |
+| Gmail-wide | 941 passed, 4 skipped |
+| full repository suite, one run after production code stabilized | 5,421 passed, 154 skipped |
+
+Compileall, diff-check, and manual scope review passed. Exact-head security
+scan, Linux/Windows CI, and the next Codex review remain external gates; their
+actual outcomes belong in the final PR report, not predictions in this commit.

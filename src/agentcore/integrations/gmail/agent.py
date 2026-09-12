@@ -93,10 +93,12 @@ class _GmailAgent(Agent):
     """Keep every conversation entry point inside the Gmail-only boundary."""
 
     def __init__(self, config: AgentConfig, deps: AgentDependencies, *,
-                 gmail: GmailAgentReadTools) -> None:
+                 gmail: GmailAgentReadTools,
+                 availability: GmailAgentAvailability) -> None:
         if type(gmail) is not GmailAgentReadTools:
             raise CredentialError(CredentialFailure.BINDING)
         self._gmail = gmail
+        self._availability = availability
         super().__init__(config, deps)
 
     def _build_tool_runner(self) -> Any:
@@ -112,9 +114,10 @@ class _GmailAgent(Agent):
         if tools is not None:
             raise CredentialError(CredentialFailure.BINDING)
         base = system_prompt or SYSTEM_PROMPT
+        status = _READY_STATUS if self._availability.ready else _UNAVAILABLE_STATUS
         return super().conversation(
             sessions=sessions,
-            system_prompt=f"{base}\n\n{_READY_STATUS}",
+            system_prompt=f"{base}\n\n{status}",
         )
 
 
@@ -193,8 +196,13 @@ class GmailAgentComposition(RuntimeOnly):
                 credential_runtime=runtime if gmail is not None else None,
                 allow_authenticated_reads=gmail is not None,
             )
-            agent = (_GmailAgent(config, composed, gmail=gmail)
-                     if gmail is not None else Agent(config, composed))
+            # Unavailability removes bindings, not the conversation boundary.
+            # Unbound, unregistered exact tool objects keep the existing scoped
+            # runner inactive: neither ordinary nor same-name tools can enter.
+            isolated = gmail if gmail is not None else GmailAgentReadTools(
+                transport=transport)
+            agent = _GmailAgent(config, composed, gmail=isolated,
+                                availability=availability)
             composition = cls(agent, availability, gmail)
         return composition
 
@@ -236,13 +244,7 @@ class GmailAgentComposition(RuntimeOnly):
                      system_prompt: str | None = None) -> Any:
         """Build the existing conversation runtime with trusted status text."""
         self._owner()
-        if self.availability.ready:
-            # The contained Gmail Agent owns both its status prompt and scoped
-            # runner, so its direct public conversation entry point is just as
-            # narrow as this convenience wrapper.
-            return self.agent.conversation(
-                sessions=sessions, system_prompt=system_prompt)
-        base = system_prompt or SYSTEM_PROMPT
+        # The contained Gmail Agent owns the status and scoped runner in every
+        # lifecycle state, including direct resume of mail-derived sessions.
         return self.agent.conversation(
-            sessions=sessions,
-            system_prompt=f"{base}\n\n{_UNAVAILABLE_STATUS}")
+            sessions=sessions, system_prompt=system_prompt)
