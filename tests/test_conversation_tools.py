@@ -919,6 +919,37 @@ def test_outcome_describe_omits_content():
     assert outcome.describe()["status"] == "ok"
 
 
+@pytest.mark.parametrize("status", ["ok", "denied", "failed"])
+def test_outcome_describe_keeps_executor_registered_identity(status):
+    tool = BrokenTool() if status == "failed" else EchoTest()
+    runner, _, executor, _ = build_runner([tool])
+    if status == "denied":
+        executor.policy = PermissionPolicy(PermConfig(
+            blocked_capabilities=(str(Capability.FS_READ),)))
+    arguments = {} if status == "failed" else {"text": "safe"}
+    outcome = runner.run_calls([call(tool.name, arguments)]).outcomes[0]
+    assert outcome.status == status
+    assert outcome.invocation is not None
+    assert outcome.invocation.tool == tool.name
+    assert outcome.describe()["tool"] == tool.name
+
+
+def test_outcome_describe_unknown_pre_executor_identity_is_categorical():
+    runner, *_ = build_runner([EchoTest()])
+    outcome = runner.run_calls([call(SECRET, call_id=SECRET)]).outcomes[0]
+    assert outcome.invocation is None
+    assert outcome.describe()["tool"] == "unregistered"
+    assert SECRET not in json.dumps(outcome.describe())
+
+
+def test_outcome_describe_uses_executor_identity_not_model_controlled_call():
+    runner, *_ = build_runner([EchoTest()])
+    outcome = runner.run_calls([call("echo_test", {"text": SECRET}, SECRET)]).outcomes[0]
+    outcome.call = call(SECRET, {"text": SECRET}, SECRET)
+    assert outcome.describe()["tool"] == "echo_test"
+    assert SECRET not in json.dumps(outcome.describe())
+
+
 # ===========================================================================
 # Session persistence and context
 # ===========================================================================

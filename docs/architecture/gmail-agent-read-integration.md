@@ -60,8 +60,16 @@ cross-capability and logging path. A future mixed-tool host requires a separate
 information-flow design; it cannot emerge from constructor injection or later
 `Agent.register_tool()` calls. This also prevents mixing the legacy raw-query
 read primitive or a send foundation into the reviewed surface. Binding
-failures abort construction so a partially bound runtime is discarded rather
-than presented as merely offline.
+failures abort construction rather than being presented as merely offline.
+The original and effective `AgentConfig` are validated before Google lifecycle
+work or tool binding. A private read-composition staging context holds the two
+bindings and executor attachment unpublished until the Agent and wrapper have
+both been constructed. A second-binding or later constructor failure drops
+staging and leaves the caller's existing bindings and authority unchanged, so
+a corrected retry can reuse the same runtime. Staged authority cannot dispatch;
+concurrent runtime operations fail busy. Only short metadata locks are used,
+never a mutex spanning construction or provider I/O. This is not a public
+per-tool unbind API or a rollback of a completed host OAuth refresh.
 
 ## Canonical execution and permission path
 
@@ -349,14 +357,13 @@ environment and isolated `--basetemp` directories:
 
 | Gate | Result |
 | --- | --- |
-| five focused post-registration, direct-resume, runner-injection, replacement, and lease-race regressions | 5 passed |
-| focused conversation tool-call bound validation | 8 passed |
-| `tests/test_gmail_agent_integration.py` | 40 passed |
-| conversation and realtime test files | 705 passed, 3 skipped |
+| focused transactional composition and trusted outcome-identity regressions | 12 passed, 129 deselected |
+| `tests/test_gmail_agent_integration.py` | 46 passed |
+| conversation, realtime, and conversation-streaming test files | 744 passed, 3 skipped |
 | `tests/test_credentials.py`, `tests/test_credential_execution.py`, `tests/test_google_oauth.py`, and `tests/test_google_refresh.py` | 250 passed, 2 skipped |
-| every `tests/test_gmail_*.py` file | 920 passed, 4 skipped |
+| every `tests/test_gmail_*.py` file | 926 passed, 4 skipped |
 | `tests/test_permissions.py`, `tests/test_tools.py`, and `tests/test_task_43_2b_tool_executor_action_boundary.py` | 129 passed, 3 skipped |
-| full repository suite | 5,368 passed, 154 skipped |
+| full repository suite (one run after final production code stabilized) | 5,379 passed, 154 skipped |
 
 The final gate also includes `python -m compileall -q src tests` and
 `git diff --check`. The initial app-backed security diff scan reviewed all ten
@@ -389,3 +396,16 @@ booleans, floats, non-finite floats, strings, and `None` could pass the early
 constructed. Configuration validation now requires an exact integer before any
 numeric comparison, and direct regressions cover each rejected type. No
 validation used a live Google or Gmail boundary.
+
+The subsequent Codex review on `94e231f227c37d4246253993b21ec893521c5f33`
+identified exactly two new P2s: failed composition could poison caller-owned
+runtime state, and outcome descriptions looked up a nonexistent invocation
+`tool_name` field. The staged construction described above repairs the first;
+deterministic tests cover invalid environment/call/message configuration before
+refresh, corrected retries, second-binding failure preserving an existing
+binding, late failure after executor attachment, and concurrent busy fencing.
+The second repair reads the canonical executor's `ToolInvocation.tool` field.
+Successful, denied, and failed registered calls retain that trusted name;
+pre-executor unknown calls stay categorically `unregistered`, and model-owned
+call text never supplies trusted observability identity. The focused gate
+includes eleven new cases plus the existing description privacy regression.

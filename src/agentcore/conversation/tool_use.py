@@ -89,7 +89,7 @@ class ToolCallOutcome:
         # A raw call name is model output until the canonical executor returns
         # an invocation for it. Unknown names can repeat prompt/tool data, so a
         # log-safe description uses only a categorical label in that case.
-        trusted_name = getattr(self.invocation, "tool_name", None)
+        trusted_name = getattr(self.invocation, "tool", None)
         if type(trusted_name) is not str or not trusted_name:
             trusted_name = ("registered" if self.needs_approval
                             else _UNREGISTERED_TOOL_LOG_NAME)

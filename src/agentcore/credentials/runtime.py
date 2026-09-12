@@ -222,6 +222,16 @@ class CredentialExecution(RuntimeOnly):
         self._arguments = {}
 
 
+class _ReadComposition(RuntimeOnly):
+    __slots__ = ("thread_id", "bindings", "authority")
+
+    def __init__(self, bindings: dict[str, _Binding],
+                 authority: object | None) -> None:
+        self.thread_id = threading.get_ident()
+        self.bindings = dict(bindings)
+        self.authority = authority
+
+
 class CredentialRuntime(RuntimeOnly):
     """Host-owned binding registry attached to one vault and one executor.
 
@@ -231,7 +241,7 @@ class CredentialRuntime(RuntimeOnly):
     """
 
     __slots__ = ("_owner_pid", "_vault", "_vault_authority", "_authority",
-                 "_lock", "_bindings", "_action_bindings", "_closed")
+                 "_lock", "_bindings", "_action_bindings", "_closed", "_composition")
 
     def __init__(self, vault: CredentialVault) -> None:
         self._owner_pid = os.getpid()
@@ -242,6 +252,7 @@ class CredentialRuntime(RuntimeOnly):
         self._bindings: dict[str, _Binding] = {}
         self._action_bindings: dict[str, Any] = {}
         self._closed = False
+        self._composition: _ReadComposition | None = None
         _metadata_call(lambda: vault._bind_runtime(self._vault_authority))
 
     def _require_owner(self) -> None:
@@ -249,17 +260,60 @@ class CredentialRuntime(RuntimeOnly):
             raise CredentialError(CredentialFailure.OWNERSHIP)
         if self._closed:
             raise CredentialError(CredentialFailure.UNAVAILABLE)
+        pending = self._composition
+        if pending is not None and pending.thread_id != threading.get_ident():
+            raise CredentialError(CredentialFailure.BUSY)
+
+    @contextmanager
+    def _read_composition(self) -> Iterator[None]:
+        """Stage read bindings and executor attachment for one host build.
+
+        No metadata mutex spans construction or provider I/O. Other threads
+        fail busy, and staged authority cannot dispatch. Failure simply drops
+        the unpublished staging object; existing bindings remain untouched.
+        """
+        self._require_owner()
+        with self._lock:
+            self._require_owner()
+            if self._composition is not None or any(
+                    binding.active for binding in (
+                        *self._bindings.values(), *self._action_bindings.values())):
+                raise CredentialError(CredentialFailure.BUSY)
+            pending = _ReadComposition(self._bindings, self._authority)
+            self._composition = pending
+        try:
+            yield
+        except BaseException:
+            raise
+        else:
+            self._require_owner()
+            with self._lock:
+                self._require_owner()
+                self._bindings = pending.bindings
+                self._authority = pending.authority
+        finally:
+            self._require_owner()
+            with self._lock:
+                self._require_owner()
+                self._composition = None
 
     def _attach_executor(self, authority: object) -> None:
         self._require_owner()
         with self._lock:
             self._require_owner()
-            if authority is None or self._authority is not None:
+            pending = self._composition
+            current = self._authority if pending is None else pending.authority
+            if authority is None or current is not None:
                 raise CredentialError(CredentialFailure.AUTHORITY)
-            self._authority = authority
+            if pending is None:
+                self._authority = authority
+            else:
+                pending.authority = authority
 
     def _require_authority(self, authority: object) -> None:
         self._require_owner()
+        if self._composition is not None:
+            raise CredentialError(CredentialFailure.BUSY)
         if self._authority is None or authority is not self._authority:
             raise CredentialError(CredentialFailure.AUTHORITY)
 
@@ -297,7 +351,9 @@ class CredentialRuntime(RuntimeOnly):
             self._require_owner()
             if tool.spec.name in self._action_bindings:
                 raise CredentialError(CredentialFailure.BINDING)
-            current = self._bindings.get(tool.spec.name)
+            bindings = (self._bindings if self._composition is None
+                        else self._composition.bindings)
+            current = bindings.get(tool.spec.name)
             if current is not None:
                 if not replace_existing:
                     raise CredentialError(CredentialFailure.BINDING)
@@ -311,9 +367,9 @@ class CredentialRuntime(RuntimeOnly):
                     or current.spec != tool.spec
                 ):
                     raise CredentialError(CredentialFailure.IDENTITY_MISMATCH)
-            elif len(self._bindings) + len(self._action_bindings) >= MAX_BINDINGS:
+            elif len(bindings) + len(self._action_bindings) >= MAX_BINDINGS:
                 raise CredentialError(CredentialFailure.CAPACITY)
-            self._bindings[tool.spec.name] = binding
+            bindings[tool.spec.name] = binding
         return info
 
     def _snapshot(self, tool: AuthenticatedReadTool) -> _Binding:
@@ -458,6 +514,9 @@ class CredentialRuntime(RuntimeOnly):
     def bind_action(self, tool, *, reference: str, provider,
                     required_scopes: frozenset[str], replace_existing: bool = False) -> CredentialInfo:
         """Explicit trusted-host binding; this is not action authority."""
+        self._require_owner()
+        if self._composition is not None:
+            raise CredentialError(CredentialFailure.BUSY)
         from agentcore.credentials.action import bind_action
         return bind_action(self, tool, reference=reference, provider=provider,
                            required_scopes=required_scopes, replace_existing=replace_existing)
@@ -475,6 +534,8 @@ class CredentialRuntime(RuntimeOnly):
         self._require_owner()
         with self._lock:
             self._require_owner()
+            if self._composition is not None:
+                raise CredentialError(CredentialFailure.BUSY)
             if any(binding.active for binding in (*self._bindings.values(), *self._action_bindings.values())):
                 raise CredentialError(CredentialFailure.BUSY)
             self._bindings.clear()

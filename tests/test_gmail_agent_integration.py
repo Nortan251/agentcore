@@ -21,7 +21,7 @@ from agentcore.credentials import (
     GoogleAccessProfile,
 )
 from agentcore.credentials.google_protocol import GOOGLE_GMAIL_SEND_SCOPES
-from agentcore.errors import ToolNotFoundError
+from agentcore.errors import ConfigError, ToolNotFoundError
 from agentcore.integrations.gmail import (
     GmailAgentComposition, GmailAgentReadTools, GmailAgentState,
     GmailReadonlyTools,
@@ -40,6 +40,7 @@ from agentcore.tools.base import (
     FunctionTool, ParamType, ToolParameter, tool_spec,
 )
 from agentcore.tools.registry import ToolRegistryLeaseError
+from agentcore.tools.authenticated import AuthenticatedReadTool
 from gmail_fakes import (
     FakeGmail, MALICIOUS, MESSAGE_ID, Wire, connected, message, multipart,
     text_part,
@@ -167,6 +168,158 @@ def test_composition_with_default_dependencies_is_gmail_only(tmp_path):
         assert set(composition.agent.registry.names()) == set(
             GMAIL_AGENT_TOOL_NAMES)
         assert "read_file" not in composition.agent.registry
+    finally:
+        value.vault.close()
+
+
+@pytest.mark.parametrize("invalid", ["environment", "call_bound", "message_bound"])
+def test_failed_config_leaves_runtime_unchanged_and_corrected_retry_succeeds(
+        tmp_path, invalid):
+    value = connected(tmp_path / "protected")
+    runtime = CredentialRuntime(value.vault)
+    gmail = FakeGmail()
+    value.clock.advance(3601)
+    bad = (AgentConfig(environment="invalid", workspace_dir=str(tmp_path / "workspace"))
+           if invalid == "environment" else config(tmp_path, **(
+               {"max_tool_calls_per_round": None} if invalid == "call_bound"
+               else {"max_message_chars": 0})))
+    try:
+        before = dict(runtime._bindings)
+        with pytest.raises(ConfigError):
+            GmailAgentComposition.build(
+                bad, google=value.service, runtime=runtime, transport=gmail)
+        assert runtime._bindings == before
+        assert runtime._authority is None and runtime._composition is None
+        assert value.service.restore().credential == value.info
+        assert not value.transport.refreshes and not gmail.calls
+
+        composition = GmailAgentComposition.build(
+            config(tmp_path), google=value.service, runtime=runtime, transport=gmail)
+        assert composition.availability.ready
+        assert set(runtime._bindings) == set(GMAIL_AGENT_TOOL_NAMES)
+        assert scoped_invoke(composition, GMAIL_SEARCH_TOOL).ok
+    finally:
+        value.vault.close()
+
+
+def test_second_binding_failure_drops_staging_and_preserves_existing_binding(
+        tmp_path, monkeypatch):
+    value = connected(tmp_path / "protected")
+    runtime = CredentialRuntime(value.vault)
+    gmail = FakeGmail()
+    providers = GmailAgentReadTools(transport=gmail)
+    existing = AuthenticatedReadTool(tool_spec(
+        "existing_read", "Synthetic existing read.",
+        capabilities=(Capability.NET_READ, Capability.CREDENTIAL_ACCESS)))
+    runtime.bind(existing, reference=value.info.reference,
+                 provider=providers._providers[0], required_scopes=value.info.scopes)
+    before = runtime._bindings
+    binding = before["existing_read"]
+    original = CredentialRuntime.bind
+    calls = []
+
+    def fail_second(self, tool, **kwargs):
+        calls.append(tool.name)
+        assert self._bindings is before
+        if tool.name == GMAIL_READ_TOOL:
+            assert set(self._composition.bindings) == {"existing_read", GMAIL_SEARCH_TOOL}
+            raise CredentialError(CredentialFailure.BINDING)
+        return original(self, tool, **kwargs)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(CredentialRuntime, "bind", fail_second)
+            with pytest.raises(CredentialError):
+                GmailAgentComposition.build(
+                    config(tmp_path), google=value.service, runtime=runtime, transport=gmail)
+        assert calls == list(GMAIL_AGENT_TOOL_NAMES)
+        assert runtime._bindings is before
+        assert runtime._bindings == {"existing_read": binding}
+        assert runtime._authority is None and runtime._composition is None
+        assert value.service.restore().credential == value.info
+        assert not gmail.calls
+        composition = GmailAgentComposition.build(
+            config(tmp_path), google=value.service, runtime=runtime, transport=gmail)
+        assert composition.availability.ready
+        assert {item["name"] for item in
+                composition.agent._build_tool_runner().catalogue()} == set(GMAIL_AGENT_TOOL_NAMES)
+        assert runtime._bindings["existing_read"] is binding
+        assert scoped_invoke(composition, GMAIL_SEARCH_TOOL).ok
+    finally:
+        value.vault.close()
+
+
+def test_late_agent_failure_drops_bindings_and_executor_attachment_for_retry(
+        tmp_path, monkeypatch):
+    value = connected(tmp_path / "protected")
+    runtime = CredentialRuntime(value.vault)
+    gmail = FakeGmail()
+
+    def fail_model(self):
+        assert set(runtime._composition.bindings) == set(GMAIL_AGENT_TOOL_NAMES)
+        assert runtime._composition.authority is not None
+        assert runtime._bindings == {} and runtime._authority is None
+        with pytest.raises(CredentialError) as error:
+            runtime._require_authority(runtime._composition.authority)
+        assert error.value.reason is CredentialFailure.BUSY
+        raise RuntimeError("synthetic constructor failure")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(Agent, "_build_model", fail_model)
+            with pytest.raises(RuntimeError, match="synthetic constructor failure"):
+                GmailAgentComposition.build(
+                    config(tmp_path), google=value.service, runtime=runtime, transport=gmail)
+        assert runtime._bindings == {} and runtime._authority is None
+        assert runtime._composition is None and not gmail.calls
+        composition = GmailAgentComposition.build(
+            config(tmp_path), google=value.service, runtime=runtime, transport=gmail)
+        assert scoped_invoke(composition, GMAIL_SEARCH_TOOL).ok
+    finally:
+        value.vault.close()
+
+
+def test_pending_composition_is_unpublished_and_other_threads_fail_busy(
+        tmp_path, monkeypatch):
+    value = connected(tmp_path / "protected")
+    runtime = CredentialRuntime(value.vault)
+    gmail = FakeGmail()
+    entered, release = threading.Event(), threading.Event()
+    original = CredentialRuntime.bind
+    results, errors = [], []
+
+    def pause_second(self, tool, **kwargs):
+        if tool.name == GMAIL_READ_TOOL:
+            entered.set()
+            assert release.wait(5)
+        return original(self, tool, **kwargs)
+
+    def build():
+        try:
+            results.append(GmailAgentComposition.build(
+                config(tmp_path), google=value.service, runtime=runtime, transport=gmail))
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(CredentialRuntime, "bind", pause_second)
+    worker = threading.Thread(target=build)
+    worker.start()
+    try:
+        assert entered.wait(5)
+        assert runtime._bindings == {} and runtime._authority is None
+        for operation in (runtime.close, lambda: runtime._attach_executor(object()),
+                          lambda: runtime._require_authority(object())):
+            with pytest.raises(CredentialError) as error:
+                operation()
+            assert error.value.reason is CredentialFailure.BUSY
+    finally:
+        release.set()
+        worker.join(5)
+    try:
+        assert not worker.is_alive() and errors == []
+        assert len(results) == 1 and results[0].availability.ready
+        assert runtime._composition is None
+        assert scoped_invoke(results[0], GMAIL_SEARCH_TOOL).ok
     finally:
         value.vault.close()
 

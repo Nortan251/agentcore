@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any
@@ -153,6 +154,9 @@ class GmailAgentComposition(RuntimeOnly):
         tools = _base_tools(deps)
         gmail: GmailAgentReadTools | None = None
 
+        # Reject the original config before clamping or credential lifecycle
+        # work. Validate the effective config too before staging any authority.
+        config.validate()
         config = replace(
             config,
             conversation=replace(
@@ -165,26 +169,34 @@ class GmailAgentComposition(RuntimeOnly):
                     config.conversation.max_tool_result_chars, 4096),
             ),
         )
-        if not all(config.tools.is_allowed(name) for name in GMAIL_AGENT_TOOL_NAMES):
-            availability = GmailAgentAvailability(GmailAgentState.DISABLED)
-        else:
-            availability, gmail = cls._activate(
-                google=google, runtime=runtime, transport=transport)
-            if availability.ready:
-                assert gmail is not None
-                tools.extend(gmail.tools)
-                availability = GmailAgentAvailability(
-                    GmailAgentState.READY, GMAIL_AGENT_TOOL_NAMES)
+        config.validate()
+        enabled = all(config.tools.is_allowed(name)
+                      for name in GMAIL_AGENT_TOOL_NAMES)
+        # Bindings and the executor attachment remain unpublished until the
+        # entire Agent and wrapper exist. A second-bind or later constructor
+        # failure drops staging, preserving the caller's runtime for retry.
+        with runtime._read_composition() if enabled else nullcontext():
+            if not enabled:
+                availability = GmailAgentAvailability(GmailAgentState.DISABLED)
+            else:
+                availability, gmail = cls._activate(
+                    google=google, runtime=runtime, transport=transport)
+                if availability.ready:
+                    assert gmail is not None
+                    tools.extend(gmail.tools)
+                    availability = GmailAgentAvailability(
+                        GmailAgentState.READY, GMAIL_AGENT_TOOL_NAMES)
 
-        composed = replace(
-            deps,
-            tools=tools,
-            credential_runtime=runtime if gmail is not None else None,
-            allow_authenticated_reads=gmail is not None,
-        )
-        agent = (_GmailAgent(config, composed, gmail=gmail)
-                 if gmail is not None else Agent(config, composed))
-        return cls(agent, availability, gmail)
+            composed = replace(
+                deps,
+                tools=tools,
+                credential_runtime=runtime if gmail is not None else None,
+                allow_authenticated_reads=gmail is not None,
+            )
+            agent = (_GmailAgent(config, composed, gmail=gmail)
+                     if gmail is not None else Agent(config, composed))
+            composition = cls(agent, availability, gmail)
+        return composition
 
     @staticmethod
     def _activate(*, google: GoogleConnectionService,
@@ -210,9 +222,8 @@ class GmailAgentComposition(RuntimeOnly):
             return (GmailAgentAvailability(_state_for_failure(exc.reason)),
                     None)
         gmail = GmailAgentReadTools(transport=transport)
-        # Binding failures are trusted-host composition errors, not service
-        # availability. Let them fail construction so a partially bound
-        # runtime is discarded rather than silently retained.
+        # Binding failures are trusted-host errors. The enclosing build stages
+        # both bindings and drops them on failure; no per-tool unbind is needed.
         gmail.bind(runtime, current.reference)
         return (GmailAgentAvailability(
             GmailAgentState.READY, GMAIL_AGENT_TOOL_NAMES), gmail)
