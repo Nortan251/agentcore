@@ -86,20 +86,20 @@ jobs:
           import subprocess
           import sys
           import time
-          
+
           root = Path(__file__).resolve().parent
           node = 'tests/test_task_43_2d_protected_action_storage.py::test_evidence_is_bound_to_action_attempt_epoch_intent_and_namespace'
           results = []
           heads = [('c105', 'c105bdf9458136e1a7c35f4973fd2f822e2ad49c'), ('cb6', 'cb6a3b60711ea0b911c32946c5fef47ca25bcdb2')]
           subprocess.run(['git', 'fetch', '--no-tags', 'origin', *(sha for _, sha in heads)], check=True)
-          
+
           def snapshot(path):
               with path.open('a') as output:
                   output.write(f'UTC={time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}\n')
                   output.flush()
                   subprocess.run(['ps', '-eo', 'pid,ppid,pgid,sid,stat,wchan:32,etime,cmd', '--forest'], stdout=output)
                   subprocess.run(['pstree', '-ap'], stdout=output)
-          
+
           def run_case(label, command, cwd, env, deadline=45):
               phases = root / 'phases.txt'
               traces = root / 'tracebacks.txt'
@@ -146,7 +146,7 @@ jobs:
               if timed_out:
                   print(traces.read_text(), flush=True)
               return result
-          
+
           probe = root / 'gc_probe.py'
           probe.write_text('''import gc
           import sys
@@ -154,7 +154,7 @@ jobs:
           from pathlib import Path
           import diagnostic_trace
           from agentcore.action_journal import protected_storage as storage
-          
+
           diagnostic_trace.pytest_configure(None)
           gc.disable()
           directory = Path(tempfile.mkdtemp(prefix='pr31-gc-probe-'))
@@ -171,7 +171,7 @@ jobs:
               gc.collect()
           print('GC completed', flush=True)
           ''')
-          
+
           for name, sha in heads:
               cwd = Path(os.environ['RUNNER_TEMP']) / f'pr31-diagnosis-{name}'
               subprocess.run(['git', 'worktree', 'add', '--detach', str(cwd), sha], check=True)
@@ -201,7 +201,7 @@ jobs:
               # The probe models the GC/finalizer re-entry already observed in the full-suite stack.
               for mode in ['locked_gc', 'outside_lock', 'explicit_close']:
                   run_case(name + '-probe-' + mode, [sys.executable, str(probe), mode], cwd, env, deadline=15)
-          
+
           # Diagnosis must remain visibly failing when a deadlock was reproduced.
           sys.exit(1 if any(row['timeout'] or row['exit_code'] for row in results) else 0)
           PY
