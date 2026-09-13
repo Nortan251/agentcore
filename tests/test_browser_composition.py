@@ -17,6 +17,33 @@ from test_browser_session import FakeBackend
 SENTINEL = "WEB-INJECTION-SENTINEL"
 
 
+@pytest.mark.parametrize("style", ["display: none !important", "visibility: hidden !important",
+    "opacity: 0.0", "opacity: .0", "opacity: 0%", "DiSpLaY:\t NoNe\n!important",
+    "display:/**/none", "display:none;display:block", "visibility:collapse ! important"])
+def test_pr31_inline_hidden_projection(style):
+    source = f'<p style="{style}">{SENTINEL}</p>'
+    assert static_html(source, BrowserConfig()) == f'<p style="display:none">{SENTINEL}</p>'
+
+
+@pytest.mark.parametrize("style", ["display:block", "display:INLINE-BLOCK", "display:flex!important",
+    "visibility:visible ! important", "opacity:1", "opacity:.5", "opacity:100%", "opacity:1e-1",
+    "color:red;background:url(https://example.com/secret)", "display:/**/block;opacity:0.5",
+    "display:block;display:flex", "visibility:visible;opacity:1"])
+def test_pr31_visible_styles_discarded_without_hiding(style):
+    assert static_html(f'<p style="{style}">Visible</p>', BrowserConfig()) == '<p>Visible</p>'
+
+
+@pytest.mark.parametrize("style", ["display:block;display:none", "opacity:1;opacity:0",
+    "opacity:0!important;opacity:1!important", "visibility:visible;visibility:hidden",
+    "opacity:-0", "opacity:+.0000% !important", "opacity:0e+20", "opacity:-0.5",
+    "display:var(--visibility)", "opacity:calc(1 - 1)", "visibility:inherit",
+    "display:none/* unfinished", "visibility", "opacity:NaN", "opacity:1e9999",
+    "display:no/**/ne", "visibility:/**/hidden/**/!/**/important"])
+def test_pr31_ambiguous_and_duplicate_visibility_prefers_hiding(style):
+    projected = static_html(f'<p style="{style}">Hidden</p>', BrowserConfig())
+    assert projected == '<p style="display:none">Hidden</p>'
+
+
 class Model:
     def __init__(self, responses):
         self.responses = list(responses)

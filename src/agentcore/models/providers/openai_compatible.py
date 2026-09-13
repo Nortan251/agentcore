@@ -483,6 +483,118 @@ class _AttemptSuccess:
     response: ModelResponse
 
 
+def _function_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Translate neutral ToolSpec dictionaries, not authority metadata.
+
+    Only representable ToolParameter contracts are accepted. In particular,
+    Python-specific regex constructs are refused rather than silently widened.
+    Local Tool.validate_args remains the execution authority.
+    """
+    def invalid() -> None:
+        raise ModelConfigError("Unsupported or malformed neutral tool contract.")
+
+    def finite(value):
+        try:
+            return type(value) in (int, float) and math.isfinite(value)
+        except OverflowError:
+            return False
+
+    def matches_type(value, kind):
+        if kind == "number":
+            return finite(value)
+        if kind == "array":
+            return type(value) in (list, tuple)
+        return type(value) is {"string": str, "integer": int, "boolean": bool,
+                               "array": list, "object": dict}[kind]
+
+    result = []
+    names = set()
+    if type(tools) is not list:
+        invalid()
+    for tool in tools:
+        if type(tool) is not dict or set(tool) - {
+            "name", "description", "parameters", "capabilities", "read_only", "version", "tags"
+        }:
+            invalid()
+        name = tool.get("name")
+        description = tool.get("description", "")
+        parameters = tool.get("parameters", [])
+        if (type(name) is not str or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name)
+                or name in names or type(description) is not str or type(parameters) is not list):
+            invalid()
+        names.add(name)
+        properties = {}
+        required = []
+        for param in parameters:
+            if type(param) is not dict or set(param) - {
+                "name", "type", "description", "required", "default", "choices",
+                "max_length", "pattern", "minimum", "maximum"
+            }:
+                invalid()
+            key, kind = param.get("name"), param.get("type")
+            if (type(key) is not str or not key or key in properties
+                    or type(kind) is not str or kind not in {"string", "integer", "number", "boolean", "array", "object"}
+                    or type(param.get("required", True)) is not bool
+                    or type(param.get("description", "")) is not str):
+                invalid()
+            schema = {"type": kind, "description": param.get("description", "")}
+            if kind == "array":
+                schema["items"] = {}  # ToolParameter imposes no item contract
+            length = param.get("max_length")
+            if length is not None:
+                if kind != "string" or type(length) is not int or length < 0:
+                    invalid()
+                schema["maxLength"] = length
+            pattern = param.get("pattern")
+            if pattern is not None:
+                if (kind != "string" or type(pattern) is not str or not pattern.isascii()
+                        or "(?" in pattern or re.search(r"\\(?![xunrtfv])\w", pattern)
+                        or re.search(r"(?:[+*?]|\})\+", pattern)):
+                    invalid()
+                try:
+                    re.compile(pattern)
+                except (re.error, RecursionError):
+                    invalid()
+                # JSON Schema searches; AgentCore uses re.fullmatch. The end
+                # assertion also refuses a trailing newline, unlike JS '$'.
+                schema["pattern"] = "^(?:" + pattern + r")(?![\s\S])"
+            for bound in ("minimum", "maximum"):
+                value = param.get(bound)
+                if value is not None:
+                    if kind not in {"integer", "number"} or not finite(value):
+                        invalid()
+                    schema[bound] = value
+            if schema.get("minimum", -math.inf) > schema.get("maximum", math.inf):
+                invalid()
+            choices = param.get("choices")
+            if choices is not None:
+                if type(choices) is not list or any(not matches_type(choice, kind) for choice in choices):
+                    invalid()
+                if choices:  # empty choices have no constraint in ToolParameter
+                    schema["enum"] = choices.copy()
+            if param.get("default") is not None:
+                default = param["default"]
+                if (not matches_type(default, kind) or (choices and default not in choices)
+                        or (length is not None and len(default) > length)
+                        or (pattern is not None and re.fullmatch(pattern, default) is None)
+                        or ("minimum" in schema and default < schema["minimum"])
+                        or ("maximum" in schema and default > schema["maximum"])):
+                    invalid()
+                schema["default"] = default
+            try:
+                schema = json.loads(json.dumps(schema, allow_nan=False))
+            except (TypeError, ValueError, RecursionError):
+                invalid()
+            properties[key] = schema
+            if param.get("required", True):
+                required.append(key)
+        result.append({"type": "function", "function": {
+            "name": name, "description": description,
+            "parameters": {"type": "object", "properties": properties,
+                           "required": required, "additionalProperties": False}}})
+    return result
+
+
 class OpenAICompatibleProvider(BaseModelProvider):
     """Talks to any ``POST {base_url}/chat/completions`` endpoint."""
 
@@ -556,7 +668,7 @@ class OpenAICompatibleProvider(BaseModelProvider):
         if request.stop:
             payload["stop"] = list(request.stop)
         if request.tools:
-            payload["tools"] = request.tools
+            payload["tools"] = _function_tools(request.tools)
         if request.response_format:
             payload["response_format"] = request.response_format
         return payload

@@ -22,6 +22,205 @@ from agentcore.tools.registry import ToolRegistry
 from test_browser_session import FakeBackend
 
 
+@pytest.mark.parametrize("restore_previous", [False, True])
+def test_pr31_policy_revocation_after_decision_before_physical_get(monkeypatch, restore_previous):
+    """Real broker resolve/connect/exchange code, synthetic socket; zero egress."""
+    import threading
+    from agentcore.browser import BrowserAgentComposition
+    from agentcore.browser.brokered_backend import BrokeredBrowserBackend
+    from agentcore.browser import fetch
+    from test_browser_fetch import Socket
+
+    sock = Socket()
+    config = BrowserConfig(enabled=True)
+    class Broker:
+        def fetch(self, url):
+            return fetch._fetch_document(url, "GET", config,
+                resolver=lambda *_: ["8.8.8.8"],
+                exchange=lambda target, method, config: fetch._exchange(target, method, config,
+                    connector=lambda target, timeout: fetch._connect(target, timeout,
+                        socket_factory=lambda *_: sock)))
+    renderer = FakeBackend()
+    renderer.render_document = lambda _: None
+    composition = BrowserAgentComposition(model=None, config=config,
+        _backend=BrokeredBrowserBackend(config, _broker=Broker(), _renderer=renderer))
+    executor = composition.executor  # public supported replacement, from another thread
+    original = executor.policy
+    checked, replaced = threading.Event(), threading.Event()
+    failures = []
+    def revoke():
+        try:
+            assert checked.wait(5)
+            executor.policy = PermissionPolicy(PermissionConfig(blocked_capabilities=("net.read",)))
+            if restore_previous:
+                executor.policy = original
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            replaced.set()
+    thread = threading.Thread(target=revoke, daemon=True)
+    thread.start()
+    checkpoints = 0
+    def checkpoint():
+        nonlocal checkpoints
+        checkpoints += 1
+        if checkpoints == 2:  # first is before the check, second after ALLOW
+            checked.set()
+            assert replaced.wait(5)
+    try:
+        result = executor.invoke("browser_open_url", {"url": "http://example.com/"}, checkpoint=checkpoint)
+    finally:
+        checked.set()
+        thread.join(5)
+        composition.close()
+    assert not thread.is_alive() and not failures
+    assert sock.destination is None and sock.request is None
+    assert result.result.metadata["kind"] == "permission_denied"
+
+
+@pytest.mark.parametrize("seam", ["connect", "get"])
+def test_pr31_policy_replacement_during_physical_seam_fails_busy(seam):
+    import threading
+    from agentcore.browser import BrowserAgentComposition
+    from agentcore.browser.brokered_backend import BrokeredBrowserBackend
+    from agentcore.browser import fetch
+    from agentcore.errors import PolicyLeaseBusyError
+    from test_browser_fetch import Socket
+    entered, attempted = threading.Event(), threading.Event()
+    failures = []
+    busy = []
+    class GatedSocket(Socket):
+        def pause(self):
+            entered.set()
+            assert attempted.wait(5)
+        def connect(self, destination):
+            if seam == "connect":
+                self.pause()
+            return super().connect(destination)
+        def sendall(self, request):
+            if seam == "get":
+                self.pause()
+            return super().sendall(request)
+    sock = GatedSocket()
+    config = BrowserConfig(enabled=True)
+    class Broker:
+        def fetch(self, url):
+            return fetch._fetch_document(url, "GET", config, resolver=lambda *_: ["8.8.8.8"],
+                exchange=lambda target, method, config: fetch._exchange(target, method, config,
+                    connector=lambda target, timeout: fetch._connect(target, timeout, socket_factory=lambda *_: sock)))
+    renderer = FakeBackend()
+    renderer.render_document = lambda _: None
+    with BrowserAgentComposition(model=None, config=config,
+        _backend=BrokeredBrowserBackend(config, _broker=Broker(), _renderer=renderer)) as composition:
+        executor, original = composition.executor, composition.executor.policy
+        def revoke():
+            try:
+                assert entered.wait(5)
+                try:
+                    executor.policy = PermissionPolicy(PermissionConfig(blocked_capabilities=("net.read",)))
+                except PolicyLeaseBusyError:
+                    busy.append(True)
+                assert executor.policy is original
+            except BaseException as error:
+                failures.append(error)
+            finally:
+                attempted.set()
+        thread = threading.Thread(target=revoke, daemon=True)
+        thread.start()
+        try:
+            result = executor.invoke("browser_open_url", {"url": "http://example.com/"})
+        finally:
+            entered.set()
+            thread.join(5)
+        assert not thread.is_alive() and not failures and busy == [True]
+        assert result.ok and sock.request.startswith(b"GET ")
+        executor.policy = PermissionPolicy(PermissionConfig(blocked_capabilities=("net.read",)))
+        assert executor.invoke("browser_open_url", {"url": "http://example.com/"}).result.metadata["kind"] == "permission_denied"
+
+
+@pytest.mark.parametrize("failure", ["exception", "cancellation", "result_failure"])
+def test_pr31_external_read_lease_released_on_all_exits(failure):
+    from agentcore.tools.base import ExternalReadTool
+    from agentcore.realtime.errors import CancellationRequested
+    class Read(ExternalReadTool):
+        spec = tool_spec("external_read", "Read", capabilities=(Capability.NET_READ,))
+        def run(self, args, context):
+            if failure == "exception":
+                raise RuntimeError("Synthetic")
+            if failure == "cancellation":
+                raise CancellationRequested("Cancelled")
+            return ToolResult.failure("Synthetic failure")
+    registry = ToolRegistry()
+    registry.register(Read())
+    executor = ToolExecutor(registry, PermissionPolicy())
+    if failure == "cancellation":
+        with pytest.raises(CancellationRequested):
+            executor.invoke("external_read")
+    else:
+        assert not executor.invoke("external_read").ok
+    executor.policy = PermissionPolicy(PermissionConfig(blocked_capabilities=("net.read",)))
+    assert executor._external_read_policy_leases == 0
+    assert executor._credential_policy_leases == 0
+    assert executor.invoke("external_read").result.metadata["kind"] == "permission_denied"
+
+
+@pytest.mark.parametrize("private_tag", [False, True])
+def test_pr31_ordinary_read_compatibility_no_tag_authority(private_tag):
+    registry = ToolRegistry()
+    executor = ToolExecutor(registry, PermissionPolicy())
+    def ordinary(args, context):
+        # Ordinary reads retain their existing semantics, regardless of privacy.
+        executor.policy = PermissionPolicy(PermissionConfig(blocked_capabilities=("net.read",)))
+        return ToolResult.success("Read")
+    registry.register(FunctionTool(tool_spec("ordinary_read", "Read", capabilities=(Capability.NET_READ,),
+        tags=("private_arguments",) if private_tag else ()), ordinary))
+    assert executor.invoke("ordinary_read").ok
+    assert executor._external_read_policy_leases == 0
+
+
+@pytest.mark.parametrize("capabilities,read_only", [((Capability.NET_WRITE,), True),
+    ((Capability.NET_READ, Capability.CREDENTIAL_ACCESS), True), ((Capability.NET_READ,), False)])
+def test_pr31_external_read_contract_cannot_grant_mutation_or_credentials(capabilities, read_only):
+    from agentcore.tools.base import ExternalReadTool
+    called = []
+    class Read(ExternalReadTool):
+        spec = tool_spec("bad_read", "Read", capabilities=capabilities, read_only=read_only)
+        def run(self, *_):
+            called.append(1)
+    registry = ToolRegistry()
+    registry.register(Read())
+    result = ToolExecutor(registry, PermissionPolicy()).invoke("bad_read")
+    assert result.result.metadata["kind"] == "validation" and not called
+
+
+def test_pr31_policy_replaced_before_check_denies_without_browser_io():
+    import threading
+    backend, session, _, executor, _ = components()
+    entered, replaced = threading.Event(), threading.Event()
+    failures = []
+    def revoke():
+        try:
+            assert entered.wait(5)
+            executor.policy = PermissionPolicy(PermissionConfig(blocked_capabilities=("net.read",)))
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            replaced.set()
+    thread = threading.Thread(target=revoke, daemon=True)
+    thread.start()
+    def checkpoint():
+        entered.set()
+        assert replaced.wait(5)
+    try:
+        result = executor.invoke("browser_open_url", {"url": "http://example.com/"}, checkpoint=checkpoint)
+    finally:
+        entered.set()
+        thread.join(5)
+        session.close()
+    assert not failures and not thread.is_alive() and not backend.calls
+    assert result.result.metadata["kind"] == "permission_denied"
+
+
 def components(*, blocked=(), enabled=True, backend=None):
     backend = backend or FakeBackend()
     session = BrowserSession(backend, config=BrowserConfig(enabled=enabled))

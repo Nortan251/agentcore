@@ -46,6 +46,26 @@ cannot enter. Injected alternate runners/tool catalogues are rejected; conversat
 composition fields are sealed. Host-private test seams are not model parameters.
 Ordinary non-browser Agent behavior remains unchanged.
 
+BrowserReadTool implements the trusted host-owned `ExternalReadTool` contract.
+It adds no permission capability, credential exception, approval, or journal
+mutation classification. After checking the captured policy, the canonical
+ToolExecutor atomically validates that exact policy identity and generation
+before leasing it through synchronous Tool.run, including broker worker GET,
+redirects, offline rendering and cleanup. Completed replacement, including ABA,
+refuses the read before I/O. Concurrent replacement during the lease returns
+`PolicyLeaseBusyError` and leaves the policy unchanged; hosts may retry replacement
+after the bounded invocation exits. No metadata mutex spans I/O, and every exit
+releases the lease. Gmail's existing credential leases and busy behavior remain
+separate and unchanged. Privacy tags never select this authority mechanism.
+
+ModelRequest keeps the neutral ToolSpec catalogue. OpenAI-compatible providers
+translate it to function tools with object JSON Schemas at the provider boundary,
+omitting capability, read_only, version and tag metadata. Unknown arguments remain
+forbidden (`additionalProperties: false`). Unsupported or malformed parameter
+contracts fail before provider I/O. Representable ASCII patterns use full-match
+anchoring; Python-specific regex features are refused. Other providers retain
+their neutral request contract and local validation remains authoritative.
+
 An optional host-selected session directory must be exclusive to browser sessions.
 The browser-specific transcript retains bounded USER/ASSISTANT/TOOL history on
 resume, never persisted SYSTEM history. A browser marker checks session routing;
@@ -132,6 +152,12 @@ This is static readable HTML, not full browser fidelity. No CSS, fonts, images,
 frames or other subresources are fetched. Class-based stylesheet visibility,
 complex layouts and JavaScript-heavy sites are unsupported; no compatibility
 exception weakens the boundary. Inline explicit hiding is preserved conservatively.
+Only display, visibility and opacity declarations are interpreted: comments,
+whitespace, case, important suffixes and numeric-zero opacity forms are normalized.
+Any hidden or ambiguous relevant declaration hides, even if later overridden;
+this intentionally does not reproduce the CSS cascade. Original styles are
+discarded; the only generated style is `display:none`. Stylesheet/class-driven
+visibility is not reproduced.
 No interactive action or direct Chromium networking is ready for enablement.
 
 ## Lifecycle and accepted containment limitation

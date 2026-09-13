@@ -1,6 +1,6 @@
 """Four pure-read tools. Conversation dispatch uses the existing executor."""
 
-from agentcore.tools.base import Tool, ToolContext, ToolParameter, ToolResult, tool_spec
+from agentcore.tools.base import ExternalReadTool, Tool, ToolContext, ToolParameter, ToolResult, tool_spec
 from agentcore.permissions.levels import Capability
 from agentcore.realtime.errors import CancellationRequested
 
@@ -8,7 +8,7 @@ from .errors import BrowserError, BrowserFailure
 from .session import BrowserSession
 
 
-class BrowserReadTool(Tool):
+class BrowserReadTool(ExternalReadTool):
     def __init__(self, session: BrowserSession, operation: str):
         if operation not in ("open_url", "current_page", "extract_text", "list_links"):
             raise ValueError("unknown browser operation")

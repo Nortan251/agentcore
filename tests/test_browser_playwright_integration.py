@@ -166,3 +166,29 @@ def test_large_document_send_cannot_defeat_parent_timeout_or_cleanup():
     assert not backend._reader_thread.is_alive()
     assert all(not process.is_running() for process in backend._observed.values())
     backend.close()
+
+
+def test_pr31_hidden_equivalent_sentinels_absent_from_real_offline_text(local_server):
+    from agentcore.browser.render import static_html
+    port, hits = local_server
+    styles = ["display: none !important", "visibility: hidden !important", "opacity: 0.0",
+        "opacity: .0", "opacity: 0%", "DiSpLaY:\t NoNe\n!important", "display:/**/none",
+        "display:none;display:block", "opacity:0.0!important;opacity:1", "visibility:collapse ! important",
+        "opacity:+.000%", "opacity:0e4", "opacity:var(--hidden)"]
+    source = '<p style="display:block;opacity:1">VISIBLE_SENTINEL</p>' + ''.join(
+        f'<p style="{style}">HIDDEN_INJECTION_{index}</p>' for index, style in enumerate(styles))
+    source += f'<img src="http://127.0.0.1:{port}/hidden-resource">'
+    config = BrowserConfig()
+    projected = static_html(source, config)
+    assert projected.count('style="display:none"') == len(styles)
+    assert "!important" not in projected and "http://" not in projected
+    backend = PlaywrightBackend(config)
+    try:
+        backend.start()
+        backend.render_document(projected)
+        text = backend.extract_text().text
+        assert "VISIBLE_SENTINEL" in text
+        assert "HIDDEN_INJECTION" not in text
+        assert hits == []
+    finally:
+        backend.close()

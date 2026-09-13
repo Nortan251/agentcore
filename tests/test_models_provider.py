@@ -33,6 +33,27 @@ API_KEY_ENV = "TEST_MODEL_KEY"
 SECRET = "sk-test-abcdef-supersecret"
 
 
+def test_pr31_browser_catalogue_has_exact_function_wire_shape():
+    from agentcore.browser import BrowserConfig, BrowserSession, browser_tools
+    from test_browser_session import FakeBackend
+    session = BrowserSession(FakeBackend(), config=BrowserConfig(enabled=True))
+    neutral = [tool.spec.to_dict() for tool in browser_tools(session)]
+    request = ModelRequest.from_prompt("Read", tools=neutral)
+    payload = build(FakeTransport()).build_payload(request)
+    expected = []
+    for tool in neutral:
+        properties = ({"url": {"type": "string", "description": "",
+                               "maxLength": session.config.max_url_chars}}
+                      if tool["name"] == "browser_open_url" else {})
+        expected.append({"type": "function", "function": {
+            "name": tool["name"], "description": tool["description"],
+            "parameters": {"type": "object", "properties": properties,
+                           "required": list(properties), "additionalProperties": False}}})
+    assert payload["tools"] == expected
+    assert request.tools is neutral and "capabilities" in neutral[0]
+    session.close()
+
+
 def make_config(**overrides: Any) -> ModelConfig:
     base = dict(provider="openai_compatible", name="test-model",
                 api_key_env=API_KEY_ENV, base_url="https://api.example.com/v1",
@@ -226,15 +247,115 @@ def test_optional_fields_omitted_when_unset():
     assert "response_format" not in payload
 
 
-def test_tools_and_response_format_forwarded_when_present():
+def test_neutral_tools_translated_and_response_format_forwarded_when_present():
+    from agentcore.tools.base import tool_spec
     transport = FakeTransport([http(200, ok_body())])
     provider = build(transport)
     provider.generate(ModelRequest(messages=[Message.user("hi")],
-                                   tools=[{"type": "function"}],
+                                   tools=[tool_spec("echo", "Echo").to_dict()],
                                    response_format={"type": "json_object"}))
     payload = transport.requests[0]["payload"]
-    assert payload["tools"] == [{"type": "function"}]
+    assert payload["tools"] == [{"type": "function", "function": {
+        "name": "echo", "description": "Echo", "parameters": {
+            "type": "object", "properties": {}, "required": [], "additionalProperties": False}}}]
     assert payload["response_format"] == {"type": "json_object"}
+
+
+def test_pr31_generic_parameter_schema_and_neutral_provider_compatibility():
+    from agentcore.tools.base import ParamType, ToolParameter, tool_spec
+    neutral = tool_spec("all_types", "Contract", parameters=(
+        ToolParameter("text", description="Text", required=False, default="ab", choices=("ab", "ac"),
+                      max_length=3, pattern="[a-z]+"),
+        ToolParameter("count", ParamType.INTEGER, minimum=1, maximum=5),
+        ToolParameter("ratio", ParamType.NUMBER, required=False, default=0.5, minimum=0, maximum=1),
+        ToolParameter("flag", ParamType.BOOLEAN), ToolParameter("items", ParamType.ARRAY),
+        ToolParameter("data", ParamType.OBJECT))).to_dict()
+    request = ModelRequest.from_prompt("Test", tools=[neutral])
+    schema = build(FakeTransport()).build_payload(request)["tools"][0]["function"]["parameters"]
+    assert schema == {"type": "object", "additionalProperties": False,
+        "required": ["count", "flag", "items", "data"], "properties": {
+        "text": {"type": "string", "description": "Text", "default": "ab", "enum": ["ab", "ac"],
+                 "maxLength": 3, "pattern": r"^(?:[a-z]+)(?![\s\S])"},
+        "count": {"type": "integer", "description": "", "minimum": 1, "maximum": 5},
+        "ratio": {"type": "number", "description": "", "default": 0.5, "minimum": 0, "maximum": 1},
+        "flag": {"type": "boolean", "description": ""},
+        "items": {"type": "array", "description": "", "items": {}},
+        "data": {"type": "object", "description": ""}}}
+    import re
+    assert re.fullmatch("[a-z]+", "ab\n") is None
+    assert re.search(schema["properties"]["text"]["pattern"], "ab\n") is None
+    echo = EchoProvider()
+    echo.generate(request)
+    assert echo.calls == [request] and request.tools == [neutral]
+
+
+@pytest.mark.parametrize("patch", [
+    {"type": "unsupported"}, {"type": []}, {"required": "false"}, {"description": 5},
+    {"choices": "abc"}, {"choices": [1]}, {"max_length": -1}, {"max_length": True},
+    {"minimum": 1}, {"maximum": float("inf")}, {"pattern": "["},
+    {"pattern": r"\w+"}, {"pattern": "(?i)text"}, {"pattern": "a++"},
+    {"pattern": r"\Atext\Z"}, {"pattern": "é+"}, {"items": {"type": "string"}},
+    {"default": 123}, {"max_length": 1, "default": "long"},
+    {"type": "number", "minimum": 4, "maximum": 3},
+    {"type": "number", "minimum": 10**1000},
+])
+def test_pr31_malformed_parameter_contract_refused_before_provider_io(patch):
+    param = {"name": "p", "type": "string", "required": True, **patch}
+    transport = FakeTransport()
+    with pytest.raises(ModelConfigError) as error:
+        build(transport).generate(ModelRequest.from_prompt("Test", tools=[{
+            "name": "test", "description": "Test", "parameters": [param]}]))
+    assert str(error.value) == "Unsupported or malformed neutral tool contract."
+    assert not transport.requests
+
+
+@pytest.mark.parametrize("contract", [
+    {"type": "function"}, {"name": "x", "parameters": {}}, {"name": "x", "description": []},
+    {"name": "x", "parameters": [{"name": "p", "type": "string"}]*2},
+    {"name": "x", "parameters": [None]}, {"name": "x", "unexpected_schema": {}},
+])
+def test_pr31_malformed_tool_contract_refused(contract):
+    with pytest.raises(ModelConfigError):
+        build(FakeTransport()).build_payload(ModelRequest.from_prompt("Test", tools=[contract]))
+
+
+def test_pr31_browser_provider_fake_http_e2e_through_exact_executor(monkeypatch):
+    from agentcore.browser import BrowserAgentComposition, BrowserConfig
+    from agentcore.browser.composition import BROWSER_TOOL_NAMES
+    from agentcore.conversation.tool_use import ConversationToolRunner
+    from test_browser_session import FakeBackend
+    call_body = ok_body("")
+    call_body["choices"][0].update(message={"role": "assistant", "content": "", "tool_calls": [{
+        "id": "read_one", "type": "function", "function": {"name": "browser_extract_text", "arguments": "{}"}}]},
+        finish_reason="tool_calls")
+    class ValidatingTransport(FakeTransport):
+        def post_json(self, url, payload, headers, timeout):
+            assert url.endswith("/chat/completions")
+            assert {tool["function"]["name"] for tool in payload["tools"]} == set(BROWSER_TOOL_NAMES)
+            for tool in payload["tools"]:
+                assert set(tool) == {"type", "function"} and tool["type"] == "function"
+                assert set(tool["function"]) == {"name", "description", "parameters"}
+                schema = tool["function"]["parameters"]
+                assert schema["type"] == "object" and schema["additionalProperties"] is False
+                assert type(schema["properties"]) is dict and type(schema["required"]) is list
+            return super().post_json(url, payload, headers, timeout)
+    transport = ValidatingTransport([http(200, call_body), http(200, ok_body("Read data"))])
+    with BrowserAgentComposition(model=build(transport), config=BrowserConfig(enabled=True),
+                                _backend=FakeBackend()) as composition:
+        assert type(composition._runner._runner) is ConversationToolRunner
+        assert composition._runner._runner.executor is composition.executor
+        invoked = []
+        original = composition.executor.invoke
+        def spy(name, args=None, **kwargs):
+            invoked.append((name, args))
+            return original(name, args, **kwargs)
+        monkeypatch.setattr(composition.executor, "invoke", spy)
+        result = composition.conversation().send("Read page")
+        assert result.ok and result.tools_executed == 1
+        assert invoked == [("browser_extract_text", {})]
+    assert len(transport.requests) == 2
+    messages = transport.requests[1]["payload"]["messages"]
+    assert any(m["role"] == "tool" and "UNTRUSTED_DATA" in m["content"] for m in messages)
 
 
 # -- response handling ------------------------------------------------------
