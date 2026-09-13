@@ -17,6 +17,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -59,7 +61,7 @@ jobs:
           sampler=$!
           set +e
           timeout --signal=TERM --kill-after=10s 8m \
-            python -m pytest -vv -s -o faulthandler_timeout=60 \
+            python -m pytest -vv -o faulthandler_timeout=60 \
             2>&1 | tee diagnostic-evidence/pytest.txt
           result=${PIPESTATUS[0]}
           kill "$sampler" 2>/dev/null || true
