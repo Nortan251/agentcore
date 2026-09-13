@@ -158,6 +158,15 @@ Any hidden or ambiguous relevant declaration hides, even if later overridden;
 this intentionally does not reproduce the CSS cascade. Original styles are
 discarded; the only generated style is `display:none`. Stylesheet/class-driven
 visibility is not reproduced.
+CSS escapes are not decoded: any escaped inline declaration or disallowed
+control hides the element conservatively, including unrelated escaped properties.
+Every duplicate style and aria-hidden attribute is examined before dictionary
+conversion; any explicit hidden signal wins. This can hide otherwise visible
+content and does not reproduce browser attribute-conflict semantics.
+At the provider boundary, emitted choices/defaults must recursively contain only
+JSON-native lists, string-keyed dictionaries and finite scalar values. Tuples,
+cycles, non-string keys and coercible non-native values fail before provider I/O;
+host ToolParameter values and local validation are unchanged.
 No interactive action or direct Chromium networking is ready for enablement.
 
 ## Lifecycle and accepted containment limitation

@@ -29,7 +29,12 @@ def _inline_hidden(style):
     Unrelated declarations have no influence and are discarded.
     """
     source = _COMMENTS.sub("", style)
-    if "/*" in source:  # unterminated comment makes visibility ambiguous
+    # No CSS identifier decoder in v1. Escapes and controls can disguise a
+    # relevant property or declaration boundary, so hide conservatively even
+    # when the original spelling might have been an unrelated visible style.
+    if "/*" in source or "\\" in source or any(
+            ord(char) < 32 and char not in "\t\n\r\f" or ord(char) == 127
+            for char in source):
         return True
     for declaration in source.split(";"):
         property_name, separator, value = declaration.partition(":")
@@ -75,7 +80,12 @@ class _StaticHTML(HTMLParser):
         self.nodes += 1
         if self.nodes > self.config.max_dom_nodes:
             raise BrowserError(BrowserFailure.SIZE)
-        attrs = dict(attrs)
+        explicitly_hidden = any(
+            name == "hidden"
+            or name == "aria-hidden" and (value or "").strip().lower() == "true"
+            or name == "style" and _inline_hidden(value or "")
+            for name, value in attrs)
+        attrs = dict(attrs)  # retain existing href/data handling
         if self.ignored:
             if tag == self.ignored[-1]:
                 self.ignored.append(tag)
@@ -93,8 +103,7 @@ class _StaticHTML(HTMLParser):
             safe_attrs += ' data-agentcore-href="' + html.escape(attrs["href"], quote=True) + '"'
         # Preserve explicit invisibility without importing arbitrary CSS URLs,
         # @imports, fonts, animations, custom elements or active attributes.
-        if ("hidden" in attrs or attrs.get("aria-hidden") == "true"
-                or _inline_hidden(attrs.get("style") or "")):
+        if explicitly_hidden:
             safe_attrs += ' style="display:none"'
         self._emit("<" + tag + safe_attrs + ">")
 

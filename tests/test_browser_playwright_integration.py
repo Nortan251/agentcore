@@ -192,3 +192,36 @@ def test_pr31_hidden_equivalent_sentinels_absent_from_real_offline_text(local_se
         assert hits == []
     finally:
         backend.close()
+
+def test_pr31_p2_escaped_duplicate_hidden_sentinels_absent_real_chromium(local_server):
+    from agentcore.browser.render import static_html
+    port, hits = local_server
+    styles = [r'\64 isplay:none', r'd\69 splay:none', r'op\61 city:0',
+              r'vis\69 bility:hidden', r'\44 ISPLAY:none', r'\000064isplay:none',
+              '\\64\tisplay:none', 'display\\', 'dis\x00play:none', r'col\6f r:red',
+              r'/*comment*/\64 isplay:/**/none !important']
+    attributes = [f'style="{style}"' for style in styles] + [
+        'style="display:none" style="display:block"',
+        'style="display:block" style="display:none"',
+        'style="opacity:0" style="visibility:hidden"',
+        r'style="\64 isplay:none" style="display:block"',
+        'style="display:var(--x)" style="opacity:1"',
+        'aria-hidden="true" aria-hidden="false"',
+        'aria-hidden="false" aria-hidden=" TRUE "']
+    source = ''.join(f'<p {attrs}>HIDDEN_P2_SENTINEL_{index}</p>' for index, attrs in enumerate(attributes))
+    source += '<p style="display:block" style="opacity:1">VISIBLE_P2_SENTINEL</p>'
+    source += f'<img src="http://127.0.0.1:{port}/forbidden-resource">'
+    config = BrowserConfig()
+    projected = static_html(source, config)
+    assert projected.count('style="display:none"') == len(attributes)
+    assert '\\' not in projected and 'http://' not in projected
+    backend = PlaywrightBackend(config)
+    try:
+        backend.start()
+        backend.render_document(projected)
+        text = backend.extract_text().text
+        assert 'HIDDEN_P2_SENTINEL' not in text
+        assert 'VISIBLE_P2_SENTINEL' in text
+        assert hits == []
+    finally:
+        backend.close()

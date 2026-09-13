@@ -245,3 +245,31 @@ def test_brokered_backend_keeps_final_url_separate_and_never_navigates_renderer(
     assert metadata.url == "https://example.com/final/path/"
     assert "attacker" not in renderer.source
     backend.close()
+
+@pytest.mark.parametrize('style', [r'\64 isplay:none', r'd\69 splay:none', r'op\61 city:0',
+    r'vis\69 bility:hidden', r'\44 ISPLAY:none', r'\000064isplay:none', r'\64\tisplay:none',
+    'display\\', 'display\\\n:none', r'col\6f r:red', 'dis\x00play:none'])
+def test_pr31_p2_escaped_properties_conservatively_hidden(style):
+    projected = static_html(f'<p style="{style}">HIDDEN_SENTINEL</p>', BrowserConfig())
+    assert projected == '<p style="display:none">HIDDEN_SENTINEL</p>'
+
+@pytest.mark.parametrize('attributes', [
+    'style="display:none" style="display:block"',
+    'style="display:block" style="display:none"',
+    'style="opacity:0" style="visibility:hidden"',
+    r'style="\64 isplay:none" style="display:block"',
+    'style="display:var(--x)" style="opacity:1"',
+    'aria-hidden="true" aria-hidden="false"',
+    'aria-hidden="false" aria-hidden=" TRUE "',
+    'hidden hidden="false"',
+])
+def test_pr31_p2_duplicate_hidden_attributes(attributes):
+    assert static_html(f'<p {attributes}>HIDDEN_SENTINEL</p>', BrowserConfig()) == '<p style="display:none">HIDDEN_SENTINEL</p>'
+
+@pytest.mark.parametrize('attributes', [
+    'style="display:block" style="opacity:1"',
+    'style="color:red" style="visibility:visible"',
+    'aria-hidden="false" aria-hidden="false"',
+])
+def test_pr31_p2_duplicate_visible_attributes(attributes):
+    assert static_html(f'<p {attributes}>VISIBLE</p>', BrowserConfig()) == '<p>VISIBLE</p>'

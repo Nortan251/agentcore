@@ -544,3 +544,44 @@ def test_secret_never_appears_in_any_error(monkeypatch):
             provider.complete("hi")
         blob = json.dumps(exc.value.to_dict()) + str(exc.value)
         assert SECRET not in blob, f"secret leaked for {failure.status}"
+
+@pytest.mark.parametrize('field', ['choices', 'default'])
+@pytest.mark.parametrize('kind,value', [
+    ('array', (1, 2)), ('array', [(1, 2)]), ('object', {1: 'value'}),
+    ('object', {'nested': (1, 2)}), ('array', [float('nan')]),
+    ('array', [float('inf')]), ('object', {'x': float('-inf')}),
+    ('array', [{'nested': {False: 1}}]), ('object', {'x': {1, 2}}),
+])
+def test_pr31_p2_non_native_choice_default_refused_before_io(field, kind, value):
+    transport = FakeTransport()
+    param = {'name': 'p', 'type': kind, field: [value] if field == 'choices' else value}
+    with pytest.raises(ModelConfigError) as error:
+        build(transport).generate(ModelRequest.from_prompt('Test', tools=[{
+            'name': 'test', 'parameters': [param]}]))
+    assert str(error.value) == 'Unsupported or malformed neutral tool contract.'
+    assert transport.requests == []
+
+@pytest.mark.parametrize('kind,value', [
+    ('array', [1, True, None, 1.0, {'x': ['s', False]}]),
+    ('object', {'x': [1, True, None, {'nested': 0.5}]}),
+])
+def test_pr31_p2_native_enum_default_matches_decoded_local_validation(kind, value):
+    from agentcore.tools.base import FunctionTool, ToolParameter, ParamType, tool_spec, ToolResult
+    parameter = ToolParameter('p', ParamType(kind), choices=(value,), default=value, required=False)
+    tool = FunctionTool(tool_spec('native', 'Fixture', parameters=(parameter,)), lambda *_: ToolResult.success())
+    schema = build(FakeTransport()).build_payload(ModelRequest.from_prompt('Test', tools=[tool.spec.to_dict()]))['tools'][0]['function']['parameters']['properties']['p']
+    decoded = json.loads(json.dumps(schema))
+    assert decoded['enum'] == [value] and decoded['default'] == value
+    assert tool.validate_args({'p': decoded['enum'][0]})['p'] == value
+    assert tool.validate_args({'p': decoded['default']})['p'] == value
+    assert type(decoded['enum'][0]) is type(value)
+
+@pytest.mark.parametrize('field', ['choices', 'default'])
+def test_pr31_p2_recursive_values_fail_categorically_before_io(field):
+    value = []
+    value.append(value)
+    transport = FakeTransport()
+    param = {'name': 'p', 'type': 'array', field: [value] if field == 'choices' else value}
+    with pytest.raises(ModelConfigError):
+        build(transport).generate(ModelRequest.from_prompt('Test', tools=[{'name': 'test', 'parameters': [param]}]))
+    assert transport.requests == []

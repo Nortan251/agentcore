@@ -503,9 +503,35 @@ def _function_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if kind == "number":
             return finite(value)
         if kind == "array":
-            return type(value) in (list, tuple)
+            return type(value) is list
         return type(value) is {"string": str, "integer": int, "boolean": bool,
                                "array": list, "object": dict}[kind]
+
+    def json_native(value, ancestors=None):
+        """Strict recursive representation contract, not Python equality.
+
+        JSON must not turn tuples into lists, stringify object keys, coerce
+        subclasses, or admit non-finite floats. Cycles fail deterministically.
+        """
+        kind = type(value)
+        if value is None or kind in (str, bool, int):
+            return True
+        if kind is float:
+            return math.isfinite(value)
+        if kind not in (list, dict):
+            return False
+        ancestors = set() if ancestors is None else ancestors
+        identity = id(value)
+        if identity in ancestors:
+            return False
+        ancestors.add(identity)
+        try:
+            if kind is dict:
+                return all(type(key) is str and json_native(item, ancestors)
+                           for key, item in value.items())
+            return all(json_native(item, ancestors) for item in value)
+        finally:
+            ancestors.remove(identity)
 
     result = []
     names = set()
@@ -568,13 +594,21 @@ def _function_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 invalid()
             choices = param.get("choices")
             if choices is not None:
-                if type(choices) is not list or any(not matches_type(choice, kind) for choice in choices):
+                try:
+                    native = json_native(choices)
+                except RecursionError:
+                    native = False
+                if type(choices) is not list or not native or any(not matches_type(choice, kind) for choice in choices):
                     invalid()
                 if choices:  # empty choices have no constraint in ToolParameter
                     schema["enum"] = choices.copy()
             if param.get("default") is not None:
                 default = param["default"]
-                if (not matches_type(default, kind) or (choices and default not in choices)
+                try:
+                    native = json_native(default)
+                except RecursionError:
+                    native = False
+                if (not native or not matches_type(default, kind) or (choices and default not in choices)
                         or (length is not None and len(default) > length)
                         or (pattern is not None and re.fullmatch(pattern, default) is None)
                         or ("minimum" in schema and default < schema["minimum"])
