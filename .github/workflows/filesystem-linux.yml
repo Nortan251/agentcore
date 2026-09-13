@@ -43,6 +43,48 @@ jobs:
           for index in range(int(len(nodes) * .88), min(len(nodes), int(len(nodes) * .92) + 1)):
               print(f'{index + 1}: {nodes[index]}')
           PY
+          cat > diagnostic-evidence/diagnostic_trace.py <<'PY'
+          import faulthandler
+          import os
+          import signal
+          import time
+          from pathlib import Path
+          import pytest
+
+          root = Path(__file__).parent
+          traceback_file = None
+
+          def record(phase, nodeid):
+              fd = os.open(root / 'phases.txt', os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+              try:
+                  os.write(fd, f'{time.monotonic():.6f} PID={os.getpid()} {phase} {nodeid}\n'.encode())
+              finally:
+                  os.close(fd)
+
+          def pytest_configure(config):
+              global traceback_file
+              traceback_file = open(root / 'tracebacks.txt', 'ab', buffering=0)
+              faulthandler.register(signal.SIGUSR1, file=traceback_file, all_threads=True)
+
+          @pytest.hookimpl(tryfirst=True)
+          def pytest_runtest_setup(item):
+              record('SETUP', item.nodeid)
+
+          @pytest.hookimpl(tryfirst=True)
+          def pytest_runtest_call(item):
+              record('CALL', item.nodeid)
+
+          @pytest.hookimpl(tryfirst=True)
+          def pytest_runtest_teardown(item):
+              record('TEARDOWN', item.nodeid)
+
+          def pytest_runtest_logreport(report):
+              record(f'REPORT_{report.when}_{report.outcome}', report.nodeid)
+
+          def pytest_sessionfinish(session, exitstatus):
+              record(f'SESSION_FINISH_{exitstatus}', '-')
+          PY
+          export PYTHONPATH="$PWD/diagnostic-evidence${PYTHONPATH:+:$PYTHONPATH}"
           (
             while true; do
               date -u
@@ -55,13 +97,18 @@ jobs:
                   cat "/proc/$pid/wchan" || true
                 fi
               done
+              for pid in $(pgrep -u "$(id -u)" -f '^python -m pytest -q -p diagnostic_trace' || true); do
+                printf '\n=== SIGUSR1 PID=%s ===\n' "$pid" >> diagnostic-evidence/tracebacks.txt
+                kill -USR1 "$pid" 2>/dev/null || true
+                sleep 1
+              done
               sleep 60
             done
           ) > diagnostic-evidence/processes.txt 2>&1 &
           sampler=$!
           set +e
           timeout --signal=TERM --kill-after=10s 8m \
-            python -m pytest -vv -o faulthandler_timeout=60 \
+            python -m pytest -q -p diagnostic_trace \
             2>&1 | tee diagnostic-evidence/pytest.txt
           result=${PIPESTATUS[0]}
           kill "$sampler" 2>/dev/null || true
@@ -70,6 +117,8 @@ jobs:
           ps -eo pid,ppid,pgid,sid,stat,wchan:32,etime,cmd --forest | tee -a diagnostic-evidence/processes.txt
           pstree -ap | tee -a diagnostic-evidence/processes.txt || true
           tail -n 180 diagnostic-evidence/processes.txt
+          tail -n 30 diagnostic-evidence/phases.txt || true
+          cat diagnostic-evidence/tracebacks.txt || true
           exit "$result"
 
       - name: Preserve diagnostic evidence
