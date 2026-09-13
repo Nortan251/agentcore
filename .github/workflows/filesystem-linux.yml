@@ -36,13 +36,6 @@ jobs:
           python --version
           python -m pip freeze > diagnostic-evidence/environment.txt
           git rev-parse HEAD
-          python -m pytest --collect-only -q -o addopts='' | tee diagnostic-evidence/collection.txt
-          python - <<'PY'
-          from pathlib import Path
-          nodes = [line for line in Path('diagnostic-evidence/collection.txt').read_text().splitlines() if '::' in line]
-          for index in range(int(len(nodes) * .88), min(len(nodes), int(len(nodes) * .92) + 1)):
-              print(f'{index + 1}: {nodes[index]}')
-          PY
           cat > diagnostic-evidence/diagnostic_trace.py <<'PY'
           import faulthandler
           import os
@@ -84,44 +77,135 @@ jobs:
           def pytest_sessionfinish(session, exitstatus):
               record(f'SESSION_FINISH_{exitstatus}', '-')
           PY
-          export PYTHONPATH="$PWD/diagnostic-evidence${PYTHONPATH:+:$PYTHONPATH}"
-          (
-            while true; do
-              date -u
-              ps -eo pid,ppid,pgid,sid,stat,wchan:32,etime,cmd --forest
-              pstree -ap || true
-              for pid in $(pgrep -u "$(id -u)" -f 'python.*pytest' || true); do
-                if [ -r "/proc/$pid/status" ]; then
-                  echo "=== /proc/$pid ==="
-                  cat "/proc/$pid/status"
-                  cat "/proc/$pid/wchan" || true
-                fi
-              done
-              if [ -s diagnostic-evidence/phases.txt ]; then
-                for pid in $(pgrep -u "$(id -u)" -f '^python -m pytest -q -p diagnostic_trace' || true); do
-                  printf '\n=== SIGUSR1 PID=%s ===\n' "$pid" >> diagnostic-evidence/tracebacks.txt
-                  kill -USR1 "$pid" 2>/dev/null || true
-                  sleep 1
-                done
-              fi
-              sleep 60
-            done
-          ) > diagnostic-evidence/processes.txt 2>&1 &
-          sampler=$!
-          set +e
-          timeout --signal=TERM --kill-after=10s 8m \
-            python -m pytest -q -p diagnostic_trace \
-            2>&1 | tee diagnostic-evidence/pytest.txt
-          result=${PIPESTATUS[0]}
-          kill "$sampler" 2>/dev/null || true
-          wait "$sampler" 2>/dev/null || true
-          date -u | tee -a diagnostic-evidence/processes.txt
-          ps -eo pid,ppid,pgid,sid,stat,wchan:32,etime,cmd --forest | tee -a diagnostic-evidence/processes.txt
-          pstree -ap | tee -a diagnostic-evidence/processes.txt || true
-          tail -n 180 diagnostic-evidence/processes.txt
-          tail -n 30 diagnostic-evidence/phases.txt || true
-          cat diagnostic-evidence/tracebacks.txt || true
-          exit "$result"
+          cat > diagnostic-evidence/classify.py <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import signal
+          import subprocess
+          import sys
+          import time
+          
+          root = Path(__file__).resolve().parent
+          node = 'tests/test_task_43_2d_protected_action_storage.py::test_evidence_is_bound_to_action_attempt_epoch_intent_and_namespace'
+          results = []
+          heads = [('c105', 'c105bdf9458136e1a7c35f4973fd2f822e2ad49c'), ('cb6', 'cb6a3b60711ea0b911c32946c5fef47ca25bcdb2')]
+          subprocess.run(['git', 'fetch', '--no-tags', 'origin', *(sha for _, sha in heads)], check=True)
+          
+          def snapshot(path):
+              with path.open('a') as output:
+                  output.write(f'UTC={time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}\n')
+                  output.flush()
+                  subprocess.run(['ps', '-eo', 'pid,ppid,pgid,sid,stat,wchan:32,etime,cmd', '--forest'], stdout=output)
+                  subprocess.run(['pstree', '-ap'], stdout=output)
+          
+          def run_case(label, command, cwd, env, deadline=45):
+              phases = root / 'phases.txt'
+              traces = root / 'tracebacks.txt'
+              phases.write_text('')
+              traces.write_text('')
+              process_log = root / f'{label}-processes.txt'
+              start = time.monotonic()
+              timed_out = False
+              next_sample = start + 10
+              with (root / f'{label}-output.txt').open('w') as output:
+                  proc = subprocess.Popen(command, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+                  pid = proc.pid
+                  while proc.poll() is None:
+                      now = time.monotonic()
+                      if now >= next_sample:
+                          snapshot(process_log)
+                          if phases.stat().st_size:
+                              with traces.open('a') as stream:
+                                  stream.write(f'\n=== SIGUSR1 parent PID={pid} ===\n')
+                              try:
+                                  os.kill(pid, signal.SIGUSR1)
+                              except ProcessLookupError:
+                                  pass
+                          next_sample = now + 10
+                      if now - start >= deadline:
+                          timed_out = True
+                          os.killpg(pid, signal.SIGTERM)
+                          try:
+                              proc.wait(timeout=5)
+                          except subprocess.TimeoutExpired:
+                              os.killpg(pid, signal.SIGKILL)
+                              proc.wait(timeout=5)
+                          break
+                      time.sleep(.1)
+                  code = proc.wait(timeout=5)
+              snapshot(process_log)
+              (root / f'{label}-phases.txt').write_text(phases.read_text())
+              (root / f'{label}-tracebacks.txt').write_text(traces.read_text())
+              result = {'label': label, 'cwd': str(cwd), 'command': command, 'parent_pid': pid, 'exit_code': code, 'timeout': timed_out, 'seconds': round(time.monotonic() - start, 3), 'last_phases': phases.read_text().splitlines()[-5:]}
+              results.append(result)
+              (root / 'results.json').write_text(json.dumps(results, indent=2))
+              print(json.dumps(result), flush=True)
+              print((root / f'{label}-output.txt').read_text()[-1500:], flush=True)
+              if timed_out:
+                  print(traces.read_text(), flush=True)
+              return result
+          
+          probe = root / 'gc_probe.py'
+          probe.write_text('''import gc
+          import sys
+          import tempfile
+          from pathlib import Path
+          import diagnostic_trace
+          from agentcore.action_journal import protected_storage as storage
+          
+          diagnostic_trace.pytest_configure(None)
+          gc.disable()
+          directory = Path(tempfile.mkdtemp(prefix='pr31-gc-probe-'))
+          store = storage.JsonFileEvidenceStore(directory, storage.StaticInstallationKeyProvider(bytes(range(32))))
+          store._store._diagnostic_cycle = store._store
+          if sys.argv[1] == 'explicit_close':
+              store.close()
+          del store
+          if sys.argv[1] == 'outside_lock':
+              gc.collect()
+          diagnostic_trace.record('PROBE', sys.argv[1])
+          print('Collecting under the existing domain lock; one main thread, no fork', flush=True)
+          with storage._DOMAINS_LOCK:
+              gc.collect()
+          print('GC completed', flush=True)
+          ''')
+          
+          for name, sha in heads:
+              cwd = Path(os.environ['RUNNER_TEMP']) / f'pr31-diagnosis-{name}'
+              subprocess.run(['git', 'worktree', 'add', '--detach', str(cwd), sha], check=True)
+              env = dict(os.environ, PYTHONPATH=str(root) + os.pathsep + str(cwd / 'src'))
+              for relative in ['src/agentcore/action_journal/protected_storage.py', node.split('::')[0]]:
+                  print(name, relative, hashlib.sha256((cwd / relative).read_bytes()).hexdigest(), flush=True)
+              collection = subprocess.run([sys.executable, '-m', 'pytest', '--collect-only', '-q', '-o', 'addopts='], cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
+              collection.check_returncode()
+              (root / f'{name}-collection.txt').write_text(collection.stdout)
+              nodes = [line for line in collection.stdout.splitlines() if line.startswith('tests/') and '::' in line]
+              index = nodes.index(node)
+              nearby = nodes[max(0, index - 10):index + 1]
+              base = [sys.executable, '-m', 'pytest', '-p', 'diagnostic_trace']
+              run_case(name + '-isolated-verbose', base + ['-vv', node], cwd, env)
+              run_case(name + '-isolated-quiet', base + ['-q', node], cwd, env)
+              for attempt in range(5):
+                  run_case(f'{name}-repeat-{attempt + 1}', base + ['-q', node], cwd, env)
+              run_case(name + '-same-process-10', base + ['-q', '--keep-duplicates'] + [node] * 10, cwd, env)
+              near = run_case(name + '-preceding-10', base + ['-q'] + nearby, cwd, env)
+              run_case(name + '-suspect-file', base + ['-q', node.split('::')[0]], cwd, env)
+              if near['timeout']:
+                  for count in range(1, 10):
+                      result = run_case(f'{name}-suffix-{count}', base + ['-q'] + nearby[-count - 1:], cwd, env)
+                      if result['timeout']:
+                          break
+              # Separate component probes; no existing test is patched or run under forced GC.
+              # The probe models the GC/finalizer re-entry already observed in the full-suite stack.
+              for mode in ['locked_gc', 'outside_lock', 'explicit_close']:
+                  run_case(name + '-probe-' + mode, [sys.executable, str(probe), mode], cwd, env, deadline=15)
+          
+          # Diagnosis must remain visibly failing when a deadlock was reproduced.
+          sys.exit(1 if any(row['timeout'] or row['exit_code'] for row in results) else 0)
+          PY
+          python diagnostic-evidence/classify.py
 
       - name: Preserve diagnostic evidence
         if: always()
