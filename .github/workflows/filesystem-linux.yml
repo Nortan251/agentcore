@@ -97,11 +97,13 @@ jobs:
                   cat "/proc/$pid/wchan" || true
                 fi
               done
-              for pid in $(pgrep -u "$(id -u)" -f '^python -m pytest -q -p diagnostic_trace' || true); do
-                printf '\n=== SIGUSR1 PID=%s ===\n' "$pid" >> diagnostic-evidence/tracebacks.txt
-                kill -USR1 "$pid" 2>/dev/null || true
-                sleep 1
-              done
+              if [ -s diagnostic-evidence/phases.txt ]; then
+                for pid in $(pgrep -u "$(id -u)" -f '^python -m pytest -q -p diagnostic_trace' || true); do
+                  printf '\n=== SIGUSR1 PID=%s ===\n' "$pid" >> diagnostic-evidence/tracebacks.txt
+                  kill -USR1 "$pid" 2>/dev/null || true
+                  sleep 1
+                done
+              fi
               sleep 60
             done
           ) > diagnostic-evidence/processes.txt 2>&1 &
