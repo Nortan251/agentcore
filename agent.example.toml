@@ -95,6 +95,7 @@ max_memory_chars = 400            # characters of each memory shown to the model
 # as autonomous runs — the model can request, never authorise.
 tools_enabled = false
 max_tool_rounds = 3               # bound on tool -> model -> tool per turn
+max_tool_calls_per_round = 32      # validate the whole batch before any call runs
 max_tool_result_chars = 2000      # tool output is truncated with a marker
 # Realtime turn deadline (seconds), from admission through final response.
 # Consumed only when a realtime turn coordinator is injected; queue/lease

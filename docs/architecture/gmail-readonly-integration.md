@@ -1,5 +1,12 @@
 # Gmail read-only integration
 
+> This document specifies the lower-level reviewed Gmail read primitive. The
+> ordinary model-facing production composition, narrower semantic contract,
+> and additional model-context bounds are specified in
+> [Gmail agent read integration](gmail-agent-read-integration.md). A trusted
+> host must use that composition for an ordinary Agent; the raw `q` and
+> `page_token` surface described here is not registered by it.
+
 Implementation baseline: `660128455fd9c569dc1bbce31777429a1bf13d09` (PR #23).
 Official Google documentation checked on 2026-08-30.
 

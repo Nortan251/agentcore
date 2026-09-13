@@ -215,23 +215,104 @@ def test_tools_are_off_by_default():
 def test_tool_bounds_defaults():
     config = ConversationConfig()
     assert config.max_tool_rounds == 3
+    assert config.max_tool_calls_per_round == 32
     assert config.max_tool_result_chars == 2000
 
 
-@pytest.mark.parametrize("field", ["max_tool_rounds", "max_tool_result_chars"])
+@pytest.mark.parametrize("field", [
+    "max_tool_rounds", "max_tool_calls_per_round", "max_tool_result_chars",
+])
 def test_invalid_tool_bounds_rejected(field):
     with pytest.raises(ConfigError) as exc:
         ConversationConfig(**{field: 0}).validate()
     assert field in str(exc.value)
 
 
+def test_tool_call_bound_cannot_exceed_streaming_absolute_limit():
+    with pytest.raises(ConfigError) as exc:
+        ConversationConfig(max_tool_calls_per_round=33).validate()
+    assert "max_tool_calls_per_round" in str(exc.value)
+
+
+@pytest.mark.parametrize("value", [
+    True, False, 1.5, float("nan"), float("inf"), "4", None,
+])
+def test_tool_call_bound_requires_an_exact_integer(value):
+    with pytest.raises(ConfigError) as exc:
+        AgentConfig(conversation=ConversationConfig(
+            max_tool_calls_per_round=value)).validate()
+    assert "max_tool_calls_per_round" in str(exc.value)
+
+
 def test_tool_config_loads_from_env():
     from agentcore.config.loader import load_config
 
     cfg = load_config(env={"AGENTCORE_CONVERSATION__TOOLS_ENABLED": "true",
-                           "AGENTCORE_CONVERSATION__MAX_TOOL_ROUNDS": "5"})
+                           "AGENTCORE_CONVERSATION__MAX_TOOL_ROUNDS": "5",
+                           "AGENTCORE_CONVERSATION__MAX_TOOL_CALLS_PER_ROUND":
+                               "7"})
     assert cfg.conversation.tools_enabled is True
     assert cfg.conversation.max_tool_rounds == 5
+    assert cfg.conversation.max_tool_calls_per_round == 7
+
+
+def test_tool_batch_bound_is_checked_before_first_invocation(monkeypatch):
+    runner, _, executor, _ = build_runner(
+        [EchoTest()], max_calls_per_round=2)
+    invoked = []
+    original = executor.invoke
+    monkeypatch.setattr(
+        executor, "invoke",
+        lambda *args, **kwargs: invoked.append(args[0])
+        or original(*args, **kwargs))
+
+    with pytest.raises(ValueError, match="call count"):
+        runner.run_calls([
+            call("echo_test", call_id=f"call-{index}")
+            for index in range(3)
+        ])
+    assert invoked == []
+
+
+def test_runtime_call_bound_precedes_an_injected_runners_larger_bound(
+        monkeypatch):
+    """Runtime configuration remains authoritative for injected runners."""
+    model = ScriptedModel(ModelResponse(
+        text="", tool_calls=[
+            call("echo_test", {"text": "first"}, "call-one"),
+            call("echo_test", {"text": "second"}, "call-two"),
+        ]))
+    runtime = build_runtime(
+        [EchoTest()], model, max_tool_calls_per_round=1)
+    invoked = []
+    original = runtime.tools.executor.invoke
+    monkeypatch.setattr(
+        runtime.tools.executor, "invoke",
+        lambda *args, **kwargs: invoked.append(args[0])
+        or original(*args, **kwargs))
+
+    result = runtime.send("Run no more than one tool.")
+
+    assert not result.ok
+    assert result.error == "the model requested tools outside safe bounds"
+    assert invoked == []
+
+
+@pytest.mark.parametrize("tool_call", [
+    ToolCall("i" * 257, "echo_test", {}),
+    ToolCall("call-one", "n" * 257, {}),
+])
+def test_tool_metadata_bound_is_checked_before_first_invocation(
+        monkeypatch, tool_call):
+    runner, _, executor, _ = build_runner([EchoTest()])
+    invoked = []
+    monkeypatch.setattr(
+        executor, "invoke",
+        lambda *args, **kwargs: invoked.append(args[0]))
+
+    with pytest.raises(ValueError, match="metadata"):
+        runner.run_calls([tool_call])
+    assert invoked == []
 
 
 # ===========================================================================
@@ -697,7 +778,7 @@ def test_large_output_is_truncated_with_a_marker():
                            max_result_chars=200).send("go")
     content = result.tool_outcomes[0].content
     assert TRUNCATION_MARKER in content
-    assert len(content) < 1000
+    assert len(content) == 200
 
 
 def test_truncation_is_deterministic():
@@ -705,6 +786,23 @@ def test_truncation_is_deterministic():
     first = runner.run_calls([call("huge")]).outcomes[0].content
     second = runner.run_calls([call("huge")]).outcomes[0].content
     assert first == second
+
+
+@pytest.mark.parametrize("bound", range(1, len(TRUNCATION_MARKER) + 1))
+def test_truncation_marker_respects_small_rendered_result_bounds(bound):
+    runner, *_ = build_runner([HugeTool()], max_result_chars=bound)
+    first = runner.run_calls([call("huge")]).outcomes[0].content
+    second = runner.run_calls([call("huge")]).outcomes[0].content
+    assert first == second == TRUNCATION_MARKER[:bound]
+    assert len(first) == bound
+    assert first.startswith("…")
+
+
+@pytest.mark.parametrize("bound", range(1, len(TRUNCATION_MARKER) + 2))
+def test_truncation_leaves_text_at_or_below_bound_unchanged(bound):
+    runner, *_ = build_runner([HugeTool()], max_result_chars=bound)
+    for text in ("", "x" * (bound - 1), "x" * bound):
+        assert runner._truncate(text) == text
 
 
 def test_small_output_is_not_truncated():
@@ -802,6 +900,20 @@ def test_arguments_and_output_are_not_logged(caplog_json):
     assert SECRET not in json.dumps(entry)
 
 
+def test_untrusted_tool_name_and_call_id_are_not_logged(caplog_json):
+    runner, *_ = build_runner([EchoTest()])
+    unknown = runner.run_calls([
+        call(SECRET, call_id="safe-id"),
+    ], session_id="safe-session").outcomes[0]
+    runner.run_calls([
+        call("echo_test", {"text": "safe"}, call_id=SECRET),
+    ], session_id="safe-session")
+
+    logs = caplog_json.getvalue()
+    assert SECRET not in logs
+    assert SECRET not in json.dumps(unknown.describe())
+
+
 def test_denial_is_logged(caplog_json):
     model = ScriptedModel(wants("danger_write"), ModelResponse(text="no"))
     build_runtime([MutatingTool()], model,
@@ -822,6 +934,37 @@ def test_outcome_describe_omits_content():
                                ).outcomes[0]
     assert "private" not in json.dumps(outcome.describe())
     assert outcome.describe()["status"] == "ok"
+
+
+@pytest.mark.parametrize("status", ["ok", "denied", "failed"])
+def test_outcome_describe_keeps_executor_registered_identity(status):
+    tool = BrokenTool() if status == "failed" else EchoTest()
+    runner, _, executor, _ = build_runner([tool])
+    if status == "denied":
+        executor.policy = PermissionPolicy(PermConfig(
+            blocked_capabilities=(str(Capability.FS_READ),)))
+    arguments = {} if status == "failed" else {"text": "safe"}
+    outcome = runner.run_calls([call(tool.name, arguments)]).outcomes[0]
+    assert outcome.status == status
+    assert outcome.invocation is not None
+    assert outcome.invocation.tool == tool.name
+    assert outcome.describe()["tool"] == tool.name
+
+
+def test_outcome_describe_unknown_pre_executor_identity_is_categorical():
+    runner, *_ = build_runner([EchoTest()])
+    outcome = runner.run_calls([call(SECRET, call_id=SECRET)]).outcomes[0]
+    assert outcome.invocation is None
+    assert outcome.describe()["tool"] == "unregistered"
+    assert SECRET not in json.dumps(outcome.describe())
+
+
+def test_outcome_describe_uses_executor_identity_not_model_controlled_call():
+    runner, *_ = build_runner([EchoTest()])
+    outcome = runner.run_calls([call("echo_test", {"text": SECRET}, SECRET)]).outcomes[0]
+    outcome.call = call(SECRET, {"text": SECRET}, SECRET)
+    assert outcome.describe()["tool"] == "echo_test"
+    assert SECRET not in json.dumps(outcome.describe())
 
 
 # ===========================================================================

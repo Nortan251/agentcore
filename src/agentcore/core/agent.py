@@ -606,6 +606,8 @@ class Agent:
         return ConversationToolRunner(
             self.executor, self.registry,
             max_result_chars=self.config.conversation.max_tool_result_chars,
+            max_calls_per_round=(
+                self.config.conversation.max_tool_calls_per_round),
             logger=get_logger("conversation.tools"))
 
     def correct_memory(self, turns: Any, *, memory_id: str | None = None) -> Any:
