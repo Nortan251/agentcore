@@ -1,0 +1,33 @@
+name: browser-integration
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  chromium:
+    name: Chromium adapter (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      AGENTCORE_BROWSER_INTEGRATION: "1"
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/work/chromium
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install optional browser dependencies
+        run: python -m pip install -e ".[dev,browser]"
+      - name: Install pinned Chromium binary and system dependencies
+        run: python -m playwright install --with-deps chromium
+      - name: Browser unit and real Chromium adapter gates
+        run: python -m pytest tests/test_browser_network.py tests/test_browser_fetch.py tests/test_browser_fetch_integration.py tests/test_browser_session.py tests/test_browser_tool_boundary.py tests/test_browser_composition.py tests/test_tool_private_arguments.py tests/test_browser_playwright_integration.py -ra

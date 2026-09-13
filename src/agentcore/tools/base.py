@@ -96,6 +96,11 @@ class ToolSpec:
     version: str = "1.0.0"
     tags: tuple[str, ...] = ()
 
+    def __post_init__(self) -> None:
+        # Tags are host-owned metadata. Detach mutable constructor inputs so
+        # privacy classification cannot change through an aliased list.
+        object.__setattr__(self, "tags", tuple(self.tags))
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,

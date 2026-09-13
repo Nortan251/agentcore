@@ -485,7 +485,8 @@ class ToolExecutor:
             )
         tool_spec = tool.spec
         mutation = not tool_spec.read_only
-        private = mutation or type(tool) is AuthenticatedReadTool
+        private = (mutation or type(tool) is AuthenticatedReadTool
+                   or "private_arguments" in tool_spec.tags)
         log = (self._log.bind(tool=tool_name) if private
                else self._log.bind(tool=tool_name, **context_meta))
         logged_args = (_redacted_declared_args(supplied, tool_spec) if private
@@ -1177,7 +1178,7 @@ class ToolExecutor:
             return ToolInvocation(
                 tool_spec.name,
                 (_redacted_declared_args(cleaned, tool_spec)
-                 if type(tool) is AuthenticatedReadTool else cleaned),
+                 if type(tool) is AuthenticatedReadTool or "private_arguments" in tool_spec.tags else cleaned),
                 ToolResult.failure(
                     "The registered tool changed before execution.",
                     kind="tool_registration_changed",
@@ -1196,8 +1197,9 @@ class ToolExecutor:
     ) -> ToolInvocation:
         """Validation/checkpoint/policy/checkpoint/run with a live lease."""
         authenticated = type(tool) is AuthenticatedReadTool
+        private_arguments = "private_arguments" in tool_spec.tags
         safe_args = (_redacted_declared_args(cleaned, tool_spec)
-                     if authenticated else cleaned)
+                     if authenticated or private_arguments else cleaned)
         binding = None
         if authenticated:
             tool.validate_contract()
@@ -1257,6 +1259,10 @@ class ToolExecutor:
                 CredentialError(exc.reason).message, kind=exc.reason.value,
             )
         except AgentError as exc:
+            if private_arguments and not authenticated:
+                log.warning(Events.TOOL_FAILED, reason="private_tool_failed")
+                result = ToolResult.failure("Tool execution failed.", kind="private_tool_failed")
+                return ToolInvocation(tool_spec.name, safe_args, result, elapsed(), decision)
             if authenticated:
                 return self._safe_pre_action_failure(
                     tool_spec.name, safe_args, elapsed(), log,
@@ -1269,6 +1275,10 @@ class ToolExecutor:
                 exc.message, kind=type(exc).__name__,
                 retryable=exc.retryable, **exc.details)
         except Exception as exc:  # noqa: BLE001 - legacy fast-path envelope
+            if private_arguments and not authenticated:
+                log.warning(Events.TOOL_FAILED, reason="private_tool_failed")
+                result = ToolResult.failure("Tool execution failed.", kind="private_tool_failed")
+                return ToolInvocation(tool_spec.name, safe_args, result, elapsed(), decision)
             if authenticated:
                 # Never stringify provider/runtime exceptions or log traceback.
                 return self._safe_pre_action_failure(
@@ -1286,7 +1296,10 @@ class ToolExecutor:
             log.info(Events.TOOL_SUCCEEDED, duration_ms=round(duration, 3))
         else:
             reason = result.metadata.get("reason") if result.metadata else None
-            if reason in _SENSITIVE_FAILURE_REASONS:
+            if private_arguments:
+                log.warning(Events.TOOL_FAILED, reason="private_tool_failed",
+                            duration_ms=round(duration, 3))
+            elif reason in _SENSITIVE_FAILURE_REASONS:
                 log.warning(Events.TOOL_FAILED, reason=reason,
                             duration_ms=round(duration, 3))
             else:
