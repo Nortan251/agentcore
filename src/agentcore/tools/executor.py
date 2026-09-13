@@ -14,6 +14,7 @@ import os
 import hmac
 import threading
 import time
+import agentcore.errors as framework_errors
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
@@ -1261,7 +1262,12 @@ class ToolExecutor:
         except AgentError as exc:
             if private_arguments and not authenticated:
                 log.warning(Events.TOOL_FAILED, reason="private_tool_failed")
-                result = ToolResult.failure("Tool execution failed.", kind="private_tool_failed")
+                # Preserve trusted framework recovery semantics while omitting
+                # messages/details and arbitrary provider class names.
+                error_type = type(exc)
+                kind = (error_type.__name__ if getattr(framework_errors, error_type.__name__, None) is error_type
+                        else "private_tool_failed")
+                result = ToolResult.failure("Tool execution failed.", kind=kind, retryable=bool(exc.retryable))
                 return ToolInvocation(tool_spec.name, safe_args, result, elapsed(), decision)
             if authenticated:
                 return self._safe_pre_action_failure(

@@ -181,6 +181,8 @@ detached into tuples. Model arguments cannot modify tags. It does not grant
 capabilities, permissions, approvals, authenticated authority, action eligibility,
 mutation classification, execution leases or success. Verifier/recovery input
 continues to use original trusted task arguments, not redacted invocation evidence.
+Raised framework failures retain their trusted retryability and framework category;
+raw messages/details and arbitrary provider class names are omitted.
 Generic regressions compare marked/unmarked read and mutation paths at every
 permission level and preserve Gmail's existing exact authenticated-read behavior.
 
@@ -203,7 +205,7 @@ authority. No future mutation permission is granted by this phase.
 | felixchaos/safe-outbound | `f9131b1e9b5f811c0d0c8773a8a773abb1c4d6b4` | `src/safe_outbound/client.py`, README/LICENSE; resolve/pin/Host/TLS/redirect reference |
 | tommypj/ssrf-safe-fetch | `56578ac1999723514bedc0f78be16b244fd71163` | fetch.py, resolver.py, README/LICENSE; per-redirect pinning reference |
 
-Playwright, BrowserGym and safehttpx are Apache-2.0. browser-use, Stagehand,
+Playwright, BrowserGym and safehttpx are Apache-2.0; psutil is BSD-3-Clause. browser-use, Stagehand,
 safe-outbound and ssrf-safe-fetch are MIT. No substantive external source was
 copied, translated or adapted; all AgentCore adapters/scripts are original.
 No vendored third-party notices are required for these original files. Only

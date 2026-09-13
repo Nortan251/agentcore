@@ -7,11 +7,12 @@ from conftest import journal_for_tools
 
 from agentcore.config.schema import AgentConfig, FeatureFlags, LoggingConfig, PermissionConfig
 from agentcore.core.agent import Agent, AgentDependencies
-from agentcore.errors import ToolValidationError
+from agentcore.errors import ToolValidationError, ToolExecutionError, ToolNotFoundError, PermissionDeniedError, ApprovalRequiredError
+from agentcore.recovery.classify import classify
 from agentcore.permissions.levels import Capability, PermissionLevel
 from agentcore.permissions.policy import PermissionPolicy
 from agentcore.state.models import AgentState
-from agentcore.tasks.models import Task, Subtask, TaskStatus, VerificationResult, VerificationStatus
+from agentcore.tasks.models import Task, Subtask, TaskStatus, VerificationResult, VerificationStatus, ErrorRecord
 from agentcore.tools.base import FunctionTool, ToolParameter, ToolResult, ToolSpec, tool_spec
 from agentcore.tools.executor import ToolExecutor
 from agentcore.tools.registry import ToolRegistry, ToolRegistryLeaseError
@@ -100,11 +101,41 @@ def test_private_marker_never_bypasses_registration_lease(monkeypatch):
     assert result.ok and runs == ["original"]
 
 
-def test_verifier_recovery_and_state_use_original_task_args_and_live_result(tmp_path):
+class PRIVATE_PROVIDER_CLASS_SECRET(ToolExecutionError):
+    pass
+
+
+@pytest.mark.parametrize("error_type", [ToolExecutionError, ToolValidationError, ToolNotFoundError,
+                                      PermissionDeniedError, ApprovalRequiredError, PRIVATE_PROVIDER_CLASS_SECRET])
+def test_private_exception_redaction_preserves_framework_recovery_classification(error_type):
+    categories = []
+    for marked in (False, True):
+        def fail(*_):
+            raise error_type("PRIVATE_MESSAGE_SECRET", body="PRIVATE_BODY_SECRET")
+        tool = FunctionTool(tool_spec("read", "read", tags=("private_arguments",) if marked else ()), fail)
+        registry = ToolRegistry()
+        registry.register(tool)
+        invocation = ToolExecutor(registry, PermissionPolicy()).invoke("read", {})
+        result = invocation.result
+        subtask = Subtask(description="read", tool_name="read")
+        subtask.errors.append(ErrorRecord(type=result.metadata["kind"], message=result.error,
+                                        retryable=bool(result.metadata.get("retryable")), details=result.metadata))
+        categories.append(classify(subtask))
+        assert not result.ok
+        if marked:
+            assert "SECRET" not in str(result)
+            assert result.metadata["retryable"] is bool(error_type.retryable)
+    assert categories[0] is categories[1]
+
+
+@pytest.mark.parametrize("failure_mode", ["result", "agent_error"])
+def test_verifier_recovery_and_state_use_original_task_args_and_live_result(tmp_path, failure_mode):
     seen = []
     def function(args, context):
         seen.append(args["text"])
         if len(seen) == 1:
+            if failure_mode == "agent_error":
+                raise ToolExecutionError("PRIVATE_EXCEPTION_SECRET", body="PRIVATE_DETAIL_SECRET")
             return ToolResult.failure("transient", retryable=True)
         return ToolResult.success("verified result")
     tool = FunctionTool(tool_spec("read", "read", parameters=(ToolParameter("text"),), tags=("private_arguments",)), function)
