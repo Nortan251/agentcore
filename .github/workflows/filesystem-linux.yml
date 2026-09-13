@@ -12,6 +12,7 @@ jobs:
   linux:
     name: Linux full suite (py3.13)
     runs-on: ubuntu-latest
+    timeout-minutes: 12
 
     steps:
       - name: Check out repository
@@ -26,4 +27,52 @@ jobs:
         run: python -m pip install -e ".[dev]"
 
       - name: Full test suite
-        run: python -m pytest -q
+        env:
+          PYTHONFAULTHANDLER: "1"
+        run: |
+          mkdir -p diagnostic-evidence
+          python --version
+          python -m pip freeze > diagnostic-evidence/environment.txt
+          git rev-parse HEAD
+          python -m pytest --collect-only -q -o addopts='' | tee diagnostic-evidence/collection.txt
+          python - <<'PY'
+          from pathlib import Path
+          nodes = [line for line in Path('diagnostic-evidence/collection.txt').read_text().splitlines() if '::' in line]
+          for index in range(int(len(nodes) * .88), min(len(nodes), int(len(nodes) * .92) + 1)):
+              print(f'{index + 1}: {nodes[index]}')
+          PY
+          (
+            while true; do
+              date -u
+              ps -eo pid,ppid,pgid,sid,stat,wchan:32,etime,cmd --forest
+              pstree -ap || true
+              for pid in $(pgrep -u "$(id -u)" -f 'python.*pytest' || true); do
+                if [ -r "/proc/$pid/status" ]; then
+                  echo "=== /proc/$pid ==="
+                  cat "/proc/$pid/status"
+                  cat "/proc/$pid/wchan" || true
+                fi
+              done
+              sleep 60
+            done
+          ) > diagnostic-evidence/processes.txt 2>&1 &
+          sampler=$!
+          set +e
+          timeout --signal=TERM --kill-after=10s 8m \
+            python -m pytest -vv -s -o faulthandler_timeout=60 \
+            2>&1 | tee diagnostic-evidence/pytest.txt
+          result=${PIPESTATUS[0]}
+          kill "$sampler" 2>/dev/null || true
+          wait "$sampler" 2>/dev/null || true
+          date -u | tee -a diagnostic-evidence/processes.txt
+          ps -eo pid,ppid,pgid,sid,stat,wchan:32,etime,cmd --forest | tee -a diagnostic-evidence/processes.txt
+          pstree -ap | tee -a diagnostic-evidence/processes.txt || true
+          tail -n 180 diagnostic-evidence/processes.txt
+          exit "$result"
+
+      - name: Preserve diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-hang-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: diagnostic-evidence/
