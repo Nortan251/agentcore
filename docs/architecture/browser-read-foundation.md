@@ -229,6 +229,15 @@ The extra pins Playwright 1.62.0 and psutil 7.2.2; Playwright selects its Chromi
 revision. Installation/upgrades are host operations and require real gate review.
 Core/dev installs and the ordinary suite do not require Chromium.
 
+Linux hosts must support Chromium's sandbox user namespaces. On Ubuntu with
+restricted unprivileged namespaces, downloaded Chromium needs a host-installed
+AppArmor allowance for its exact binary paths, as described in the
+[Chromium sandbox documentation](https://chromium.googlesource.com/chromium/src/+/main/docs/security/apparmor-userns-restrictions.md).
+The Linux browser CI installs that narrowly scoped allowance for its downloaded
+binaries, preserves the global restriction, and runs all real tests with
+chromium_sandbox=True. A blank host probe reports only categorical prerequisites.
+Tools never install profiles or disable the sandbox to recover from launch failure.
+
 Set AGENTCORE_BROWSER_INTEGRATION=1 to enable real browser tests. Custom binary
 installs require a matching PLAYWRIGHT_BROWSERS_PATH. Enabled gate failures are
 failures, not dependency skips. Controlled HTTP/TLS fixtures use a test-defined

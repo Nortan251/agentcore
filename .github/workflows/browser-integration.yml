@@ -29,5 +29,43 @@ jobs:
         run: python -m pip install -e ".[dev,browser]"
       - name: Install pinned Chromium binary and system dependencies
         run: python -m playwright install --with-deps chromium
+      - name: Permit sandbox namespaces for the installed Linux Chromium binaries
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # Ubuntu restricts user namespaces for downloaded Chromium binaries.
+          # Scope the exception to these exact CI-installed binary paths. Keep
+          # the global restriction and Chromium's own sandbox enabled.
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from playwright.sync_api import sync_playwright
+          with sync_playwright() as driver:
+              try:
+                  browser = driver.chromium.launch(headless=True, chromium_sandbox=True)
+              except Exception as error:
+                  detail = str(error).lower()  # blank host probe; never logged
+                  category = ("sandbox_user_namespace_denied" if any(value in detail for value in
+                      ("no usable sandbox", "failed to move to new namespace", "operation not permitted"))
+                      else "sandboxed_blank_launch_failed")
+                  print(category)
+                  if category != "sandbox_user_namespace_denied":
+                      raise RuntimeError(category) from None
+              else:
+                  browser.close()
+                  print("sandboxed_blank_launch_ready")
+          root = Path(os.environ["PLAYWRIGHT_BROWSERS_PATH"]).resolve()
+          binaries = sorted(path for path in root.rglob("*") if path.is_file()
+                            and path.name in {"chrome", "chrome-headless-shell"})
+          if not binaries:
+              raise RuntimeError("installed_chromium_binary_missing")
+          profiles = ["abi <abi/4.0>,\ninclude <tunables/global>\n"]
+          for index, binary in enumerate(binaries):
+              profiles.append(f'profile agentcore-ci-chromium-{index} "{binary}" flags=(unconfined) {{\n  userns,\n}}\n')
+          Path(os.environ["RUNNER_TEMP"], "agentcore-browser-userns").write_text("".join(profiles))
+          PY
+          if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null)" = "1" ]; then
+            sudo apparmor_parser -r "$RUNNER_TEMP/agentcore-browser-userns"
+          fi
       - name: Browser unit and real Chromium adapter gates
         run: python -m pytest tests/test_browser_network.py tests/test_browser_fetch.py tests/test_browser_fetch_integration.py tests/test_browser_session.py tests/test_browser_tool_boundary.py tests/test_browser_composition.py tests/test_tool_private_arguments.py tests/test_browser_playwright_integration.py -ra
