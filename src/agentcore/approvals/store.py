@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Protocol, runtime_checkable
 
+from agentcore.util.domain_finalizers import DomainFinalizers
+
 from agentcore.approvals.errors import (
     ApprovalAlreadyExistsError,
     ApprovalNotFoundError,
@@ -160,14 +162,15 @@ class _StoreDomain:
 
 
 _DOMAINS: dict[str, _StoreDomain] = {}
-_DOMAINS_LOCK = threading.Lock()
+_DOMAINS_LOCK = threading.RLock()
 
 
 def _after_fork_in_child() -> None:
-    global _DOMAINS, _DOMAINS_LOCK
+    global _DOMAINS, _DOMAINS_LOCK, _DOMAIN_FINALIZERS
     inherited = tuple(_DOMAINS.values())
     _DOMAINS = {}
-    _DOMAINS_LOCK = threading.Lock()
+    _DOMAINS_LOCK = threading.RLock()
+    _DOMAIN_FINALIZERS = DomainFinalizers(_DOMAINS_LOCK, _release_domain)
     for domain in inherited:
         try:
             domain.handle.close()
@@ -175,8 +178,18 @@ def _after_fork_in_child() -> None:
             pass
 
 
+def _before_fork() -> None:
+    _DOMAIN_FINALIZERS.before_fork()
+
+
+def _after_fork_in_parent() -> None:
+    _DOMAIN_FINALIZERS.after_fork_parent()
+
+
 if hasattr(os, "register_at_fork"):  # pragma: no branch - POSIX only
-    os.register_at_fork(after_in_child=_after_fork_in_child)
+    os.register_at_fork(
+        before=_before_fork, after_in_parent=_after_fork_in_parent,
+        after_in_child=_after_fork_in_child)
 
 
 def _domain_key(directory: Path) -> str:
@@ -186,10 +199,12 @@ def _domain_key(directory: Path) -> str:
 def _acquire_domain(directory: Path) -> _StoreDomain:
     key = _domain_key(directory)
     owner_pid = os.getpid()
-    with _DOMAINS_LOCK:
+    with _DOMAIN_FINALIZERS.guard():
         existing = _DOMAINS.get(key)
         if existing is not None:
             if existing.owner_pid == owner_pid:
+                if existing.references == 0:
+                    raise ApprovalStoreOwnershipError("domain ownership is closing")
                 existing.references += 1
                 return existing
             _DOMAINS.pop(key, None)
@@ -198,7 +213,10 @@ def _acquire_domain(directory: Path) -> _StoreDomain:
             except BaseException:
                 pass
         handle = (directory / _OWNER_FILENAME).open("a+b")
+        domain = None
         try:
+            if owner_pid != os.getpid():
+                raise ApprovalStoreOwnershipError("domain construction belongs to another process")
             handle.seek(0, os.SEEK_END)
             if handle.tell() == 0:
                 handle.write(b"0")
@@ -206,31 +224,43 @@ def _acquire_domain(directory: Path) -> _StoreDomain:
                 os.fsync(handle.fileno())
             handle.seek(0)
             _lock_owner_handle(handle)
+            domain = _StoreDomain(
+                key=key, handle=handle, mutex=threading.RLock(),
+                owner_pid=owner_pid)
+            if owner_pid != os.getpid():
+                raise ApprovalStoreOwnershipError("domain construction belongs to another process")
+            _DOMAINS[key] = domain
         except BaseException:
+            if domain is not None and _DOMAINS.get(key) is domain:
+                _DOMAINS.pop(key, None)
             handle.close()
             raise
-        domain = _StoreDomain(
-            key=key, handle=handle, mutex=threading.RLock(),
-            owner_pid=owner_pid)
-        _DOMAINS[key] = domain
         return domain
 
 
 def _release_domain(domain: _StoreDomain) -> None:
     if domain.owner_pid != os.getpid():
         return
-    with _DOMAINS_LOCK:
+    with _DOMAIN_FINALIZERS.guard():
         current = _DOMAINS.get(domain.key)
         if current is not domain:
             return
         domain.references -= 1
         if domain.references:
             return
-        _DOMAINS.pop(domain.key, None)
+        # Keep last-close descriptors tracked through fork until fully closed.
         try:
-            _unlock_owner_handle(domain.handle)
+            _unlock_owner_handle(domain.handle, owner_pid=domain.owner_pid)
         finally:
-            domain.handle.close()
+            try:
+                if not domain.handle.closed:
+                    domain.handle.close()
+            finally:
+                if _DOMAINS.get(domain.key) is domain:
+                    _DOMAINS.pop(domain.key, None)
+
+
+_DOMAIN_FINALIZERS = DomainFinalizers(_DOMAINS_LOCK, _release_domain)
 
 
 class JsonFileApprovalStore:
@@ -241,8 +271,18 @@ class JsonFileApprovalStore:
         self._closed = True
         self._directory = Path(directory).resolve()
         self._directory.mkdir(parents=True, exist_ok=True)
-        self._domain = _acquire_domain(self._directory)
-        self._closed = False
+        if self._owner_pid != os.getpid():
+            raise ApprovalStoreOwnershipError("store construction belongs to another process")
+        domain = _acquire_domain(self._directory)
+        try:
+            if self._owner_pid != os.getpid() or domain.owner_pid != os.getpid():
+                raise ApprovalStoreOwnershipError("store construction belongs to another process")
+            self._domain = domain
+            self._closed = False
+        except BaseException:
+            self._closed = True
+            _release_domain(domain)
+            raise
 
     def _require_owner(self) -> None:
         if self._owner_pid != os.getpid() or (
@@ -397,7 +437,15 @@ class JsonFileApprovalStore:
 
     def __del__(self) -> None:  # pragma: no cover - defensive cleanup
         try:
-            self.close()
+            if self._owner_pid != os.getpid():
+                self._closed = True
+                return
+            if self._closed:
+                return
+            self._closed = True
+            # A reachable method/explicit close keeps self alive. A finalizer
+            # owns only its lease; never wait on a shared domain's mutex here.
+            _DOMAIN_FINALIZERS.release_later(self._domain)
         except BaseException:
             pass
 
@@ -491,14 +539,24 @@ def _lock_owner_handle(handle: BinaryIO) -> None:
             "approval store is owned by another process") from exc
 
 
-def _unlock_owner_handle(handle: BinaryIO) -> None:
+def _unlock_owner_handle(handle: BinaryIO, *, owner_pid: int) -> None:
+    # Recheck AFTER descriptor lookup: a same-thread fork inside cleanup must
+    # close only its local copy, never unlock the parent's shared description.
+    if owner_pid != os.getpid() or handle.closed:
+        return
     if os.name == "nt":
         import msvcrt
+
         handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        descriptor = handle.fileno()
+        if owner_pid == os.getpid():
+            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
     else:
         import fcntl
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+        descriptor = handle.fileno()
+        if owner_pid == os.getpid():
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
 
 
 def _fsync_directory(directory: Path) -> None:
