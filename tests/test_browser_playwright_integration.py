@@ -262,3 +262,45 @@ def test_pr31_p2_escaped_duplicate_hidden_sentinels_absent_real_chromium(local_s
         assert hits == []
     finally:
         backend.close()
+
+
+def test_pr31_hidden_wrapper_and_nonvoid_solidus_match_offline_chromium(local_server):
+    from agentcore.browser.render import static_html
+
+    port, hits = local_server
+    cases = [
+        '<x-panel hidden><p>P1_SECRET</p></x-panel>VISIBLE_TAIL',
+        '<x-panel style="display:none"><p>P1_SECRET</p></x-panel>VISIBLE_TAIL',
+        '<x-panel hidden><x-panel><p>P1_SECRET</p></x-panel>'
+        'STILL_HIDDEN</x-panel>VISIBLE_TAIL',
+        '<div hidden/>P1_SECRET</div>VISIBLE_TAIL',
+        '<x-panel hidden/>P1_SECRET</x-panel>VISIBLE_TAIL',
+        '<script/>P1_SECRET</script>VISIBLE_TAIL',
+        '<style/>P1_SECRET</style>VISIBLE_TAIL',
+        '<textarea/>P1_SECRET</textarea>VISIBLE_TAIL',
+    ]
+    backend = PlaywrightBackend(BrowserConfig())
+    try:
+        backend.start()
+        for source in cases:
+            raw = source + f'<img src="http://127.0.0.1:{port}/never">'
+            backend.render_document(raw)
+            original_text = backend.extract_text().text
+            assert 'P1_SECRET' not in original_text, source
+            assert 'VISIBLE_TAIL' in original_text, source
+
+            projected = static_html(raw, BrowserConfig())
+            backend.render_document(projected)
+            sanitized_text = backend.extract_text().text
+            assert 'P1_SECRET' not in sanitized_text, source
+            assert 'VISIBLE_TAIL' in sanitized_text, source
+            assert hits == []
+        for source in ('<x-panel hidden><div>P1_SECRET</x-panel>P1_TAIL',
+                       '<x-panel hidden>P1_SECRET'):
+            for document in (source, static_html(source, BrowserConfig())):
+                backend.render_document(document)
+                text = backend.extract_text().text
+                assert 'P1_SECRET' not in text and 'P1_TAIL' not in text, source
+        assert hits == []
+    finally:
+        backend.close()

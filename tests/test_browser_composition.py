@@ -233,6 +233,34 @@ def test_static_projection_strips_all_resources_active_and_base_authority():
     assert 'style="display:none"' in projected
 
 
+@pytest.mark.parametrize("source,expected", [
+    ('<x-panel hidden><p>SECRET</p></x-panel>VISIBLE', 'VISIBLE'),
+    ('<x-panel aria-hidden="true"><span>SECRET</span></x-panel>VISIBLE', 'VISIBLE'),
+    ('<x-panel style="display:none"><p>SECRET</p></x-panel>VISIBLE', 'VISIBLE'),
+    ('<x-panel hidden><x-panel><p>SECRET</p></x-panel>STILL_HIDDEN</x-panel>VISIBLE',
+     'VISIBLE'),
+    ('<x-panel hidden><div>SECRET</x-panel>TAIL', ''),
+    ('<x-panel hidden><br/>SECRET</x-panel>VISIBLE', 'VISIBLE'),
+    ('<x-panel hidden><p>SECRET</p>', ''),
+    ('<x-panel hidden/><p>SECRET</p>', ''),
+    ('<script/>SECRET', ''),
+    ('<style/>SECRET', ''),
+    ('<textarea/>SECRET', ''),
+])
+def test_hidden_or_excluded_nonvoid_subtrees_never_project_visible_text(source, expected):
+    assert static_html(source, BrowserConfig()) == expected
+
+
+def test_supported_hidden_self_closing_spelling_keeps_following_text_inside():
+    assert static_html('<div hidden/>SECRET', BrowserConfig()) == \
+        '<div style="display:none">SECRET'
+
+
+def test_real_void_elements_do_not_suppress_following_visible_text():
+    source = '<br/><hr/><img hidden/><input hidden/><source hidden/><wbr hidden/>VISIBLE'
+    assert static_html(source, BrowserConfig()) == '<br><hr>VISIBLE'
+
+
 def test_brokered_backend_keeps_final_url_separate_and_never_navigates_renderer():
     class Broker:
         def fetch(self, url):

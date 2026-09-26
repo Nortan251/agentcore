@@ -15,6 +15,9 @@ from .network import canonical_url
 
 _TAGS = frozenset("html head body title div span p h1 h2 h3 h4 h5 h6 pre code blockquote ul ol li dl dt dd table thead tbody tfoot tr th td a br hr strong em b i u s small sup sub section article main header footer nav aside figure figcaption".split())
 _VOID = frozenset({"br", "hr"})
+# The complete HTML void set governs parser state even for tags we strip.
+# A trailing slash does not close any other HTML element in a browser.
+_HTML_VOID = frozenset("area base br col embed hr img input link meta param source track wbr".split())
 _EXCLUDE = frozenset("script style noscript template form input textarea select button iframe object embed svg math".split())
 
 _COMMENTS = re.compile(r"/\*.*?\*/", re.DOTALL)
@@ -90,14 +93,18 @@ class _StaticHTML(HTMLParser):
             for name, value in attrs)
         attrs = dict(attrs)  # retain existing href/data handling
         if self.ignored:
-            if tag == self.ignored[-1]:
+            # Track every non-void descendant. A premature/mismatched end tag
+            # must not release a suppressed wrapper and expose later text.
+            if tag not in _HTML_VOID:
                 self.ignored.append(tag)
             return
         if tag in _EXCLUDE or "contenteditable" in attrs:
-            if tag not in {"input", "embed"}:
+            if tag not in _HTML_VOID:
                 self.ignored.append(tag)
             return
         if tag not in _TAGS:
+            if explicitly_hidden and tag not in _HTML_VOID:
+                self.ignored.append(tag)
             return
         safe_attrs = ""
         if tag == "a" and type(attrs.get("href")) is str and len(attrs["href"]) <= self.config.max_url_chars:
@@ -133,7 +140,8 @@ class _StaticHTML(HTMLParser):
 
     def handle_startendtag(self, tag, attrs):
         self.handle_starttag(tag, attrs)
-        self.handle_endtag(tag)
+        if tag in _HTML_VOID:
+            self.handle_endtag(tag)
 
     def handle_data(self, data):
         if not self.ignored:
