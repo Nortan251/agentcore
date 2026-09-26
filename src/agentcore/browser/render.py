@@ -8,8 +8,10 @@ Only link href DATA is retained; parent code decides link destinations.
 import html
 import re
 from html.parser import HTMLParser
+from urllib.parse import urljoin
 
 from .errors import BrowserError, BrowserFailure
+from .network import canonical_url
 
 _TAGS = frozenset("html head body title div span p h1 h2 h3 h4 h5 h6 pre code blockquote ul ol li dl dt dd table thead tbody tfoot tr th td a br hr strong em b i u s small sup sub section article main header footer nav aside figure figcaption".split())
 _VOID = frozenset({"br", "hr"})
@@ -62,9 +64,10 @@ def _inline_hidden(style):
 
 
 class _StaticHTML(HTMLParser):
-    def __init__(self, config):
+    def __init__(self, config, final_url=None):
         super().__init__(convert_charrefs=True)
         self.config = config
+        self.final_url = final_url
         self.parts = []
         self.ignored = []
         self.nodes = 0
@@ -98,9 +101,22 @@ class _StaticHTML(HTMLParser):
             return
         safe_attrs = ""
         if tag == "a" and type(attrs.get("href")) is str and len(attrs["href"]) <= self.config.max_url_chars:
-            # Keep destinations as inert data, not navigable browser hrefs
-            # (including file/javascript URLs or speculative anchor fetches).
-            safe_attrs += ' data-agentcore-href="' + html.escape(attrs["href"], quote=True) + '"'
+            # Keep link proposals as inert data, never navigable browser hrefs.
+            href = attrs["href"]
+            if self.final_url is not None:
+                # urljoin/urlsplit can strip control characters before policy
+                # sees them. Reject ambiguous raw markup before resolution.
+                if (not href.isascii() or "\\" in href
+                        or any(ord(char) <= 32 or ord(char) == 127 for char in href)):
+                    href = None
+                else:
+                    try:
+                        href = canonical_url(urljoin(self.final_url, href),
+                                             max_chars=self.config.max_url_chars)
+                    except (BrowserError, ValueError, UnicodeError):
+                        href = None
+            if href is not None:
+                safe_attrs += ' data-agentcore-href="' + html.escape(href, quote=True) + '"'
         # Preserve explicit invisibility without importing arbitrary CSS URLs,
         # @imports, fonts, animations, custom elements or active attributes.
         if explicitly_hidden:
@@ -124,10 +140,10 @@ class _StaticHTML(HTMLParser):
             self._emit(html.escape(data, quote=False))
 
 
-def static_html(source, config):
+def static_html(source, config, *, final_url=None):
     if type(source) is not str or len(source) > config.max_body_bytes * 6 + 16:
         raise BrowserError(BrowserFailure.SIZE)
-    parser = _StaticHTML(config)
+    parser = _StaticHTML(config, final_url=final_url)
     try:
         parser.feed(source)
         parser.close()

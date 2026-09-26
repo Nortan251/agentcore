@@ -43,7 +43,7 @@ _TEXT = """bounds => {
 }"""
 _LINKS = """bounds => {
     const walker = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_ELEMENT);
-    const links = []; let scanned = 0, node, truncated = false;
+    const links = [], seen = new Set(); let scanned = 0, node, truncated = false;
     while ((node = walker.nextNode())) {
         if (++scanned > bounds.nodes) { truncated = true; break; }
         if (node.tagName !== 'A' || !(node.hasAttribute('data-agentcore-href') || node.hasAttribute('href')) || node.closest('form,[contenteditable]')) continue;
@@ -55,7 +55,8 @@ _LINKS = """bounds => {
         }
         if (!visible) continue;
         const href = node.getAttribute('data-agentcore-href') ?? node.getAttribute('href');
-        if (href.length > bounds.url) continue;
+        if (href.length > bounds.url || seen.has(href)) continue;
+        seen.add(href);
         links.push({url: href, text: node.innerText.slice(0, bounds.text)});
         if (links.length > bounds.links) { truncated = true; break; }
     }

@@ -93,7 +93,10 @@ def test_persisted_hostile_content_postregistered_callback_and_same_name_replace
     assert second.ok and not executed
     assert second.session.id == first.session.id
     assert second.tools_executed == 0
-    assert any(SENTINEL in message.content for message in model.requests[-1].messages if message.role is Role.TOOL)
+    assert any(SENTINEL in message.content and "HISTORICAL TOOL RESULT" in message.content
+               for message in model.requests[-1].messages if message.role is Role.USER)
+    assert all(SENTINEL not in message.content for message in model.requests[-1].messages
+               if message.role is Role.TOOL)
     assert calls == ["browser_extract_text"]
     assert all({tool["name"] for tool in request.tools} <= set(BROWSER_TOOL_NAMES) for request in model.requests)
 
@@ -245,6 +248,23 @@ def test_brokered_backend_keeps_final_url_separate_and_never_navigates_renderer(
     assert metadata.url == "https://example.com/final/path/"
     assert "attacker" not in renderer.source
     backend.close()
+
+
+def test_projected_link_candidates_use_trusted_final_url_before_budget():
+    source = ('<base href="https://attacker.com/">'
+              + '<a href="mailto:noise@example.com">noise</a>' * 6
+              + '<a href="javascript:alert(1)">script</a>' * 6
+              + '<a href="http://[:::]">malformed</a>' * 6
+              + '<a href="https://example.com/a\nb">control</a>' * 6
+              + '<a href="../ok#first">first</a>'
+              + '<a href="../ok#second">duplicate canonical</a>' * 6
+              + '<a href="https://example.com/next?q=1">next</a>')
+    projected = static_html(source, BrowserConfig(max_links=2),
+                            final_url="https://example.com/final/page")
+    assert projected.count("data-agentcore-href=") == 8
+    assert 'data-agentcore-href="https://example.com/ok"' in projected
+    assert 'data-agentcore-href="https://example.com/next?q=1"' in projected
+    assert "attacker.com" not in projected
 
 @pytest.mark.parametrize('style', [r'\64 isplay:none', r'd\69 splay:none', r'op\61 city:0',
     r'vis\69 bility:hidden', r'\44 ISPLAY:none', r'\000064isplay:none', r'\64\tisplay:none',

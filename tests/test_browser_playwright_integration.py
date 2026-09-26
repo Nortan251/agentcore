@@ -112,6 +112,43 @@ def test_real_chromium_text_links_and_local_subresources(local_server):
     backend.close()
 
 
+@pytest.mark.parametrize("extra_usable,expected_truncated", [(True, True), (False, False)])
+def test_brokered_renderer_limits_visible_canonical_links_after_filtering(
+        local_server, extra_usable, expected_truncated):
+    from agentcore.browser.brokered_backend import BrokeredBrowserBackend
+    from agentcore.browser.fetch import FetchedDocument
+    from agentcore.browser.session import BrowserSession
+
+    port, hits = local_server
+    source = ('<base href="https://attacker.com/">'
+              + '<a href="mailto:noise@example.com">noise</a>' * 8
+              + '<a href="javascript:alert(1)">bad</a>' * 8
+              + '<a href="file:///secret">bad</a>' * 8
+              + '<a href="http://[:::]">malformed</a>' * 8
+              + '<a href="../first#one">FIRST VISIBLE</a>'
+              + '<a href="../first#two">duplicate</a>' * 8
+              + '<a style="display:none" href="/hidden">hidden</a>'
+              + '<form><a href="/form">form</a></form>'
+              + '<div contenteditable><a href="/editable">editable</a></div>'
+              + '<a href="/second?q=1">SECOND</a>'
+              + f'<img src="http://127.0.0.1:{port}/never">'
+              + ('<a href="/third">THIRD</a>' if extra_usable else ''))
+    class Broker:
+        def fetch(self, _):
+            return FetchedDocument("https://example.com/final/page", source)
+    config = BrowserConfig(enabled=True, max_links=2)
+    renderer = PlaywrightBackend(config)
+    backend = BrokeredBrowserBackend(config, _broker=Broker(), _renderer=renderer)
+    with BrowserSession(backend, config=config) as session:
+        session.open_url("https://example.com/")
+        result = session.list_links()
+        assert result["links"] == [
+            {"url": "https://example.com/first", "text": "FIRST VISIBLE"},
+            {"url": "https://example.com/second?q=1", "text": "SECOND"}]
+        assert result["truncated"] is expected_truncated
+        assert hits == []
+
+
 def test_real_repeat_start_stop_no_observed_process_left():
     for _ in range(2):
         backend = PlaywrightBackend(BrowserConfig())

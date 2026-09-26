@@ -30,7 +30,7 @@ class BrokeredBrowserBackend:
         self.start()
         document = self._broker.fetch(canonical_url(url))
         final_url = canonical_url(document.final_url)
-        source = static_html(document.html, self._config)
+        source = static_html(document.html, self._config, final_url=final_url)
         self._renderer.start()
         self._renderer.render_document(source)
         self._final_url = final_url

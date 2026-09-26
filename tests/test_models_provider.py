@@ -24,7 +24,7 @@ from agentcore.models.errors import (
     ModelResponseError,
     ModelTimeoutError,
 )
-from agentcore.models.messages import FinishReason, Message, ModelRequest
+from agentcore.models.messages import FinishReason, Message, ModelRequest, Role, ToolCall
 from agentcore.models.providers.echo import EchoProvider
 from agentcore.models.providers.openai_compatible import OpenAICompatibleProvider
 from agentcore.models.transport import HttpResponse, RetryPolicy
@@ -94,6 +94,29 @@ class FakeTransport:
         if isinstance(item, Exception):
             raise item
         return item
+
+
+class StrictToolTransport(FakeTransport):
+    """Local OpenAI server surrogate that rejects orphan/misordered tool wire."""
+
+    def post_json(self, url, payload, headers, timeout):
+        pending = []
+        for message in payload["messages"]:
+            if message["role"] == "assistant" and message.get("tool_calls"):
+                assert not pending
+                calls = message["tool_calls"]
+                pending = [call["id"] for call in calls]
+                assert len(set(pending)) == len(pending)
+                assert all(call["type"] == "function" and
+                           type(call["function"]["name"]) is str and
+                           type(json.loads(call["function"]["arguments"])) is dict
+                           for call in calls)
+            elif message["role"] == "tool":
+                assert pending and message["tool_call_id"] == pending.pop(0)
+            else:
+                assert not pending
+        assert not pending
+        return super().post_json(url, payload, headers, timeout)
 
 
 def http(status: int, body: Any, headers: dict[str, str] | None = None
@@ -328,7 +351,7 @@ def test_pr31_browser_provider_fake_http_e2e_through_exact_executor(monkeypatch)
     call_body["choices"][0].update(message={"role": "assistant", "content": "", "tool_calls": [{
         "id": "read_one", "type": "function", "function": {"name": "browser_extract_text", "arguments": "{}"}}]},
         finish_reason="tool_calls")
-    class ValidatingTransport(FakeTransport):
+    class ValidatingTransport(StrictToolTransport):
         def post_json(self, url, payload, headers, timeout):
             assert url.endswith("/chat/completions")
             assert {tool["function"]["name"] for tool in payload["tools"]} == set(BROWSER_TOOL_NAMES)
@@ -356,6 +379,109 @@ def test_pr31_browser_provider_fake_http_e2e_through_exact_executor(monkeypatch)
     assert len(transport.requests) == 2
     messages = transport.requests[1]["payload"]["messages"]
     assert any(m["role"] == "tool" and "UNTRUSTED_DATA" in m["content"] for m in messages)
+    assistant = next(m for m in messages if m["role"] == "assistant" and m.get("tool_calls"))
+    tool = next(m for m in messages if m["role"] == "tool")
+    assert assistant["tool_calls"][0]["id"] == "read_one"
+    assert tool["tool_call_id"] == "read_one"
+
+
+def test_pr31_strict_browser_transport_preserves_two_calls_and_two_rounds():
+    from agentcore.browser import BrowserAgentComposition, BrowserConfig
+    from test_browser_session import FakeBackend
+
+    def call_body(*calls):
+        body = ok_body("")
+        body["choices"][0].update(message={"role": "assistant", "content": "",
+            "tool_calls": [{"id": identifier, "type": "function", "function": {
+                "name": name, "arguments": "{}"}} for identifier, name in calls]},
+            finish_reason="tool_calls")
+        return http(200, body)
+
+    transport = StrictToolTransport([
+        call_body(("one", "browser_current_page"), ("two", "browser_extract_text")),
+        call_body(("three", "browser_list_links")),
+        http(200, ok_body("done")),
+    ])
+    with BrowserAgentComposition(model=build(transport), config=BrowserConfig(enabled=True),
+                                 _backend=FakeBackend()) as composition:
+        result = composition.conversation().send("Read")
+        assert result.ok and result.reply.content == "done" and result.tools_executed == 3
+    assert len(transport.requests) == 3
+    last = transport.requests[-1]["payload"]["messages"]
+    assert [m["tool_call_id"] for m in last if m["role"] == "tool"] == ["one", "two", "three"]
+    assert [[c["id"] for c in m["tool_calls"]] for m in last if m.get("tool_calls")] == [
+        ["one", "two"], ["three"]]
+
+
+def test_pr31_strict_browser_resume_reframes_historical_tool_data(tmp_path):
+    from agentcore.browser import BrowserAgentComposition, BrowserConfig
+    from test_browser_session import FakeBackend
+
+    call_body = ok_body("")
+    call_body["choices"][0].update(message={"role": "assistant", "content": "",
+        "tool_calls": [{"id": "current-only-id", "type": "function", "function": {
+            "name": "browser_open_url",
+            "arguments": '{"url":"https://example.com/page?private=argument"}'}}]},
+        finish_reason="tool_calls")
+    first_wire = StrictToolTransport([http(200, call_body), http(200, ok_body("read"))])
+    directory = tmp_path / "browser-sessions"
+    with BrowserAgentComposition(model=build(first_wire), config=BrowserConfig(enabled=True),
+                                 sessions_directory=directory, _backend=FakeBackend()) as first:
+        initial = first.conversation().send("Open")
+        assert initial.ok
+        session_id = initial.session.id
+    saved = (directory / (session_id + ".json")).read_text(encoding="utf-8")
+    assert "private=argument" not in saved and "current-only-id" not in saved
+    assert '"tool_calls"' not in saved
+    second_wire = StrictToolTransport([http(200, ok_body("resumed"))])
+    with BrowserAgentComposition(model=build(second_wire), config=BrowserConfig(enabled=True),
+                                 sessions_directory=directory, _backend=FakeBackend()) as second:
+        resumed = second.conversation().send("Resume", session_id=session_id)
+        assert resumed.ok and resumed.reply.content == "resumed"
+    messages = second_wire.requests[0]["payload"]["messages"]
+    assert not any(m["role"] == "tool" for m in messages)
+    assert any("HISTORICAL TOOL RESULT" in m["content"] for m in messages
+               if m["role"] == "user")
+
+
+def test_pr31_current_tool_result_is_not_replayed_as_history_when_session_trims():
+    from agentcore.browser import BrowserAgentComposition, BrowserConfig
+    from agentcore.conversation.config import ConversationConfig
+    from test_browser_session import FakeBackend
+
+    call_body = ok_body("")
+    call_body["choices"][0].update(message={"role": "assistant", "content": "",
+        "tool_calls": [{"id": "trimmed-id", "type": "function", "function": {
+            "name": "browser_extract_text", "arguments": "{}"}}]}, finish_reason="tool_calls")
+    transport = StrictToolTransport([http(200, call_body), http(200, ok_body("done"))])
+    with BrowserAgentComposition(model=build(transport), config=BrowserConfig(enabled=True),
+            conversation_config=ConversationConfig(max_context_messages=1,
+                                                   max_session_messages=1),
+            _backend=FakeBackend()) as composition:
+        result = composition.conversation().send("Read")
+        assert result.ok and result.reply.content == "done"
+    messages = transport.requests[1]["payload"]["messages"]
+    assert len([m for m in messages if m["role"] == "tool"]) == 1
+    assert not any("HISTORICAL TOOL RESULT" in m["content"] for m in messages)
+
+
+@pytest.mark.parametrize("messages", [
+    [Message.user("x"), Message(Role.TOOL, "result", tool_call_id="orphan")],
+    [Message.user("x"), Message(Role.ASSISTANT, "", tool_calls=(ToolCall("same", "a"),
+        ToolCall("same", "b"))), Message(Role.TOOL, "one", tool_call_id="same"),
+        Message(Role.TOOL, "two", tool_call_id="same")],
+    [Message.user("x"), Message(Role.ASSISTANT, "", tool_calls=(ToolCall("one", "a"),
+        ToolCall("two", "b"))), Message(Role.TOOL, "two", tool_call_id="two"),
+        Message(Role.TOOL, "one", tool_call_id="one")],
+    [Message.user("x"), Message(Role.ASSISTANT, "", tool_calls=(ToolCall("x" * 257, "a"),)),
+        Message(Role.TOOL, "result", tool_call_id="x" * 257)],
+])
+def test_pr31_malformed_tool_protocol_fails_before_provider_io(messages):
+    transport = StrictToolTransport()
+    with pytest.raises(ModelConfigError) as error:
+        build(transport).generate(ModelRequest(messages=messages))
+    assert not transport.requests
+    assert "same" not in str(error.value) and "orphan" not in str(error.value)
 
 
 # -- response handling ------------------------------------------------------

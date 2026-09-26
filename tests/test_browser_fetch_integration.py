@@ -190,4 +190,5 @@ def test_fetch_then_offline_renderer_and_persisted_composition_exploit(fixture_s
         assert executed == [] and hits == before
         assert len(hits) == 2  # exactly broker GETs, ZERO Chromium requests
         assert all({tool["name"] for tool in request.tools} <= set(BROWSER_TOOL_NAMES) for request in model.requests)
-        assert any("WEB-INJECTION-SENTINEL" in message.content for message in model.requests[-1].messages if message.role is Role.TOOL)
+        assert any("WEB-INJECTION-SENTINEL" in message.content and "HISTORICAL TOOL RESULT" in message.content
+                   for message in model.requests[-1].messages if message.role is Role.USER)

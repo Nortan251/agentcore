@@ -74,6 +74,16 @@ reviewed composition and exact registrations. Hosts must not deliberately replay
 browser transcripts into an unrestricted Agent. Models cannot choose stores,
 compositions, directories, or resume authority.
 
+During one tool round, the neutral ModelRequest carries the assistant's exact
+structured calls followed by matching tool-call IDs. The OpenAI-compatible
+provider translates and validates that sequence before HTTP I/O. These protocol
+fields, including raw model arguments and call IDs, remain in memory for that
+turn and are not written through ConversationSession's persisted message shape. A later
+browser turn replays bounded historical TOOL content only as explicitly labelled
+untrusted data at user level; without the original envelope it is never sent
+as a provider `role: tool` message. Current-turn tool results retain their
+normal tool protocol role and still pass through ToolExecutor.
+
 ## Safe-fetch connection boundary
 
 The address validated by AgentCore is the address actually dialed. `fetch.py`
@@ -129,8 +139,10 @@ Production never calls public `page.goto`, route.continue_ or route.fetch.
 Fetched HTML first passes through an original allowlist projection into inert
 structural markup. Scripts/styles/forms/editable content/frames/plugins/SVG/math,
 base elements, meta refresh, active attributes and external resources are removed.
-Anchor destinations survive only as escaped `data-agentcore-href` values, not
-navigable hrefs. This avoids exposing resource/file navigation markup to Chromium;
+Only parent-canonicalized HTTP(S) anchor destinations survive as escaped
+`data-agentcore-href` values, not navigable hrefs. They resolve against the
+broker's final fetched URL; hostile base elements have no authority. This avoids
+exposing resource/file navigation markup to Chromium;
 offline HTTP routing alone would not be a filesystem boundary.
 
 Playwright renders that bounded projection with `page.set_content`. The owned
@@ -142,8 +154,10 @@ Fixed host adapter scripts extract only bounded main-document title/text/link
 fields; arbitrary JavaScript is never exposed to the model.
 
 The trusted final fetched URL is retained separately from Chromium's about:blank.
-Parent code resolves raw link data against that URL, ignoring attacker-supplied
-base elements. Destinations are bounded proposals, not approval; opening a link
+The renderer scans at most max_dom_nodes elements and deduplicates visible
+canonical destinations before applying max_links, so unusable or repeated raw
+anchors cannot consume the usable-result budget. IPC carries at most one extra
+usable link to establish truncation. Destinations are bounded proposals, not approval; opening a link
 requires another NET_READ tool invocation and complete pinned-fetch validation.
 Stable first-document ordering/deduplication and deterministic text/link/node
 caps apply. Explicit hidden/form/editable text is excluded.

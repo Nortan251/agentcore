@@ -31,6 +31,7 @@ from agentcore.models.messages import (
     FinishReason,
     ModelRequest,
     ModelResponse,
+    Role,
     ToolCall,
     Usage,
 )
@@ -70,6 +71,56 @@ _FINISH_REASONS = {
 }
 
 _SAFE_ERROR_KIND = re.compile(r"^[A-Za-z0-9_]{1,128}$")
+
+
+def _wire_messages(messages: list) -> list[dict[str, Any]]:
+    """Translate and validate one complete neutral tool protocol transcript.
+
+    The call envelope is ephemeral ModelRequest state. Persisted TOOL history
+    has no envelope and must be reframed by the conversation runtime instead
+    of being sent as an orphan wire tool response.
+    """
+    wire: list[dict[str, Any]] = []
+    pending: list[str] = []
+    for message in messages:
+        if message.role is Role.TOOL:
+            identifier = message.tool_call_id
+            if not pending or identifier != pending[0] or message.tool_calls:
+                raise ModelConfigError("Malformed tool message correlation.")
+            pending.pop(0)
+            wire.append({"role": "tool", "tool_call_id": identifier,
+                         "content": message.content})
+            continue
+        if pending or message.tool_call_id is not None:
+            raise ModelConfigError("Malformed tool message correlation.")
+        if message.tool_calls:
+            if message.role is not Role.ASSISTANT or len(message.tool_calls) > 32:
+                raise ModelConfigError("Malformed assistant tool-call envelope.")
+            calls = []
+            ids: set[str] = set()
+            for call in message.tool_calls:
+                if (not isinstance(call, ToolCall) or type(call.id) is not str
+                        or not 1 <= len(call.id) <= 256 or not call.id.isprintable()
+                        or type(call.name) is not str or not 1 <= len(call.name) <= 256
+                        or not call.name.isprintable()
+                        or type(call.arguments) is not dict or call.id in ids):
+                    raise ModelConfigError("Malformed assistant tool-call envelope.")
+                try:
+                    arguments = json.dumps(call.arguments, separators=(",", ":"),
+                                           ensure_ascii=True, allow_nan=False)
+                except (TypeError, ValueError):
+                    raise ModelConfigError("Malformed assistant tool-call envelope.") from None
+                ids.add(call.id)
+                pending.append(call.id)
+                calls.append({"id": call.id, "type": "function", "function": {
+                    "name": call.name, "arguments": arguments}})
+            wire.append({"role": "assistant", "content": message.content,
+                         "tool_calls": calls})
+            continue
+        wire.append(message.to_dict())
+    if pending:
+        raise ModelConfigError("Malformed tool message correlation.")
+    return wire
 
 
 @dataclass
@@ -691,7 +742,7 @@ class OpenAICompatibleProvider(BaseModelProvider):
         """
         payload: dict[str, Any] = {
             "model": request.model or self.config.name,
-            "messages": [m.to_dict() for m in request.messages],
+            "messages": _wire_messages(request.messages),
         }
         temperature = (request.temperature if request.temperature is not None
                        else self.config.temperature)
