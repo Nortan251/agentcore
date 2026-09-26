@@ -19,9 +19,11 @@ _VOID = frozenset({"br", "hr"})
 # A trailing slash does not close any other HTML element in a browser.
 _HTML_VOID = frozenset("area base br col embed hr img input link meta param source track wbr".split())
 _EXCLUDE = frozenset("script style noscript template form input textarea select button iframe object embed svg math".split())
-# Chromium hides these native fallback subtrees. Stripping only their wrapper
-# would otherwise promote hidden text into model-visible page content.
-_HIDDEN_FALLBACK = frozenset({"audio", "video", "datalist", "progress", "meter"})
+# Chromium can hide these native fallback subtrees. Stripping only their wrapper
+# can promote hidden text into model-visible page content, so over-hide.
+_HIDDEN_FALLBACK = frozenset({
+    "audio", "video", "datalist", "progress", "meter", "rp", "noembed", "noframes", "slot",
+})
 _CLOSED_BY_DEFAULT = frozenset({"dialog", "details"})
 
 _COMMENTS = re.compile(r"/\*.*?\*/", re.DOTALL)

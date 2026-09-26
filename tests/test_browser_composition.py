@@ -289,6 +289,37 @@ def test_native_hidden_and_fallback_containers_preserve_visibility(source, expec
     assert static_html(source, BrowserConfig()) == expected
 
 
+@pytest.mark.parametrize("source,expected", [
+    ('<ruby>VISIBLE<rp>SECRET</rp><rt>ANNOTATION</rt></ruby>', 'VISIBLEANNOTATION'),
+    ('<ruby>VISIBLE<rp>ONE</rp><rt>ANNOTATION</rt><rp>TWO</rp></ruby>TAIL',
+     'VISIBLEANNOTATIONTAIL'),
+    ('<rp><p>SECRET</p></rp>TAIL', 'TAIL'),
+    ('<dialog><rp>SECRET</rp></dialog>TAIL', 'TAIL'),
+    ('<rp><rp>SECRET</rp>STILL_SECRET</rp>TAIL', 'TAIL'),
+    ('<rp><div>SECRET</rp>TAIL', ''),
+    ('<rp/>SECRET', ''),
+    ('<ruby>VISIBLE<rt>ANNOTATION</rt></ruby>TAIL', 'VISIBLEANNOTATIONTAIL'),
+    ('BEFORE<ruby>BASE<rp>SECRET</rp><rt>ANNOTATION</rt></ruby>AFTER',
+     'BEFOREBASEANNOTATIONAFTER'),
+    ('<rp>SECRET', ''),
+])
+def test_ruby_fallback_never_widens_visibility(source, expected):
+    assert static_html(source, BrowserConfig()) == expected
+
+
+@pytest.mark.parametrize("source,expected", [
+    ('<noembed>SECRET</noembed>VISIBLE', 'VISIBLE'),
+    ('<noframes>SECRET</noframes>VISIBLE', 'VISIBLE'),
+    ('<slot>SECRET</slot>VISIBLE', 'VISIBLE'),
+    ('<slot><p>SECRET</p></slot>VISIBLE', 'VISIBLE'),
+    ('<noembed/>SECRET', ''),
+    ('<noframes/>SECRET', ''),
+    ('<slot/>SECRET', ''),
+])
+def test_additional_native_hidden_fallbacks_never_widen_visibility(source, expected):
+    assert static_html(source, BrowserConfig()) == expected
+
+
 def test_brokered_backend_keeps_final_url_separate_and_never_navigates_renderer():
     class Broker:
         def fetch(self, url):

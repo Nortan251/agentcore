@@ -353,3 +353,69 @@ def test_pr31_native_hidden_containers_match_raw_offline_chromium():
             context.close()
         finally:
             browser.close()
+
+
+def test_pr31_unsupported_native_visibility_matrix_offline_chromium():
+    """Projection must not promote a raw-Chromium-hidden native sentinel."""
+    from playwright.sync_api import sync_playwright
+    from agentcore.browser.render import static_html
+    from agentcore.browser.playwright_backend import _TEXT
+
+    cases = [
+        ('ruby', '<ruby>{S}<rt>annotation</rt></ruby>'),
+        ('rp', '<ruby>RUBY_VISIBLE<rp>{S}</rp><rt>ANNOTATION_VISIBLE</rt></ruby>'),
+        ('rt', '<ruby>base<rt>{S}</rt></ruby>'),
+        ('rb', '<ruby><rb>{S}</rb><rt>annotation</rt></ruby>'),
+        ('rtc', '<ruby>base<rtc>{S}</rtc></ruby>'),
+        ('noembed', '<noembed>{S}</noembed>'),
+        ('noframes', '<noframes>{S}</noframes>'),
+        ('option', '<select><option>{S}</option></select>'),
+        ('optgroup', '<select><optgroup label="group"><option>{S}</option></optgroup></select>'),
+        ('picture_source', '<picture><source type="image/png">{S}</picture>'),
+        ('map_area', '<map name="regions"><area alt="region">{S}</map>'),
+        ('slot', '<slot>{S}</slot>'),
+        ('fieldset_legend', '<fieldset><legend>{S}</legend></fieldset>'),
+        ('output', '<output>{S}</output>'),
+        ('object', '<object>{S}</object>'),
+        ('template', '<template>{S}</template>'),
+        ('noscript', '<noscript>{S}</noscript>'),
+        ('dialog', '<dialog>{S}</dialog>'),
+        ('details', '<details><summary>Heading</summary>{S}</details>'),
+        ('audio', '<audio>{S}</audio>'),
+        ('video', '<video>{S}</video>'),
+        ('datalist', '<datalist>{S}</datalist>'),
+        ('progress', '<progress>{S}</progress>'),
+        ('meter', '<meter>{S}</meter>'),
+        ('canvas', '<canvas>{S}</canvas>'),
+    ]
+    config = BrowserConfig()
+    bounds = {'chars': config.max_text_chars, 'nodes': config.max_dom_nodes}
+    requests = []
+    observations = {}
+    with sync_playwright() as driver:
+        browser = driver.chromium.launch(headless=True, chromium_sandbox=True)
+        try:
+            context = browser.new_context(java_script_enabled=False, service_workers='block',
+                                          accept_downloads=False, offline=True)
+            context.route('**/*', lambda route: (
+                requests.append(route.request.url), route.abort('blockedbyclient')))
+            context.route_web_socket('**/*', lambda socket: socket.close())
+            page = context.new_page()
+            for name, fixture in cases:
+                sentinel = 'RP_SECRET' if name == 'rp' else f'NATIVE_{name.upper()}_SENTINEL'
+                source = fixture.replace('{S}', sentinel)
+                page.set_content(source, wait_until='load')
+                raw_text = page.evaluate(_TEXT, bounds)['text']
+                page.set_content(static_html(source, config), wait_until='load')
+                projected_text = page.evaluate(_TEXT, bounds)['text']
+                observations[name] = (sentinel in raw_text, sentinel in projected_text)
+                if name == 'rp':
+                    assert 'RUBY_VISIBLE' in raw_text and 'RUBY_VISIBLE' in projected_text
+                    assert 'ANNOTATION_VISIBLE' in raw_text and 'ANNOTATION_VISIBLE' in projected_text
+            context.close()
+        finally:
+            browser.close()
+    assert requests == []
+    widened = {name: state for name, state in observations.items() if state == (False, True)}
+    assert not widened, f'visibility widened: {widened}; complete matrix: {observations}'
+    assert observations['rp'] == (False, False)
