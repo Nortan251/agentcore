@@ -419,3 +419,64 @@ def test_pr31_unsupported_native_visibility_matrix_offline_chromium():
     widened = {name: state for name, state in observations.items() if state == (False, True)}
     assert not widened, f'visibility widened: {widened}; complete matrix: {observations}'
     assert observations['rp'] == (False, False)
+
+
+def test_pr31_attribute_and_inline_css_visibility_matrix_offline_chromium():
+    """Attribute/style projection must not expose extractor-hidden text."""
+    from playwright.sync_api import sync_playwright
+    from agentcore.browser.render import static_html
+    from agentcore.browser.playwright_backend import _TEXT
+
+    cases = [
+        ('popover', '<div popover>{S}</div>'),
+        ('popover_empty', '<div popover="">{S}</div>'),
+        ('popover_auto', '<div popover="auto">{S}</div>'),
+        ('popover_manual', '<div popover="manual">{S}</div>'),
+        ('popover_hint', '<div popover="hint">{S}</div>'),
+        ('popover_nonsense', '<div popover="nonsense">{S}</div>'),
+        ('hidden', '<div hidden>{S}</div>'),
+        ('hidden_empty', '<div hidden="">{S}</div>'),
+        ('hidden_until_found', '<div hidden="until-found">{S}</div>'),
+        ('aria_hidden_true', '<div aria-hidden="true">{S}</div>'),
+        ('aria_hidden_false', '<div aria-hidden="false">{S}</div>'),
+        ('inert', '<div inert>{S}</div>'),
+        ('display_none', '<div style="display:none">{S}</div>'),
+        ('visibility_hidden', '<div style="visibility:hidden">{S}</div>'),
+        ('visibility_collapse', '<div style="visibility:collapse">{S}</div>'),
+        ('opacity_zero', '<div style="opacity:0">{S}</div>'),
+        ('content_visibility_hidden', '<div style="content-visibility:hidden">{S}</div>'),
+        ('display_block', '<div style="display:block">{S}</div>'),
+        ('visibility_visible', '<div style="visibility:visible">{S}</div>'),
+        ('opacity_one', '<div style="opacity:1">{S}</div>'),
+        ('content_visibility_visible', '<div style="content-visibility:visible">{S}</div>'),
+        ('content_visibility_auto', '<div style="content-visibility:auto">{S}</div>'),
+    ]
+    config = BrowserConfig()
+    bounds = {'chars': config.max_text_chars, 'nodes': config.max_dom_nodes}
+    observations = {}
+    requests = []
+    with sync_playwright() as driver:
+        browser = driver.chromium.launch(headless=True, chromium_sandbox=True)
+        try:
+            context = browser.new_context(java_script_enabled=False, service_workers='block',
+                                          accept_downloads=False, offline=True)
+            context.route('**/*', lambda route: (
+                requests.append(route.request.url), route.abort('blockedbyclient')))
+            context.route_web_socket('**/*', lambda socket: socket.close())
+            page = context.new_page()
+            for name, fixture in cases:
+                sentinel = 'POPOVER_SECRET' if name == 'popover' else f'ATTRIBUTE_{name.upper()}'
+                source = fixture.replace('{S}', sentinel) + '<p>TAIL_REMAINS</p>'
+                page.set_content(source, wait_until='load')
+                raw = page.evaluate(_TEXT, bounds)['text']
+                page.set_content(static_html(source, config), wait_until='load')
+                projected = page.evaluate(_TEXT, bounds)['text']
+                observations[name] = (sentinel in raw, sentinel in projected)
+                assert 'TAIL_REMAINS' in raw and 'TAIL_REMAINS' in projected, name
+            context.close()
+        finally:
+            browser.close()
+    assert requests == []
+    widened = {name: state for name, state in observations.items() if state == (False, True)}
+    assert not widened, f'visibility widened: {widened}; complete matrix: {observations}'
+    assert observations['popover'] == (False, False)

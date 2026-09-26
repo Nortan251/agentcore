@@ -320,6 +320,27 @@ def test_additional_native_hidden_fallbacks_never_widen_visibility(source, expec
     assert static_html(source, BrowserConfig()) == expected
 
 
+@pytest.mark.parametrize("source,expected", [
+    ('<div popover>SECRET</div>VISIBLE', 'VISIBLE'),
+    ('<div popover="">SECRET</div>VISIBLE', 'VISIBLE'),
+    ('<div popover="auto">SECRET</div>VISIBLE', 'VISIBLE'),
+    ('<div popover="manual">SECRET</div>VISIBLE', 'VISIBLE'),
+    ('<div popover="hint">SECRET</div>VISIBLE', 'VISIBLE'),
+    ('<div popover="nonsense">SECRET</div>VISIBLE', 'VISIBLE'),
+    ('<section popover><p>SECRET</p></section>VISIBLE', 'VISIBLE'),
+    ('<x-panel popover><p>SECRET</p></x-panel>VISIBLE', 'VISIBLE'),
+    ('<div popover><section popover>SECRET</section>STILL_SECRET</div>VISIBLE', 'VISIBLE'),
+    ('<dialog><div popover>SECRET</div></dialog>VISIBLE', 'VISIBLE'),
+    ('<div popover/>SECRET', ''),
+    ('<div popover><span>SECRET</div>TAIL', ''),
+    ('<div popover>SECRET', ''),
+    ('<br popover>VISIBLE', '<br>VISIBLE'),
+    ('<img popover>VISIBLE', 'VISIBLE'),
+])
+def test_popover_attribute_suppresses_nonvoid_subtree(source, expected):
+    assert static_html(source, BrowserConfig()) == expected
+
+
 def test_brokered_backend_keeps_final_url_separate_and_never_navigates_renderer():
     class Broker:
         def fetch(self, url):

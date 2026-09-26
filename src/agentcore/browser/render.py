@@ -32,6 +32,15 @@ _OPACITY = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)
 _VISIBLE_DISPLAY = frozenset("block inline inline-block flex inline-flex grid inline-grid table table-row table-cell contents list-item flow-root".split())
 
 
+def _native_hidden(tag, attrs):
+    """Conservatively suppress native hidden state from original attributes."""
+    if tag in _HTML_VOID:
+        return False
+    if tag in _HIDDEN_FALLBACK or any(name == "popover" for name, _ in attrs):
+        return True
+    return tag in _CLOSED_BY_DEFAULT and not any(name == "open" for name, _ in attrs)
+
+
 def _inline_hidden(style):
     """Small conservative subset, never replay original CSS into Chromium.
 
@@ -97,11 +106,11 @@ class _StaticHTML(HTMLParser):
             or name == "aria-hidden" and (value or "").strip().lower() == "true"
             or name == "style" and _inline_hidden(value or "")
             for name, value in attrs)
-        # HTML boolean attributes are true by presence, including open="false".
-        # Check the original sequence before converting duplicate attributes.
-        native_hidden = (tag in _HIDDEN_FALLBACK
-                         or tag in _CLOSED_BY_DEFAULT
-                         and not any(name == "open" for name, _ in attrs))
+        # Keep presence semantics from the original sequence, including
+        # open="false" and any popover value, before collapsing duplicates.
+        suppress_subtree = (_native_hidden(tag, attrs) or tag in _EXCLUDE
+                            or any(name == "contenteditable" for name, _ in attrs)
+                            or (explicitly_hidden and tag not in _TAGS))
         attrs = dict(attrs)  # retain existing href/data handling
         if self.ignored:
             # Track every non-void descendant. A premature/mismatched end tag
@@ -109,13 +118,11 @@ class _StaticHTML(HTMLParser):
             if tag not in _HTML_VOID:
                 self.ignored.append(tag)
             return
-        if native_hidden or tag in _EXCLUDE or "contenteditable" in attrs:
+        if suppress_subtree:
             if tag not in _HTML_VOID:
                 self.ignored.append(tag)
             return
         if tag not in _TAGS:
-            if explicitly_hidden and tag not in _HTML_VOID:
-                self.ignored.append(tag)
             return
         safe_attrs = ""
         if tag == "a" and type(attrs.get("href")) is str and len(attrs["href"]) <= self.config.max_url_chars:

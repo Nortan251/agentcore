@@ -167,6 +167,9 @@ subtrees in audio, video, datalist, progress, meter, ruby `rp`, noembed,
 noframes and slot are conservatively omitted, while canvas fallback text and
 ruby `rt` remain readable. Boolean `open` is true by presence, even when its
 value is `false`.
+Any non-void element with a `popover` attribute is conservatively suppressed
+regardless of its value: offline Browser Read cannot establish an open runtime
+popover state after stripping active attributes.
 
 This is static readable HTML, not full browser fidelity. No CSS, fonts, images,
 frames or other subresources are fetched. Class-based stylesheet visibility,
