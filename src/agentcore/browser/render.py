@@ -19,6 +19,10 @@ _VOID = frozenset({"br", "hr"})
 # A trailing slash does not close any other HTML element in a browser.
 _HTML_VOID = frozenset("area base br col embed hr img input link meta param source track wbr".split())
 _EXCLUDE = frozenset("script style noscript template form input textarea select button iframe object embed svg math".split())
+# Chromium hides these native fallback subtrees. Stripping only their wrapper
+# would otherwise promote hidden text into model-visible page content.
+_HIDDEN_FALLBACK = frozenset({"audio", "video", "datalist", "progress", "meter"})
+_CLOSED_BY_DEFAULT = frozenset({"dialog", "details"})
 
 _COMMENTS = re.compile(r"/\*.*?\*/", re.DOTALL)
 _IMPORTANT = re.compile(r"\s*!\s*important\s*$", re.IGNORECASE)
@@ -91,6 +95,11 @@ class _StaticHTML(HTMLParser):
             or name == "aria-hidden" and (value or "").strip().lower() == "true"
             or name == "style" and _inline_hidden(value or "")
             for name, value in attrs)
+        # HTML boolean attributes are true by presence, including open="false".
+        # Check the original sequence before converting duplicate attributes.
+        native_hidden = (tag in _HIDDEN_FALLBACK
+                         or tag in _CLOSED_BY_DEFAULT
+                         and not any(name == "open" for name, _ in attrs))
         attrs = dict(attrs)  # retain existing href/data handling
         if self.ignored:
             # Track every non-void descendant. A premature/mismatched end tag
@@ -98,7 +107,7 @@ class _StaticHTML(HTMLParser):
             if tag not in _HTML_VOID:
                 self.ignored.append(tag)
             return
-        if tag in _EXCLUDE or "contenteditable" in attrs:
+        if native_hidden or tag in _EXCLUDE or "contenteditable" in attrs:
             if tag not in _HTML_VOID:
                 self.ignored.append(tag)
             return

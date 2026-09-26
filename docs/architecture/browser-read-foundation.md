@@ -161,6 +161,11 @@ usable link to establish truncation. Destinations are bounded proposals, not app
 requires another NET_READ tool invocation and complete pinned-fetch validation.
 Stable first-document ordering/deduplication and deterministic text/link/node
 caps apply. Explicit hidden/form/editable text is excluded.
+Hidden unsupported wrappers and closed `dialog`/`details` subtrees are suppressed;
+closed `details` summaries are conservatively omitted too. Chromium-hidden
+fallback text in audio, video, datalist, progress and meter is omitted, while
+visible canvas fallback text remains readable. Boolean `open` is true by
+presence, even when its value is `false`.
 
 This is static readable HTML, not full browser fidelity. No CSS, fonts, images,
 frames or other subresources are fetched. Class-based stylesheet visibility,

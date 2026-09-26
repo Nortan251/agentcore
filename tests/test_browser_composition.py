@@ -261,6 +261,34 @@ def test_real_void_elements_do_not_suppress_following_visible_text():
     assert static_html(source, BrowserConfig()) == '<br><hr>VISIBLE'
 
 
+@pytest.mark.parametrize("source,expected", [
+    ('<dialog><p>SECRET</p></dialog>VISIBLE', 'VISIBLE'),
+    ('<dialog open><p>SECRET</p></dialog>VISIBLE', '<p>SECRET</p>VISIBLE'),
+    ('<dialog open=""><p>SECRET</p></dialog>VISIBLE', '<p>SECRET</p>VISIBLE'),
+    ('<dialog open="false"><p>SECRET</p></dialog>VISIBLE', '<p>SECRET</p>VISIBLE'),
+    ('<details><summary>Heading</summary><p>SECRET</p></details>VISIBLE', 'VISIBLE'),
+    ('<details open><summary>Heading</summary><p>SECRET</p></details>VISIBLE',
+     'Heading<p>SECRET</p>VISIBLE'),
+    ('<details open="false"><p>SECRET</p></details>VISIBLE', '<p>SECRET</p>VISIBLE'),
+    ('<dialog/>SECRET', ''),
+    ('<details/>SECRET', ''),
+    ('<dialog open/>SECRET', 'SECRET'),
+    ('<details open/>SECRET', 'SECRET'),
+    ('<dialog><details open><p>SECRET</p></details></dialog>VISIBLE', 'VISIBLE'),
+    ('<dialog><div>SECRET</dialog>TAIL', ''),
+    ('<details><p>SECRET</p>', ''),
+    ('<audio>SECRET</audio>VISIBLE', 'VISIBLE'),
+    ('<audio/>SECRET', ''),
+    ('<video>SECRET</video>VISIBLE', 'VISIBLE'),
+    ('<datalist><option>SECRET</option></datalist>VISIBLE', 'VISIBLE'),
+    ('<progress>SECRET</progress>VISIBLE', 'VISIBLE'),
+    ('<meter>SECRET</meter>VISIBLE', 'VISIBLE'),
+    ('<canvas>VISIBLE_FALLBACK</canvas>VISIBLE', 'VISIBLE_FALLBACKVISIBLE'),
+])
+def test_native_hidden_and_fallback_containers_preserve_visibility(source, expected):
+    assert static_html(source, BrowserConfig()) == expected
+
+
 def test_brokered_backend_keeps_final_url_separate_and_never_navigates_renderer():
     class Broker:
         def fetch(self, url):

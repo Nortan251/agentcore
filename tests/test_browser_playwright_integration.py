@@ -304,3 +304,52 @@ def test_pr31_hidden_wrapper_and_nonvoid_solidus_match_offline_chromium(local_se
         assert hits == []
     finally:
         backend.close()
+
+
+def test_pr31_native_hidden_containers_match_raw_offline_chromium():
+    from playwright.sync_api import sync_playwright
+    from agentcore.browser.render import static_html
+    from agentcore.browser.playwright_backend import _TEXT
+
+    hidden = [
+        ('<dialog><p>SECRET_DIALOG</p></dialog>VISIBLE', 'SECRET_DIALOG'),
+        ('<details><summary>Heading</summary><p>SECRET_DETAILS</p></details>VISIBLE',
+         'SECRET_DETAILS'),
+        ('<dialog/>SECRET_DIALOG', 'SECRET_DIALOG'),
+        ('<details/>SECRET_DETAILS', 'SECRET_DETAILS'),
+        ('<dialog><details open>SECRET_NESTED</details></dialog>VISIBLE', 'SECRET_NESTED'),
+        ('<audio>SECRET_AUDIO</audio>VISIBLE', 'SECRET_AUDIO'),
+        ('<video>SECRET_VIDEO</video>VISIBLE', 'SECRET_VIDEO'),
+        ('<datalist>SECRET_DATALIST</datalist>VISIBLE', 'SECRET_DATALIST'),
+        ('<progress>SECRET_PROGRESS</progress>VISIBLE', 'SECRET_PROGRESS'),
+        ('<meter>SECRET_METER</meter>VISIBLE', 'SECRET_METER'),
+    ]
+    visible = [
+        ('<dialog open="false">OPEN_DIALOG</dialog>VISIBLE', 'OPEN_DIALOG'),
+        ('<details open><summary>Heading</summary>OPEN_DETAILS</details>VISIBLE',
+         'OPEN_DETAILS'),
+        ('<canvas>VISIBLE_CANVAS</canvas>VISIBLE', 'VISIBLE_CANVAS'),
+    ]
+    config = BrowserConfig()
+    requests = []
+    with sync_playwright() as driver:
+        browser = driver.chromium.launch(headless=True, chromium_sandbox=True)
+        try:
+            context = browser.new_context(java_script_enabled=False, service_workers='block',
+                                          accept_downloads=False, offline=True)
+            context.route('**/*', lambda route: (
+                requests.append(route.request.url), route.abort('blockedbyclient')))
+            context.route_web_socket('**/*', lambda socket: socket.close())
+            page = context.new_page()
+            for source, sentinel in hidden + visible:
+                page.set_content(source, wait_until='load')
+                raw_visible = page.locator('body').inner_text()
+                page.set_content(static_html(source, config), wait_until='load')
+                projected = page.evaluate(_TEXT, {'chars': config.max_text_chars,
+                                                  'nodes': config.max_dom_nodes})['text']
+                assert (sentinel in raw_visible) == (sentinel in projected), source
+                assert (sentinel in raw_visible) == ((source, sentinel) in visible), source
+                assert requests == []
+            context.close()
+        finally:
+            browser.close()
