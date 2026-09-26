@@ -1,8 +1,7 @@
-"""Owned Playwright worker with hard parent deadlines.
+"""Owned offline Chromium renderer with hard parent deadlines.
 
-The default backend deliberately DOES NOT advertise network isolation.
-Request abortion/offline mode are defense in depth, not an SSRF guarantee.
-Only trusted host integration tests start this backend directly.
+The renderer itself does not advertise network isolation or fetch URLs. Only
+BrokeredBrowserBackend can pair it with AgentCore's pinned-IP SafeFetchBroker.
 """
 
 import multiprocessing
@@ -15,52 +14,80 @@ from .backend import PageLink, PageLinks, PageMetadata, PageText
 from .config import BrowserConfig
 from .errors import BrowserError, BrowserFailure
 
-# Fixed original adapter scripts, never model supplied. Bound the result in
-# Chromium before IPC. Main document only; no iframe or arbitrary DOM dump.
+# Fixed host-owned synthetic origin; never derived from a fetched URL or HTML.
+_DOCUMENT_URL = "https://agentcore.invalid/document"
+_CSP = ("default-src 'none'; script-src 'none'; connect-src 'none'; img-src 'none'; "
+        "media-src 'none'; font-src 'none'; object-src 'none'; frame-src 'none'; "
+        "child-src 'none'; worker-src 'none'; form-action 'none'; base-uri 'none'; "
+        "style-src 'unsafe-inline'; sandbox")
+
+# Fixed trusted adapter scripts, never model supplied. Bound results in
+# Chromium before IPC. Main document only; no arbitrary DOM dump.
 _METADATA = """limit => ({url: location.href.slice(0, 2049),
     title: document.title.slice(0, limit), state: document.readyState})"""
-_TEXT = """bounds => {
-    const walker = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT);
-    let out = '', scanned = 0, node, truncated = false;
+_DOM_COUNT = """limit => {
+    const pending = [document]; let count = 0;
+    while (pending.length) {
+        const node = pending.pop();
+        if (++count > limit) return false;
+        for (let child = node.lastChild; child; child = child.previousSibling) pending.push(child);
+        if (node.content) pending.push(node.content);
+        if (node.shadowRoot) pending.push(node.shadowRoot);
+    }
+    return true;
+}"""
+_TEXT = """limit => {
+    const walker = document.createTreeWalker(document.body || document.documentElement,
+                                             NodeFilter.SHOW_TEXT);
+    const rendered = new WeakMap();
+    let out = '', node, truncated = false;
     while ((node = walker.nextNode())) {
-        if (++scanned > bounds.nodes) { truncated = true; break; }
-        const p = node.parentElement;
-        if (!p || p.closest('script,style,noscript,template,form,input,textarea,select,[contenteditable]')) continue;
-        if (!p.getClientRects().length) continue;
-        let visible = true;
-        for (let e = p; e; e = e.parentElement) {
-            const s = getComputedStyle(e);
-            if (s.display === 'none' || s.visibility !== 'visible' || s.opacity === '0') { visible = false; break; }
+        const parent = node.parentElement;
+        if (!parent || parent.closest('script,style,noscript,template,form,input,textarea,select,[contenteditable]')) continue;
+        if (!parent.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) continue;
+        // A text node's parent can have a rectangle even while the native
+        // parser hides that particular text (e.g. closed details children).
+        // Native innerText answers this without rewriting source HTML.
+        let visibleText = rendered.get(parent);
+        if (visibleText === undefined) {
+            visibleText = parent.innerText || '';
+            rendered.set(parent, visibleText);
         }
-        if (!visible) continue;
-        const remaining = bounds.chars - out.length;
         const text = node.textContent;
+        if (!text.trim() || !visibleText.includes(text.trim())) continue;
+        const remaining = limit - out.length;
         if (text.length > remaining) { out += text.slice(0, remaining); truncated = true; break; }
         out += text;
-        if (out.length < bounds.chars) out += '\\n';
+        if (out.length < limit) out += '\\n';
     }
-    return {text: out.slice(0, bounds.chars), truncated};
+    return {text: out.slice(0, limit), truncated};
 }"""
-_LINKS = """bounds => {
-    const walker = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_ELEMENT);
-    const links = [], seen = new Set(); let scanned = 0, node, truncated = false;
-    while ((node = walker.nextNode())) {
-        if (++scanned > bounds.nodes) { truncated = true; break; }
-        if (node.tagName !== 'A' || !(node.hasAttribute('data-agentcore-href') || node.hasAttribute('href')) || node.closest('form,[contenteditable]')) continue;
-        if (!node.getClientRects().length) continue;
-        let visible = true;
-        for (let e = node; e; e = e.parentElement) {
-            const s = getComputedStyle(e);
-            if (s.display === 'none' || s.visibility !== 'visible' || s.opacity === '0') { visible = false; break; }
+_LINK_BATCH = """bounds => {
+    const anchors = document.querySelectorAll('a[href]');
+    const end = Math.min(anchors.length, bounds.cursor + bounds.size);
+    const links = [];
+    const visibleLabel = anchor => {
+        const walker = document.createTreeWalker(anchor, NodeFilter.SHOW_TEXT);
+        let label = '', node;
+        while ((node = walker.nextNode()) && label.length < bounds.text) {
+            const parent = node.parentElement;
+            if (!parent || parent.closest('script,style,noscript,template,form,[contenteditable]') ||
+                !parent.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) continue;
+            const value = node.textContent;
+            if (!value.trim() || !(parent.innerText || '').includes(value.trim())) continue;
+            label += value.slice(0, bounds.text - label.length);
         }
-        if (!visible) continue;
-        const href = node.getAttribute('data-agentcore-href') ?? node.getAttribute('href');
-        if (href.length > bounds.url || seen.has(href)) continue;
-        seen.add(href);
-        links.push({url: href, text: node.innerText.slice(0, bounds.text)});
-        if (links.length > bounds.links) { truncated = true; break; }
+        return label;
+    };
+    for (let index = bounds.cursor; index < end; index++) {
+        const anchor = anchors[index];
+        if (anchor.closest('form,[contenteditable]') ||
+            !anchor.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) continue;
+        const href = anchor.getAttribute('href');
+        if (href.length > bounds.url) continue;
+        links.push({url: href, text: visibleLabel(anchor)});
     }
-    return {links, truncated};
+    return {links, cursor: end, done: end === anchors.length};
 }"""
 
 
@@ -112,19 +139,66 @@ def _serve(pipe, config: BrowserConfig, *, _prepare=None):
                     # Even direct host adapter calls cannot enable navigation.
                     raise BrowserError(BrowserFailure.NETWORK_BOUNDARY)
                 if operation == "render_document":
-                    if type(argument) is not str or len(argument) > config.max_body_bytes * 6 + 1024:
+                    if (type(argument) is not str or len(argument) > config.max_body_bytes
+                            or len(argument.encode("utf-8")) > config.max_body_bytes * 3):
                         raise BrowserError(BrowserFailure.SIZE)
-                    page.set_content(argument, wait_until="load",
-                                     timeout=config.operation_timeout_seconds * 1000)
+                    # Each source gets a fresh non-persistent context. The
+                    # route is installed before page creation and can fulfill
+                    # only the first exact main-frame synthetic navigation.
+                    context.close()
+                    context = browser.new_context(java_script_enabled=False,
+                                                  service_workers="block",
+                                                  accept_downloads=False, offline=True)
+                    context.set_default_timeout(config.operation_timeout_seconds * 1000)
+                    context.set_default_navigation_timeout(config.operation_timeout_seconds * 1000)
+                    served = [False]
+
+                    def route_document(route):
+                        request = route.request
+                        try:
+                            eligible = (not served[0] and request.url == _DOCUMENT_URL
+                                        and request.method == "GET"
+                                        and request.is_navigation_request()
+                                        and request.frame == page.main_frame)
+                        except Exception:
+                            eligible = False
+                        if eligible:
+                            served[0] = True
+                            route.fulfill(status=200, body=argument, headers={
+                                "Content-Type": "text/html; charset=utf-8",
+                                "Content-Security-Policy": _CSP,
+                                "Cache-Control": "no-store",
+                                "X-Content-Type-Options": "nosniff",
+                            })
+                        else:
+                            route.abort("blockedbyclient")
+
+                    context.route("**/*", route_document)
+                    context.route_web_socket("**/*", lambda socket: socket.close())
+                    page = context.new_page()
+                    page.on("dialog", lambda dialog: dialog.dismiss())
+                    page.on("popup", lambda popup: popup.close())
+                    page.on("crash", lambda _: crashed.__setitem__(0, True))
+                    page.goto(_DOCUMENT_URL, wait_until="load",
+                              timeout=config.operation_timeout_seconds * 1000)
+                    if not served[0] or page.url != _DOCUMENT_URL:
+                        raise BrowserError(BrowserFailure.NETWORK_BOUNDARY)
+                    if not page.evaluate(_DOM_COUNT, config.max_dom_nodes):
+                        raise BrowserError(BrowserFailure.SIZE)
                     pipe.send((True, None))
                     continue
                 if operation == "current_page":
                     data = page.evaluate(_METADATA, config.max_title_chars)
                 elif operation == "extract_text":
-                    data = page.evaluate(_TEXT, {"chars": config.max_text_chars, "nodes": config.max_dom_nodes})
-                elif operation == "list_links":
-                    data = page.evaluate(_LINKS, {"links": config.max_links, "url": config.max_url_chars,
-                                                "text": config.max_link_text_chars, "nodes": config.max_dom_nodes})
+                    data = page.evaluate(_TEXT, config.max_text_chars)
+                elif operation == "link_batch":
+                    cursor, size = argument
+                    if (type(cursor) is not int or type(size) is not int or cursor < 0
+                            or cursor > config.max_dom_nodes or not 1 <= size <= 64):
+                        raise BrowserError(BrowserFailure.PROVIDER)
+                    data = page.evaluate(_LINK_BATCH, {"cursor": cursor, "size": size,
+                                                       "url": config.max_url_chars,
+                                                       "text": config.max_link_text_chars})
                 else:
                     raise BrowserError(BrowserFailure.PROVIDER)
                 pipe.send((True, data))
@@ -275,8 +349,27 @@ class PlaywrightBackend:
         return PageText(data["text"], data["truncated"])
 
     def list_links(self):
-        data = self._request("list_links")
-        return PageLinks(tuple(PageLink(item["url"], item["text"]) for item in data["links"]), data["truncated"])
+        # Direct adapter use has no trusted fetched URL for canonicalization;
+        # BrokeredBrowserBackend uses link_batch and filters before its quota.
+        links = []
+        seen = set()
+        cursor = 0
+        done = False
+        while not done and len(links) <= self._config.max_links:
+            batch, cursor, done = self.link_batch(cursor, min(64, self._config.max_dom_nodes))
+            for link in batch:
+                if link.url not in seen:
+                    seen.add(link.url)
+                    links.append(link)
+                    if len(links) > self._config.max_links:
+                        break
+        return PageLinks(tuple(links[:self._config.max_links]),
+                         len(links) > self._config.max_links)
+
+    def link_batch(self, cursor: int, size: int):
+        data = self._request("link_batch", (cursor, size))
+        return (tuple(PageLink(item["url"], item["text"]) for item in data["links"]),
+                data["cursor"], data["done"])
 
     def close(self):
         self._require_owner()

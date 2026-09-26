@@ -12,7 +12,7 @@ BrowserAgentComposition / BrowserConversation
  -> fixed scoped ToolRegistry -> validation -> canonical ToolExecutor
  -> PermissionPolicy / NET_READ -> BrowserReadTool -> BrowserSession
  -> SafeFetchBroker: canonicalize -> resolve/check all IPs -> numeric socket connect
- -> inert HTML projection -> owned offline Playwright worker -> Chromium
+ -> one-shot synthetic document -> owned offline Playwright worker -> Chromium
  -> bounded UNTRUSTED_DATA title/text/links -> Role.TOOL conversation history
 ```
 
@@ -135,62 +135,62 @@ foundation tests; it is not used as a Chromium connection authority.
 
 ## Offline renderer boundary
 
-Production never calls public `page.goto`, route.continue_ or route.fetch.
-Fetched HTML first passes through an original allowlist projection into inert
-structural markup. Scripts/styles/forms/editable content/frames/plugins/SVG/math,
-base elements, meta refresh, active attributes and external resources are removed.
-Only parent-canonicalized HTTP(S) anchor destinations survive as escaped
-`data-agentcore-href` values, not navigable hrefs. They resolve against the
-broker's final fetched URL; hostile base elements have no authority. This avoids
-exposing resource/file navigation markup to Chromium;
-offline HTTP routing alone would not be a filesystem boundary.
+Production never navigates Chromium to the fetched URL. SafeFetchBroker alone
+validates and dials web destinations. Its bounded decoded HTML is passed without
+Python HTML reconstruction to a fresh non-persistent Chromium context. A catch-all
+route is registered before page creation. While `offline=True`, the route may
+fulfill exactly one initial main-frame GET to the fixed host-owned URL
+`https://agentcore.invalid/document`, using the fetched HTML as the response
+body. Every other request, including another request for that same URL, is
+aborted. The route never continues or fetches. The synthetic URL is never a
+page identity or link-resolution base shown to the model.
 
-Playwright renders that bounded projection with `page.set_content`. The owned
-fresh non-persistent context has JavaScript disabled, service workers blocked,
-offline=True, all HTTP routes aborted and websocket routes closed. Downloads
-are off; popups close and dialogs dismiss. No profile reuse, CDP attachment,
-extensions, credentials, clipboard, traces, HAR, videos or screenshots are used.
-Fixed host adapter scripts extract only bounded main-document title/text/link
-fields; arbitrary JavaScript is never exposed to the model.
+The local synthetic response sets this CSP:
 
-The trusted final fetched URL is retained separately from Chromium's about:blank.
-The renderer scans at most max_dom_nodes elements and deduplicates visible
-canonical destinations before applying max_links, so unusable or repeated raw
-anchors cannot consume the usable-result budget. IPC carries at most one extra
-usable link to establish truncation. Destinations are bounded proposals, not approval; opening a link
-requires another NET_READ tool invocation and complete pinned-fetch validation.
-Stable first-document ordering/deduplication and deterministic text/link/node
-caps apply. Explicit hidden/form/editable text is excluded.
-Hidden unsupported wrappers and closed `dialog`/`details` subtrees are suppressed;
-closed `details` summaries are conservatively omitted too. Native fallback
-subtrees in audio, video, datalist, progress, meter, ruby `rp`, noembed,
-noframes and slot are conservatively omitted, while canvas fallback text and
-ruby `rt` remain readable. Boolean `open` is true by presence, even when its
-value is `false`.
-Any non-void element with a `popover` attribute is conservatively suppressed
-regardless of its value: offline Browser Read cannot establish an open runtime
-popover state after stripping active attributes.
+```text
+default-src 'none'; script-src 'none'; connect-src 'none'; img-src 'none';
+media-src 'none'; font-src 'none'; object-src 'none'; frame-src 'none';
+child-src 'none'; worker-src 'none'; form-action 'none'; base-uri 'none';
+style-src 'unsafe-inline'; sandbox
+```
 
-This is static readable HTML, not full browser fidelity. No CSS, fonts, images,
-frames or other subresources are fetched. Class-based stylesheet visibility,
-complex layouts and JavaScript-heavy sites are unsupported; no compatibility
-exception weakens the boundary. Inline explicit hiding is preserved conservatively.
-Only display, visibility and opacity declarations are interpreted: comments,
-whitespace, case, important suffixes and numeric-zero opacity forms are normalized.
-Any hidden or ambiguous relevant declaration hides, even if later overridden;
-this intentionally does not reproduce the CSS cascade. Original styles are
-discarded; the only generated style is `display:none`. Stylesheet/class-driven
-visibility is not reproduced.
-CSS escapes are not decoded: any escaped inline declaration or disallowed
-control hides the element conservatively, including unrelated escaped properties.
-Every duplicate style and aria-hidden attribute is examined before dictionary
-conversion; any explicit hidden signal wins. This can hide otherwise visible
-content and does not reproduce browser attribute-conflict semantics.
-At the provider boundary, emitted choices/defaults must recursively contain only
-JSON-native lists, string-keyed dictionaries and finite scalar values. Tuples,
-cycles, non-string keys and coercible non-native values fail before provider I/O;
-host ToolParameter values and local validation are unchanged.
-No interactive action or direct Chromium networking is ready for enablement.
+JavaScript is independently disabled, service workers blocked, WebSockets
+closed, downloads disabled, and popups/dialogs closed or dismissed. No profile,
+CDP attachment, extensions, credentials, clipboard, traces, HAR, videos or
+screenshots are used. Inline CSS remains available so Chromium can determine
+native visibility. External resources, stylesheets, images, fonts, media,
+frames, and scripts cannot load. A blocked iframe may have an inert blank or
+Chromium error-frame placeholder; it does not load its requested document.
+File, data, blob and JavaScript resource attempts and meta refresh have opt-in
+real-Chromium proof tests with zero fixture network requests.
+
+After parsing, a trusted bounded DOM walk counts nodes, including template
+contents and exposed shadow roots. Exceeding `max_dom_nodes` fails categorically.
+The broker body-byte cap and operation deadline apply before this post-parse
+check; the DOM count does not prevent Chromium's initial parsing work. Fixed
+host adapter JavaScript extracts only bounded main-document title, text and
+link candidates. It uses Chromium `checkVisibility` and native `innerText`
+rather than a Python tag/property visibility reconstruction. The text adapter
+also excludes form and editable descendants. Native visibility acceptance
+cases include frameset, closed dialog/details, popover, fallback containers,
+HTML non-void self-closing syntax and inline CSS. No arbitrary JavaScript tool
+is exposed to the model.
+
+Link candidates are read from the Chromium-parsed DOM with raw
+`getAttribute("href")`, never `anchor.href` or `document.baseURI`. Candidate
+batches contain at most 64 entries; the parent filters malformed, non-HTTP(S)
+and duplicate destinations, resolving only against SafeFetchBroker's trusted
+final URL. It stops at `max_links + 1` usable canonical links to determine
+truncation. Unusable anchors do not consume the useful-link quota. Opening any
+returned link is a new NET_READ invocation through the broker and its complete
+pinned-IP validation. The final fetched URL, not the synthetic renderer URL,
+is exposed as page state.
+
+This is brokered read-only web navigation with offline static rendering, not a
+JavaScript-capable browsing session. JavaScript-heavy sites may expose little
+content. External CSS and subresources are deliberately unavailable. The
+renderer does not claim general browser interaction, direct Chromium network
+safety, or perfect pixel-level visibility semantics.
 
 ## Lifecycle and accepted containment limitation
 
