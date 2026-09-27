@@ -11,6 +11,7 @@ explicit host enablement and installation of the optional browser extra/binary.
 BrowserAgentComposition / BrowserConversation
  -> fixed scoped ToolRegistry -> validation -> canonical ToolExecutor
  -> PermissionPolicy / NET_READ -> BrowserReadTool -> BrowserSession
+ -> exact host-owned per-turn navigation grant check
  -> SafeFetchBroker: canonicalize -> resolve/check all IPs -> numeric socket connect
  -> inert HTML projection -> owned offline Playwright worker -> Chromium
  -> bounded UNTRUSTED_DATA title/text/links -> Role.TOOL conversation history
@@ -30,8 +31,37 @@ from agentcore.browser import BrowserAgentComposition, BrowserConfig
 
 with BrowserAgentComposition(model=model, config=BrowserConfig(enabled=True)) as browser:
     conversation = browser.conversation()
-    reply = conversation.send("Read https://example.com/")
+    reply = conversation.send(
+        "Read the approved page",
+        navigation_urls=("https://example.com/",),  # trusted host input
+    )
 ```
+
+`navigation_urls` is a deliberate host API, separate from the natural-language
+message and every model tool argument. The host supplies at most 16 complete
+HTTP(S) URLs for one synchronous turn. `canonical_url()` validates and stores
+only their full canonical network form: scheme, host, path and query; fragments
+are irrelevant. A model proposal must match an exact grant before backend
+startup, DNS, broker worker creation, socket connection or Chromium rendering.
+Changing the path or query, including appending conversation data, fails with
+`browser_navigation_not_authorized` without reflecting the URL. Canonical
+equivalents may match, and the exact target may be reused within that one turn.
+The normal ToolExecutor still evaluates NET_READ before calling the browser
+tool; the host grant is an additional browser-specific check before network I/O.
+
+Grants are in-memory composition state, never ConversationSession metadata,
+Durable Memory, AgentState, ActionJournal, credentials or generic logs. They
+are revoked at turn completion, exception and composition close. A new process
+or persisted session resume starts with no navigation authority. The host must
+explicitly reauthorize any URL on a later turn, including a URL suggested by
+`browser_list_links`. Page text and links are UNTRUSTED DATA; the model cannot
+promote them to network authority or use a private-data-dependent choice among
+page-provided links to create a covert request. The model may instead ask the
+host/user to authorize an exact discovered URL on a later turn. The hosting
+layer must not automatically scrape URLs from messages or transcript history.
+Server `Location` redirects remain part of the approved initial fetch and
+continue through the broker's existing per-hop SSRF checks; they do not require
+another model navigation grant.
 
 Defaults perform zero browser/provider/DNS I/O and advertise no tools. A closed
 or unavailable backend, or any missing/replaced original registration, produces

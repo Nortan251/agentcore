@@ -8,6 +8,7 @@ from agentcore.realtime.errors import CancellationRequested
 from .backend import BrowserBackend, PageLinks, PageMetadata, PageText
 from .config import BrowserConfig
 from .errors import BrowserError, BrowserFailure
+from .navigation_authority import BrowserNavigationAuthority
 from .network import canonical_url, display_url
 
 
@@ -16,13 +17,16 @@ def safe_text(value: str, limit: int) -> str:
 
 
 class BrowserSession:
-    def __init__(self, backend: BrowserBackend | None = None, *, config: BrowserConfig | None = None):
+    def __init__(self, backend: BrowserBackend | None = None, *, config: BrowserConfig | None = None,
+                 navigation_authority: BrowserNavigationAuthority | None = None):
         self.config = config or BrowserConfig()
         self.config.validate()
         if backend is None:
             from .playwright_backend import PlaywrightBackend
             backend = PlaywrightBackend(self.config)
         self._backend = backend
+        self._navigation_authority = (navigation_authority if navigation_authority is not None
+                                      else BrowserNavigationAuthority(max_url_chars=self.config.max_url_chars))
         self._owner = (os.getpid(), threading.get_ident())
         self._started = False
         self._closed = False
@@ -86,8 +90,19 @@ class BrowserSession:
 
     def open_url(self, url: str) -> dict:
         self._require_owner()
+        # Preserve the existing unavailable/closed categories without starting
+        # a provider. They never imply permission to navigate.
+        if self._closed:
+            raise BrowserError(BrowserFailure.CLOSED)
+        if not self.config.enabled:
+            raise BrowserError(BrowserFailure.DISABLED)
+        if not self._backend.network_isolated:
+            raise BrowserError(BrowserFailure.NETWORK_BOUNDARY)
         # Static validation never performs DNS, launches a provider or logs URL.
         normalized = canonical_url(url, max_chars=self.config.max_url_chars)
+        # The model's URL is only a proposal. This check precedes backend
+        # startup, DNS, broker worker creation and rendering.
+        self._navigation_authority.require(normalized)
         return self._metadata(self._call("open_url", normalized))
 
     def current_page(self) -> dict:

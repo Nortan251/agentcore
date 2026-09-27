@@ -25,6 +25,7 @@ from agentcore.tools.registry import ToolRegistry, ToolRegistryLeaseError
 from .brokered_backend import BrokeredBrowserBackend
 from .config import BrowserConfig
 from .errors import BrowserError, BrowserFailure
+from .navigation_authority import BrowserNavigationAuthority
 from .session import BrowserSession
 from .tools import browser_tools
 
@@ -188,15 +189,19 @@ class _BrowserConversation(ConversationRuntime):
         session.metadata[_SESSION_MARKER] = True
         return _BrowserTranscript.from_dict(session.to_dict())
 
-    def send(self, text, *, session=None, session_id=None, on_stream_event=None):
+    def send(self, text, *, session=None, session_id=None, on_stream_event=None,
+             navigation_urls=()):
         self._guard()
-        if session is None:
-            session = self.start(session_id=session_id)
-        if session.metadata.get(_SESSION_MARKER) is not True:
-            raise BrowserError(BrowserFailure.CONTRACT)
-        if not isinstance(session, _BrowserTranscript):
-            session = _BrowserTranscript.from_dict(session.to_dict())
-        return super().send(text, session=session, on_stream_event=on_stream_event)
+        # Only this trusted host API publishes grants. Neither transcript
+        # replay nor page/tool output can populate the authority object.
+        with self._composition._navigation.for_turn(navigation_urls):
+            if session is None:
+                session = self.start(session_id=session_id)
+            if session.metadata.get(_SESSION_MARKER) is not True:
+                raise BrowserError(BrowserFailure.CONTRACT)
+            if not isinstance(session, _BrowserTranscript):
+                session = _BrowserTranscript.from_dict(session.to_dict())
+            return super().send(text, session=session, on_stream_event=on_stream_event)
 
 
 class BrowserAgentComposition(_Owned):
@@ -217,7 +222,9 @@ class BrowserAgentComposition(_Owned):
         self._conversation_config = replace(conversation_config or ConversationConfig(), tools_enabled=True)
         self._conversation_config.validate()
         backend = _backend if _backend is not None else BrokeredBrowserBackend(self._config)
-        self._session = BrowserSession(backend, config=self._config)
+        self._navigation = BrowserNavigationAuthority(max_url_chars=self._config.max_url_chars)
+        self._session = BrowserSession(backend, config=self._config,
+                                       navigation_authority=self._navigation)
         self._registry = ToolRegistry()
         self._tools = tuple(browser_tools(self._session))
         self._registry.register_all(list(self._tools))
@@ -258,7 +265,10 @@ class BrowserAgentComposition(_Owned):
 
     def close(self):
         self._owner()
-        self._session.close()
+        try:
+            self._session.close()
+        finally:
+            self._navigation.close()
 
     def __enter__(self):
         self._owner()
