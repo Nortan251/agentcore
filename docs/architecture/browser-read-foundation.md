@@ -43,6 +43,8 @@ HTTP(S) URLs for one synchronous turn. `canonical_url()` validates and stores
 only their full canonical network form: scheme, host, path and query; fragments
 are irrelevant. A model proposal must match an exact grant before backend
 startup, DNS, broker worker creation, socket connection or Chromium rendering.
+For a mutable host list, an immutable copy is taken before the count check and
+validation; later list changes cannot add grants to that turn.
 Changing the path or query, including appending conversation data, fails with
 `browser_navigation_not_authorized` without reflecting the URL. Canonical
 equivalents may match, and the exact target may be reused within that one turn.

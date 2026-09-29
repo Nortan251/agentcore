@@ -40,11 +40,21 @@ class BrowserNavigationAuthority:
     def for_turn(self, urls=()):
         """Accept only an explicit, bounded host sequence; retain no raw URL."""
         self._require_owner()
-        if self._closed or self._active or type(urls) not in (tuple, list) or len(urls) > _MAX_GRANTS:
+        if self._closed or self._active:
+            raise BrowserError(BrowserFailure.CONTRACT)
+        if type(urls) is tuple:
+            snapshot = urls
+        elif type(urls) is list:
+            # List ownership stays with the host. Copy once before checking
+            # bounds so later appends cannot enter this turn's authority.
+            snapshot = tuple(urls.copy())
+        else:
+            raise BrowserError(BrowserFailure.CONTRACT)
+        if len(snapshot) > _MAX_GRANTS:
             raise BrowserError(BrowserFailure.CONTRACT)
         # Complete validation precedes publication. A bad grant never leaves a
         # partially authorized set, and canonical_url performs no DNS or I/O.
-        canonical = frozenset(canonical_url(url, max_chars=self._max_url_chars) for url in urls)
+        canonical = frozenset(canonical_url(url, max_chars=self._max_url_chars) for url in snapshot)
         self._urls = canonical
         self._active = True
         try:

