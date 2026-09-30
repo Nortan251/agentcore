@@ -165,7 +165,8 @@ def test_brokered_link_label_excludes_invisible_descendant():
 
     config = BrowserConfig(enabled=True)
     with BrowserSession(BrokeredBrowserBackend(config, _broker=Broker()), config=config) as session:
-        session.open_url("https://example.com/")
+        with session._navigation_authority.for_turn(("https://example.com/",)):
+            session.open_url("https://example.com/")
         assert session.list_links()["links"] == [{"url": "https://example.com/read", "text": "VISIBLE"}]
 
 
