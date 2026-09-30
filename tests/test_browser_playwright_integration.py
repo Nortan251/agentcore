@@ -142,7 +142,8 @@ def test_brokered_renderer_limits_visible_canonical_links_after_filtering(
     renderer = PlaywrightBackend(config)
     backend = BrokeredBrowserBackend(config, _broker=Broker(), _renderer=renderer)
     with BrowserSession(backend, config=config) as session:
-        session.open_url("https://example.com/")
+        with session._navigation_authority.for_turn(("https://example.com/",)):
+            session.open_url("https://example.com/")
         result = session.list_links()
         assert result["links"] == [
             {"url": "https://example.com/first", "text": "FIRST VISIBLE"},

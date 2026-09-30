@@ -7,6 +7,7 @@ class BrowserFailure(str, Enum):
     DISABLED = "browser_disabled"
     NETWORK_BOUNDARY = "browser_network_boundary_unavailable"
     DESTINATION = "browser_destination_denied"
+    NAVIGATION_NOT_AUTHORIZED = "browser_navigation_not_authorized"
     DNS = "browser_dns_failed"
     LAUNCH = "browser_launch_failed"
     TIMEOUT = "browser_timeout"
