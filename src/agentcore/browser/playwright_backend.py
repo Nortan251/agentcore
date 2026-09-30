@@ -91,6 +91,16 @@ _LINK_BATCH = """bounds => {
 }"""
 
 
+def _check_render_source(config: BrowserConfig, source: str) -> None:
+    try:
+        oversized = (type(source) is not str or len(source) > config.render_source_limit
+                     or len(source.encode("utf-8")) > config.render_source_limit)
+    except UnicodeError:
+        oversized = True
+    if oversized:
+        raise BrowserError(BrowserFailure.SIZE)
+
+
 def _serve(pipe, config: BrowserConfig, *, _prepare=None):
     """Private worker entry; _prepare exists solely for offline fixture tests."""
     driver = browser = context = None
@@ -139,9 +149,7 @@ def _serve(pipe, config: BrowserConfig, *, _prepare=None):
                     # Even direct host adapter calls cannot enable navigation.
                     raise BrowserError(BrowserFailure.NETWORK_BOUNDARY)
                 if operation == "render_document":
-                    if (type(argument) is not str or len(argument) > config.max_body_bytes
-                            or len(argument.encode("utf-8")) > config.max_body_bytes * 3):
-                        raise BrowserError(BrowserFailure.SIZE)
+                    _check_render_source(config, argument)
                     # Each source gets a fresh non-persistent context. The
                     # route is installed before page creation and can fulfill
                     # only the first exact main-frame synthetic navigation.
@@ -337,6 +345,8 @@ class PlaywrightBackend:
         raise BrowserError(BrowserFailure.NETWORK_BOUNDARY)
 
     def render_document(self, source):
+        self._require_owner()
+        _check_render_source(self._config, source)
         return self._request("render_document", source)
 
     def current_page(self):

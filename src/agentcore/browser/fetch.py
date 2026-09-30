@@ -305,7 +305,14 @@ class SafeFetchBroker:
                         stage_deadline = (min(deadline, time.monotonic() + self._config.dns_timeout_seconds)
                                           if data == "dns" else deadline)
                     elif kind == "ok":
-                        if len(data[1]) > self._config.max_body_bytes * 6 + 16:
+                        source = data[1]
+                        try:
+                            oversized = (type(source) is not str
+                                         or len(source) > self._config.render_source_limit
+                                         or len(source.encode("utf-8")) > self._config.render_source_limit)
+                        except UnicodeError:
+                            oversized = True
+                        if oversized:
                             raise BrowserError(BrowserFailure.SIZE)
                         return FetchedDocument(*data)
                     else:
