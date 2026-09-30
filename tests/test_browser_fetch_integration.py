@@ -170,7 +170,8 @@ def test_fetch_then_offline_renderer_and_persisted_composition_exploit(fixture_s
     model = Model([wants("browser_open_url", url="http://fixture.example.com/start"),
                    wants("browser_extract_text"), ModelResponse(text="Observed static page")])
     with BrowserAgentComposition(model=model, config=config, sessions_directory=tmp_path / "browser-sessions", _backend=backend) as composition:
-        result = composition.conversation().send("Open and read the fixture")
+        result = composition.conversation().send(
+            "Open and read the fixture", navigation_urls=("http://fixture.example.com/start",))
         assert result.ok and result.tools_executed == 2
         text = backend.extract_text().text
         assert "WEB-INJECTION-SENTINEL" in text

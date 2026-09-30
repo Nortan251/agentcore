@@ -427,7 +427,8 @@ def test_pr31_strict_browser_resume_reframes_historical_tool_data(tmp_path):
     directory = tmp_path / "browser-sessions"
     with BrowserAgentComposition(model=build(first_wire), config=BrowserConfig(enabled=True),
                                  sessions_directory=directory, _backend=FakeBackend()) as first:
-        initial = first.conversation().send("Open")
+        initial = first.conversation().send(
+            "Open", navigation_urls=("https://example.com/page?private=argument",))
         assert initial.ok
         session_id = initial.session.id
     saved = (directory / (session_id + ".json")).read_text(encoding="utf-8")

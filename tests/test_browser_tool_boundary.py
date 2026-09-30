@@ -128,7 +128,8 @@ def test_pr31_policy_replacement_during_physical_seam_fails_busy(seam):
         thread = threading.Thread(target=revoke, daemon=True)
         thread.start()
         try:
-            result = executor.invoke("browser_open_url", {"url": "http://example.com/"})
+            with composition._navigation.for_turn(("http://example.com/",)):
+                result = executor.invoke("browser_open_url", {"url": "http://example.com/"})
         finally:
             entered.set()
             thread.join(5)
@@ -238,7 +239,8 @@ def test_net_read_observe_no_journal_no_write_authority():
         assert spec.capabilities == frozenset({Capability.NET_READ})
         assert spec.read_only
         assert "private_arguments" in spec.tags
-    result = executor.invoke("browser_open_url", {"url": "https://example.com/"})
+    with session._navigation_authority.for_turn(("https://example.com/",)):
+        result = executor.invoke("browser_open_url", {"url": "https://example.com/"})
     assert result.result.ok
     assert executor.policy.check((Capability.NET_WRITE,)).allowed is False
     assert "open_url" in backend.calls
@@ -267,7 +269,8 @@ def test_real_backend_gate_through_canonical_executor():
     registry = ToolRegistry()
     registry.register_all(browser_tools(session))
     executor = ToolExecutor(registry, PermissionPolicy())
-    result = executor.invoke("browser_open_url", {"url": "https://example.com/"})
+    with session._navigation_authority.for_turn(("https://example.com/",)):
+        result = executor.invoke("browser_open_url", {"url": "https://example.com/"})
     assert result.result.metadata["kind"] == BrowserFailure.NETWORK_BOUNDARY.value
     assert session._backend._worker is None
 
@@ -321,8 +324,9 @@ def browser_logs():
 
 def test_query_secrets_not_logged_or_retained_in_invocation(browser_logs):
     _, session, _, executor, _ = components()
-    result = executor.invoke("browser_open_url", {"url": "https://example.com/secret?key=QUERY_SECRET"},
-                             attacker="CONTEXT_SECRET")
+    with session._navigation_authority.for_turn(("https://example.com/secret?key=QUERY_SECRET",)):
+        result = executor.invoke("browser_open_url", {"url": "https://example.com/secret?key=QUERY_SECRET"},
+                                 attacker="CONTEXT_SECRET")
     assert result.result.ok
     assert "QUERY_SECRET" not in browser_logs.getvalue()
     assert "CONTEXT_SECRET" not in browser_logs.getvalue()
