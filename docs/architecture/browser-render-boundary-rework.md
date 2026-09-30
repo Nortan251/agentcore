@@ -36,9 +36,23 @@ The production path removes `static_html()` reconstruction, retains broker
 byte and operation deadlines, applies a bounded post-parse DOM walk, and
 extracts bounded title/text/link data from Chromium's original parsed document.
 `max_dom_nodes` limits the parsed DOM walk, not the CPU cost of parsing the
-already broker-bounded body. Chromium supplies raw `href` attributes in batches
-of at most 64; the trusted parent resolves, validates, filters, and deduplicates
-them against the broker's final URL before the usable-link limit applies. The
-text adapter uses Chromium visibility and rendered-text APIs while excluding
-forms/editables. The model receives neither arbitrary JavaScript execution nor
-the synthetic URL. JavaScript-heavy pages and external CSS remain unsupported.
+already broker-bounded body. Page text is the root Chromium `innerText`, sliced
+to `max_text_chars` with truncation determined before slicing. Link discovery
+uses Playwright 1.62.0's default non-hidden `link` role. Each bounded batch of
+at most 64 role candidates retains only actual `HTMLAnchorElement` instances
+with an explicit `href`; it returns the raw attribute and bounded anchor
+`innerText` label. The trusted parent resolves, validates, filters, and
+deduplicates raw hrefs against the broker's final URL before the usable-link
+limit applies. Accessibility semantics may omit visually present links, such
+as `aria-hidden` anchors or anchors overridden to `role=button`. Empty,
+image-only, and ARIA-label-only anchors can have empty rendered labels.
+
+These are observational projections, not a pixel-visibility security filter.
+Opacity-zero content, slot fallback, form/editable text, or direct inline
+`content-visibility:hidden` text can appear if Chromium includes it. Extraction
+never changes the DOM, style, or attributes; hostile CSS could react to such
+changes. All returned content remains `UNTRUSTED_DATA`. It cannot grant URL
+navigation or ordinary tools: BrowserAgentComposition isolates the catalogue
+and exact trusted host grants separately authorize each model-proposed URL.
+The model receives neither arbitrary JavaScript execution nor the synthetic
+URL. JavaScript-heavy pages and external CSS remain unsupported.

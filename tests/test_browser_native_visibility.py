@@ -12,6 +12,9 @@ pytestmark = pytest.mark.skipif(os.environ.get("AGENTCORE_BROWSER_INTEGRATION") 
                                reason="explicit real Chromium integration gate")
 
 
+# Browser Read returns bounded Chromium innerText, not a pixel-visibility
+# judgment. Slot fallback, opacity-zero, form, and editable text may appear;
+# the other native-state expectations below remain unchanged.
 _CASES = [
     ("hidden wrapper", '<div hidden>SECRET</div><p>VISIBLE</p>', False),
     ("duplicate hidden first", '<div style="display:none" style="display:block">SECRET</div><p>VISIBLE</p>', False),
@@ -37,7 +40,7 @@ _CASES = [
     ("ruby rt", '<ruby>base<rt>SECRET</rt></ruby><p>VISIBLE</p>', True),
     ("noembed", '<noembed>SECRET</noembed><p>VISIBLE</p>', False),
     ("noframes", '<noframes>SECRET</noframes><p>VISIBLE</p>', False),
-    ("slot", '<slot>SECRET</slot><p>VISIBLE</p>', False),
+    ("slot", '<slot>SECRET</slot><p>VISIBLE</p>', True),
     ("popover", '<div popover>SECRET</div><p>VISIBLE</p>', False),
     ("popover empty", '<div popover="">SECRET</div><p>VISIBLE</p>', False),
     ("popover auto", '<div popover="auto">SECRET</div><p>VISIBLE</p>', False),
@@ -54,13 +57,13 @@ _CASES = [
     ("visibility hidden", '<p style="visibility:hidden">SECRET</p><p>VISIBLE</p>', False),
     ("visibility collapse", '<p style="visibility:collapse">SECRET</p><p>VISIBLE</p>', False),
     ("visibility visible", '<p style="visibility:visible">SECRET</p><p>VISIBLE</p>', True),
-    ("opacity zero", '<p style="opacity:0">SECRET</p><p>VISIBLE</p>', False),
+    ("opacity zero", '<p style="opacity:0">SECRET</p><p>VISIBLE</p>', True),
     ("opacity one", '<p style="opacity:1">SECRET</p><p>VISIBLE</p>', True),
     ("content visibility hidden", '<p style="content-visibility:hidden">SECRET</p><p>VISIBLE</p>', False),
     ("content visibility visible", '<p style="content-visibility:visible">SECRET</p><p>VISIBLE</p>', True),
     ("content visibility auto", '<p style="content-visibility:auto">SECRET</p><p>VISIBLE</p>', True),
-    ("form exclusion", '<form>SECRET</form><p>VISIBLE</p>', False),
-    ("editable exclusion", '<div contenteditable>SECRET</div><p>VISIBLE</p>', False),
+    ("form exclusion", '<form>SECRET</form><p>VISIBLE</p>', True),
+    ("editable exclusion", '<div contenteditable>SECRET</div><p>VISIBLE</p>', True),
 ]
 
 

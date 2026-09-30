@@ -37,57 +37,15 @@ _DOM_COUNT = """limit => {
     return true;
 }"""
 _TEXT = """limit => {
-    const walker = document.createTreeWalker(document.body || document.documentElement,
-                                             NodeFilter.SHOW_TEXT);
-    const rendered = new WeakMap();
-    let out = '', node, truncated = false;
-    while ((node = walker.nextNode())) {
-        const parent = node.parentElement;
-        if (!parent || parent.closest('script,style,noscript,template,form,input,textarea,select,[contenteditable]')) continue;
-        if (!parent.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) continue;
-        // A text node's parent can have a rectangle even while the native
-        // parser hides that particular text (e.g. closed details children).
-        // Native innerText answers this without rewriting source HTML.
-        let visibleText = rendered.get(parent);
-        if (visibleText === undefined) {
-            visibleText = parent.innerText || '';
-            rendered.set(parent, visibleText);
-        }
-        const text = node.textContent;
-        if (!text.trim() || !visibleText.includes(text.trim())) continue;
-        const remaining = limit - out.length;
-        if (text.length > remaining) { out += text.slice(0, remaining); truncated = true; break; }
-        out += text;
-        if (out.length < limit) out += '\\n';
-    }
-    return {text: out.slice(0, limit), truncated};
+    const root = document.body || document.documentElement;
+    const value = root ? (root.innerText || '') : '';
+    return {text: value.slice(0, limit), truncated: value.length > limit};
 }"""
-_LINK_BATCH = """bounds => {
-    const anchors = document.querySelectorAll('a[href]');
-    const end = Math.min(anchors.length, bounds.cursor + bounds.size);
-    const links = [];
-    const visibleLabel = anchor => {
-        const walker = document.createTreeWalker(anchor, NodeFilter.SHOW_TEXT);
-        let label = '', node;
-        while ((node = walker.nextNode()) && label.length < bounds.text) {
-            const parent = node.parentElement;
-            if (!parent || parent.closest('script,style,noscript,template,form,[contenteditable]') ||
-                !parent.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) continue;
-            const value = node.textContent;
-            if (!value.trim() || !(parent.innerText || '').includes(value.trim())) continue;
-            label += value.slice(0, bounds.text - label.length);
-        }
-        return label;
-    };
-    for (let index = bounds.cursor; index < end; index++) {
-        const anchor = anchors[index];
-        if (anchor.closest('form,[contenteditable]') ||
-            !anchor.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) continue;
-        const href = anchor.getAttribute('href');
-        if (href.length > bounds.url) continue;
-        links.push({url: href, text: visibleLabel(anchor)});
-    }
-    return {links, cursor: end, done: end === anchors.length};
+_ROLE_LINK = """(element, bounds) => {
+    if (!(element instanceof HTMLAnchorElement) || !element.hasAttribute('href')) return null;
+    const href = element.getAttribute('href');
+    if (href.length > bounds.url) return null;
+    return {url: href, text: (element.innerText || '').slice(0, bounds.text)};
 }"""
 
 
@@ -204,9 +162,21 @@ def _serve(pipe, config: BrowserConfig, *, _prepare=None):
                     if (type(cursor) is not int or type(size) is not int or cursor < 0
                             or cursor > config.max_dom_nodes or not 1 <= size <= 64):
                         raise BrowserError(BrowserFailure.PROVIDER)
-                    data = page.evaluate(_LINK_BATCH, {"cursor": cursor, "size": size,
-                                                       "url": config.max_url_chars,
-                                                       "text": config.max_link_text_chars})
+                    # Playwright applies its default accessibility-hidden
+                    # semantics. The host reads only this bounded candidate
+                    # window and never mutates the hostile document.
+                    roles = page.get_by_role("link")
+                    count = roles.count()
+                    if type(count) is not int or not 0 <= count <= config.max_dom_nodes or cursor > count:
+                        raise BrowserError(BrowserFailure.PROVIDER)
+                    end = min(count, cursor + size)
+                    bounds = {"url": config.max_url_chars, "text": config.max_link_text_chars}
+                    links = []
+                    for index in range(cursor, end):
+                        item = roles.nth(index).evaluate(_ROLE_LINK, bounds)
+                        if item is not None:
+                            links.append(item)
+                    data = {"links": links, "cursor": end, "done": end >= count}
                 else:
                     raise BrowserError(BrowserFailure.PROVIDER)
                 pipe.send((True, data))

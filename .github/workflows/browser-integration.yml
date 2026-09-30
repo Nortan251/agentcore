@@ -68,4 +68,4 @@ jobs:
             sudo apparmor_parser -r "$RUNNER_TEMP/agentcore-browser-userns"
           fi
       - name: Browser unit and real Chromium adapter gates
-        run: python -m pytest tests/test_browser_network.py tests/test_browser_fetch.py tests/test_browser_fetch_integration.py tests/test_browser_session.py tests/test_browser_tool_boundary.py tests/test_browser_composition.py tests/test_tool_private_arguments.py tests/test_browser_playwright_integration.py tests/test_browser_native_visibility.py tests/test_browser_renderer_boundary_proof.py -ra
+        run: python -m pytest tests/test_browser_network.py tests/test_browser_fetch.py tests/test_browser_fetch_integration.py tests/test_browser_session.py tests/test_browser_tool_boundary.py tests/test_browser_composition.py tests/test_tool_private_arguments.py tests/test_browser_playwright_integration.py tests/test_browser_native_visibility.py tests/test_browser_renderer_boundary_proof.py tests/test_browser_render_source_bound.py tests/test_browser_observational_proof.py -ra
