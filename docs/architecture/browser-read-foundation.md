@@ -200,23 +200,31 @@ After parsing, a trusted bounded DOM walk counts nodes, including template
 contents and exposed shadow roots. Exceeding `max_dom_nodes` fails categorically.
 The broker body-byte cap and operation deadline apply before this post-parse
 check; the DOM count does not prevent Chromium's initial parsing work. Fixed
-host adapter JavaScript extracts only bounded main-document title, text and
-link candidates. It uses Chromium `checkVisibility` and native `innerText`
-rather than a Python tag/property visibility reconstruction. The text adapter
-also excludes form and editable descendants. Native visibility acceptance
-cases include frameset, closed dialog/details, popover, fallback containers,
-HTML non-void self-closing syntax and inline CSS. No arbitrary JavaScript tool
-is exposed to the model.
+host adapter code extracts only bounded main-document title, text and link
+candidates. Page text is Chromium's root `innerText`, sliced to
+`max_text_chars` with truncation determined before slicing. This observational
+projection is not a pixel-visibility filter: opacity-zero content, slot
+fallback, form/editable text, or direct inline `content-visibility:hidden`
+text may appear when Chromium includes it. Extraction does not mutate the DOM,
+style, or attributes. Native acceptance cases include frameset, closed
+dialog/details, popover, fallback containers, HTML non-void self-closing syntax
+and inline CSS. No arbitrary JavaScript tool is exposed to the model. All
+returned page content remains `UNTRUSTED_DATA` and cannot grant navigation or
+ordinary-tool authority.
 
-Link candidates are read from the Chromium-parsed DOM with raw
-`getAttribute("href")`, never `anchor.href` or `document.baseURI`. Candidate
-batches contain at most 64 entries; the parent filters malformed, non-HTTP(S)
-and duplicate destinations, resolving only against SafeFetchBroker's trusted
-final URL. It stops at `max_links + 1` usable canonical links to determine
-truncation. Unusable anchors do not consume the useful-link quota. Opening any
-returned link is a new NET_READ invocation through the broker and its complete
-pinned-IP validation. The final fetched URL, not the synthetic renderer URL,
-is exposed as page state.
+Link discovery uses Playwright 1.62.0's default non-hidden `link` role. Bounded
+candidate batches retain only actual `HTMLAnchorElement` instances with an
+explicit `href`, returning raw `getAttribute("href")`, never `anchor.href` or
+`document.baseURI`, and bounded `anchor.innerText` labels. Accessibility
+semantics may omit visually present anchors, such as `aria-hidden` anchors or
+anchors overridden to `role=button`. Candidate batches contain at most 64
+entries; the parent filters malformed, non-HTTP(S) and duplicate destinations,
+resolving only against SafeFetchBroker's trusted final URL. It stops at
+`max_links + 1` usable canonical links to determine truncation. Unusable
+anchors do not consume the useful-link quota. Opening any returned link
+requires an exact host grant and a new NET_READ invocation through the broker and
+its complete pinned-IP validation. The final fetched URL, not the synthetic
+renderer URL, is exposed as page state.
 
 This is brokered read-only web navigation with offline static rendering, not a
 JavaScript-capable browsing session. JavaScript-heavy sites may expose little
