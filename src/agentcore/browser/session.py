@@ -118,7 +118,7 @@ class BrowserSession:
         page: PageLinks = self._call("list_links")
         links = []
         seen = set()
-        # Preserve first visible document occurrence; never sort by hostile text.
+        # Preserve first accessibility-exposed candidate order; never sort by hostile text.
         for link in page.links[:self.config.max_links + 1]:
             try:
                 url = canonical_url(urljoin(self._url, link.url), max_chars=self.config.max_url_chars)

@@ -20,6 +20,12 @@ class BrowserConfig:
     dns_timeout_seconds: float = 5.0
     max_redirects: int = 3
 
+    @property
+    def render_source_limit(self) -> int:
+        # html.escape(quote=True) expands each plaintext character by at most
+        # six; <pre></pre> adds eleven. Keep a small fixed framing margin.
+        return self.max_body_bytes * 6 + 16
+
     def validate(self) -> None:
         if type(self.enabled) is not bool:
             raise ConfigError("browser.enabled must be a boolean")

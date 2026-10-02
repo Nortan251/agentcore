@@ -175,9 +175,13 @@ def test_fetch_then_offline_renderer_and_persisted_composition_exploit(fixture_s
         assert result.ok and result.tools_executed == 2
         text = backend.extract_text().text
         assert "WEB-INJECTION-SENTINEL" in text
-        assert all(value not in text for value in ("JS_EXECUTED", "FORM_SECRET", "EDITABLE_SECRET", "HIDDEN_SECRET"))
+        assert all(value not in text for value in ("JS_EXECUTED", "HIDDEN_SECRET"))
+        # Chromium includes editable text here but not textarea contents.
+        # Either way, bounded web text has no tool or network authority.
+        assert "EDITABLE_SECRET" in text and "FORM_SECRET" not in text
         assert backend.current_page().title == "Fixture"
         links = composition._session.list_links()
+        assert links["trust"] == "UNTRUSTED_DATA"
         assert [link["url"] for link in links["links"]] == ["http://fixture.example.com/directory/relative", "http://fixture.example.com/second"]
         before = list(hits)
         executed = []

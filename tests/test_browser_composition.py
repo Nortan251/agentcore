@@ -3,11 +3,11 @@ import json
 import pytest
 
 from agentcore.browser import BrowserAgentComposition, BrowserConfig
+from agentcore.browser.backend import PageLink
 from agentcore.browser.brokered_backend import BrokeredBrowserBackend
 from agentcore.browser.composition import BROWSER_TOOL_NAMES
 from agentcore.browser.errors import BrowserError, BrowserFailure
 from agentcore.browser.fetch import FetchedDocument
-from agentcore.browser.render import static_html
 from agentcore.config.schema import AgentConfig, ConversationConfig, LoggingConfig
 from agentcore.core.agent import Agent, AgentDependencies
 from agentcore.models.messages import ModelResponse, Role, ToolCall
@@ -15,33 +15,6 @@ from agentcore.tools.base import FunctionTool, ToolResult, tool_spec
 from test_browser_session import FakeBackend
 
 SENTINEL = "WEB-INJECTION-SENTINEL"
-
-
-@pytest.mark.parametrize("style", ["display: none !important", "visibility: hidden !important",
-    "opacity: 0.0", "opacity: .0", "opacity: 0%", "DiSpLaY:\t NoNe\n!important",
-    "display:/**/none", "display:none;display:block", "visibility:collapse ! important"])
-def test_pr31_inline_hidden_projection(style):
-    source = f'<p style="{style}">{SENTINEL}</p>'
-    assert static_html(source, BrowserConfig()) == f'<p style="display:none">{SENTINEL}</p>'
-
-
-@pytest.mark.parametrize("style", ["display:block", "display:INLINE-BLOCK", "display:flex!important",
-    "visibility:visible ! important", "opacity:1", "opacity:.5", "opacity:100%", "opacity:1e-1",
-    "color:red;background:url(https://example.com/secret)", "display:/**/block;opacity:0.5",
-    "display:block;display:flex", "visibility:visible;opacity:1"])
-def test_pr31_visible_styles_discarded_without_hiding(style):
-    assert static_html(f'<p style="{style}">Visible</p>', BrowserConfig()) == '<p>Visible</p>'
-
-
-@pytest.mark.parametrize("style", ["display:block;display:none", "opacity:1;opacity:0",
-    "opacity:0!important;opacity:1!important", "visibility:visible;visibility:hidden",
-    "opacity:-0", "opacity:+.0000% !important", "opacity:0e+20", "opacity:-0.5",
-    "display:var(--visibility)", "opacity:calc(1 - 1)", "visibility:inherit",
-    "display:none/* unfinished", "visibility", "opacity:NaN", "opacity:1e9999",
-    "display:no/**/ne", "visibility:/**/hidden/**/!/**/important"])
-def test_pr31_ambiguous_and_duplicate_visibility_prefers_hiding(style):
-    projected = static_html(f'<p style="{style}">Hidden</p>', BrowserConfig())
-    assert projected == '<p style="display:none">Hidden</p>'
 
 
 class Model:
@@ -219,128 +192,6 @@ def test_ordinary_nonbrowser_agent_still_advertises_executes_ordinary_tools(tmp_
     assert any(tool["name"] == "ordinary_callback" for tool in model.requests[0].tools)
 
 
-def test_static_projection_strips_all_resources_active_and_base_authority():
-    source = '''<base href="https://attacker.com/"><meta http-equiv="refresh" content="0;url=file:///secret">
-      <style>@import 'http://localhost/';</style><script>INJECTION</script><iframe src="file:///secret"></iframe>
-      <img src="http://localhost/" onerror="alert(1)"><p style="background:url(file:///secret)">read</p>
-      <p hidden>HIDDEN</p><form><textarea>FORM</textarea></form><div contenteditable>EDITABLE</div>
-      <a href="relative" ping="https://attacker.com/">link</a>'''
-    projected = static_html(source, BrowserConfig())
-    assert 'data-agentcore-href="relative"' in projected
-    assert '<a href=' not in projected
-    for value in ("attacker", "file:", "localhost", "onerror", "http-equiv", "INJECTION", "FORM", "EDITABLE", "ping="):
-        assert value not in projected
-    assert 'style="display:none"' in projected
-
-
-@pytest.mark.parametrize("source,expected", [
-    ('<x-panel hidden><p>SECRET</p></x-panel>VISIBLE', 'VISIBLE'),
-    ('<x-panel aria-hidden="true"><span>SECRET</span></x-panel>VISIBLE', 'VISIBLE'),
-    ('<x-panel style="display:none"><p>SECRET</p></x-panel>VISIBLE', 'VISIBLE'),
-    ('<x-panel hidden><x-panel><p>SECRET</p></x-panel>STILL_HIDDEN</x-panel>VISIBLE',
-     'VISIBLE'),
-    ('<x-panel hidden><div>SECRET</x-panel>TAIL', ''),
-    ('<x-panel hidden><br/>SECRET</x-panel>VISIBLE', 'VISIBLE'),
-    ('<x-panel hidden><p>SECRET</p>', ''),
-    ('<x-panel hidden/><p>SECRET</p>', ''),
-    ('<script/>SECRET', ''),
-    ('<style/>SECRET', ''),
-    ('<textarea/>SECRET', ''),
-])
-def test_hidden_or_excluded_nonvoid_subtrees_never_project_visible_text(source, expected):
-    assert static_html(source, BrowserConfig()) == expected
-
-
-def test_supported_hidden_self_closing_spelling_keeps_following_text_inside():
-    assert static_html('<div hidden/>SECRET', BrowserConfig()) == \
-        '<div style="display:none">SECRET'
-
-
-def test_real_void_elements_do_not_suppress_following_visible_text():
-    source = '<br/><hr/><img hidden/><input hidden/><source hidden/><wbr hidden/>VISIBLE'
-    assert static_html(source, BrowserConfig()) == '<br><hr>VISIBLE'
-
-
-@pytest.mark.parametrize("source,expected", [
-    ('<dialog><p>SECRET</p></dialog>VISIBLE', 'VISIBLE'),
-    ('<dialog open><p>SECRET</p></dialog>VISIBLE', '<p>SECRET</p>VISIBLE'),
-    ('<dialog open=""><p>SECRET</p></dialog>VISIBLE', '<p>SECRET</p>VISIBLE'),
-    ('<dialog open="false"><p>SECRET</p></dialog>VISIBLE', '<p>SECRET</p>VISIBLE'),
-    ('<details><summary>Heading</summary><p>SECRET</p></details>VISIBLE', 'VISIBLE'),
-    ('<details open><summary>Heading</summary><p>SECRET</p></details>VISIBLE',
-     'Heading<p>SECRET</p>VISIBLE'),
-    ('<details open="false"><p>SECRET</p></details>VISIBLE', '<p>SECRET</p>VISIBLE'),
-    ('<dialog/>SECRET', ''),
-    ('<details/>SECRET', ''),
-    ('<dialog open/>SECRET', 'SECRET'),
-    ('<details open/>SECRET', 'SECRET'),
-    ('<dialog><details open><p>SECRET</p></details></dialog>VISIBLE', 'VISIBLE'),
-    ('<dialog><div>SECRET</dialog>TAIL', ''),
-    ('<details><p>SECRET</p>', ''),
-    ('<audio>SECRET</audio>VISIBLE', 'VISIBLE'),
-    ('<audio/>SECRET', ''),
-    ('<video>SECRET</video>VISIBLE', 'VISIBLE'),
-    ('<datalist><option>SECRET</option></datalist>VISIBLE', 'VISIBLE'),
-    ('<progress>SECRET</progress>VISIBLE', 'VISIBLE'),
-    ('<meter>SECRET</meter>VISIBLE', 'VISIBLE'),
-    ('<canvas>VISIBLE_FALLBACK</canvas>VISIBLE', 'VISIBLE_FALLBACKVISIBLE'),
-])
-def test_native_hidden_and_fallback_containers_preserve_visibility(source, expected):
-    assert static_html(source, BrowserConfig()) == expected
-
-
-@pytest.mark.parametrize("source,expected", [
-    ('<ruby>VISIBLE<rp>SECRET</rp><rt>ANNOTATION</rt></ruby>', 'VISIBLEANNOTATION'),
-    ('<ruby>VISIBLE<rp>ONE</rp><rt>ANNOTATION</rt><rp>TWO</rp></ruby>TAIL',
-     'VISIBLEANNOTATIONTAIL'),
-    ('<rp><p>SECRET</p></rp>TAIL', 'TAIL'),
-    ('<dialog><rp>SECRET</rp></dialog>TAIL', 'TAIL'),
-    ('<rp><rp>SECRET</rp>STILL_SECRET</rp>TAIL', 'TAIL'),
-    ('<rp><div>SECRET</rp>TAIL', ''),
-    ('<rp/>SECRET', ''),
-    ('<ruby>VISIBLE<rt>ANNOTATION</rt></ruby>TAIL', 'VISIBLEANNOTATIONTAIL'),
-    ('BEFORE<ruby>BASE<rp>SECRET</rp><rt>ANNOTATION</rt></ruby>AFTER',
-     'BEFOREBASEANNOTATIONAFTER'),
-    ('<rp>SECRET', ''),
-])
-def test_ruby_fallback_never_widens_visibility(source, expected):
-    assert static_html(source, BrowserConfig()) == expected
-
-
-@pytest.mark.parametrize("source,expected", [
-    ('<noembed>SECRET</noembed>VISIBLE', 'VISIBLE'),
-    ('<noframes>SECRET</noframes>VISIBLE', 'VISIBLE'),
-    ('<slot>SECRET</slot>VISIBLE', 'VISIBLE'),
-    ('<slot><p>SECRET</p></slot>VISIBLE', 'VISIBLE'),
-    ('<noembed/>SECRET', ''),
-    ('<noframes/>SECRET', ''),
-    ('<slot/>SECRET', ''),
-])
-def test_additional_native_hidden_fallbacks_never_widen_visibility(source, expected):
-    assert static_html(source, BrowserConfig()) == expected
-
-
-@pytest.mark.parametrize("source,expected", [
-    ('<div popover>SECRET</div>VISIBLE', 'VISIBLE'),
-    ('<div popover="">SECRET</div>VISIBLE', 'VISIBLE'),
-    ('<div popover="auto">SECRET</div>VISIBLE', 'VISIBLE'),
-    ('<div popover="manual">SECRET</div>VISIBLE', 'VISIBLE'),
-    ('<div popover="hint">SECRET</div>VISIBLE', 'VISIBLE'),
-    ('<div popover="nonsense">SECRET</div>VISIBLE', 'VISIBLE'),
-    ('<section popover><p>SECRET</p></section>VISIBLE', 'VISIBLE'),
-    ('<x-panel popover><p>SECRET</p></x-panel>VISIBLE', 'VISIBLE'),
-    ('<div popover><section popover>SECRET</section>STILL_SECRET</div>VISIBLE', 'VISIBLE'),
-    ('<dialog><div popover>SECRET</div></dialog>VISIBLE', 'VISIBLE'),
-    ('<div popover/>SECRET', ''),
-    ('<div popover><span>SECRET</div>TAIL', ''),
-    ('<div popover>SECRET', ''),
-    ('<br popover>VISIBLE', '<br>VISIBLE'),
-    ('<img popover>VISIBLE', 'VISIBLE'),
-])
-def test_popover_attribute_suppresses_nonvoid_subtree(source, expected):
-    assert static_html(source, BrowserConfig()) == expected
-
-
 def test_brokered_backend_keeps_final_url_separate_and_never_navigates_renderer():
     class Broker:
         def fetch(self, url):
@@ -354,50 +205,44 @@ def test_brokered_backend_keeps_final_url_separate_and_never_navigates_renderer(
     backend = BrokeredBrowserBackend(BrowserConfig(), _broker=Broker(), _renderer=renderer)
     metadata = backend.open_url("https://example.com/")
     assert metadata.url == "https://example.com/final/path/"
-    assert "attacker" not in renderer.source
+    assert renderer.source == '<base href="https://attacker.com/"><a href="../link">L</a>'
     backend.close()
 
 
-def test_projected_link_candidates_use_trusted_final_url_before_budget():
-    source = ('<base href="https://attacker.com/">'
-              + '<a href="mailto:noise@example.com">noise</a>' * 6
-              + '<a href="javascript:alert(1)">script</a>' * 6
-              + '<a href="http://[:::]">malformed</a>' * 6
-              + '<a href="https://example.com/a\nb">control</a>' * 6
-              + '<a href="../ok#first">first</a>'
-              + '<a href="../ok#second">duplicate canonical</a>' * 6
-              + '<a href="https://example.com/next?q=1">next</a>')
-    projected = static_html(source, BrowserConfig(max_links=2),
-                            final_url="https://example.com/final/page")
-    assert projected.count("data-agentcore-href=") == 8
-    assert 'data-agentcore-href="https://example.com/ok"' in projected
-    assert 'data-agentcore-href="https://example.com/next?q=1"' in projected
-    assert "attacker.com" not in projected
+@pytest.mark.parametrize("third,expected_truncated", [(True, True), (False, False)])
+def test_brokered_link_quota_applies_after_multiple_filtered_batches(third, expected_truncated):
+    class Broker:
+        def fetch(self, _):
+            return FetchedDocument("https://example.com/final/page", "<p>original source</p>")
 
-@pytest.mark.parametrize('style', [r'\64 isplay:none', r'd\69 splay:none', r'op\61 city:0',
-    r'vis\69 bility:hidden', r'\44 ISPLAY:none', r'\000064isplay:none', r'\64\tisplay:none',
-    'display\\', 'display\\\n:none', r'col\6f r:red', 'dis\x00play:none'])
-def test_pr31_p2_escaped_properties_conservatively_hidden(style):
-    projected = static_html(f'<p style="{style}">HIDDEN_SENTINEL</p>', BrowserConfig())
-    assert projected == '<p style="display:none">HIDDEN_SENTINEL</p>'
+    class Renderer(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.cursors = []
+            self.candidates = ([PageLink("mailto:noise@example.com", "noise")] * 130
+                               + [PageLink("../first#fragment", "FIRST"),
+                                  PageLink("../first", "duplicate"),
+                                  PageLink("/second", "SECOND")]
+                               + ([PageLink("/third", "THIRD")] if third else []))
 
-@pytest.mark.parametrize('attributes', [
-    'style="display:none" style="display:block"',
-    'style="display:block" style="display:none"',
-    'style="opacity:0" style="visibility:hidden"',
-    r'style="\64 isplay:none" style="display:block"',
-    'style="display:var(--x)" style="opacity:1"',
-    'aria-hidden="true" aria-hidden="false"',
-    'aria-hidden="false" aria-hidden=" TRUE "',
-    'hidden hidden="false"',
-])
-def test_pr31_p2_duplicate_hidden_attributes(attributes):
-    assert static_html(f'<p {attributes}>HIDDEN_SENTINEL</p>', BrowserConfig()) == '<p style="display:none">HIDDEN_SENTINEL</p>'
+        def render_document(self, source):
+            assert source == "<p>original source</p>"
 
-@pytest.mark.parametrize('attributes', [
-    'style="display:block" style="opacity:1"',
-    'style="color:red" style="visibility:visible"',
-    'aria-hidden="false" aria-hidden="false"',
-])
-def test_pr31_p2_duplicate_visible_attributes(attributes):
-    assert static_html(f'<p {attributes}>VISIBLE</p>', BrowserConfig()) == '<p>VISIBLE</p>'
+        def link_batch(self, cursor, size):
+            self.cursors.append(cursor)
+            assert size == 64
+            end = min(len(self.candidates), cursor + size)
+            return tuple(self.candidates[cursor:end]), end, end == len(self.candidates)
+
+    renderer = Renderer()
+    backend = BrokeredBrowserBackend(BrowserConfig(max_links=2), _broker=Broker(), _renderer=renderer)
+    try:
+        backend.open_url("https://example.com/")
+        result = backend.list_links()
+        assert [(link.url, link.text) for link in result.links[:2]] == [
+            ("https://example.com/first", "FIRST"),
+            ("https://example.com/second", "SECOND")]
+        assert result.truncated is expected_truncated
+        assert renderer.cursors == [0, 64, 128]
+    finally:
+        backend.close()
