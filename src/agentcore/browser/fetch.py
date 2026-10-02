@@ -289,12 +289,17 @@ class SafeFetchBroker:
                 try:
                     while True:
                         messages.put(parent.recv())
-                except (EOFError, OSError):
+                except Exception:
+                    # EOF, truncated frames and decoder failures are all
+                    # categorical protocol failure; never leak reader traces.
                     messages.put(("error", BrowserFailure.FETCH.value))
             # poll() only promises some bytes, not a complete IPC frame. Never
             # let a partial frame defeat the parent's DNS/operation deadline.
             reader = threading.Thread(target=receive, daemon=True)
             reader.start()
+            # Exit can follow buffered progress and terminal frames. Consume
+            # the ordered stream through terminal/EOF; process liveness must
+            # not discard a result. The reader and deadlines bound this wait.
             while time.monotonic() < min(deadline, stage_deadline):
                 try:
                     kind, data = messages.get(timeout=min(.05, max(0, min(deadline, stage_deadline) - time.monotonic())))
@@ -317,8 +322,6 @@ class SafeFetchBroker:
                         return FetchedDocument(*data)
                     else:
                         raise BrowserError(BrowserFailure(data))
-                if not worker.is_alive():
-                    raise BrowserError(BrowserFailure.FETCH)
             raise BrowserError(BrowserFailure.TIMEOUT)
         except BrowserError:
             raise

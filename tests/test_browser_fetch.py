@@ -1,6 +1,8 @@
 import io
+import functools
 import socket
 import ssl
+import threading
 import time
 
 import pytest
@@ -331,3 +333,121 @@ def test_partial_ipc_frame_cannot_defeat_deadline_and_cleanup_is_categorical(mon
     assert error.value.failure is (BrowserFailure.CLEANUP if cleanup_error else BrowserFailure.TIMEOUT)
     assert "SECRET" not in str(error.value) and "ADDRESS" not in str(error.value)
     assert stopped.is_set() and time.monotonic() - before < 3
+
+
+def completion_worker(pipe, url, method, config, *, case):
+    """Real spawn/IPC fixture; no resolver, socket or HTTP operation."""
+    try:
+        if case in ("progress_ok", "progress_error", "progress_only"):
+            pipe.send(("stage", "dns"))
+        if case in ("progress_ok", "progress_error"):
+            pipe.send(("stage", "connect"))
+        if case == "progress_error":
+            pipe.send(("error", BrowserFailure.DESTINATION.value))
+        elif case == "truncated":
+            # Transport frame contains only the pickle protocol prefix. recv()
+            # encounters EOF before a complete protocol message can exist.
+            pipe.send_bytes(b"\x80\x04")
+        elif case == "malformed":
+            # Pickle declares an eight-byte payload frame but supplies one.
+            pipe.send_bytes(b"\x80\x04\x95\x08\x00\x00\x00\x00\x00\x00\x00N")
+        elif case == "never_terminal":
+            threading.Event().wait(30)  # parent deadline must terminate us
+        elif case != "progress_only":
+            pipe.send(("ok", (url, "<p>completed</p>")))
+        # No sleep after the terminal send; process exits immediately.
+    finally:
+        pipe.close()
+
+
+def completion_broker(monkeypatch, case, *, delay_reader=True, cleanup_error=False):
+    """Select a valid scheduling order with join, not timing-only sleeps."""
+    spawn = fetch.multiprocessing.get_context("spawn")
+    real_thread = threading.Thread
+    workers, exited_before_receive = [], []
+
+    class Worker:
+        def __init__(self, process):
+            self.process = process
+
+        def __getattr__(self, name):
+            return getattr(self.process, name)
+
+        def close(self):
+            self.process.close()
+            if cleanup_error:
+                raise OSError("PRIVATE_CLEANUP_SECRET")
+
+    class Spawn:
+        def Pipe(self, **kwargs):
+            return spawn.Pipe(**kwargs)
+
+        def Process(self, **kwargs):
+            worker = Worker(spawn.Process(**kwargs))
+            workers.append(worker)
+            return worker
+
+    class Reader(real_thread):
+        def start(self):
+            if delay_reader:
+                workers[0].join(timeout=5)
+                assert not workers[0].is_alive(), "fixture worker did not exit"
+                assert workers[0].exitcode == 0
+                exited_before_receive.append(True)
+            return super().start()
+
+    monkeypatch.setattr(fetch.multiprocessing, "get_context", lambda _: Spawn())
+    monkeypatch.setattr(fetch.threading, "Thread", Reader)
+    config = BrowserConfig(operation_timeout_seconds=5 if delay_reader else 1)
+    broker = fetch.SafeFetchBroker(config,
+        _worker_target=functools.partial(completion_worker, case=case))
+    return broker, workers, exited_before_receive
+
+
+@pytest.mark.parametrize("case,expected", [
+    ("progress_ok", None),
+    ("progress_error", BrowserFailure.DESTINATION),
+    ("progress_only", BrowserFailure.FETCH),
+    ("terminal_only", None),
+    ("truncated", BrowserFailure.FETCH),
+    ("malformed", BrowserFailure.FETCH),
+])
+def test_ordered_completion_after_confirmed_worker_exit(monkeypatch, case, expected):
+    broker, workers, observed_exit = completion_broker(monkeypatch, case)
+    if expected is None:
+        document = broker.fetch("https://example.com/")
+        assert document.final_url == "https://example.com/"
+        assert document.html == "<p>completed</p>"
+    else:
+        with pytest.raises(BrowserError) as error:
+            broker.fetch("https://example.com/")
+        assert error.value.failure is expected
+    assert observed_exit == [True]  # exited before ANY parent receive
+    assert workers[0].process._closed
+
+
+def test_terminal_success_immediately_before_exit(monkeypatch):
+    broker, workers, observed_exit = completion_broker(
+        monkeypatch, "terminal_only", delay_reader=False)
+    assert broker.fetch("https://example.com/").html == "<p>completed</p>"
+    assert observed_exit == [] and workers[0].process._closed
+
+
+def test_live_worker_without_terminal_still_has_hard_deadline(monkeypatch):
+    broker, workers, _ = completion_broker(monkeypatch, "never_terminal", delay_reader=False)
+    before = time.monotonic()
+    with pytest.raises(BrowserError) as error:
+        broker.fetch("https://example.com/")
+    assert error.value.failure is BrowserFailure.TIMEOUT
+    assert time.monotonic() - before < 3
+    assert workers[0].process._closed
+
+
+def test_real_completion_cleanup_uncertainty_overrides_success(monkeypatch):
+    broker, workers, observed_exit = completion_broker(
+        monkeypatch, "terminal_only", cleanup_error=True)
+    with pytest.raises(BrowserError) as error:
+        broker.fetch("https://example.com/")
+    assert error.value.failure is BrowserFailure.CLEANUP
+    assert "PRIVATE_CLEANUP_SECRET" not in str(error.value)
+    assert observed_exit == [True] and workers[0].process._closed
