@@ -194,6 +194,54 @@ def test_redirect_dns_private_and_count_bound():
     assert len(connects) == 3
 
 
+@pytest.mark.parametrize("initial_path,locations,visited_paths,failure", [
+    ("a" * 30 + "/start", ("b" * 30,), ("a" * 30 + "/start",), BrowserFailure.DESTINATION),
+    ("a" * 30 + "/start", ("b" * 13,), ("a" * 30 + "/start", "a" * 30 + "/" + "b" * 13), None),
+    ("a" * 30 + "/start", ("b" * 14,), ("a" * 30 + "/start",), BrowserFailure.DESTINATION),
+    ("folder/start", ("next",), ("folder/start", "folder/next"), None),
+    ("start", ("https://example.com/" + "b" * 45,), ("start",), BrowserFailure.REDIRECT),
+    ("start", ("a" * 30 + "/step", "b" * 30), ("start", "a" * 30 + "/step"), BrowserFailure.DESTINATION),
+    ("start", ("a" * 30 + "/step", "b" * 13), ("start", "a" * 30 + "/step", "a" * 30 + "/" + "b" * 13), None),
+    ("a" * 45, (), (), BrowserFailure.DESTINATION),
+], ids=["joined-over-limit", "exact-limit", "limit-plus-one", "relative-under-limit",
+        "absolute-over-limit", "multi-hop-over-limit", "multi-hop-exact-limit", "initial-over-limit"])
+def test_fetch_document_configured_url_cap(monkeypatch, initial_path, locations, visited_paths, failure):
+    # Fake resolver/exchange only; count each accepted hop to prove rejection
+    # precedes the next resolution and exchange, including direct entry calls.
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *_a, **_k: pytest.fail("real DNS forbidden"))
+    monkeypatch.setattr(socket, "socket", lambda *_a, **_k: pytest.fail("real sockets forbidden"))
+    resolved, exchanged = [], []
+    root = "https://example.com/"
+    expected = [root + path for path in visited_paths]
+    config = BrowserConfig(max_url_chars=64)
+
+    def resolver(host, port):
+        resolved.append((host, port))
+        return ["8.8.8.8"]
+
+    def exchange(target, method, config):
+        exchanged.append(target.url)
+        hop = len(exchanged) - 1
+        return (302, locations[hop], None) if hop < len(locations) else (200, None, "<p>done</p>")
+
+    def run():
+        return fetch._fetch_document(root + initial_path, "GET", config, resolver=resolver, exchange=exchange)
+
+    if failure is not None:
+        with pytest.raises(BrowserError) as error:
+            run()
+        assert error.value.failure is failure
+        assert str(error.value) == failure.value
+    else:
+        result = run()
+        assert result.final_url == expected[-1]
+        assert len(result.final_url) <= config.max_url_chars
+        if "b" * 13 in visited_paths[-1]:
+            assert len(result.final_url) == config.max_url_chars
+    assert exchanged == expected
+    assert resolved == [("example.com", 443)] * len(expected)
+
+
 @pytest.mark.parametrize("data", [
     b"HTTP/1.1 200 OK\nContent-Type: text/html\n\nhi",
     b"HTTP/1.1 200 OK\r\n Content-Type: text/html\r\n\r\n",

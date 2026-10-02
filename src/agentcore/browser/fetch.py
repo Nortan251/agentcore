@@ -228,7 +228,7 @@ def _exchange(target, method, config, *, connector=_connect):
 def _fetch_document(url, method, config, *, resolver=system_resolver, exchange=_exchange, stage=lambda _: None):
     if method not in ("GET", "HEAD"):
         raise BrowserError(BrowserFailure.DESTINATION)
-    current = canonical_url(url)
+    current = canonical_url(url, max_chars=config.max_url_chars)
     for hop in range(config.max_redirects + 1):
         target = _resolve(current, resolver, stage)
         status, location, content = exchange(target, method, config)
@@ -236,7 +236,10 @@ def _fetch_document(url, method, config, *, resolver=system_resolver, exchange=_
             return FetchedDocument(target.url, content)
         if hop == config.max_redirects or not location or len(location) > config.max_url_chars:
             raise BrowserError(BrowserFailure.REDIRECT)
-        next_url = canonical_url(urljoin(target.url, location))
+        next_url = canonical_url(
+            urljoin(target.url, location),
+            max_chars=config.max_url_chars,
+        )
         if target.secure and urlsplit(next_url).scheme != "https":
             raise BrowserError(BrowserFailure.REDIRECT)
         current = next_url  # next iteration repeats resolve/check/PIN in full
