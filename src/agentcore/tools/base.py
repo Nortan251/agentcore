@@ -170,6 +170,8 @@ class ToolContext:
     #: One-use, non-serializable access supplied only by ToolExecutor for an
     #: explicitly bound authenticated operation. This field never contains tokens.
     credential_execution: CredentialExecution | CredentialActionExecution | None = field(default=None, repr=False)
+    #: One-use journal-bound filesystem write context, supplied only by executor.
+    filesystem_write_execution: Any = field(default=None, repr=False)
 
 
 class Tool(ABC):

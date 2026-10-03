@@ -89,12 +89,13 @@ from agentcore.credentials.action import (
 from agentcore.fs.sensitive import DEFAULT_SENSITIVE_POLICY
 from agentcore.observability.events import Events
 from agentcore.observability.logging import StructuredLogger, get_logger
-from agentcore.permissions.levels import READ_ONLY_CAPABILITIES, Capability
+from agentcore.permissions.levels import READ_ONLY_CAPABILITIES, Capability, PermissionLevel
 from agentcore.permissions.policy import Decision, Outcome, PermissionPolicy
 from agentcore.realtime.errors import CancellationRequested
 from agentcore.tools.base import ExternalReadTool, ToolContext, ToolResult, ToolSpec
 from agentcore.tools.authenticated import AuthenticatedReadTool
 from agentcore.tools.authenticated_action import AuthenticatedActionTool
+from agentcore.tools.builtin.write_file import WriteFileTool, _WriteExecution, _ISSUER
 from agentcore.tools.registry import ToolRegistry, ToolRegistryLeaseError
 from agentcore.util.clock import Clock, SystemClock
 from agentcore.util.ids import new_id
@@ -160,6 +161,10 @@ class _CurrentAuthorityBlocked(Exception):
         self.safe_message = message
         self.request_id = request_id
         self.decision = decision
+
+
+class _FilesystemWriteNotInvoked(_CredentialActionNotInvoked):
+    """The live executor proved no filesystem staging boundary was entered."""
 
 
 def _safe_args_for_log(args: Mapping[str, Any]) -> dict[str, Any]:
@@ -254,6 +259,7 @@ class ToolExecutor:
         self._policy_generation = 0
         self._credential_policy_leases = 0
         self._external_read_policy_leases = 0
+        self._filesystem_write_policy_leases = 0
         self.policy = policy
         self.workspace = workspace
         self.workspace_dir = (str(workspace.root) if workspace is not None
@@ -315,6 +321,8 @@ class ToolExecutor:
                 raise CredentialError(CredentialFailure.BUSY)
             if self._external_read_policy_leases:
                 raise PolicyLeaseBusyError("Permission policy is in use by an external read.")
+            if self._filesystem_write_policy_leases:
+                raise PolicyLeaseBusyError("Permission policy is in use by a filesystem write.")
             self._policy = policy
             self._policy_generation += 1
 
@@ -457,6 +465,7 @@ class ToolExecutor:
         *,
         action_execution_permit: ActionExecutionPermit | None = None,
         credential_execution: CredentialExecution | CredentialActionExecution | None = None,
+        filesystem_write_execution: Any = None,
     ) -> ToolContext:
         return ToolContext(
             config=dict(self._tool_settings.get(tool_name, {})),
@@ -465,6 +474,7 @@ class ToolExecutor:
             workspace=self.workspace,
             action_execution_permit=action_execution_permit,
             credential_execution=credential_execution,
+            filesystem_write_execution=filesystem_write_execution,
         )
 
     def invoke(
@@ -1524,6 +1534,57 @@ class ToolExecutor:
         # No provider exception or secret-bearing context leaves this method.
         raise _CredentialActionNotInvoked()
 
+    def _run_filesystem_write(self, *, store, claimed, tool, tool_spec, cleaned,
+                              adapter, spec, prepared, current_approval_receipt, checkpoint):
+        execution = None
+
+        def validate():
+            if checkpoint is not None:
+                checkpoint()
+            if store.load(claimed.action_id) != claimed or self.workspace is not tool._guard:
+                raise ValueError("filesystem write claim or workspace changed")
+            self._validate_current_execution_authority(
+                record=claimed, tool=tool, tool_spec=tool_spec, adapter=adapter,
+                spec=spec, prepared=prepared, current_approval_receipt=current_approval_receipt)
+
+        @contextmanager
+        def authorize():
+            policy, generation = self._policy_snapshot()
+            tool.validate_contract()
+            validate()
+            with self._policy_lock:
+                self._require_policy_owner()
+                if self._policy is not policy or self._policy_generation != generation:
+                    raise ValueError("filesystem write policy changed")
+                self._filesystem_write_policy_leases += 1
+            try:
+                yield
+            finally:
+                self._require_policy_owner()
+                with self._policy_lock:
+                    self._filesystem_write_policy_leases -= 1
+
+        try:
+            payload, _ = self._resolve_action_protected_storage(claimed)
+            if payload is None or not self._protected_intent_matches(claimed, prepared):
+                raise ValueError("verified filesystem intent unavailable")
+            execution = _WriteExecution(_ISSUER, tool, payload, authorize, validate)
+            result = tool.run(cleaned, self._context(tool_spec.name, filesystem_write_execution=execution))
+            return adapter.normalize_effect(result).validate(spec), None
+        except (CancellationRequested, KeyboardInterrupt, SystemExit) as exc:
+            if execution is not None and execution.entered:
+                return self._unknown_effect(spec, "filesystem.interrupted"), exc
+            if isinstance(exc, CancellationRequested):
+                raise _FilesystemWriteNotInvoked(cancellation=exc) from None
+            raise _FilesystemWriteNotInvoked(interruption=type(exc)) from None
+        except Exception:
+            if execution is not None and execution.entered:
+                return self._unknown_effect(spec, "filesystem.uncertain"), None
+            raise _FilesystemWriteNotInvoked() from None
+        finally:
+            if execution is not None:
+                execution.active = False
+
     def _current_policy_decision(
         self,
         tool_spec: ToolSpec,
@@ -1531,6 +1592,11 @@ class ToolExecutor:
         description: str,
     ) -> tuple[Decision, bool]:
         """Return current aggregate policy truth without boolean approval."""
+        filesystem_write = (tool_spec.name == "write_file" and
+                            type(self.registry.get(tool_spec.name)) is WriteFileTool)
+        if filesystem_write and self.policy.level in {PermissionLevel.OBSERVE, PermissionLevel.PROPOSE}:
+            return Decision(Outcome.DENY, "filesystem writes require mutation authority",
+                            capability=Capability.FS_WRITE), False
         authenticated_send_caps = frozenset({Capability.EMAIL_SEND, Capability.NET_WRITE, Capability.CREDENTIAL_ACCESS})
         current_tool = self.registry.get(tool_spec.name) if tool_spec.capabilities == authenticated_send_caps else None
         if type(current_tool) is AuthenticatedActionTool:
@@ -1551,6 +1617,9 @@ class ToolExecutor:
                 tool_spec.capabilities, description=description)
             if not isinstance(decision, Decision):
                 raise TypeError("permission policy returned an invalid decision")
+            if filesystem_write and self.policy.level is PermissionLevel.CONFIRM and decision.allowed:
+                return Decision(Outcome.REQUIRE_APPROVAL, "filesystem write requires durable approval",
+                                capability=Capability.FS_WRITE), True
             return decision, decision.outcome is Outcome.REQUIRE_APPROVAL
         evaluation = self.policy.evaluate_all(tool_spec.capabilities)
         if evaluation.outcome is Outcome.DENY:
@@ -1564,6 +1633,9 @@ class ToolExecutor:
                 capability=capability,
                 required_level=self.policy.required_level(capability),
             ), True
+        if filesystem_write and self.policy.level is PermissionLevel.CONFIRM:
+            return Decision(Outcome.REQUIRE_APPROVAL, "filesystem write requires durable approval",
+                            capability=Capability.FS_WRITE), True
         return Decision(Outcome.ALLOW, "all capabilities permitted"), False
 
     def _authorize_approval(
@@ -3425,20 +3497,27 @@ class ToolExecutor:
                 raise exc.cancellation
             published = self._publish_confirmed_no_effect(
                 store, claimed, attempt_status=ActionAttemptStatus.NOT_INVOKED,
-                result_class="gmail.send.not_invoked",
-                summary="The authenticated send provider was not entered.")
+                result_class=("filesystem.not_invoked" if isinstance(exc, _FilesystemWriteNotInvoked)
+                              else "gmail.send.not_invoked"),
+                summary=("The filesystem staging boundary was not entered."
+                         if isinstance(exc, _FilesystemWriteNotInvoked)
+                         else "The authenticated send provider was not entered."))
             if exc.interruption is not None:
                 raise exc.interruption() from None
             return self._published_or_uncertain(
                 tool_spec.name, redacted, published, decision, invocation_id, attempt_id,
-                elapsed(), log, fallback_kind="action_credential_unavailable",
+                elapsed(), log, fallback_kind=("filesystem_write_unavailable"
+                    if isinstance(exc, _FilesystemWriteNotInvoked) else "action_credential_unavailable"),
                 fallback_action_id=claimed.action_id)
         except _CurrentAuthorityBlocked as exc:
-            if type(tool) is AuthenticatedActionTool:
+            if type(tool) in {AuthenticatedActionTool, WriteFileTool}:
                 published = self._publish_confirmed_no_effect(
                     store, claimed, attempt_status=ActionAttemptStatus.NOT_INVOKED,
-                    result_class="gmail.send.authority_denied",
-                    summary="Current authority prevented entry to the send provider.")
+                    result_class=("filesystem.authority_denied" if type(tool) is WriteFileTool
+                                  else "gmail.send.authority_denied"),
+                    summary=("Current authority prevented entry to filesystem staging."
+                             if type(tool) is WriteFileTool else
+                             "Current authority prevented entry to the send provider."))
                 return self._published_or_uncertain(
                     tool_spec.name, redacted, published, exc.decision or decision,
                     invocation_id, attempt_id, elapsed(), log, fallback_kind=exc.kind,
@@ -3625,6 +3704,12 @@ class ToolExecutor:
                 cancellation: BaseException | None = None
                 if type(tool) is AuthenticatedActionTool:
                     normalized, cancellation = self._run_authenticated_action(
+                        store=store, claimed=claimed, tool=tool, tool_spec=tool_spec,
+                        cleaned=cleaned, adapter=adapter, spec=spec, prepared=prepared,
+                        current_approval_receipt=current_approval_receipt, checkpoint=checkpoint)
+                    return normalized, cancellation, final_decision
+                if type(tool) is WriteFileTool:
+                    normalized, cancellation = self._run_filesystem_write(
                         store=store, claimed=claimed, tool=tool, tool_spec=tool_spec,
                         cleaned=cleaned, adapter=adapter, spec=spec, prepared=prepared,
                         current_approval_receipt=current_approval_receipt, checkpoint=checkpoint)

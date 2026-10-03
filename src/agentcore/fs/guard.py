@@ -13,7 +13,7 @@ checks, special-file checks or bounds.
 
 The authoritative security ordering
 -----------------------------------
-Every filesystem access goes through these steps, in this order, in exactly
+Every filesystem read goes through these steps, in this order, in exactly
 one place (:meth:`WorkspaceGuard.open_file`). A tool must not re-implement or
 reorder any of them::
 
@@ -53,6 +53,11 @@ TOCTOU is therefore **reduced, not eliminated**. What is still not guaranteed:
   size-bounded file that the descriptor itself vouches for.
 
 These limits are asserted by tests so they cannot be quietly overstated later.
+
+Create-only mutation uses the separate guard-owned descriptor/handle-relative
+boundary in ``fs.mutation``. Its explicit host trust boundary and durability
+limits are documented in ``docs/architecture/filesystem-write-v1.md``; it does
+not inherit this read path's pathname-only containment as its write authority.
 """
 
 from __future__ import annotations
@@ -159,6 +164,18 @@ class WorkspaceGuard:
         and is treated as a match so old state keeps loading.
         """
         return identity is None or identity == self.identity
+
+    def prepare_create(self, requested: Any) -> dict[str, Any]:
+        from agentcore.fs.mutation import prepare
+        return prepare(self, requested)
+
+    def create_file(self, intent: Any, data: bytes, validate: Any) -> str:
+        from agentcore.fs.mutation import create
+        return create(self, intent, data, validate)
+
+    def observe_create(self, intent: Any, size: int) -> str | None:
+        from agentcore.fs.mutation import observe
+        return observe(self, intent, size)
 
     # -- containment -------------------------------------------------------
     def resolve_relative(self, requested: Any) -> SafePath:

@@ -903,7 +903,7 @@ def test_documented_toctou_limitation_is_stated():
 # ===========================================================================
 
 def test_guard_exposes_no_write_operations():
-    """The primitive must not offer a way to mutate the filesystem."""
+    """Only the explicitly enabled bounded create foundation may mutate."""
     public = [n for n in dir(WorkspaceGuard) if not n.startswith("_")]
     forbidden = ("write", "unlink", "delete", "remove", "mkdir", "rmdir",
                  "rename", "chmod", "touch", "copy", "move", "truncate")
@@ -911,8 +911,8 @@ def test_guard_exposes_no_write_operations():
         assert not any(word in name.lower() for word in forbidden), name
 
 
-def test_guard_source_never_calls_write_apis():
-    """AST scan: the fs package must not reference mutating filesystem APIs.
+def test_read_primitives_never_call_write_apis():
+    """AST scan: read/path primitives do not call mutating filesystem APIs.
 
     Textual matching was previously shown to be too weak (it matches
     docstrings), so this walks the parsed tree and inspects attribute names.
@@ -926,6 +926,10 @@ def test_guard_source_never_calls_write_apis():
     package_dir = Path(fs_pkg.__file__).parent
     offenders = []
     for path in sorted(package_dir.glob("*.py")):
+        # V1 explicitly adds the guard-owned mutation boundary. Keep the
+        # structural read guarantee on every pre-existing filesystem module.
+        if path.name in {"mutation.py", "_windows_mutation.py"}:
+            continue
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.Attribute) and node.attr in banned:
