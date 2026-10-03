@@ -26,6 +26,7 @@ Two rules govern the design:
 
 from __future__ import annotations
 
+import errno
 import inspect
 import json
 from dataclasses import dataclass, field
@@ -399,6 +400,10 @@ class ConversationRuntime:
                 # Supplied in-memory sessions historically accept IDs that
                 # storage cannot address; persistence remains best-effort.
                 exists = False
+            except OSError as error:
+                if error.errno != errno.ENAMETOOLONG:
+                    raise
+                exists = False  # This supplied ID cannot address a saved file.
             if exists:
                 self._load_session(session.id)
         # Streaming is explicit and requires real turn ownership.  Check this

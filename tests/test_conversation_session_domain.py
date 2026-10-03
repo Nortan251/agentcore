@@ -1,5 +1,6 @@
 """Browser history never enters ordinary Agent, even through storage aliases."""
 
+import errno
 import json
 import multiprocessing
 import os
@@ -14,6 +15,7 @@ from agentcore import cli
 from agentcore.browser import BrowserAgentComposition, BrowserConfig
 from agentcore.browser.backend import PageText
 from agentcore.conversation.errors import SessionDomainError
+from agentcore.conversation.runtime import ConversationRuntime
 from agentcore.conversation.session import (
     BROWSER_SESSION_MARKER, ConversationSession, InMemorySessionStore, JsonFileSessionStore,
 )
@@ -56,6 +58,33 @@ def ordinary_agent(tmp_path, directory):
 def assert_no_ordinary_work(model, tools, spies):
     assert model.requests == [] and tools == []
     assert all(spy.calls == [] for spy in spies)
+
+
+@pytest.mark.parametrize("failure,allowed", [
+    (OSError(errno.ENAMETOOLONG, "synthetic unaddressable ID"), True),
+    (PermissionError(errno.EACCES, "synthetic permission denial"), False),
+    (OSError(errno.EIO, "synthetic lookup uncertainty"), False),
+    (SessionDomainError("conversation_session_domain_mismatch"), False),
+])
+def test_supplied_session_lookup_only_ignores_unaddressable_ids(tmp_path, monkeypatch, failure, allowed):
+    store = JsonFileSessionStore(tmp_path / "ordinary")
+    model = FakeModel("normal reply")
+    runtime = ConversationRuntime(model=model, sessions=store)
+    session = runtime.start()
+    before = session.to_dict()
+
+    def exists(*args):
+        raise failure
+
+    monkeypatch.setattr(store, "exists", exists)
+    if allowed:
+        result = runtime.send("ordinary turn", session=session)
+        assert result.ok and model.requests
+    else:
+        with pytest.raises(type(failure)):
+            runtime.send("ordinary turn", session=session)
+        assert model.requests == [] and session.to_dict() == before
+    assert list(store.directory.glob("*.json")) == []
 
 
 @pytest.mark.parametrize("storage", ["json", "memory"])
