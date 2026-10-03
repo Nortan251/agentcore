@@ -105,3 +105,137 @@ def test_text_size_bound_and_repeat_fresh_document():
         assert len(page.text) <= 48 and page.truncated
     finally:
         backend.close()
+
+
+@pytest.fixture(scope="module")
+def compatibility_renderer():
+    # Keep new real tests in this existing Chromium CI selection. Each render
+    # still creates a fresh offline context in the production adapter.
+    backend = PlaywrightBackend(BrowserConfig())
+    try:
+        backend.start()
+        yield backend
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize("kind", ("python", "search"))
+def test_compatibility_modern_static_projection(compatibility_renderer, kind):
+    from test_browser_response_compatibility import Transport, modern_page
+
+    document = Transport([modern_page(kind)]).run()
+    backend = compatibility_renderer
+    backend.render_document(document.html)
+    text = backend.extract_text()
+    links = backend.list_links()
+    if kind == "python":
+        assert "Readable static page" in text.text
+        assert len(text.text) == 8000 and text.truncated
+        assert len(links.links) == 50 and links.truncated
+        assert [link.url for link in links.links] == [f"/topic/{i}" for i in range(50)]
+    else:
+        assert text.text.strip() == "Enable JavaScript to search."
+        assert not text.truncated and not links.links
+        assert "SCRIPT_EXECUTED" not in text.text
+
+
+@pytest.mark.parametrize("size", (64 * 1024, 128 * 1024, 255 * 1024, 262143, 262144))
+def test_compatibility_accepted_body_reaches_output_projection(compatibility_renderer, size):
+    from test_browser_response_compatibility import Transport, html_body, wire
+
+    document = Transport([wire(html_body(size))]).run()
+    compatibility_renderer.render_document(document.html)
+    result = compatibility_renderer.extract_text()
+    assert "Readable static page" in result.text
+    assert len(result.text) == 8000 and result.truncated
+
+
+@pytest.mark.parametrize("delta", (-1, 0, 1))
+def test_compatibility_dom_count_boundary(delta):
+    from agentcore.browser.playwright_backend import _check_render_source
+
+    config = BrowserConfig()
+    # Document + html + head + body = 4; each empty i adds one element.
+    # No whitespace/text/doctype nodes obscure the exact N-1/N/N+1 count.
+    source = "<html><head></head><body>" + "<i></i>" * (config.max_dom_nodes + delta - 4) + "</body></html>"
+    _check_render_source(config, source)
+    assert len(source.encode()) < config.max_body_bytes
+    backend = PlaywrightBackend(config)
+    try:
+        backend.start()
+        if delta <= 0:
+            backend.render_document(source)
+            assert backend.extract_text().text == ""
+        else:
+            with pytest.raises(BrowserError) as caught:
+                backend.render_document(source)
+            # Source validated before IPC; this inert, sub-body-cap document
+            # can reach SIZE only at the worker's post-parse _DOM_COUNT guard.
+            assert caught.value.failure is BrowserFailure.SIZE
+            assert str(caught.value) == BrowserFailure.SIZE.value
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize("delta", (-1, 0, 1))
+@pytest.mark.parametrize("multibyte", (False, True), ids=("ascii", "utf8-bytes"))
+def test_compatibility_renderer_source_boundary(compatibility_renderer, delta, multibyte):
+    from test_browser_response_compatibility import generated_source
+
+    config = BrowserConfig()
+    source = generated_source(config.render_source_limit + delta, multibyte)
+    backend = compatibility_renderer
+    if delta <= 0:
+        backend.render_document(source)
+        result = backend.extract_text()
+        assert len(result.text) == config.max_text_chars and result.truncated
+    else:
+        with pytest.raises(BrowserError) as caught:
+            backend.render_document(source)
+        assert caught.value.failure is BrowserFailure.SIZE
+        assert str(caught.value) == BrowserFailure.SIZE.value
+
+
+@pytest.mark.parametrize("bound", ("text", "title", "label", "links"))
+@pytest.mark.parametrize("delta", (-1, 0, 1))
+def test_compatibility_output_boundary(compatibility_renderer, bound, delta):
+    backend = compatibility_renderer
+    config = BrowserConfig()
+    limit = {"text": config.max_text_chars, "title": config.max_title_chars,
+             "label": config.max_link_text_chars, "links": config.max_links}[bound]
+    size = limit + delta
+    source = {
+        "text": "<p>" + "T" * size + "</p>",
+        "title": "<title>" + "T" * size + "</title>",
+        "label": '<a href="/topic">' + "L" * size + "</a>",
+        "links": "".join(f'<a href="/topic/{i}">Topic</a>' for i in range(size)),
+    }[bound]
+    backend.render_document(source)
+    if bound == "text":
+        result = backend.extract_text()
+        assert result.text == "T" * min(size, limit)
+        assert result.truncated is (delta > 0)
+    elif bound == "title":
+        assert backend.current_page().title == "T" * min(size, limit)
+    elif bound == "label":
+        assert backend.list_links().links[0].text == "L" * min(size, limit)
+    else:
+        result = backend.list_links()
+        assert len(result.links) == min(size, limit)
+        assert result.truncated is (delta > 0)
+
+
+@pytest.mark.parametrize("cut,expected", (
+    ("<p>Readable prefix</p><script", "Readable prefix"),
+    ("<p>Readable prefix</p><scr", "Readable prefix"),
+    ("<p>Readable prefix</p><script>Hidden text", "Readable prefix"),
+))
+def test_compatibility_truncation_can_change_dom(compatibility_renderer, cut, expected):
+    # Evidence only, never a new fetch truncation policy. Cutting inside markup
+    # loses elements/text; raw-text script EOF keeps following text hidden.
+    complete = '<p>Readable prefix</p><script>Hidden text</script><p>Readable suffix</p>'
+    backend = compatibility_renderer
+    backend.render_document(complete)
+    assert backend.extract_text().text == "Readable prefix\n\nReadable suffix"
+    backend.render_document(cut)
+    assert backend.extract_text().text == expected
