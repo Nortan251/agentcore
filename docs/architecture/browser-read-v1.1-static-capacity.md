@@ -9,7 +9,7 @@ it adds no interactive browsing capability or authority.
 
 | Bound | Pre-v1.1 default | v1.1 default | Host configuration ceiling |
 | --- | ---: | ---: | ---: |
-| Individual response header/status line, including CRLF | 8,192 bytes | 24,576 bytes | 32,768 bytes |
+| Individual response header/status line, including CRLF | 8,192 bytes | 24,576 bytes | 24,576 bytes |
 | Complete fetched body | 262,144 bytes | 2,097,152 bytes | 2,097,152 bytes |
 | Derived renderer source, UTF-8 bytes and characters | 1,572,880 | 12,582,928 | `max_body_bytes * 6 + 16` |
 

@@ -31,7 +31,7 @@ def test_static_capacity_config_preserves_positional_constructor():
     assert config.render_source_limit == 262144 * 6 + 16
 
 
-@pytest.mark.parametrize("field,ceiling", (("max_header_line_bytes", 32768), ("max_body_bytes", 2097152)))
+@pytest.mark.parametrize("field,ceiling", (("max_header_line_bytes", 24576), ("max_body_bytes", 2097152)))
 @pytest.mark.parametrize("delta", (-1, 0, 1))
 def test_static_capacity_config_ceiling(field, ceiling, delta):
     config = BrowserConfig(**{field: ceiling + delta})
@@ -43,8 +43,9 @@ def test_static_capacity_config_ceiling(field, ceiling, delta):
 
 
 @pytest.mark.parametrize("field", ("max_header_line_bytes", "max_body_bytes"))
-def test_static_capacity_config_minimum(field):
-    BrowserConfig(**{field: 1}).validate()
+@pytest.mark.parametrize("value", (1, 8192))
+def test_static_capacity_config_minimum_and_lower_values(field, value):
+    BrowserConfig(**{field: value}).validate()
 
 
 @pytest.mark.parametrize("field", ("max_header_line_bytes", "max_body_bytes"))

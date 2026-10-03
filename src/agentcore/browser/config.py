@@ -42,7 +42,7 @@ class BrowserConfig:
                               ("max_url_chars", 2048), ("max_title_chars", 256),
                               ("max_link_text_chars", 256), ("max_dom_nodes", 10000),
                               ("max_body_bytes", 2 * 1024 * 1024),
-                              ("max_header_line_bytes", 32 * 1024)):
+                              ("max_header_line_bytes", 24 * 1024)):
             value = getattr(self, name)
             if type(value) is not int or not 1 <= value <= ceiling:
                 raise ConfigError("browser bound is invalid", field=name)
