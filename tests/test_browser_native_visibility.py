@@ -1,10 +1,13 @@
 """Permanent real-Chromium acceptance corpus for original-source rendering."""
 
+from contextlib import contextmanager
 import os
+import sys
 
 import pytest
 
 from agentcore.browser.config import BrowserConfig
+from agentcore.browser.backend import PageText
 from agentcore.browser.errors import BrowserError, BrowserFailure
 from agentcore.browser.playwright_backend import PlaywrightBackend, _DOCUMENT_URL
 
@@ -107,10 +110,10 @@ def test_text_size_bound_and_repeat_fresh_document():
         backend.close()
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function")
 def compatibility_renderer():
-    # Keep new real tests in this existing Chromium CI selection. Each render
-    # still creates a fresh offline context in the production adapter.
+    # One owner per test, including DOM cases. Pytest completes this teardown
+    # before the next test can start an independent renderer.
     backend = PlaywrightBackend(BrowserConfig())
     try:
         backend.start()
@@ -151,7 +154,7 @@ def test_compatibility_accepted_body_reaches_output_projection(compatibility_ren
 
 
 @pytest.mark.parametrize("delta", (-1, 0, 1))
-def test_compatibility_dom_count_boundary(delta):
+def test_compatibility_dom_count_boundary(delta, compatibility_renderer):
     from agentcore.browser.playwright_backend import _check_render_source
 
     config = BrowserConfig()
@@ -160,21 +163,63 @@ def test_compatibility_dom_count_boundary(delta):
     source = "<html><head></head><body>" + "<i></i>" * (config.max_dom_nodes + delta - 4) + "</body></html>"
     _check_render_source(config, source)
     assert len(source.encode()) < config.max_body_bytes
-    backend = PlaywrightBackend(config)
-    try:
-        backend.start()
-        if delta <= 0:
+    backend = compatibility_renderer
+    if delta <= 0:
+        backend.render_document(source)
+        assert backend.extract_text().text == ""
+    else:
+        with pytest.raises(BrowserError) as caught:
             backend.render_document(source)
-            assert backend.extract_text().text == ""
-        else:
-            with pytest.raises(BrowserError) as caught:
-                backend.render_document(source)
-            # Source validated before IPC; this inert, sub-body-cap document
-            # can reach SIZE only at the worker's post-parse _DOM_COUNT guard.
-            assert caught.value.failure is BrowserFailure.SIZE
-            assert str(caught.value) == BrowserFailure.SIZE.value
-    finally:
-        backend.close()
+        # Source validated before IPC; this inert, sub-body-cap document
+        # can reach SIZE only at the worker's post-parse _DOM_COUNT guard.
+        assert caught.value.failure is BrowserFailure.SIZE
+        assert str(caught.value) == BrowserFailure.SIZE.value
+
+
+def test_compatibility_renderer_lifecycle(monkeypatch):
+    active = None
+    events = []
+
+    class Backend:
+        def __init__(self, _config):
+            self.started = False
+
+        def start(self):
+            nonlocal active
+            assert active is None, "compatibility renderer owners overlap"
+            active = self
+            self.started = True
+            events.append("start")
+
+        def render_document(self, _source):
+            assert active is self
+
+        def extract_text(self):
+            assert active is self
+            return PageText("")
+
+        def close(self):
+            nonlocal active
+            if self.started:
+                assert active is self
+                active = None
+                self.started = False
+                events.append("close")
+
+    # Instrument the actual fixture construction seam and execute the actual
+    # DOM path, without launching a process or relying on pytest test order.
+    monkeypatch.setattr(sys.modules[__name__], "PlaywrightBackend", Backend)
+    renderer = contextmanager(compatibility_renderer.__wrapped__)
+    for delta in (-1, 0):
+        with renderer() as backend:
+            test_compatibility_dom_count_boundary(delta, backend)
+        assert active is None
+    assert events == ["start", "close", "start", "close"]
+    # Support both pytest fixture-marker representations and check lifetime.
+    marker = getattr(compatibility_renderer, "_fixture_function_marker", None)
+    if marker is None:
+        marker = compatibility_renderer._pytestfixturefunction
+    assert marker.scope == "function"
 
 
 @pytest.mark.parametrize("delta", (-1, 0, 1))
