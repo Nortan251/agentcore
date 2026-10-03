@@ -106,15 +106,16 @@ def _connect(target, timeout, socket_factory=socket.socket, tls_factory=_tls_con
         raise
 
 
-def _line(stream, remaining):
-    line = stream.readline(min(8192, remaining) + 1)
-    if not line.endswith(b"\r\n") or len(line) > min(8192, remaining):
+def _line(stream, remaining, cap=8192):
+    limit = min(cap, remaining)
+    line = stream.readline(limit + 1)
+    if not line.endswith(b"\r\n") or len(line) > limit:
         raise BrowserError(BrowserFailure.RESPONSE)
     return line
 
 
-def _headers(stream):
-    status_line = _line(stream, _MAX_HEADER_BYTES)
+def _headers(stream, line_cap):
+    status_line = _line(stream, _MAX_HEADER_BYTES, line_cap)
     match = _STATUS.fullmatch(status_line)
     if match is None:
         raise BrowserError(BrowserFailure.RESPONSE)
@@ -123,7 +124,7 @@ def _headers(stream):
     headers = {}
     count = 0
     while True:
-        line = _line(stream, remaining)
+        line = _line(stream, remaining, line_cap)
         remaining -= len(line)
         if line == b"\r\n":
             break
@@ -203,7 +204,7 @@ def _exchange(target, method, config, *, connector=_connect):
                    "Accept-Encoding: identity\r\nConnection: close\r\n\r\n")
         sock.sendall(request.encode("ascii"))
         with sock.makefile("rb") as stream:
-            status, headers = _headers(stream)
+            status, headers = _headers(stream, config.max_header_line_bytes)
             if status in _REDIRECTS:
                 # No automatic redirect, cookie, authorization or body replay.
                 return status, headers.get("location"), None

@@ -256,6 +256,20 @@ def test_hard_denial_before_any_browser_io(name):
     session.close()
 
 
+@pytest.mark.parametrize("name", ["browser_open_url", "browser_current_page", "browser_extract_text", "browser_list_links"])
+@pytest.mark.parametrize("bound", ["max_header_line_bytes", "max_body_bytes"])
+def test_static_capacity_model_cannot_choose_host_bounds(name, bound):
+    backend, session, _, executor, _ = components()
+    args = {"url": "https://example.com/"} if name == "browser_open_url" else {}
+    args[bound] = 1
+    try:
+        result = executor.invoke(name, args)
+        assert result.result.metadata["kind"] == "validation"
+        assert backend.calls == []
+    finally:
+        session.close()
+
+
 def test_registration_allowlist_cannot_initialize_provider():
     backend = FakeBackend()
     session = BrowserSession(backend, config=BrowserConfig(enabled=True))

@@ -10,6 +10,8 @@ from agentcore.browser.config import BrowserConfig
 from agentcore.browser.backend import PageText
 from agentcore.browser.errors import BrowserError, BrowserFailure
 from agentcore.browser.playwright_backend import PlaywrightBackend, _DOCUMENT_URL
+from test_browser_response_compatibility import CONFIG as LEGACY_CONFIG
+from test_browser_playwright_integration import local_server, _assert_owned_processes_terminated
 
 pytestmark = pytest.mark.skipif(os.environ.get("AGENTCORE_BROWSER_INTEGRATION") != "1",
                                reason="explicit real Chromium integration gate")
@@ -114,7 +116,7 @@ def test_text_size_bound_and_repeat_fresh_document():
 def compatibility_renderer():
     # One owner per test, including DOM cases. Pytest completes this teardown
     # before the next test can start an independent renderer.
-    backend = PlaywrightBackend(BrowserConfig())
+    backend = PlaywrightBackend(LEGACY_CONFIG)
     try:
         backend.start()
         yield backend
@@ -157,7 +159,7 @@ def test_compatibility_accepted_body_reaches_output_projection(compatibility_ren
 def test_compatibility_dom_count_boundary(delta, compatibility_renderer):
     from agentcore.browser.playwright_backend import _check_render_source
 
-    config = BrowserConfig()
+    config = LEGACY_CONFIG
     # Document + html + head + body = 4; each empty i adds one element.
     # No whitespace/text/doctype nodes obscure the exact N-1/N/N+1 count.
     source = "<html><head></head><body>" + "<i></i>" * (config.max_dom_nodes + delta - 4) + "</body></html>"
@@ -227,7 +229,7 @@ def test_compatibility_renderer_lifecycle(monkeypatch):
 def test_compatibility_renderer_source_boundary(compatibility_renderer, delta, multibyte):
     from test_browser_response_compatibility import generated_source
 
-    config = BrowserConfig()
+    config = LEGACY_CONFIG
     source = generated_source(config.render_source_limit + delta, multibyte)
     backend = compatibility_renderer
     if delta <= 0:
@@ -245,7 +247,7 @@ def test_compatibility_renderer_source_boundary(compatibility_renderer, delta, m
 @pytest.mark.parametrize("delta", (-1, 0, 1))
 def test_compatibility_output_boundary(compatibility_renderer, bound, delta):
     backend = compatibility_renderer
-    config = BrowserConfig()
+    config = LEGACY_CONFIG
     limit = {"text": config.max_text_chars, "title": config.max_title_chars,
              "label": config.max_link_text_chars, "links": config.max_links}[bound]
     size = limit + delta
@@ -284,3 +286,93 @@ def test_compatibility_truncation_can_change_dom(compatibility_renderer, cut, ex
     assert backend.extract_text().text == "Readable prefix\n\nReadable suffix"
     backend.render_document(cut)
     assert backend.extract_text().text == expected
+
+
+@pytest.fixture(scope="function")
+def static_capacity_renderer():
+    backend = PlaywrightBackend(BrowserConfig())
+    try:
+        backend.start()
+        yield backend
+    finally:
+        backend.close()
+        _assert_owned_processes_terminated(backend)
+
+
+@pytest.mark.parametrize("kind", ("wikipedia", "python"))
+def test_static_capacity_modern_projection(static_capacity_renderer, kind):
+    from test_browser_response_compatibility import Transport, modern_page
+
+    document = Transport([modern_page(kind)]).run(BrowserConfig())
+    backend = static_capacity_renderer
+    backend.render_document(document.html)
+    assert backend.current_page().title == "Static fixture"
+    text, links = backend.extract_text(), backend.list_links()
+    assert "Readable static page" in text.text
+    assert len(text.text) == 8000 and text.truncated
+    assert len(links.links) == 50 and links.truncated
+    assert [link.url for link in links.links] == [f"/topic/{i}" for i in range(50)]
+
+
+@pytest.mark.parametrize("delta", (-1, 0))
+def test_static_capacity_near_max_html(static_capacity_renderer, delta):
+    from test_browser_response_compatibility import Transport, html_body, wire
+
+    config = BrowserConfig()
+    body = html_body(config.max_body_bytes + delta, anchors=60)
+    document = Transport([wire(body)]).run(config)
+    assert document.html.encode("ascii") == body
+    backend = static_capacity_renderer
+    backend.render_document(document.html)
+    text, links = backend.extract_text(), backend.list_links()
+    assert len(text.text) == 8000 and text.truncated
+    assert len(links.links) == 50 and links.truncated
+
+
+@pytest.mark.parametrize("delta", (-1, 0, 1))
+def test_static_capacity_dom_count_boundary(static_capacity_renderer, delta):
+    # Same native parsing/count guard as the historical corpus, new defaults.
+    config = BrowserConfig()
+    source = "<html><head></head><body>" + "<i></i>" * (config.max_dom_nodes + delta - 4) + "</body></html>"
+    assert len(source.encode("utf-8")) < 100_000 < config.max_body_bytes
+    if delta <= 0:
+        static_capacity_renderer.render_document(source)
+        assert static_capacity_renderer.extract_text().text == ""
+    else:
+        with pytest.raises(BrowserError) as error:
+            static_capacity_renderer.render_document(source)
+        assert error.value.failure is BrowserFailure.SIZE
+
+
+def test_static_capacity_plaintext_real_worst_escape(static_capacity_renderer):
+    from test_browser_render_source_bound import _plain_document
+
+    config = BrowserConfig()
+    document = _plain_document(b"'" * config.max_body_bytes, "utf-8", config)
+    assert len(document.html.encode("utf-8")) == 12_582_923
+    static_capacity_renderer.render_document(document.html)
+    text = static_capacity_renderer.extract_text()
+    assert text.text == "'" * 8000 and text.truncated
+    assert static_capacity_renderer.list_links().links == ()
+
+
+def test_static_capacity_large_document_keeps_resources_inert(static_capacity_renderer, local_server):
+    from test_browser_response_compatibility import Transport, wire
+
+    port, hits = local_server
+    config = BrowserConfig()
+    prefix = (f'<html><head><title>INERT</title><link rel="stylesheet" href="http://127.0.0.1:{port}/style">'
+              f'<style>@font-face{{font-family:fixture;src:url(http://127.0.0.1:{port}/font)}}'
+              'body{font-family:fixture}</style></head><body>'
+              f'<script>document.title="SCRIPT_EXECUTED";fetch("http://127.0.0.1:{port}/script");'
+              f'new WebSocket("ws://127.0.0.1:{port}/socket");</script>'
+              f'<img src="http://127.0.0.1:{port}/image"><iframe src="http://127.0.0.1:{port}/frame"></iframe>'
+              f'<video src="http://127.0.0.1:{port}/video"></video><p>').encode("ascii")
+    suffix = b"</p></body></html>"
+    body = prefix + b"T" * (config.max_body_bytes - len(prefix) - len(suffix)) + suffix
+    document = Transport([wire(body)]).run(config)
+    static_capacity_renderer.render_document(document.html)
+    assert static_capacity_renderer.current_page().title == "INERT"
+    text = static_capacity_renderer.extract_text()
+    assert text.text == "T" * 8000 and text.truncated
+    assert hits == []

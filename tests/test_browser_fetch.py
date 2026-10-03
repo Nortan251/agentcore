@@ -62,7 +62,7 @@ def document(url="https://example.com/path?secret=QUERY", *, addresses=("8.8.8.8
         def wrap_socket(self, sock, server_hostname):
             sock.sni = server_hostname
             return sock
-    config = BrowserConfig(max_body_bytes=cap)
+    config = BrowserConfig(max_body_bytes=cap, max_header_line_bytes=8192)
     exchange = lambda target, method, config: fetch._exchange(target, method, config, connector=connector)
     result = fetch._fetch_document(url, "GET", config, resolver=resolver, exchange=exchange)
     return result, sockets, resolved

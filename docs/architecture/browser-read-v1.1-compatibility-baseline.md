@@ -3,7 +3,11 @@
 Authoritative base: `f4e544b52d0f4676ecb96903efee8699d8ce847b`.
 This is characterization, not a production compatibility change. Synthetic
 fixtures model response classes; they are not scraped pages or claims about
-current public sites. All limits below are the unchanged default configuration.
+current public sites. All limits below record the pre-v1.1 default configuration;
+the characterization corpus retains explicit legacy header/body settings.
+See [v1.1 static capacity](browser-read-v1.1-static-capacity.md) for the subsequent
+bounded production capacity change. Measurements and conclusions below remain
+historical evidence.
 
 ## Evidence and measurement
 
