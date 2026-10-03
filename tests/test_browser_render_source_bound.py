@@ -1,6 +1,7 @@
 """Plaintext expansion remains bounded without rejecting accepted raw bodies."""
 
 import io
+import functools
 import multiprocessing
 import os
 
@@ -102,18 +103,68 @@ def test_renderer_worker_uses_same_generated_source_bound():
     _check_render_source(config, "<pre>" + "&amp;" * 32 + "</pre>")
 
 
+@pytest.mark.parametrize("delta", (-1, 0, 1))
+@pytest.mark.parametrize("multibyte", (False, True), ids=("ascii", "utf8-bytes"))
+def test_static_capacity_source_boundary(delta, multibyte):
+    from test_browser_response_compatibility import generated_source
+
+    config = BrowserConfig()
+    assert config.render_source_limit == 12_582_928
+    source = generated_source(config.render_source_limit + delta, multibyte)
+    assert len(source.encode("utf-8")) == config.render_source_limit + delta
+    if delta <= 0:
+        _check_render_source(config, source)
+    else:
+        backend = PlaywrightBackend(config)
+        with pytest.raises(BrowserError) as error:
+            backend.render_document(source)
+        assert error.value.failure is BrowserFailure.SIZE
+        assert backend._worker is None  # parent rejects before starting/IPC
+
+
+@pytest.mark.parametrize("delta", (-1, 0, 1))
+@pytest.mark.parametrize("multibyte", (False, True), ids=("ascii", "utf8-bytes"))
+def test_static_capacity_broker_source_boundary(delta, multibyte):
+    from test_browser_response_compatibility import generated_source_worker
+
+    config = BrowserConfig()
+    broker = SafeFetchBroker(config, _worker_target=functools.partial(
+        generated_source_worker, delta=delta, multibyte=multibyte))
+    if delta <= 0:
+        document = broker.fetch("https://example.com/start")
+        assert len(document.html.encode("utf-8")) == config.render_source_limit + delta
+    else:
+        with pytest.raises(BrowserError) as error:
+            broker.fetch("https://example.com/start")
+        assert error.value.failure is BrowserFailure.SIZE
+
+
+def test_static_capacity_plaintext_worst_escape():
+    config = BrowserConfig()
+    document = _plain_document(b"'" * config.max_body_bytes, "utf-8", config)
+    assert document.html == "<pre>" + "&#x27;" * config.max_body_bytes + "</pre>"
+    assert len(document.html.encode("utf-8")) == 12_582_923
+    assert config.render_source_limit - len(document.html) == 5
+    _check_render_source(config, document.html)
+
+
 @pytest.mark.skipif(os.environ.get("AGENTCORE_BROWSER_INTEGRATION") != "1",
                     reason="explicit real Chromium integration gate")
-def test_worker_rejects_oversized_source_sent_directly_over_ipc():
+@pytest.mark.parametrize("body_cap", (32, 2 * 1024 * 1024))
+@pytest.mark.parametrize("multibyte", (False, True), ids=("ascii", "utf8-bytes"))
+def test_worker_rejects_oversized_source_sent_directly_over_ipc(body_cap, multibyte):
+    from test_browser_response_compatibility import generated_source
+
+    config = BrowserConfig(max_body_bytes=body_cap)
     spawn = multiprocessing.get_context("spawn")
     parent, child = spawn.Pipe()
-    worker = spawn.Process(target=_serve, args=(child, BrowserConfig(max_body_bytes=32)),
+    worker = spawn.Process(target=_serve, args=(child, config),
                            daemon=True)
     try:
         worker.start()
         child.close()
         assert parent.poll(10) and parent.recv() == (True, None)
-        parent.send(("render_document", "x" * 209))
+        parent.send(("render_document", generated_source(config.render_source_limit + 1, multibyte)))
         assert parent.poll(10) and parent.recv() == (False, BrowserFailure.SIZE.value)
     finally:
         parent.close()

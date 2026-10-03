@@ -18,7 +18,8 @@ from agentcore.browser.network import canonical_url
 from agentcore.browser.playwright_backend import _check_render_source
 
 
-CONFIG = BrowserConfig()
+# PR #37's pre-v1.1 characterization remains historical evidence.
+CONFIG = BrowserConfig(max_header_line_bytes=8192, max_body_bytes=262144)
 FETCH_DOCUMENT = fetch._fetch_document
 BODY_MAX = CONFIG.max_body_bytes
 LINE_MAX = 8192  # Includes name, colon, whitespace and CRLF, not just value.
@@ -139,6 +140,7 @@ class Transport:
         self.visited = []
         self.streams = []
         self.body_reads = []
+        self.body_read_sizes = []
         self.requests = []
         self.closed = 0
 
@@ -150,7 +152,9 @@ class Transport:
         class Stream(io.BytesIO):
             def read(self, size=-1):
                 owner.body_reads.append(size)
-                return super().read(size)
+                result = super().read(size)
+                owner.body_read_sizes.append(len(result))
+                return result
 
         stream = Stream(data)
         self.streams.append(stream)
@@ -439,3 +443,179 @@ def test_broker_generated_source_boundary(delta, multibyte):
             broker.fetch("https://example.com/start")
         assert caught.value.failure is BrowserFailure.SIZE
         assert str(caught.value) == BrowserFailure.SIZE.value
+
+
+# v1.1 regressions intentionally use the new defaults, independent of CONFIG.
+STATIC_CONFIG = BrowserConfig()
+
+
+@pytest.mark.parametrize("name", ("Content-Security-Policy", "Permissions-Policy", "Link", "Report-To", "Reporting-Endpoints"))
+@pytest.mark.parametrize("delta", (-1, 0, 1))
+def test_static_capacity_header_line_boundary(name, delta):
+    size = STATIC_CONFIG.max_header_line_bytes + delta
+    transport = Transport([wire(headers=[TYPE, ("Content-Length", str(len(BODY))), large_header(name, size)])])
+    if delta <= 0:
+        assert transport.run(STATIC_CONFIG).html == BODY.decode()
+        assert transport.body_reads == [len(BODY)]
+    else:
+        with pytest.raises(BrowserError) as caught:
+            transport.run(STATIC_CONFIG)
+        assert caught.value.failure is BrowserFailure.RESPONSE
+        assert_site(caught.value, "header-line")
+        assert transport.body_reads == []
+    assert transport.closed == 1
+
+
+@pytest.mark.parametrize("delta", (-1, 0, 1))
+def test_static_capacity_status_line_bound(delta):
+    prefix = b"HTTP/1.1 200 "
+    size = STATIC_CONFIG.max_header_line_bytes + delta
+    status = prefix + b"x" * (size - len(prefix) - 2) + b"\r\n"
+    data = status + wire().split(b"\r\n", 1)[1]
+    transport = Transport([data])
+    if delta <= 0:
+        assert transport.run(STATIC_CONFIG).html == BODY.decode()
+    else:
+        with pytest.raises(BrowserError) as caught:
+            transport.run(STATIC_CONFIG)
+        assert_site(caught.value, "header-line")
+        assert transport.body_reads == []
+
+
+@pytest.mark.parametrize("delta", (-1, 0, 1))
+def test_static_capacity_aggregate_header_boundary(delta):
+    transport = Transport([aggregate_wire(HEADER_MAX + delta)])
+    if delta <= 0:
+        assert transport.run(STATIC_CONFIG).html == BODY.decode()
+    else:
+        with pytest.raises(BrowserError) as caught:
+            transport.run(STATIC_CONFIG)
+        assert_site(caught.value, "aggregate-headers")
+        assert transport.body_reads == []
+
+
+def test_static_capacity_long_lines_cannot_bypass_aggregate_budget():
+    fields = [TYPE, ("Content-Length", str(len(BODY))),
+              large_header("Content-Security-Policy", 20000), large_header("Permissions-Policy", 13000)]
+    assert all(len(f"{name}: {value}\r\n".encode()) <= STATIC_CONFIG.max_header_line_bytes
+               for name, value in fields)
+    transport = Transport([wire(headers=fields)])
+    with pytest.raises(BrowserError) as caught:
+        transport.run(STATIC_CONFIG)
+    assert_site(caught.value, "aggregate-headers")
+    assert transport.body_reads == []
+
+
+@pytest.mark.parametrize("count", (99, 100, 101))
+def test_static_capacity_header_count_boundary(count):
+    transport = Transport([wire(headers=[TYPE, ("Content-Length", str(len(BODY)))]
+                          + [(f"X-{i}", "v") for i in range(count - 2)])])
+    if count <= 100:
+        assert transport.run(STATIC_CONFIG).html == BODY.decode()
+    else:
+        with pytest.raises(BrowserError) as caught:
+            transport.run(STATIC_CONFIG)
+        assert_site(caught.value, "header-count")
+        assert transport.body_reads == []
+
+
+@pytest.mark.parametrize("delta", (-1, 0, 1))
+def test_static_capacity_lower_header_cap(delta):
+    config = BrowserConfig(max_header_line_bytes=8192)
+    transport = Transport([wire(headers=[TYPE, ("Content-Length", str(len(BODY))),
+                           large_header("Content-Security-Policy", 8192 + delta)])])
+    if delta <= 0:
+        assert transport.run(config).html == BODY.decode()
+    else:
+        with pytest.raises(BrowserError) as caught:
+            transport.run(config)
+        assert_site(caught.value, "header-line")
+        assert transport.body_reads == []
+
+
+@pytest.mark.parametrize("cap", (2097152, 262144), ids=("default", "lower-host"))
+@pytest.mark.parametrize("framing", ("length", "chunked", "eof"))
+@pytest.mark.parametrize("delta", (-1, 0, 1))
+def test_static_capacity_body_boundary(cap, framing, delta):
+    config = STATIC_CONFIG if cap == 2097152 else BrowserConfig(max_body_bytes=cap)
+    body = html_body(cap + delta)
+    if framing == "length":
+        data = wire(body)
+    elif framing == "chunked":
+        data = wire(f"{len(body):x}\r\n".encode() + body + b"\r\n0\r\n\r\n",
+                    headers=[TYPE, ("Transfer-Encoding", "chunked")])
+    else:
+        data = wire(body, headers=[TYPE])
+    transport = Transport([data])
+    if delta <= 0:
+        document = transport.run(config)
+        assert document.html == body.decode()
+        _check_render_source(config, document.html)
+    else:
+        with pytest.raises(BrowserError) as caught:
+            transport.run(config)
+        assert caught.value.failure is BrowserFailure.SIZE
+        assert_site(caught.value, {"length": "declared-body-size", "chunked": "chunk-body-size",
+                                  "eof": "eof-body-size"}[framing])
+    if delta > 0 and framing != "eof":
+        assert transport.body_reads == []  # Declared length/chunk payload not consumed.
+    elif framing == "eof":
+        assert transport.body_reads == [cap + 1]
+        assert transport.body_read_sizes == [cap + delta]
+    elif framing == "chunked":
+        assert transport.body_reads == [cap + delta, 2]
+        assert transport.body_read_sizes == [cap + delta, 2]
+    else:
+        assert transport.body_reads == transport.body_read_sizes == [cap + delta]
+    assert transport.closed == 1
+
+
+def test_static_capacity_chunk_crossing_rejected_before_second_payload():
+    cap = STATIC_CONFIG.max_body_bytes
+    first = b"x" * cap
+    transport = Transport([wire(f"{cap:x}\r\n".encode() + first + b"\r\n1\r\nx\r\n0\r\n\r\n",
+                           headers=[TYPE, ("Transfer-Encoding", "chunked")])])
+    with pytest.raises(BrowserError) as caught:
+        transport.run(STATIC_CONFIG)
+    assert caught.value.failure is BrowserFailure.SIZE
+    assert_site(caught.value, "chunk-body-size")
+    assert transport.body_reads == [cap, 2]
+    assert transport.body_read_sizes == [cap, 2]
+
+
+@pytest.mark.parametrize("kind", ("wikipedia", "python", "search", "search-202"))
+def test_static_capacity_modern_responses(kind):
+    data = modern_page(kind)
+    transport = Transport([data])
+    if kind == "search-202":
+        with pytest.raises(BrowserError) as caught:
+            transport.run(STATIC_CONFIG)
+        assert_site(caught.value, "status")
+        assert transport.body_reads == []
+    else:
+        document = transport.run(STATIC_CONFIG)
+        assert document.html.encode() == data.split(b"\r\n\r\n", 1)[1]
+        _check_render_source(STATIC_CONFIG, document.html)
+
+
+@pytest.mark.parametrize("encoding", ("gzip", "deflate", "br", "unknown"))
+def test_static_capacity_compression_still_rejected(encoding):
+    transport = Transport([wire(headers=[TYPE, ("Content-Length", str(len(BODY))),
+                           ("Content-Encoding", encoding)])])
+    with pytest.raises(BrowserError) as caught:
+        transport.run(STATIC_CONFIG)
+    assert_site(caught.value, "encoding")
+    assert transport.body_reads == []
+
+
+@pytest.mark.parametrize("budget", (32, 8192))
+@pytest.mark.parametrize("delta", (-1, 0, 1))
+def test_static_capacity_non_header_line_budgets_unchanged(budget, delta):
+    stream = io.BytesIO(b"x" * (budget + delta - 2) + b"\r\n")
+    if delta <= 0:
+        assert len(fetch._line(stream, budget)) == budget + delta
+    else:
+        with pytest.raises(BrowserError) as caught:
+            fetch._line(stream, budget)
+        assert_site(caught.value, "header-line")
+        assert stream.tell() == budget + 1

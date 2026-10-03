@@ -10,6 +10,50 @@ from agentcore.errors import ConfigError
 from agentcore.tools.base import ToolContext
 
 
+def test_static_capacity_config_defaults_and_independent_bounds():
+    config = BrowserConfig()
+    config.validate()
+    assert config.max_header_line_bytes == 24576
+    assert config.max_body_bytes == 2097152
+    assert config.render_source_limit == 12582928
+    assert (config.max_dom_nodes, config.max_text_chars, config.max_links,
+            config.max_title_chars, config.max_link_text_chars, config.max_url_chars,
+            config.max_redirects, config.operation_timeout_seconds,
+            config.dns_timeout_seconds) == (10000, 8000, 50, 256, 256, 2048, 3, 15.0, 5.0)
+
+
+def test_static_capacity_config_preserves_positional_constructor():
+    config = BrowserConfig(True, 15.0, 8000, 50, 2048, 256, 256, 10000, 262144, 5.0, 3)
+    config.validate()
+    assert config.max_body_bytes == 262144
+    assert config.max_redirects == 3
+    assert config.max_header_line_bytes == 24576
+    assert config.render_source_limit == 262144 * 6 + 16
+
+
+@pytest.mark.parametrize("field,ceiling", (("max_header_line_bytes", 32768), ("max_body_bytes", 2097152)))
+@pytest.mark.parametrize("delta", (-1, 0, 1))
+def test_static_capacity_config_ceiling(field, ceiling, delta):
+    config = BrowserConfig(**{field: ceiling + delta})
+    if delta <= 0:
+        config.validate()
+    else:
+        with pytest.raises(ConfigError):
+            config.validate()
+
+
+@pytest.mark.parametrize("field", ("max_header_line_bytes", "max_body_bytes"))
+def test_static_capacity_config_minimum(field):
+    BrowserConfig(**{field: 1}).validate()
+
+
+@pytest.mark.parametrize("field", ("max_header_line_bytes", "max_body_bytes"))
+@pytest.mark.parametrize("value", (-1, 0, True, False, 1.0, "1024", None))
+def test_static_capacity_config_requires_bounded_exact_int(field, value):
+    with pytest.raises(ConfigError):
+        BrowserConfig(**{field: value}).validate()
+
+
 class FakeBackend:
     network_isolated = True
 

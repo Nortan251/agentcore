@@ -16,9 +16,10 @@ class BrowserConfig:
     max_title_chars: int = 256
     max_link_text_chars: int = 256
     max_dom_nodes: int = 10000
-    max_body_bytes: int = 262144
+    max_body_bytes: int = 2 * 1024 * 1024
     dns_timeout_seconds: float = 5.0
     max_redirects: int = 3
+    max_header_line_bytes: int = 24 * 1024
 
     @property
     def render_source_limit(self) -> int:
@@ -40,7 +41,8 @@ class BrowserConfig:
         for name, ceiling in (("max_text_chars", 8000), ("max_links", 100),
                               ("max_url_chars", 2048), ("max_title_chars", 256),
                               ("max_link_text_chars", 256), ("max_dom_nodes", 10000),
-                              ("max_body_bytes", 262144)):
+                              ("max_body_bytes", 2 * 1024 * 1024),
+                              ("max_header_line_bytes", 32 * 1024)):
             value = getattr(self, name)
             if type(value) is not int or not 1 <= value <= ceiling:
                 raise ConfigError("browser bound is invalid", field=name)
