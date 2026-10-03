@@ -8,6 +8,7 @@ This branch has an independent documentation-only root commit. Its tracked tree 
 
 | PR | Area | Task | Exact head | Status | Handoff |
 |----|------|------|------------|--------|---------|
+| [#39](https://github.com/Nortan251/agentcore/pull/39) | gmail | Windows Gmail authority-test rendezvous hotfix | `d90eeab49b1de149a480351f28756b6291ee9f40` | Open; six green CI jobs and exact-head review; project-lead review required | [PR-0039-windows-rendezvous-hotfix.md](gmail/PR-0039-windows-rendezvous-hotfix.md) |
 | [#38](https://github.com/Nortan251/agentcore/pull/38) | browser | Browser Read v1.1 static capacity | `be7f1a8340b27b8ad41d411673b77806f9142585` | Open; Gmail integration and fresh review pending | [PR-0038-static-capacity.md](browser/PR-0038-static-capacity.md) |
 
 ## Organization
@@ -72,4 +73,4 @@ Include workflow/job IDs when available and the exact reviewed SHA. Mark missing
 
 ## Initial backfill
 
-PR #38 is recorded as an explicitly incomplete integration snapshot. The current Gmail Windows rendezvous hotfix is still in progress; add its handoff after completion using its actual PR number and evidence, and amend PR #38 after integration. Do not reconstruct older tasks from memory. Backfill older important PRs from GitHub evidence only when requested.
+PR #38 is recorded as an explicitly incomplete integration snapshot with a dated amendment. The Gmail Windows rendezvous hotfix is recorded as PR #39 after all six exact-head CI jobs and Codex review passed. Both PRs remain open and unmerged; amend PR #38 after hotfix integration and final validation. Do not reconstruct older tasks from memory. Backfill older important PRs from GitHub evidence only when requested.

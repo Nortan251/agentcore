@@ -101,3 +101,9 @@ Finish the separately scoped Gmail reliability hotfix and record its actual PR/h
 ## Final verdict
 
 Browser capacity repair is documented and ready for Gmail-hotfix integration. PR #38 remains open and unmerged; the overall task is **not complete or ready for merge** at this snapshot. Six current-head green jobs do not remove the outstanding integration and review requirements.
+
+## Amendment — 2026-10-03, 19:17 UTC: separate Gmail hotfix verified
+
+Supersedes only the original snapshot's statement that Gmail-hotfix implementation/verification remains unfinished. [PR #39](https://github.com/Nortan251/agentcore/pull/39) now has six successful exact-head CI jobs, a clean exact-head Codex review and zero inline review threads at `d90eeab49b1de149a480351f28756b6291ee9f40`. See its [classified handoff](../gmail/PR-0039-windows-rendezvous-hotfix.md) for authoritative job/review links and diagnosis limits.
+
+PR #39 is still open and unmerged. PR #38 remains open at `be7f1a8340b27b8ad41d411673b77806f9142585`; this ledger task changed neither implementation PR. Hotfix merge authorization, integration into PR #38, and six green jobs plus a fresh review on the final integrated Browser head remain required. The original failed job's exact trigger remains unknown; green hotfix CI does not retrospectively prove it.
