@@ -242,6 +242,15 @@ def _build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--json", action="store_true", dest="as_json",
                       help="emit the turn as JSON (requires --message)")
 
+    browser = sub.add_parser("browser", help="read explicitly granted web pages")
+    browser.add_argument("--allow-url", action="append", required=True,
+                         metavar="URL", help="grant one exact URL for this turn; repeatable")
+    browser.add_argument("--session", metavar="ID", dest="session_id",
+                         help="resume a browser-only conversation")
+    browser.add_argument("--json", action="store_true", dest="as_json",
+                         help="emit a bounded browser turn summary")
+    browser.add_argument("prompt", help="model input; never navigation authority")
+
     run = sub.add_parser("run", help="plan and run an objective, "
                                      "or continue a persisted run")
     run.add_argument("objective", nargs="?",
@@ -2432,6 +2441,13 @@ def _chat_loop(agent: Any, runtime: Any, session: Any,
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    if args.command == "browser":
+        # Keep even configuration errors inside the browser's categorical output
+        # boundary, before ordinary Agent construction or its logging setup.
+        from agentcore.browser.cli import command_browser
+
+        _quiet_logging()
+        return command_browser(args)
     try:
         config = load_config(args.config)
     except AgentError as exc:

@@ -1247,3 +1247,69 @@ See `agent.example.toml`. Precedence: defaults → TOML → `AGENTCORE_*` env va
 
 Secrets are never stored in config: `model.api_key_env` names an environment
 variable, resolved at call time. Log output redacts key/token/password fields.
+
+## Browser Read from the CLI
+
+Configure a tool-capable model with the existing model settings, for example
+`AGENTCORE_MODEL__PROVIDER=openai`, `AGENTCORE_MODEL__NAME=<model identifier>`
+and `AGENTCORE_MODEL__API_KEY_ENV=OPENAI_API_KEY`. Set the credential in that
+environment variable; never put its value in TOML. Other existing provider
+aliases and their `base_url` settings also work. To select a TOML file, put
+`--config agent.local.toml` before `browser`. The normal loader applies defaults,
+the selected TOML file, then `AGENTCORE_*` environment overrides. No provider
+configured means a categorical error before browser, DNS or model request I/O.
+
+Install the optional browser dependencies and Chromium in your environment:
+
+```sh
+python -m pip install -e '.[browser]'
+python -m playwright install chromium
+```
+
+Manual smoke test with a configured real model (POSIX shell):
+
+```sh
+agentcore browser --allow-url "https://www.python.org/" \
+  "Open python.org and tell me the latest Python news."
+```
+
+Windows CMD single-line equivalent:
+
+```cmd
+agentcore browser --allow-url "https://www.python.org/" "Open python.org and tell me the latest Python news."
+```
+
+The expected flow is model tool selection, SafeFetch retrieval of Python.org,
+offline rendering, bounded page text marked `UNTRUSTED_DATA` in model context,
+then a natural-language reply. Human output contains only the final reply;
+operator failures produce a single categorical error line on stderr.
+
+`--allow-url` may be repeated, up to the existing 16-grant authority limit.
+Each grant applies only to this turn and that full canonical URL (including
+path and query; fragments are equivalent). Prompt URLs, discovered links and
+persisted history never authorize navigation. To open a discovered link, the
+operator must explicitly grant its exact URL on a later invocation. Existing
+broker-checked server redirects retain the v1 behavior.
+
+Use `--json` for a bounded object with `ok`, `session_id`, `reply` (at most
+8,000 characters), `tools_executed` (successful calls), and a categorical
+`error` on failure. A failed tool proposal makes the command fail even if the
+model subsequently supplies a reply. Cleanup uncertainty overrides success.
+Raw tool arguments and internal exception details are never rendered.
+
+Each invocation without `--session` starts a new browser conversation.
+Use the ID from JSON output with `--session ID` to resume. Transcripts live
+only in `<workspace_dir>/.browser_sessions`, independently of ordinary chat's
+configured directory. Missing, malformed or non-browser sessions are refused;
+there is no ordinary Agent fallback. Browser sessions must never be replayed
+into ordinary Agent chat. Session history retains bounded untrusted page data;
+navigation grants are revoked after every turn and are never persisted.
+The catalogue contains only `browser_open_url`, `browser_current_page`,
+`browser_extract_text` and `browser_list_links`; host-selected browser defaults
+remain unchanged. `PermissionPolicy` still evaluates `NET_READ` for each call.
+
+Known v1 compatibility limits (not repaired by this milestone): Google Search
+may return a JavaScript fallback; DuckDuckGo HTML returned HTTP 202, rejected
+by the current 200-only page contract; Wikipedia can exceed strict header/body
+bounds. Python.org works with real text and link extraction. No HTTP, header
+or body limits were raised. See the [Browser Read architecture](docs/architecture/browser-read-foundation.md).
