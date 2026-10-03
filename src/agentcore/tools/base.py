@@ -23,7 +23,7 @@ import re
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
 from agentcore.errors import ToolValidationError
-from agentcore.permissions.levels import Capability
+from agentcore.permissions.levels import Capability, READ_ONLY_CAPABILITIES
 
 if TYPE_CHECKING:
     from agentcore.credentials.action import CredentialActionExecution
@@ -95,6 +95,11 @@ class ToolSpec:
     read_only: bool = True
     version: str = "1.0.0"
     tags: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        # Tags are host-owned metadata. Detach mutable constructor inputs so
+        # privacy classification cannot change through an aliased list.
+        object.__setattr__(self, "tags", tuple(self.tags))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -233,6 +238,23 @@ class Tool(ABC):
                 raise ToolValidationError("argument violates numeric bounds", tool=spec.name, argument=name)
             cleaned[name] = value
         return cleaned
+
+
+class ExternalReadTool(Tool):
+    """Trusted host contract for reads with physical external I/O.
+
+    ToolExecutor pins the evaluated policy identity/generation through run,
+    including worker I/O and cleanup. This contract adds no capability or
+    credential exception and never derives authority from tags or arguments.
+    Implementations must complete their owned I/O before returning from run.
+    """
+
+    def validate_args(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        spec = self.spec
+        if (not spec.read_only or Capability.NET_READ not in spec.capabilities
+                or not spec.capabilities <= READ_ONLY_CAPABILITIES):
+            raise ToolValidationError("invalid external read contract", tool=spec.name)
+        return super().validate_args(args)
 
 
 class FunctionTool(Tool):

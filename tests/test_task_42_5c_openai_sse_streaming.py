@@ -2611,6 +2611,11 @@ def test_native_fragmented_tool_round_uses_existing_executor_then_streams_again(
     assert len(transport.stream_calls) == 2
     assert any(message["role"] == "tool"
                for message in transport.stream_calls[1]["payload"]["messages"])
+    followup = transport.stream_calls[1]["payload"]["messages"]
+    envelope = next(message for message in followup if message.get("tool_calls"))
+    outcome = next(message for message in followup if message["role"] == "tool")
+    assert envelope["tool_calls"][0]["id"] == "call_native_counter"
+    assert outcome["tool_call_id"] == "call_native_counter"
     assert [message.role for message in session.messages] == [
         Role.USER, Role.TOOL, Role.ASSISTANT]
     assert [message.role for message in

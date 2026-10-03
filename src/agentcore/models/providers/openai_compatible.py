@@ -31,6 +31,7 @@ from agentcore.models.messages import (
     FinishReason,
     ModelRequest,
     ModelResponse,
+    Role,
     ToolCall,
     Usage,
 )
@@ -70,6 +71,56 @@ _FINISH_REASONS = {
 }
 
 _SAFE_ERROR_KIND = re.compile(r"^[A-Za-z0-9_]{1,128}$")
+
+
+def _wire_messages(messages: list) -> list[dict[str, Any]]:
+    """Translate and validate one complete neutral tool protocol transcript.
+
+    The call envelope is ephemeral ModelRequest state. Persisted TOOL history
+    has no envelope and must be reframed by the conversation runtime instead
+    of being sent as an orphan wire tool response.
+    """
+    wire: list[dict[str, Any]] = []
+    pending: list[str] = []
+    for message in messages:
+        if message.role is Role.TOOL:
+            identifier = message.tool_call_id
+            if not pending or identifier != pending[0] or message.tool_calls:
+                raise ModelConfigError("Malformed tool message correlation.")
+            pending.pop(0)
+            wire.append({"role": "tool", "tool_call_id": identifier,
+                         "content": message.content})
+            continue
+        if pending or message.tool_call_id is not None:
+            raise ModelConfigError("Malformed tool message correlation.")
+        if message.tool_calls:
+            if message.role is not Role.ASSISTANT or len(message.tool_calls) > 32:
+                raise ModelConfigError("Malformed assistant tool-call envelope.")
+            calls = []
+            ids: set[str] = set()
+            for call in message.tool_calls:
+                if (not isinstance(call, ToolCall) or type(call.id) is not str
+                        or not 1 <= len(call.id) <= 256 or not call.id.isprintable()
+                        or type(call.name) is not str or not 1 <= len(call.name) <= 256
+                        or not call.name.isprintable()
+                        or type(call.arguments) is not dict or call.id in ids):
+                    raise ModelConfigError("Malformed assistant tool-call envelope.")
+                try:
+                    arguments = json.dumps(call.arguments, separators=(",", ":"),
+                                           ensure_ascii=True, allow_nan=False)
+                except (TypeError, ValueError):
+                    raise ModelConfigError("Malformed assistant tool-call envelope.") from None
+                ids.add(call.id)
+                pending.append(call.id)
+                calls.append({"id": call.id, "type": "function", "function": {
+                    "name": call.name, "arguments": arguments}})
+            wire.append({"role": "assistant", "content": message.content,
+                         "tool_calls": calls})
+            continue
+        wire.append(message.to_dict())
+    if pending:
+        raise ModelConfigError("Malformed tool message correlation.")
+    return wire
 
 
 @dataclass
@@ -483,6 +534,152 @@ class _AttemptSuccess:
     response: ModelResponse
 
 
+def _function_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Translate neutral ToolSpec dictionaries, not authority metadata.
+
+    Only representable ToolParameter contracts are accepted. In particular,
+    Python-specific regex constructs are refused rather than silently widened.
+    Local Tool.validate_args remains the execution authority.
+    """
+    def invalid() -> None:
+        raise ModelConfigError("Unsupported or malformed neutral tool contract.")
+
+    def finite(value):
+        try:
+            return type(value) in (int, float) and math.isfinite(value)
+        except OverflowError:
+            return False
+
+    def matches_type(value, kind):
+        if kind == "number":
+            return finite(value)
+        if kind == "array":
+            return type(value) is list
+        return type(value) is {"string": str, "integer": int, "boolean": bool,
+                               "array": list, "object": dict}[kind]
+
+    def json_native(value, ancestors=None):
+        """Strict recursive representation contract, not Python equality.
+
+        JSON must not turn tuples into lists, stringify object keys, coerce
+        subclasses, or admit non-finite floats. Cycles fail deterministically.
+        """
+        kind = type(value)
+        if value is None or kind in (str, bool, int):
+            return True
+        if kind is float:
+            return math.isfinite(value)
+        if kind not in (list, dict):
+            return False
+        ancestors = set() if ancestors is None else ancestors
+        identity = id(value)
+        if identity in ancestors:
+            return False
+        ancestors.add(identity)
+        try:
+            if kind is dict:
+                return all(type(key) is str and json_native(item, ancestors)
+                           for key, item in value.items())
+            return all(json_native(item, ancestors) for item in value)
+        finally:
+            ancestors.remove(identity)
+
+    result = []
+    names = set()
+    if type(tools) is not list:
+        invalid()
+    for tool in tools:
+        if type(tool) is not dict or set(tool) - {
+            "name", "description", "parameters", "capabilities", "read_only", "version", "tags"
+        }:
+            invalid()
+        name = tool.get("name")
+        description = tool.get("description", "")
+        parameters = tool.get("parameters", [])
+        if (type(name) is not str or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name)
+                or name in names or type(description) is not str or type(parameters) is not list):
+            invalid()
+        names.add(name)
+        properties = {}
+        required = []
+        for param in parameters:
+            if type(param) is not dict or set(param) - {
+                "name", "type", "description", "required", "default", "choices",
+                "max_length", "pattern", "minimum", "maximum"
+            }:
+                invalid()
+            key, kind = param.get("name"), param.get("type")
+            if (type(key) is not str or not key or key in properties
+                    or type(kind) is not str or kind not in {"string", "integer", "number", "boolean", "array", "object"}
+                    or type(param.get("required", True)) is not bool
+                    or type(param.get("description", "")) is not str):
+                invalid()
+            schema = {"type": kind, "description": param.get("description", "")}
+            if kind == "array":
+                schema["items"] = {}  # ToolParameter imposes no item contract
+            length = param.get("max_length")
+            if length is not None:
+                if kind != "string" or type(length) is not int or length < 0:
+                    invalid()
+                schema["maxLength"] = length
+            pattern = param.get("pattern")
+            if pattern is not None:
+                if (kind != "string" or type(pattern) is not str or not pattern.isascii()
+                        or "(?" in pattern or re.search(r"\\(?![xunrtfv])\w", pattern)
+                        or re.search(r"(?:[+*?]|\})\+", pattern)):
+                    invalid()
+                try:
+                    re.compile(pattern)
+                except (re.error, RecursionError):
+                    invalid()
+                # JSON Schema searches; AgentCore uses re.fullmatch. The end
+                # assertion also refuses a trailing newline, unlike JS '$'.
+                schema["pattern"] = "^(?:" + pattern + r")(?![\s\S])"
+            for bound in ("minimum", "maximum"):
+                value = param.get(bound)
+                if value is not None:
+                    if kind not in {"integer", "number"} or not finite(value):
+                        invalid()
+                    schema[bound] = value
+            if schema.get("minimum", -math.inf) > schema.get("maximum", math.inf):
+                invalid()
+            choices = param.get("choices")
+            if choices is not None:
+                try:
+                    native = json_native(choices)
+                except RecursionError:
+                    native = False
+                if type(choices) is not list or not native or any(not matches_type(choice, kind) for choice in choices):
+                    invalid()
+                if choices:  # empty choices have no constraint in ToolParameter
+                    schema["enum"] = choices.copy()
+            if param.get("default") is not None:
+                default = param["default"]
+                try:
+                    native = json_native(default)
+                except RecursionError:
+                    native = False
+                if (not native or not matches_type(default, kind) or (choices and default not in choices)
+                        or (length is not None and len(default) > length)
+                        or (pattern is not None and re.fullmatch(pattern, default) is None)
+                        or ("minimum" in schema and default < schema["minimum"])
+                        or ("maximum" in schema and default > schema["maximum"])):
+                    invalid()
+                schema["default"] = default
+            try:
+                schema = json.loads(json.dumps(schema, allow_nan=False))
+            except (TypeError, ValueError, RecursionError):
+                invalid()
+            properties[key] = schema
+            if param.get("required", True):
+                required.append(key)
+        result.append({"type": "function", "function": {
+            "name": name, "description": description,
+            "parameters": {"type": "object", "properties": properties,
+                           "required": required, "additionalProperties": False}}})
+    return result
+
+
 class OpenAICompatibleProvider(BaseModelProvider):
     """Talks to any ``POST {base_url}/chat/completions`` endpoint."""
 
@@ -545,7 +742,7 @@ class OpenAICompatibleProvider(BaseModelProvider):
         """
         payload: dict[str, Any] = {
             "model": request.model or self.config.name,
-            "messages": [m.to_dict() for m in request.messages],
+            "messages": _wire_messages(request.messages),
         }
         temperature = (request.temperature if request.temperature is not None
                        else self.config.temperature)
@@ -556,7 +753,7 @@ class OpenAICompatibleProvider(BaseModelProvider):
         if request.stop:
             payload["stop"] = list(request.stop)
         if request.tools:
-            payload["tools"] = request.tools
+            payload["tools"] = _function_tools(request.tools)
         if request.response_format:
             payload["response_format"] = request.response_format
         return payload

@@ -55,6 +55,14 @@ class PermissionDeniedError(AgentError):
     """The active permission policy refused an action."""
 
 
+class PolicyLeaseBusyError(ToolError):
+    """Policy replacement was refused during an externally effectful read.
+
+    The current policy is unchanged. Hosts may retry replacement after the
+    bounded invocation finishes; this is not an execution authorization.
+    """
+
+
 class ApprovalRequiredError(AgentError):
     """Action is allowed but requires an explicit human confirmation first."""
 

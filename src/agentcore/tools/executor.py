@@ -14,6 +14,7 @@ import os
 import hmac
 import threading
 import time
+import agentcore.errors as framework_errors
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
@@ -77,6 +78,7 @@ from agentcore.action_journal import (
 from agentcore.errors import (
     AgentError,
     PermissionDeniedError,
+    PolicyLeaseBusyError,
     ToolValidationError,
 )
 from agentcore.credentials import CredentialError, CredentialFailure, CredentialRuntime
@@ -90,7 +92,7 @@ from agentcore.observability.logging import StructuredLogger, get_logger
 from agentcore.permissions.levels import READ_ONLY_CAPABILITIES, Capability
 from agentcore.permissions.policy import Decision, Outcome, PermissionPolicy
 from agentcore.realtime.errors import CancellationRequested
-from agentcore.tools.base import ToolContext, ToolResult, ToolSpec
+from agentcore.tools.base import ExternalReadTool, ToolContext, ToolResult, ToolSpec
 from agentcore.tools.authenticated import AuthenticatedReadTool
 from agentcore.tools.authenticated_action import AuthenticatedActionTool
 from agentcore.tools.registry import ToolRegistry, ToolRegistryLeaseError
@@ -219,6 +221,10 @@ class ToolInvocation:
         }
 
 
+class _ExternalReadPolicyChanged(PermissionDeniedError):
+    """Internal categorical refusal; never changes ordinary tool errors."""
+
+
 class ToolExecutor:
     """The only authority permitted to enter ``Tool.run``."""
 
@@ -247,6 +253,7 @@ class ToolExecutor:
         self._policy_lock = threading.Lock()
         self._policy_generation = 0
         self._credential_policy_leases = 0
+        self._external_read_policy_leases = 0
         self.policy = policy
         self.workspace = workspace
         self.workspace_dir = (str(workspace.root) if workspace is not None
@@ -296,8 +303,8 @@ class ToolExecutor:
         """Replace a complete host policy, or fail busy without changing it.
 
         Replacement from another thread is supported. Once an authenticated
-        dispatch leases its evaluated generation, replacement cannot complete
-        until that dispatch exits. No policy mutex is held across callbacks or
+        dispatch or ExternalReadTool leases its evaluated generation, replacement
+        fails busy until that dispatch exits. No policy mutex is held across callbacks or
         I/O. In-place changes to published policy authority are unsupported.
         This lease does not change Stage 5 mutation/approval ownership.
         """
@@ -306,6 +313,8 @@ class ToolExecutor:
             self._require_policy_owner()
             if self._credential_policy_leases:
                 raise CredentialError(CredentialFailure.BUSY)
+            if self._external_read_policy_leases:
+                raise PolicyLeaseBusyError("Permission policy is in use by an external read.")
             self._policy = policy
             self._policy_generation += 1
 
@@ -485,7 +494,8 @@ class ToolExecutor:
             )
         tool_spec = tool.spec
         mutation = not tool_spec.read_only
-        private = mutation or type(tool) is AuthenticatedReadTool
+        private = (mutation or type(tool) is AuthenticatedReadTool
+                   or "private_arguments" in tool_spec.tags)
         log = (self._log.bind(tool=tool_name) if private
                else self._log.bind(tool=tool_name, **context_meta))
         logged_args = (_redacted_declared_args(supplied, tool_spec) if private
@@ -1177,7 +1187,7 @@ class ToolExecutor:
             return ToolInvocation(
                 tool_spec.name,
                 (_redacted_declared_args(cleaned, tool_spec)
-                 if type(tool) is AuthenticatedReadTool else cleaned),
+                 if type(tool) is AuthenticatedReadTool or "private_arguments" in tool_spec.tags else cleaned),
                 ToolResult.failure(
                     "The registered tool changed before execution.",
                     kind="tool_registration_changed",
@@ -1196,8 +1206,10 @@ class ToolExecutor:
     ) -> ToolInvocation:
         """Validation/checkpoint/policy/checkpoint/run with a live lease."""
         authenticated = type(tool) is AuthenticatedReadTool
+        external_read = isinstance(tool, ExternalReadTool)
+        private_arguments = "private_arguments" in tool_spec.tags
         safe_args = (_redacted_declared_args(cleaned, tool_spec)
-                     if authenticated else cleaned)
+                     if authenticated or private_arguments else cleaned)
         binding = None
         if authenticated:
             tool.validate_contract()
@@ -1208,10 +1220,11 @@ class ToolExecutor:
             binding = self._credential_runtime._snapshot(tool)
         if checkpoint is not None:
             checkpoint()
-        decision = (self.policy.check(
+        policy, generation = self._policy_snapshot()
+        decision = (policy.check(
             tool_spec.capabilities, description=tool_spec.description,
             authenticated_read=True,
-        ) if authenticated else self.policy.check(
+        ) if authenticated else policy.check(
             tool_spec.capabilities, description=tool_spec.description))
         log.debug(Events.PERMISSION_CHECKED, **decision.to_dict())
         if not decision.allowed:
@@ -1247,16 +1260,30 @@ class ToolExecutor:
                         tool_spec.name, credential_execution=permit,
                     ))
             else:
-                result = tool.run(cleaned, self._context(tool_spec.name))
+                with (self._external_read_policy_lease(tool, tool_spec, policy, generation)
+                      if external_read else nullcontext()):
+                    result = tool.run(cleaned, self._context(tool_spec.name))
             if not isinstance(result, ToolResult):
                 result = ToolResult.success(result)
         except CancellationRequested:
             raise
+        except _ExternalReadPolicyChanged:
+            result = ToolResult.failure("Current permission authority changed before execution.",
+                                        kind="permission_denied")
         except CredentialError as exc:
             result = ToolResult.failure(
                 CredentialError(exc.reason).message, kind=exc.reason.value,
             )
         except AgentError as exc:
+            if private_arguments and not authenticated:
+                log.warning(Events.TOOL_FAILED, reason="private_tool_failed")
+                # Preserve trusted framework recovery semantics while omitting
+                # messages/details and arbitrary provider class names.
+                error_type = type(exc)
+                kind = (error_type.__name__ if getattr(framework_errors, error_type.__name__, None) is error_type
+                        else "private_tool_failed")
+                result = ToolResult.failure("Tool execution failed.", kind=kind, retryable=bool(exc.retryable))
+                return ToolInvocation(tool_spec.name, safe_args, result, elapsed(), decision)
             if authenticated:
                 return self._safe_pre_action_failure(
                     tool_spec.name, safe_args, elapsed(), log,
@@ -1269,6 +1296,10 @@ class ToolExecutor:
                 exc.message, kind=type(exc).__name__,
                 retryable=exc.retryable, **exc.details)
         except Exception as exc:  # noqa: BLE001 - legacy fast-path envelope
+            if private_arguments and not authenticated:
+                log.warning(Events.TOOL_FAILED, reason="private_tool_failed")
+                result = ToolResult.failure("Tool execution failed.", kind="private_tool_failed")
+                return ToolInvocation(tool_spec.name, safe_args, result, elapsed(), decision)
             if authenticated:
                 # Never stringify provider/runtime exceptions or log traceback.
                 return self._safe_pre_action_failure(
@@ -1286,7 +1317,10 @@ class ToolExecutor:
             log.info(Events.TOOL_SUCCEEDED, duration_ms=round(duration, 3))
         else:
             reason = result.metadata.get("reason") if result.metadata else None
-            if reason in _SENSITIVE_FAILURE_REASONS:
+            if private_arguments:
+                log.warning(Events.TOOL_FAILED, reason="private_tool_failed",
+                            duration_ms=round(duration, 3))
+            elif reason in _SENSITIVE_FAILURE_REASONS:
                 log.warning(Events.TOOL_FAILED, reason=reason,
                             duration_ms=round(duration, 3))
             else:
@@ -1294,6 +1328,34 @@ class ToolExecutor:
                             duration_ms=round(duration, 3))
         return ToolInvocation(
             tool_spec.name, safe_args, result, duration, decision)
+
+    @contextmanager
+    def _external_read_policy_lease(self, tool, tool_spec, policy, generation) -> Iterator[None]:
+        """Fence an evaluated ALLOW across synchronous owned external read I/O.
+
+        Registry execution_lease already pins the exact tool. Completed policy
+        replacement, including replacement-back ABA, invalidates this snapshot.
+        Reference counts share the setter mutex, which never spans tool/worker
+        I/O. The parent retains the lease through worker completion and cleanup.
+        """
+        if self.registry.get(tool_spec.name) is not tool or tool.spec != tool_spec:
+            raise _ExternalReadPolicyChanged("External read binding changed.")
+        self._require_policy_owner()
+        thread_id = threading.get_ident()
+        with self._policy_lock:
+            self._require_policy_owner()
+            if self._policy is not policy or self._policy_generation != generation:
+                raise _ExternalReadPolicyChanged("External read policy changed.")
+            self._external_read_policy_leases += 1
+        try:
+            yield
+        finally:
+            self._require_policy_owner()
+            if threading.get_ident() != thread_id:
+                raise _ExternalReadPolicyChanged("External read lease ownership changed.")
+            with self._policy_lock:
+                self._require_policy_owner()
+                self._external_read_policy_leases -= 1
 
     @contextmanager
     def _check_credential_authority(

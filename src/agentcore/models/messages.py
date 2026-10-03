@@ -51,8 +51,13 @@ class Message:
     role: Role
     content: str
     name: str | None = None
+    # Protocol-only, current-turn metadata. ConversationSession persists only
+    # role/content/name via to_dict(); it never stores model arguments or IDs.
+    tool_calls: tuple[ToolCall, ...] = ()
+    tool_call_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
+        """Persisted dialogue shape, deliberately excluding protocol metadata."""
         payload: dict[str, Any] = {"role": self.role.value, "content": self.content}
         if self.name:
             payload["name"] = self.name
@@ -158,6 +163,7 @@ class ModelRequest:
         return request
 
     def to_dict(self) -> dict[str, Any]:
+        """Diagnostic shape; current-turn tool protocol metadata is excluded."""
         return {
             "messages": [m.to_dict() for m in self.messages],
             "model": self.model,

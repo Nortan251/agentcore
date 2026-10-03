@@ -99,6 +99,32 @@ def tool_call(name, arguments, identifier="call-one") -> ModelResponse:
         text="", tool_calls=[ToolCall(identifier, name, arguments)])
 
 
+def test_pr31_openai_protocol_envelope_survives_gmail_fake_transport(tmp_path, monkeypatch):
+    from test_models_provider import StrictToolTransport, build, http, ok_body
+
+    monkeypatch.setenv("TEST_MODEL_KEY", "synthetic-model-token")
+    first = ok_body("")
+    first["choices"][0].update(message={"role": "assistant", "content": "",
+        "tool_calls": [{"id": "gmail-fixed-id", "type": "function", "function": {
+            "name": GMAIL_SEARCH_TOOL, "arguments": '{"max_results":1}'}}]},
+        finish_reason="tool_calls")
+    model_wire = StrictToolTransport([http(200, first), http(200, ok_body("done"))])
+    gmail_wire = FakeGmail()
+    built = compose(tmp_path, model=build(model_wire), transport=gmail_wire)
+    try:
+        result = built.composition.conversation(
+            sessions=InMemorySessionStore()).send("Find synthetic mail")
+        assert result.ok and result.reply.content == "done"
+        assert len(gmail_wire.calls) == 1 and gmail_wire.calls[0][0] == "list"
+        messages = model_wire.requests[1]["payload"]["messages"]
+        assert [item["id"] for item in next(m for m in messages if m.get("tool_calls"))
+                ["tool_calls"]] == ["gmail-fixed-id"]
+        assert [m["tool_call_id"] for m in messages if m["role"] == "tool"] == ["gmail-fixed-id"]
+        assert all(not m.tool_calls and m.tool_call_id is None for m in result.session.messages)
+    finally:
+        built.value.vault.close()
+
+
 def scoped_invoke(composition, name, arguments=None, *,
                   session_id="conv_test_session"):
     """Invoke through the production conversation runner's trusted scope."""

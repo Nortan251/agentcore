@@ -383,14 +383,15 @@ def test_tool_message_enters_the_session_in_order():
         [Role.USER, Role.TOOL, Role.ASSISTANT]
 
 
-def test_tool_message_carries_call_id_and_name():
+def test_tool_message_persists_name_but_not_protocol_call_id():
     model = ScriptedModel(wants("echo_test", {"text": "hello"}, call_id="abc"),
                           ModelResponse(text="done"))
     result = build_runtime([EchoTest()], model).send("go")
     tool_message = [m for m in result.session.messages
                     if m.role is Role.TOOL][0]
     assert tool_message.name == "echo_test"
-    assert "call abc" in tool_message.content
+    assert tool_message.tool_call_id is None
+    assert "abc" not in tool_message.content
     assert "ECHO: hello" in tool_message.content
 
 
@@ -463,6 +464,62 @@ def test_multiple_rounds():
     assert len(result.tool_rounds) == 2
     assert echo.runs == [{"text": "first"}, {"text": "second"}]
     assert result.reply.content == "finished"
+
+
+@pytest.mark.parametrize("tool,identifier,level,status", [
+    (EchoTest, "echo_test", PermissionLevel.AUTONOMOUS, "ok"),
+    (BrokenTool, "broken", PermissionLevel.AUTONOMOUS, "failed"),
+    (None, "unknown", PermissionLevel.AUTONOMOUS, "failed"),
+    (MutatingTool, "danger_write", PermissionLevel.OBSERVE, "denied"),
+])
+def test_current_tool_protocol_matches_every_outcome_without_persisting_arguments(
+        tool, identifier, level, status):
+    call_id = "exact-model-id"
+    call = ToolCall(call_id, identifier, {"text": "private-argument"} if tool is EchoTest else {})
+    model = ScriptedModel(ModelResponse(text="", tool_calls=[call]), ModelResponse(text="done"))
+    result = build_runtime([tool()] if tool else [EchoTest()], model, level=level).send("go")
+    assert result.ok and result.tool_outcomes[0].status == status
+    protocol = model.requests[-1].messages
+    envelope = [item for item in protocol if item.tool_calls]
+    responses = [item for item in protocol if item.role is Role.TOOL]
+    assert len(envelope) == len(responses) == 1
+    assert envelope[0].tool_calls == (call,)
+    assert responses[0].tool_call_id == call_id
+    assert all(not item.tool_calls and item.tool_call_id is None for item in result.session.messages)
+    saved = json.dumps(result.session.to_dict())
+    assert '"tool_calls"' not in saved and '"tool_call_id"' not in saved
+    assert '"arguments"' not in saved
+
+
+def test_duplicate_tool_ids_fail_before_any_tool_execution():
+    echo = EchoTest()
+    model = ScriptedModel(ModelResponse(text="", tool_calls=[
+        call("echo_test", {"text": "one"}, "duplicate"),
+        call("echo_test", {"text": "two"}, "duplicate")]))
+    result = build_runtime([echo], model).send("go")
+    assert not result.ok and echo.runs == []
+    assert len(model.requests) == 1
+
+
+def test_protocol_envelope_keeps_original_nested_arguments_after_tool_mutates_input():
+    class MutatingArguments(Tool):
+        @property
+        def spec(self):
+            return tool_spec("mutating_arguments", "Mutates a nested object.",
+                             parameters=[ToolParameter("payload", ParamType.OBJECT)],
+                             capabilities=[Capability.FS_READ], read_only=True)
+
+        def run(self, args, context):
+            args["payload"]["value"] = "changed"
+            return ToolResult.success("done")
+
+    requested = ToolCall("exact-id", "mutating_arguments", {"payload": {"value": "original"}})
+    model = ScriptedModel(ModelResponse(text="", tool_calls=[requested]),
+                          ModelResponse(text="final"))
+    result = build_runtime([MutatingArguments()], model).send("go")
+    assert result.ok and result.tools_executed == 1
+    envelope = next(message for message in model.requests[1].messages if message.tool_calls)
+    assert envelope.tool_calls[0].arguments == {"payload": {"value": "original"}}
 
 
 def test_round_limit_is_enforced():
