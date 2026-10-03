@@ -49,6 +49,7 @@ runs/
 .agentcore/
 **/memory/*.json
 **/conversations/*.json
+**/.browser_sessions/
 
 # Temporary scratch material
 scratch_*/

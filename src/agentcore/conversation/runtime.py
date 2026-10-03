@@ -26,6 +26,7 @@ Two rules govern the design:
 
 from __future__ import annotations
 
+import errno
 import inspect
 import json
 from dataclasses import dataclass, field
@@ -36,8 +37,11 @@ from agentcore.conversation.config import ConversationConfig
 from agentcore.conversation.errors import (
     ConversationValidationError,
     ResponseGenerationError,
+    SessionDomainError,
 )
-from agentcore.conversation.session import ConversationSession
+from agentcore.conversation.session import (
+    ConversationSession, validate_session_directory, validate_session_domain,
+)
 from agentcore.models.messages import Message, ModelRequest, Role, ToolCall
 from agentcore.observability.events import Events
 from agentcore.observability.logging import StructuredLogger, get_logger
@@ -249,12 +253,19 @@ class ConversationRuntime:
                  turns: Any = None,
                  config: ConversationConfig | None = None,
                  system_prompt: str = SYSTEM_PROMPT,
+                 session_domain: str = "ordinary",
                  logger: StructuredLogger | None = None) -> None:
         self.model = model
         self.memory = memory
         self.capture = capture
         self.resolver = resolver
         self.sessions = sessions
+        if session_domain not in ("ordinary", "browser_read"):
+            raise SessionDomainError("conversation_session_domain_mismatch")
+        self._session_domain = session_domain
+        bind = getattr(sessions, "bind_domain", None)
+        if bind is not None and _accepts_kwarg(bind, "domain"):
+            bind(domain=session_domain)
         # Tool use is optional. With no runner the conversation behaves
         # exactly as it did before: the model is never offered a catalogue.
         self.tools = tools
@@ -272,6 +283,19 @@ class ConversationRuntime:
         self._log = logger or get_logger("conversation.runtime")
 
     # -- sessions ----------------------------------------------------------
+    def _validate_session(self, session=None):
+        directory = getattr(self.sessions, "directory", None)
+        validate_session_directory(directory, domain=self._session_domain)
+        if session is not None:
+            validate_session_domain(session.metadata, domain=self._session_domain)
+
+    def _load_session(self, session_id):
+        load = self.sessions.load
+        session = (load(session_id, session_domain=self._session_domain)
+                   if _accepts_kwarg(load, "session_domain") else load(session_id))
+        self._validate_session(session)
+        return session
+
     def start(self, *, session_id: str | None = None,
               scope_key: str | None = None) -> ConversationSession:
         """Begin a conversation, resuming a persisted one when it exists."""
@@ -285,15 +309,18 @@ class ConversationRuntime:
                scope_key: str | None,
                safe_log_session: bool) -> ConversationSession:
         """Start internally with optional opaque streaming log correlation."""
+        self._validate_session()
         if session_id and self.sessions is not None:
             try:
                 if self.sessions.exists(session_id):
-                    session = self.sessions.load(session_id)
+                    session = self._load_session(session_id)
                     self._log.info(Events.CONVERSATION_RESUMED,
                                    **self._session_log_fields(
                                        session,
                                        safe_log_session=safe_log_session))
                     return session
+            except SessionDomainError:
+                raise  # A foreign transcript must never become a fresh session.
             except Exception as exc:  # noqa: BLE001 - a bad file starts fresh
                 self._log.warning(Events.CONVERSATION_FAILED,
                                   stage="resume", error=type(exc).__name__)
@@ -326,6 +353,9 @@ class ConversationRuntime:
         if self.sessions is None:
             return False
         try:
+            self._validate_session(session)
+            if self.sessions.exists(session.id):
+                self._load_session(session.id)
             save = self.sessions.save
             if log_session_id is not None and _accepts_kwarg(
                     save, "log_session_id"):
@@ -362,6 +392,20 @@ class ConversationRuntime:
         turn can neither persist a late assistant message nor report success.
         Without one, the path below is exactly the pre-Task-42.3 path.
         """
+        self._validate_session(session)
+        if session is not None and self.sessions is not None:
+            try:
+                exists = self.sessions.exists(session.id)
+            except ConversationValidationError:
+                # Supplied in-memory sessions historically accept IDs that
+                # storage cannot address; persistence remains best-effort.
+                exists = False
+            except OSError as error:
+                if error.errno != errno.ENAMETOOLONG:
+                    raise
+                exists = False  # This supplied ID cannot address a saved file.
+            if exists:
+                self._load_session(session.id)
         # Streaming is explicit and requires real turn ownership.  Check this
         # before starting or mutating a session: no unowned call may fabricate
         # realtime identity or appear to be fenced.
