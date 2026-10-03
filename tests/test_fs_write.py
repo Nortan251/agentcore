@@ -244,6 +244,8 @@ def _publication_hook(monkeypatch, hook):
     else:
         original = os.link
         def link(*args, **kwargs):
+            if "src_dir_fd" not in kwargs:
+                return original(*args, **kwargs)
             return hook(lambda: original(*args, **kwargs))
         monkeypatch.setattr(mutation.os, "link", link)
 
