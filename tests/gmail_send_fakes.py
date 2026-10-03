@@ -3,6 +3,8 @@
 import base64
 import json
 import os
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 from agentcore.action_journal import (
@@ -31,6 +33,64 @@ SENDER = "sender@sample.invalid"
 KEY = StaticInstallationKeyProvider(bytes(range(32)))
 PROTECTOR_KEY = base64.urlsafe_b64encode(bytes(range(32)))
 SCOPES = " ".join(sorted(GOOGLE_GMAIL_SEND_SCOPES))
+
+# Three times GmailMutationHttp's 10s socket bound, allowing durable local
+# writes/TLS setup and loaded Windows scheduling. This is a test watchdog,
+# not a production deadline or an assertion about operation latency.
+WORKER_WATCHDOG = 30
+
+
+class WorkerRendezvous:
+    """Wait for boundary entry OR a captured worker outcome, without polling."""
+
+    def __init__(self):
+        self._condition = threading.Condition()
+        self._entered = self._finished = False
+        self._release_failed = False
+        self.release = threading.Event()
+        self.results = []
+
+    def enter(self):
+        with self._condition:
+            self._entered = True
+            self._condition.notify_all()
+        if not self.release.wait(WORKER_WATCHDOG):
+            self._release_failed = True
+            raise AssertionError("worker boundary release watchdog expired")
+
+    def wait_for_entry(self, *, timeout=WORKER_WATCHDOG):
+        with self._condition:
+            ready = self._condition.wait_for(lambda: self._entered or self._finished, timeout)
+            if self._finished:
+                result = self.results[0]
+                if isinstance(result, BaseException):
+                    raise result
+                assert self._entered, f"worker exited before required boundary entry: {result!r}"
+            assert ready, f"worker rendezvous watchdog expired after {timeout}s: no entry or worker exit"
+
+    @contextmanager
+    def worker(self, operation):
+        def call():
+            try:
+                self.results.append(operation())
+            except BaseException as exc:
+                self.results.append(exc)
+            finally:
+                with self._condition:
+                    self._finished = True
+                    self._condition.notify_all()
+
+        worker = threading.Thread(target=call, daemon=True)
+        worker.start()
+        try:
+            yield worker, self.results
+        finally:
+            self.release.set()
+            worker.join(WORKER_WATCHDOG)
+            assert not worker.is_alive(), "worker cleanup watchdog expired after release"
+            # Production may scrub callback exceptions into a failed result.
+            # Such a timeout must never impersonate an authority rejection.
+            assert not self._release_failed, "worker boundary release watchdog expired"
 
 
 class RecordingLogger:
