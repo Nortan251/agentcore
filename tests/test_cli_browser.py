@@ -1,7 +1,11 @@
 """CLI -> existing provider -> isolated browser; all I/O is synthetic."""
 
+from contextlib import redirect_stderr, redirect_stdout
+import io
 import json
+import multiprocessing
 import os
+from pathlib import Path
 import socket
 
 import pytest
@@ -305,6 +309,7 @@ def test_cleanup_uncertainty_overrides_success(harness, capsys, monkeypatch):
     status, payload = invoke(capsys)
     assert status == 1 and payload["error"] == BrowserFailure.CLEANUP.value
     assert payload["reply"] is None and payload["tools_executed"] == 1
+    assert payload["session_id"] is not None
     assert "secret" not in json.dumps(payload) and URL not in json.dumps(payload)
 
 
@@ -335,16 +340,221 @@ def test_config_file_and_environment_precedence(harness, capsys, monkeypatch, tm
     assert transport.requests[0]["payload"]["model"] == "from-file"
 
 
-def test_save_failure_is_not_reported_as_durable_success(harness, capsys, monkeypatch):
+@pytest.mark.parametrize("resumed", [False, True])
+@pytest.mark.parametrize("json_mode", [False, True])
+@pytest.mark.parametrize("save_fails", [False, True])
+def test_session_id_requires_final_save(harness, capsys, monkeypatch, tmp_path,
+                                       resumed, json_mode, save_fails):
     transport, _, _ = harness
+    session_id = "persisted" if resumed else None
+    if resumed:
+        JsonFileSessionStore(tmp_path / ".browser_sessions").save(
+            ConversationSession(id=session_id, metadata={"browser_read_isolated_v1": True}))
+    original_save = JsonFileSessionStore.save
+    saves = []
 
-    def fail(*args, **kwargs):
-        raise OSError("private storage path")
+    def save(store, session):
+        saves.append(session.id)
+        if save_fails and len(saves) == 2:
+            raise OSError("private storage path")
+        return original_save(store, session)
 
-    monkeypatch.setattr(JsonFileSessionStore, "save", fail)
+    monkeypatch.setattr(JsonFileSessionStore, "save", save)
+    finish(transport)
+    status, output = invoke(capsys, session=session_id, json_mode=json_mode)
+    assert len(saves) == 2  # Autosave succeeds; the required final save decides publication.
+    assert status == (1 if save_fails else 0)
+    if json_mode:
+        if save_fails:
+            assert output["error"] == "browser_session_storage_failed"
+            assert output["session_id"] is None and output["reply"] is None
+        else:
+            assert output["session_id"] == saves[-1] and output["reply"] == REPLY
+    elif save_fails:
+        assert not output.out
+        assert output.err == host._MESSAGES["browser_session_storage_failed"] + "\n"
+    else:
+        assert output.out == REPLY + "\n" and not output.err
+
+
+def test_all_saves_fail_without_publishing_id(harness, capsys, monkeypatch):
+    transport, _, _ = harness
+    monkeypatch.setattr(JsonFileSessionStore, "save", lambda *a: (_ for _ in ()).throw(OSError("private path")))
     finish(transport)
     _, payload = invoke(capsys)
-    assert payload["error"] == "browser_session_storage_failed" and not payload["ok"]
+    assert payload["error"] == "browser_session_storage_failed"
+    assert payload["session_id"] is None
+
+
+def test_tilde_workspace_uses_exact_canonical_directory(harness, capsys, monkeypatch, tmp_path):
+    transport, _, _ = harness
+    home = tmp_path / "home"
+    workspace = home / "workspace"
+    workspace.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("AGENTCORE_WORKSPACE_DIR", "~/workspace")
+    monkeypatch.chdir(tmp_path)
+    finish(transport)
+    _, payload = invoke(capsys)
+    directory = host.load_config().canonical_workspace() / ".browser_sessions"
+    assert directory == workspace / ".browser_sessions"
+    assert (directory / (payload["session_id"] + ".json")).is_file()
+    assert (directory / ("session-" + payload["session_id"] + ".lock")).is_file()
+    assert not (tmp_path / "~").exists()
+    assert all(str(directory) not in json.dumps(request["payload"]) for request in transport.requests)
+
+
+def _process_browser_turn(workspace, session_id, phase, connection, json_mode=True):
+    # Spawned OS processes run the real CLI/provider/composition with synthetic
+    # I/O. Pipes stop the owner at the exact seam; no timing/sleep assumptions.
+    with pytest.MonkeyPatch.context() as patch:
+        transport, backends, _ = harness.__wrapped__(Path(workspace), patch)
+        finish(transport, open_response(URL))
+        reached = False
+        exists_calls = 0
+        saves = 0
+
+        def pause(at):
+            nonlocal reached
+            if phase == at and not reached:
+                reached = True
+                connection.send(("held", os.getpid()))
+                assert connection.poll(30), "owner release was not received"
+                assert connection.recv() == "release"
+
+        original_exists = JsonFileSessionStore.exists
+        original_save = JsonFileSessionStore.save
+        original_post = transport.post_json
+        original_close = FakeBackend.close
+
+        def exists(store, identifier):
+            nonlocal exists_calls
+            exists_calls += 1
+            pause("exists")
+            return original_exists(store, identifier)
+
+        def save(store, session):
+            nonlocal saves
+            saves += 1
+            if saves == 2:
+                pause("final_save")
+            return original_save(store, session)
+
+        def post(*args, **kwargs):
+            pause("model")
+            return original_post(*args, **kwargs)
+
+        def close(backend):
+            pause("cleanup")
+            return original_close(backend)
+
+        patch.setattr(JsonFileSessionStore, "exists", exists)
+        patch.setattr(JsonFileSessionStore, "save", save)
+        patch.setattr(transport, "post_json", post)
+        patch.setattr(FakeBackend, "close", close)
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            args = ["browser", "--session", session_id, "--allow-url", URL]
+            status = cli.main(args + (["--json"] if json_mode else []) + ["Read this page"])
+        connection.send(("done", {"pid": os.getpid(), "status": status,
+            "out": out.getvalue(), "err": err.getvalue(), "model_calls": len(transport.requests),
+            "browser_calls": [call for backend in backends for call in backend.calls],
+            "exists_calls": exists_calls, "saves": saves}))
+    connection.close()
+
+
+@pytest.mark.parametrize("phase", ["exists", "model", "final_save", "cleanup"])
+@pytest.mark.parametrize("json_mode", [False, True])
+def test_resumed_session_lease_is_cross_process_and_spans_turn(tmp_path, phase, json_mode):
+    store = JsonFileSessionStore(tmp_path / ".browser_sessions")
+    for identifier in ("shared", "independent"):
+        store.save(ConversationSession(id=identifier, metadata={"browser_read_isolated_v1": True}))
+    context = multiprocessing.get_context("spawn")
+    processes = []
+    connections = []
+
+    def start(identifier, hold=None):
+        parent, child = context.Pipe()
+        process = context.Process(target=_process_browser_turn,
+            args=(str(tmp_path), identifier, hold, child, json_mode))
+        processes.append(process)
+        connections.append(parent)
+        process.start()
+        child.close()
+        return parent, process
+
+    def receive(connection, expected):
+        assert connection.poll(25), "browser CLI process did not reach expected seam"
+        kind, data = connection.recv()
+        assert kind == expected
+        return data
+
+    try:
+        owner, owner_process = start("shared", phase)
+        owner_pid = receive(owner, "held")
+        loser, loser_process = start("shared")
+        blocked = receive(loser, "done")
+        loser_process.join(5)
+        assert loser_process.exitcode == 0 and blocked["pid"] != owner_pid
+        assert blocked["status"] == 1
+        assert blocked["model_calls"] == 0 and blocked["browser_calls"] == []
+        assert blocked["exists_calls"] == 0 and blocked["saves"] == 0
+        if json_mode:
+            assert json.loads(blocked["out"]) == {"ok": False, "session_id": None,
+                "reply": None, "tools_executed": 0, "error": "browser_session_busy"}
+            assert not blocked["err"]
+        else:
+            assert not blocked["out"]
+            assert blocked["err"] == host._MESSAGES["browser_session_busy"] + "\n"
+        other, _ = start("independent")
+        assert receive(other, "done")["status"] == 0
+        owner.send("release")
+        assert receive(owner, "done")["status"] == 0
+        owner_process.join(5)
+        assert owner_process.exitcode == 0
+        resumed, _ = start("shared")
+        assert receive(resumed, "done")["status"] == 0
+        # Both completed turns survive; the losing process added no turn.
+        assert sum(message.role == "user" for message in store.load("shared").messages) == 2
+    finally:
+        for process in processes:
+            process.join(1)
+            if process.is_alive():
+                process.terminate()
+                process.join(5)
+        for connection in connections:
+            connection.close()
+
+
+@pytest.mark.parametrize("failure", ["model", "browser", "storage", "cleanup", "exception"])
+def test_session_lease_released_after_failure(harness, capsys, monkeypatch, tmp_path, failure):
+    transport, _, _ = harness
+    directory = tmp_path / ".browser_sessions"
+    JsonFileSessionStore(directory).save(ConversationSession(
+        id="shared", metadata={"browser_read_isolated_v1": True}))
+    if failure == "model":
+        transport.responses.append(RuntimeError("private model error"))
+    else:
+        finish(transport, open_response(URL))
+    if failure == "browser":
+        monkeypatch.setattr(FakeBackend, "open_url", lambda *a: (_ for _ in ()).throw(BrowserError(BrowserFailure.TIMEOUT)))
+    elif failure == "storage":
+        monkeypatch.setattr(JsonFileSessionStore, "save", lambda *a: (_ for _ in ()).throw(OSError("private path")))
+    elif failure == "cleanup":
+        monkeypatch.setattr(FakeBackend, "close", lambda *a: (_ for _ in ()).throw(RuntimeError("private cleanup")))
+    elif failure == "exception":
+        monkeypatch.setattr(JsonFileSessionStore, "exists", lambda *a: (_ for _ in ()).throw(RuntimeError("unexpected")))
+    if failure == "exception":
+        with pytest.raises(RuntimeError, match="unexpected"):
+            invoke(capsys, session="shared")
+    else:
+        status, payload = invoke(capsys, session="shared")
+        assert status == 1
+        assert (payload["session_id"] is None) == (failure == "storage")
+    # A fresh native descriptor can own the same session after every exit.
+    with host._session_lease(directory, "shared"):
+        pass
 
 
 def test_reply_is_bounded_and_terminal_controls_removed(harness, capsys):

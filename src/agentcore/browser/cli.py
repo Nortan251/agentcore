@@ -1,7 +1,9 @@
 """Trusted CLI host for the existing isolated Browser Read composition."""
 
+from contextlib import contextmanager
+import errno
 import json
-from pathlib import Path
+import os
 import re
 import sys
 
@@ -10,6 +12,7 @@ from agentcore.conversation.errors import ConversationError
 from agentcore.errors import ConfigError
 from agentcore.models.errors import ModelError
 from agentcore.models.factory import provider_from_config
+from agentcore.util.ids import new_id
 
 from .composition import BrowserAgentComposition
 from .config import BrowserConfig
@@ -39,10 +42,51 @@ _MESSAGES = {
     "model_configuration_failed": "Model configuration failed; set model.provider and model.name using --config or AGENTCORE_* variables.",
     "model_failed": "The configured model could not complete the turn; check its configuration and credential environment variable.",
     "browser_session_invalid": "The browser session is missing, invalid, or belongs to another conversation type.",
+    "browser_session_busy": "The browser session is already in use; try again after its current turn finishes.",
     "browser_session_storage_failed": "The browser session could not be saved or read.",
     "browser_prompt_invalid": "The browser prompt is empty or exceeds the configured message bound.",
     "browser_tool_failed": "A proposed browser tool call was refused or failed.",
 }
+
+
+class _SessionBusy(Exception):
+    pass
+
+
+@contextmanager
+def _session_lease(directory, session_id):
+    # The caller validates bounded IDs before any storage access. Keep the
+    # lock inode after release: unlinking it would allow concurrent owners.
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / ("session-" + session_id + ".lock")).open("a+b") as handle:
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                raise _SessionBusy from None
+            raise
+        owner_pid = os.getpid()
+        try:
+            # Native byte locks can cover EOF. Initialize only after owning
+            # the lease, so contenders never write into a locked byte.
+            if os.fstat(handle.fileno()).st_size == 0:
+                handle.write(b"0")
+                handle.flush()
+            yield
+        finally:
+            # A forked child must not unlock the parent's shared descriptor.
+            if os.getpid() == owner_pid:
+                if os.name == "nt":
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _turn_error(result):
@@ -72,25 +116,27 @@ def command_browser(args):
         elif args.session_id is not None and not _SESSION_ID.fullmatch(args.session_id):
             error = "browser_session_invalid"
         else:
-            with BrowserAgentComposition(
+            directory = config.canonical_workspace() / ".browser_sessions"
+            session_id = args.session_id or new_id("conv")
+            # New turns also hold their lease before runtime's best-effort
+            # autosave can make the transcript visible to a resume process.
+            with _session_lease(directory, session_id), BrowserAgentComposition(
                 model=model, config=BrowserConfig(enabled=True),
                 permissions=config.permissions, conversation_config=config.conversation,
-                sessions_directory=Path(config.workspace_dir) / ".browser_sessions",
+                sessions_directory=directory,
             ) as browser:
                 conversation = browser.conversation()
                 if not browser.available:
                     error = BrowserFailure.NETWORK_BOUNDARY.value
-                elif args.session_id and not conversation.sessions.exists(args.session_id):
+                elif conversation.sessions.exists(session_id) != (args.session_id is not None):
                     error = "browser_session_invalid"
                 else:
                     # Composition.start checks the browser-only marker. Do not
                     # use ordinary chat's fallback/new-session resume helper.
-                    session = conversation.start(session_id=args.session_id)
-                    if (not _SESSION_ID.fullmatch(session.id)
-                            or args.session_id and session.id != args.session_id):
+                    session = conversation.start(session_id=session_id)
+                    if session.id != session_id:
                         error = "browser_session_invalid"
                     else:
-                        payload["session_id"] = session.id
                         result = conversation.send(args.prompt, session=session,
                                                    navigation_urls=tuple(args.allow_url))
                         payload["tools_executed"] = result.tools_executed
@@ -99,11 +145,15 @@ def command_browser(args):
                         # required durable save rather than promise a lost id.
                         if not conversation.save(result.session):
                             error = "browser_session_storage_failed"
+                        else:
+                            payload["session_id"] = session.id
                         if error is None:
                             reply = result.reply.content
                             if len(reply) > _MAX_REPLY_CHARS:
                                 reply = reply[:_MAX_REPLY_CHARS - 14] + "… [truncated]"
                             payload["reply"] = safe_text(reply, _MAX_REPLY_CHARS)
+    except _SessionBusy:
+        error = "browser_session_busy"
     except BrowserError as exc:
         error = exc.failure.value
     except (ConfigError, ModelError):
@@ -115,6 +165,8 @@ def command_browser(args):
 
     # Publication follows context-manager cleanup: uncertainty overrides reply.
     payload["ok"] = error is None
+    if error == "browser_session_storage_failed":
+        payload["session_id"] = None
     if error:
         payload["reply"] = None
         payload["error"] = error
