@@ -132,3 +132,82 @@ The project lead independently rechecked the final PR metadata, exact-head CI, r
 Authoritative `main` after merge: `72a0f55be620565344b3e57667371e2a695adb0e`.
 
 Final status: **MERGED; Browser Read v1.1 static-capacity task complete.**
+
+## Amendment — 2026-10-03, 20:08 UTC: complete final implementation handoff
+
+This amendment supplements the merge snapshot with final test evidence, limitations and disposition. Earlier snapshots remain historical; their open/unmerged status and blockers are superseded. This ledger update performed no implementation change or PR merge.
+
+AREA: browser
+TASK: Browser Read v1.1 static capacity, integrated with the merged test-only Gmail reliability hotfix.
+STATUS: MERGED; implementation and final ledger handoff complete.
+
+BASE SHA: `7d9d34453ac384dc2a423600dba6a900731002c0`
+HEAD SHA: `a404120a739d4dd0960f687ebe94cf34adebb939`
+PARENT SHA: `be7f1a8340b27b8ad41d411673b77806f9142585`
+SECOND PARENT SHA: `7d9d34453ac384dc2a423600dba6a900731002c0`
+BRANCH: `codex/browser-read-v1-1-static-capacity`
+MERGE SHA: `72a0f55be620565344b3e57667371e2a695adb0e`
+
+The original implementation base remains `dfedf634e3a2bbbf4f77e5fc03630446bb982069`. The final head is the conflict-free integration commit, separate from GitHub's subsequent merge commit. Live [PR metadata](https://github.com/Nortan251/agentcore/pull/38) confirms merged at 2026-10-03 19:55:59 UTC. [Merge commit](https://github.com/Nortan251/agentcore/commit/72a0f55be620565344b3e57667371e2a695adb0e) parents are the final base and implementation head above.
+
+### Goal, production scope and changed files
+
+Accept larger complete static HTTP 200 responses within finite host-owned limits. Relative to the final base, the ten changed files remain:
+
+- `docs/architecture/browser-read-v1.1-compatibility-baseline.md`
+- `docs/architecture/browser-read-v1.1-static-capacity.md`
+- `src/agentcore/browser/config.py`
+- `src/agentcore/browser/fetch.py`
+- `tests/test_browser_fetch.py`
+- `tests/test_browser_native_visibility.py`
+- `tests/test_browser_render_source_bound.py`
+- `tests/test_browser_response_compatibility.py`
+- `tests/test_browser_session.py`
+- `tests/test_browser_tool_boundary.py`
+
+Production changes are confined to config.py and fetch.py. The entire `src` tree hash at both the prior Browser head and final head is `ec5adfc18fad23194a57bbb9b5b588c4a7b8d649`: integration added no production changes. The four Gmail hotfix files (`tests/gmail_send_fakes.py`, `tests/test_gmail_mutation_authority.py`, `tests/test_gmail_send_authority.py`, `tests/test_gmail_worker_rendezvous.py`) match the final base exactly and remain test-only. These comparisons were independently rechecked for this amendment.
+
+### Architecture/security decisions and bugs
+
+The inspected final production diff enforces a 24,576-byte maximum/default header line, a separate 32,768-byte aggregate header budget and a 2,097,152-byte complete body cap. Source capacity remains derived `max_body_bytes * 6 + 16` (12,582,928). Header configurability reaches only response header/status parsing; other line bounds remain unchanged. Complete Content-Length/chunked/EOF body semantics remain complete-or-reject.
+
+The [exact-head architecture document](https://github.com/Nortan251/agentcore/blob/a404120a739d4dd0960f687ebe94cf34adebb939/docs/architecture/browser-read-v1.1-static-capacity.md) records unchanged `ToolRegistry -> validation -> PermissionPolicy -> ToolExecutor -> Tool.run`, host navigation authority, exact four NET_READ tools, SafeFetch numeric dialing/DNS/peer/TLS/redirect validation, offline nonpersistent Chromium, disabled JavaScript/resource activity, process ownership and bounded UNTRUSTED_DATA projections. Integration preserves these contracts; this ledger amendment is not an independent security audit.
+
+Fixed: static-response capacity rejection for the characterized fixture and the earlier erroneous 32,768-byte configurable line ceiling. The separate [PR #39](https://github.com/Nortan251/agentcore/pull/39) test-only WorkerRendezvous fix is integrated intact: condition-based entry-or-finished notifications, captured worker outcomes and release/join watchdog assertions. No conflict or manual resolution occurred. The exact trigger of historical Gmail job `111259652394` remains unknown; successful final CI does not retrospectively prove its cause or establish a production authority defect.
+
+### Final tests and known limitations
+
+The implementation task ran these checks after integration. This amendment inspected its command records, log summaries and JUnit reports; tests were not rerun by this documentation task.
+
+- Complete Browser selection with real Chromium: **722 passed, 0 skipped**, 173.39 seconds; JUnit confirms 722 tests, zero failures/errors.
+- Gmail rendezvous/mutation/send authority: **33 passed, 2 POSIX-fork skips, 1 warning**, 8.00 seconds; JUnit confirms 35 tests, zero failures/errors.
+- Full repository on native Windows Python 3.13: **6,210 passed, 252 skipped, 89 warnings**, 721.98 seconds; JUnit confirms 6,462 tests, zero failures/errors.
+- `python -m compileall -q src tests`: passed in the implementation task and rerun successfully for this amendment.
+- `git diff --check` and final-base-to-head `git diff --check`: passed; implementation checkout clean.
+
+Warnings are `PytestUnraisableExceptionWarning` from Gmail response test objects lacking `fp`; no suppression or unrelated fix was added. Windows full-suite skips include POSIX-only cases and opt-in Chromium. Chromium was enabled separately for the complete 722-pass Browser selection; Linux full CI supplies the Linux gate.
+
+Limitations remain static HTTP 200 input only: non-200 responses (including 202), compression, malformed/conflicting framing, unsupported types/charsets, input beyond finite bounds and excessive DOM counts reject. Dynamic JavaScript, clicks, forms, login and interactive navigation remain outside scope. Larger input does not enlarge model-visible projections. No live public-site compatibility or real-credential test is claimed.
+
+### Final exact-head CI
+
+Live GitHub run and job APIs independently confirm all three workflows completed successfully on `a404120a739d4dd0960f687ebe94cf34adebb939`, each with `run_attempt=1`. These post-integration results replace earlier-head evidence for final validation.
+
+- Linux full: **SUCCESS**, workflow `filesystem-linux`, run `37148069605`, [job `111276005295`](https://github.com/Nortan251/agentcore/actions/runs/37148069605/job/111276005295).
+- Windows 3.11: **SUCCESS**, workflow `filesystem-windows`, run `37148069664`, [job `111276005416`](https://github.com/Nortan251/agentcore/actions/runs/37148069664/job/111276005416).
+- Windows 3.12: **SUCCESS**, workflow `filesystem-windows`, run `37148069664`, [job `111276005523`](https://github.com/Nortan251/agentcore/actions/runs/37148069664/job/111276005523).
+- Windows 3.13: **SUCCESS**, workflow `filesystem-windows`, run `37148069664`, [job `111276005547`](https://github.com/Nortan251/agentcore/actions/runs/37148069664/job/111276005547).
+- Chromium Linux: **SUCCESS**, workflow `browser-integration`, run `37148069518`, [job `111276004940`](https://github.com/Nortan251/agentcore/actions/runs/37148069518/job/111276004940).
+- Chromium Windows: **SUCCESS**, workflow `browser-integration`, run `37148069518`, [job `111276004758`](https://github.com/Nortan251/agentcore/actions/runs/37148069518/job/111276004758).
+
+### Codex review and unresolved threads
+
+The [fresh request `5972720163`](https://github.com/Nortan251/agentcore/pull/38#issuecomment-5972720163) names full final head `a404120a739d4dd0960f687ebe94cf34adebb939`. [Codex response `5972744532`](https://github.com/Nortan251/agentcore/pull/38#issuecomment-5972744532) reports no major issues and identifies reviewed commit `a404120a73`, matching that head. Both comments were fetched live. GraphQL returned **0 review threads / 0 unresolved**, with `hasNextPage=false`.
+
+### Blockers, next required action and final verdict
+
+Blockers: **none for this implementation handoff**. Known platform skips, response-object warnings and historical failure uncertainty remain recorded above; no missing final CI or review evidence is concealed.
+
+Next required action: **none for PR #38 implementation or ledger handoff**. Any future Browser feature or warning cleanup needs its own scoped task. The separate ledger branch must remain documentation-only and must never merge into main.
+
+Final status: **MERGED; final available evidence recorded; handoff complete.**
