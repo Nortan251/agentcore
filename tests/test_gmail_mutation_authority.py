@@ -15,39 +15,26 @@ from agentcore.realtime.errors import CancellationRequested
 from agentcore.tools.base import FunctionTool, tool_spec
 from agentcore.tools.registry import ToolRegistryLeaseError
 from gmail_mutation_http_fakes import PROFILE_PATH, LiveHarness, Reply, boundary, live, no_network
-from gmail_send_fakes import DecisionGate, send_policy
-
-
-def worker_call(operation):
-    results = []
-    def call():
-        try:
-            results.append(operation())
-        except BaseException as exc:
-            results.append(exc)
-    worker = threading.Thread(target=call, daemon=True)
-    worker.start()
-    return worker, results
+from gmail_send_fakes import DecisionGate, WorkerRendezvous, send_policy
 
 
 @pytest.mark.parametrize("change", ["approval_expiry", "credential_expiry", "cancellation", "claim_changed"])
 def test_profile_io_cannot_make_a_stale_approval_lease_or_attempt_reach_post(live, boundary, change):
     h = live
-    entered, release, cancel = threading.Event(), threading.Event(), threading.Event()
+    rendezvous, cancel = WorkerRendezvous(), threading.Event()
 
     def profile(request):
         assert request.path == PROFILE_PATH and request.method == "GET"
-        entered.set()
-        assert release.wait(5)
+        rendezvous.enter()
 
     def checkpoint():
         if cancel.is_set():
             raise CancellationRequested("synthetic host cancellation")
 
     boundary.on_response = profile
-    worker, results = worker_call(lambda: h.invoke(checkpoint=checkpoint))
-    try:
-        assert entered.wait(3) and not boundary.posts
+    with rendezvous.worker(lambda: h.invoke(checkpoint=checkpoint)) as (worker, results):
+        rendezvous.wait_for_entry()
+        assert not boundary.posts
         claimed = h.actions.load(h.actions.list_actions()[0])
         assert claimed.state is ActionState.IN_FLIGHT
         if change == "approval_expiry":
@@ -60,9 +47,6 @@ def test_profile_io_cannot_make_a_stale_approval_lease_or_attempt_reach_post(liv
             cancel.set()
         else:
             h.executor._publish_claimed_cancellation(h.actions, claimed)
-    finally:
-        release.set()
-        worker.join(5)
     assert not worker.is_alive() and len(results) == 1
     assert len(boundary.requests) == 1 and not boundary.posts
     record = h.actions.load(h.actions.list_actions()[0])
@@ -82,18 +66,16 @@ def test_current_leases_span_profile_post_and_probe_without_holding_metadata_mut
         first = h.invoke()
         boundary.template_mime = boundary.mime
         boundary.requests.clear()
-    entered, release = threading.Event(), threading.Event()
+    rendezvous = WorkerRendezvous()
 
     def at_response(request):
         if phase == "post" and request.method != "POST":
             return
-        entered.set()
-        assert release.wait(5)
+        rendezvous.enter()
 
     boundary.on_response = at_response
-    worker, results = worker_call(h.invoke if phase != "probe" else lambda: h.reconcile(first.action_id))
-    try:
-        assert entered.wait(3)
+    with rendezvous.worker(h.invoke if phase != "probe" else lambda: h.reconcile(first.action_id)) as (worker, results):
+        rendezvous.wait_for_entry()
         assert len(boundary.posts) == (phase == "post")
         with pytest.raises(CredentialError) as error:
             h.executor.policy = send_policy(send=False, probe=False)
@@ -115,9 +97,6 @@ def test_current_leases_span_profile_post_and_probe_without_holding_metadata_mut
                      h.actions._domain.mutex, h.approvals._domain.mutex):
             assert lock.acquire(blocking=False)
             lock.release()
-    finally:
-        release.set()
-        worker.join(5)
     assert not worker.is_alive() and len(results) == 1 and not isinstance(results[0], BaseException)
     assert results[0].ok if phase != "probe" else results[0].status is ActionReconciliationStatus.SETTLED_SUCCEEDED
     h.executor.policy = send_policy(send=False, probe=False)
@@ -169,47 +148,43 @@ def test_fork_cannot_reuse_production_transport_or_verified_sender_before_inheri
     def verified(submission, credential):
         proof = verify(submission, credential)
         probe = GmailProbeRequest(submission._payload, replace(submission.identity, claim_epoch=1))
-        locked, release = threading.Event(), threading.Event()
+        rendezvous = WorkerRendezvous()
         def hold():
             with h.runtime._lock, h.foundation._lock, h.executor._policy_lock, h.google.vault._lock:
-                locked.set()
-                assert release.wait(10)
-        worker = threading.Thread(target=hold, daemon=True)
-        worker.start()
-        assert locked.wait(3)
-        read_fd, write_fd = os.pipe()
-        child = os.fork()
-        if child == 0:
-            os.close(read_fd)
-            rejected = 0
-            operations = (
-                lambda: transport.verify_sender(submission, credential),
-                lambda: transport.send(submission, credential, verification=proof),
-                lambda: transport.probe(probe, credential),
-                lambda: proof.consume(transport, submission, credential),
-                lambda: submission.mime_bytes,
-            )
-            for operation in operations:
-                try:
-                    operation()
-                except CredentialError as exc:
-                    rejected += exc.reason is CredentialFailure.OWNERSHIP
-            os.write(write_fd, str(rejected).encode("ascii"))
-            os._exit(0)
-        os.close(write_fd)
-        reaped = False
-        try:
-            assert select.select([read_fd], [], [], 5)[0], "child touched an inherited lock"
-            assert os.read(read_fd, 16) == b"5"
-            assert os.waitpid(child, 0)[1] == 0
-            reaped = True
-        finally:
-            if not reaped:
-                os.kill(child, signal.SIGKILL)
-                os.waitpid(child, 0)
-            os.close(read_fd)
-            release.set()
-            worker.join(3)
+                rendezvous.enter()
+        with rendezvous.worker(hold):
+            rendezvous.wait_for_entry()
+            read_fd, write_fd = os.pipe()
+            child = os.fork()
+            if child == 0:
+                os.close(read_fd)
+                rejected = 0
+                operations = (
+                    lambda: transport.verify_sender(submission, credential),
+                    lambda: transport.send(submission, credential, verification=proof),
+                    lambda: transport.probe(probe, credential),
+                    lambda: proof.consume(transport, submission, credential),
+                    lambda: submission.mime_bytes,
+                )
+                for operation in operations:
+                    try:
+                        operation()
+                    except CredentialError as exc:
+                        rejected += exc.reason is CredentialFailure.OWNERSHIP
+                os.write(write_fd, str(rejected).encode("ascii"))
+                os._exit(0)
+            os.close(write_fd)
+            reaped = False
+            try:
+                assert select.select([read_fd], [], [], 5)[0], "child touched an inherited lock"
+                assert os.read(read_fd, 16) == b"5"
+                assert os.waitpid(child, 0)[1] == 0
+                reaped = True
+            finally:
+                if not reaped:
+                    os.kill(child, signal.SIGKILL)
+                    os.waitpid(child, 0)
+                os.close(read_fd)
         return proof
 
     monkeypatch.setattr(transport, "verify_sender", verified)

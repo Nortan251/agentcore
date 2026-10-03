@@ -17,7 +17,7 @@ from agentcore.permissions.levels import Capability
 from agentcore.realtime.errors import CancellationRequested
 from agentcore.tools.base import FunctionTool, tool_spec
 from agentcore.tools.registry import ToolRegistryLeaseError
-from gmail_send_fakes import ARGS, Harness, send_policy
+from gmail_send_fakes import ARGS, WORKER_WATCHDOG, Harness, WorkerRendezvous, send_policy
 
 
 @pytest.fixture
@@ -52,7 +52,7 @@ def test_policy_replacement_after_final_evaluation_before_lease_cannot_dispatch(
     original_check = getattr(current, method)
     original_lease = h.google.vault._lease
     in_lookup = False
-    checked, release = threading.Event(), threading.Event()
+    rendezvous = WorkerRendezvous()
 
     @contextmanager
     def lookup(*args, **kwargs):
@@ -64,21 +64,16 @@ def test_policy_replacement_after_final_evaluation_before_lease_cannot_dispatch(
     def check(*args, **kwargs):
         decision = original_check(*args, **kwargs)
         if in_lookup:
-            checked.set()
-            assert release.wait(5)
+            rendezvous.enter()
         return decision
 
     monkeypatch.setattr(h.google.vault, "_lease", lookup)
     monkeypatch.setattr(current, method, check)
-    worker, results = worker_call(h.invoke if operation == "send" else lambda: h.reconcile(first.action_id))
-    try:
-        assert checked.wait(3)
+    with rendezvous.worker(h.invoke if operation == "send" else lambda: h.reconcile(first.action_id)) as (worker, results):
+        rendezvous.wait_for_entry()
         h.executor.policy = send_policy(send=False, probe=False)
         if aba:
             h.executor.policy = current
-    finally:
-        release.set()
-        worker.join(5)
     assert not worker.is_alive() and len(results) == 1 and not isinstance(results[0], BaseException)
     if operation == "send":
         assert not results[0].ok and not h.fake.sends
@@ -94,13 +89,12 @@ def test_policy_replacement_after_final_evaluation_before_lease_cannot_dispatch(
 def test_authority_changes_while_vault_lookup_is_paused_are_rechecked_before_send(harness, monkeypatch, change):
     h = harness
     original_lease = h.google.vault._lease
-    looked_up, release, cancel = threading.Event(), threading.Event(), threading.Event()
+    rendezvous, cancel = WorkerRendezvous(), threading.Event()
 
     @contextmanager
     def lookup(*args, **kwargs):
         with original_lease(*args, **kwargs) as lease:
-            looked_up.set()
-            assert release.wait(5)
+            rendezvous.enter()
             yield lease
 
     def checkpoint():
@@ -108,9 +102,8 @@ def test_authority_changes_while_vault_lookup_is_paused_are_rechecked_before_sen
             raise CancellationRequested("synthetic host cancellation")
 
     monkeypatch.setattr(h.google.vault, "_lease", lookup)
-    worker, results = worker_call(lambda: h.invoke(checkpoint=checkpoint))
-    try:
-        assert looked_up.wait(3)
+    with rendezvous.worker(lambda: h.invoke(checkpoint=checkpoint)) as (worker, results):
+        rendezvous.wait_for_entry()
         assert not h.fake.sends
         if change == "send_permission":
             h.executor.policy = send_policy(send=False)
@@ -124,9 +117,6 @@ def test_authority_changes_while_vault_lookup_is_paused_are_rechecked_before_sen
             h.clock.advance((h.info.expires_at - h.clock.now()).total_seconds() + 1)
         else:
             cancel.set()
-    finally:
-        release.set()
-        worker.join(5)
     assert not worker.is_alive() and len(results) == 1 and not h.fake.sends
     record = h.actions.load(h.actions.list_actions()[0])
     assert record.attempts[-1].status is ActionAttemptStatus.NOT_INVOKED
@@ -145,20 +135,18 @@ def test_final_policy_registry_and_credential_leases_block_mutation_but_release_
         h.fake.after_effect = "timeout"
         first = h.invoke()
     original_identity = action_module._provider_identity
-    checked, release = threading.Event(), threading.Event()
+    rendezvous = WorkerRendezvous()
     host_thread = threading.get_ident()
 
     def identity(provider):
         result = original_identity(provider)
         if threading.get_ident() != host_thread and h.executor._credential_policy_leases:
-            checked.set()
-            assert release.wait(5)
+            rendezvous.enter()
         return result
 
     monkeypatch.setattr(action_module, "_provider_identity", identity)
-    worker, results = worker_call(h.invoke if operation == "send" else lambda: h.reconcile(first.action_id))
-    try:
-        assert checked.wait(3)
+    with rendezvous.worker(h.invoke if operation == "send" else lambda: h.reconcile(first.action_id)) as (worker, results):
+        rendezvous.wait_for_entry()
         assert len(h.fake.sends) == (operation == "probe") and not h.fake.probes
         with pytest.raises(CredentialError) as error:
             h.executor.policy = send_policy(send=False, probe=False)
@@ -182,9 +170,6 @@ def test_final_policy_registry_and_credential_leases_block_mutation_but_release_
                      h.actions._domain.mutex, h.approvals._domain.mutex):
             assert lock.acquire(blocking=False)
             lock.release()
-    finally:
-        release.set()
-        worker.join(5)
     assert not worker.is_alive() and len(results) == 1 and not isinstance(results[0], BaseException)
     assert results[0].ok if operation == "send" else results[0].status is ActionReconciliationStatus.SETTLED_SUCCEEDED
     h.executor.policy = send_policy(send=False, probe=False)
@@ -211,7 +196,7 @@ def test_permit_cannot_be_forged_reused_moved_to_another_thread_or_serialized(ha
             with pytest.raises(TypeError):
                 serialize(permit)
         worker, results = worker_call(lambda: permit.invoke(h.foundation.tool, args))
-        worker.join(3)
+        worker.join(WORKER_WATCHDOG)
         assert not worker.is_alive() and isinstance(results[0], CredentialError)
         assert results[0].reason is CredentialFailure.OWNERSHIP
         with pytest.raises(CredentialError):
@@ -260,51 +245,47 @@ def test_real_fork_rejects_inherited_send_permit_and_provider_before_poisoned_lo
     def run(args, context):
         payload, _ = h.foundation._load_preparation(h.preparation.preparation_id)
         submission = GmailSendSubmission(payload, context.credential_execution._identity)
-        locked, release = threading.Event(), threading.Event()
+        rendezvous = WorkerRendezvous()
         def hold():
             with h.runtime._lock, h.foundation._lock, h.executor._policy_lock:
-                locked.set()
-                assert release.wait(10)
-        worker = threading.Thread(target=hold, daemon=True)
-        worker.start()
-        assert locked.wait(3)
-        read_fd, write_fd = os.pipe()
-        child = os.fork()
-        if child == 0:
-            os.close(read_fd)
-            rejected = 0
-            operations = (
-                lambda: action_snapshot(h.runtime, h.foundation.tool),
-                lambda: h.foundation.prepare(args),
-                lambda: h.foundation.release(h.preparation),
-                lambda: context.credential_execution.invoke(h.foundation.tool, args),
-                context.credential_execution._finish,
-                lambda: h.foundation._provider.validate_intent(payload, h.info, reconcile=False),
-                lambda: h.foundation.reconciler.probe(None),
-                lambda: submission.mime_bytes,
-                lambda: h.executor.policy,
-            )
-            for operation in operations:
-                try:
-                    operation()
-                except CredentialError as exc:
-                    rejected += exc.reason is CredentialFailure.OWNERSHIP
-            os.write(write_fd, str(rejected).encode("ascii"))
-            os._exit(0)
-        os.close(write_fd)
-        reaped = False
-        try:
-            assert select.select([read_fd], [], [], 5)[0], "child touched an inherited lock"
-            assert os.read(read_fd, 16) == b"9"
-            assert os.waitpid(child, 0)[1] == 0
-            reaped = True
-        finally:
-            if not reaped:
-                os.kill(child, signal.SIGKILL)
-                os.waitpid(child, 0)
-            os.close(read_fd)
-            release.set()
-            worker.join(3)
+                rendezvous.enter()
+        with rendezvous.worker(hold):
+            rendezvous.wait_for_entry()
+            read_fd, write_fd = os.pipe()
+            child = os.fork()
+            if child == 0:
+                os.close(read_fd)
+                rejected = 0
+                operations = (
+                    lambda: action_snapshot(h.runtime, h.foundation.tool),
+                    lambda: h.foundation.prepare(args),
+                    lambda: h.foundation.release(h.preparation),
+                    lambda: context.credential_execution.invoke(h.foundation.tool, args),
+                    context.credential_execution._finish,
+                    lambda: h.foundation._provider.validate_intent(payload, h.info, reconcile=False),
+                    lambda: h.foundation.reconciler.probe(None),
+                    lambda: submission.mime_bytes,
+                    lambda: h.executor.policy,
+                )
+                for operation in operations:
+                    try:
+                        operation()
+                    except CredentialError as exc:
+                        rejected += exc.reason is CredentialFailure.OWNERSHIP
+                os.write(write_fd, str(rejected).encode("ascii"))
+                os._exit(0)
+            os.close(write_fd)
+            reaped = False
+            try:
+                assert select.select([read_fd], [], [], 5)[0], "child touched an inherited lock"
+                assert os.read(read_fd, 16) == b"9"
+                assert os.waitpid(child, 0)[1] == 0
+                reaped = True
+            finally:
+                if not reaped:
+                    os.kill(child, signal.SIGKILL)
+                    os.waitpid(child, 0)
+                os.close(read_fd)
         return original(args, context)
 
     monkeypatch.setattr(h.foundation.tool, "run", run)
