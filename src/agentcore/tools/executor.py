@@ -16,7 +16,7 @@ import threading
 import time
 import agentcore.errors as framework_errors
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, ExitStack
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -259,7 +259,7 @@ class ToolExecutor:
         self._policy_generation = 0
         self._credential_policy_leases = 0
         self._external_read_policy_leases = 0
-        self._filesystem_write_policy_leases = 0
+        self._filesystem_policy_leases = 0
         self.policy = policy
         self.workspace = workspace
         self.workspace_dir = (str(workspace.root) if workspace is not None
@@ -321,10 +321,24 @@ class ToolExecutor:
                 raise CredentialError(CredentialFailure.BUSY)
             if self._external_read_policy_leases:
                 raise PolicyLeaseBusyError("Permission policy is in use by an external read.")
-            if self._filesystem_write_policy_leases:
-                raise PolicyLeaseBusyError("Permission policy is in use by a filesystem write.")
+            if self._filesystem_policy_leases:
+                raise PolicyLeaseBusyError("Permission policy is in use by a filesystem operation.")
             self._policy = policy
             self._policy_generation += 1
+
+    @contextmanager
+    def _filesystem_policy_lease(self):
+        """Pin current authority before checks and through filesystem I/O."""
+        self._require_policy_owner()
+        with self._policy_lock:
+            self._require_policy_owner()
+            self._filesystem_policy_leases += 1
+        try:
+            yield
+        finally:
+            self._require_policy_owner()
+            with self._policy_lock:
+                self._filesystem_policy_leases -= 1
 
     @property
     def action_domain_health(self) -> ActionDomainHealth:
@@ -670,11 +684,17 @@ class ToolExecutor:
             )
         try:
             with store.execution_guard(claim.action_id):
-                return self._reconcile_under_action_guard(
-                    store,
-                    claim,
-                    checkpoint=checkpoint,
-                )
+                current = self._load_exact_recovery_claim(store, claim)
+                try:
+                    tool = self.registry.get(current.tool_name) if current is not None else None
+                except Exception:
+                    tool = None  # The existing boundary releases unavailable registrations.
+                with ExitStack() as leases:
+                    if type(tool) is WriteFileTool:
+                        leases.enter_context(self.registry.execution_lease(tool.name, tool))
+                        leases.enter_context(self._filesystem_policy_lease())
+                    return self._reconcile_under_action_guard(
+                        store, claim, checkpoint=checkpoint)
         except CancellationRequested:
             raise
         except Exception:
@@ -1549,20 +1569,10 @@ class ToolExecutor:
 
         @contextmanager
         def authorize():
-            policy, generation = self._policy_snapshot()
             tool.validate_contract()
-            validate()
-            with self._policy_lock:
-                self._require_policy_owner()
-                if self._policy is not policy or self._policy_generation != generation:
-                    raise ValueError("filesystem write policy changed")
-                self._filesystem_write_policy_leases += 1
-            try:
+            with self._filesystem_policy_lease():
+                validate()
                 yield
-            finally:
-                self._require_policy_owner()
-                with self._policy_lock:
-                    self._filesystem_write_policy_leases -= 1
 
         try:
             payload, _ = self._resolve_action_protected_storage(claimed)
@@ -2517,19 +2527,6 @@ class ToolExecutor:
     ) -> ToolInvocation:
         redacted = _redacted_args(cleaned)
         invocation_id = self._id_factory("inv")
-        # The write adapter inspects destination objects during preparation.
-        # Denied writes must not provide filesystem observations, including on
-        # a resume. Current authority is checked again at the physical seam.
-        if type(tool) is WriteFileTool:
-            decision, _ = self._current_policy_decision(
-                tool_spec, description=tool_spec.description)
-            if decision.outcome is Outcome.DENY:
-                log.warning(Events.TOOL_DENIED, **decision.to_dict())
-                return ToolInvocation(
-                    tool_spec.name, redacted,
-                    ToolResult.failure("Permission was not granted for this action.",
-                                       kind="permission_denied"),
-                    elapsed(), decision, invocation_id=invocation_id)
         try:
             trusted_context = action_context or ActionInvocationContext()
             if not isinstance(trusted_context, ActionInvocationContext):
@@ -2553,12 +2550,27 @@ class ToolExecutor:
                 log=log, invocation_id=invocation_id)
 
         try:
-            if type(tool) is AuthenticatedActionTool:
-                tool.validate_action_context(trusted_context, repeat=duplicate_risk_context is not None)
-            prepared = adapter.prepare_intent(cleaned, trusted_context)
-            if not isinstance(prepared, PreparedActionIntent):
-                raise TypeError("adapter preflight type")
-            prepared.validate()
+            with ExitStack() as leases:
+                # Preparation observes the destination; pin permission and
+                # exact registration before checking either and through I/O.
+                if type(tool) is WriteFileTool:
+                    leases.enter_context(self.registry.execution_lease(tool_spec.name, tool))
+                    leases.enter_context(self._filesystem_policy_lease())
+                    decision, _ = self._current_policy_decision(
+                        tool_spec, description=tool_spec.description)
+                    if decision.outcome is Outcome.DENY:
+                        log.warning(Events.TOOL_DENIED, **decision.to_dict())
+                        return ToolInvocation(
+                            tool_spec.name, redacted,
+                            ToolResult.failure("Permission was not granted for this action.",
+                                               kind="permission_denied"),
+                            elapsed(), decision, invocation_id=invocation_id)
+                if type(tool) is AuthenticatedActionTool:
+                    tool.validate_action_context(trusted_context, repeat=duplicate_risk_context is not None)
+                prepared = adapter.prepare_intent(cleaned, trusted_context)
+                if not isinstance(prepared, PreparedActionIntent):
+                    raise TypeError("adapter preflight type")
+                prepared.validate()
         except Exception:
             return self._journal_failure(
                 tool_spec.name, redacted, elapsed(),

@@ -17,6 +17,10 @@ never permission. Current registration, claim, workspace, health, policy and
 one-shot approval are checked before staging and again before publication.
 An immutable policy-generation lease and registry execution lease span staging,
 publication and cleanup, without holding their metadata mutexes across I/O.
+The same leases cover destination preparation and read-only reconciliation,
+including publication of reconciled journal truth. Revocation/removal fails
+busy while an observation is leased and succeeds after it ends; a revocation
+completed before leasing prevents filesystem access.
 OBSERVE/PROPOSE refuse writes; CONFIRM requires the existing durable approval
 path, including when a host capability override requests a lower level.
 AUTONOMOUS still respects current capability denial.

@@ -485,6 +485,116 @@ def test_permission_and_registration_leases_at_publication_hold_without_mutex_io
     assert not thread.is_alive() and len(results) == 1 and results[0].ok
 
 
+@pytest.mark.parametrize("path,allowed", [("sub/absent", True), ("sub/existing", False),
+                                         ("missing-parent/file", False)])
+def test_preparation_pins_permission_and_registration_through_destination_probe(make, monkeypatch, path, allowed):
+    h = make()
+    (h.root / "sub/existing").write_bytes(b"private")
+    entered, release = threading.Event(), threading.Event()
+    results = []
+    original = h.guard.prepare_create
+    def paused(requested):
+        entered.set()
+        assert release.wait(15)
+        return original(requested)
+    monkeypatch.setattr(h.guard, "prepare_create", paused)
+    def worker():
+        try:
+            results.append(h.invoke(path=path))
+        except BaseException as exc:
+            results.append(exc)
+    thread = threading.Thread(target=worker)
+    thread.start()
+    denied = PermissionPolicy(PermissionConfig(level=PermissionLevel.OBSERVE,
+        blocked_capabilities=(str(Capability.FS_READ), str(Capability.FS_WRITE))))
+    try:
+        assert entered.wait(15)
+        with pytest.raises(PolicyLeaseBusyError):
+            h.executor.policy = denied
+        with pytest.raises(ToolRegistryLeaseError):
+            h.registry.unregister("write_file")
+        for lock in (h.executor._policy_lock, h.registry._lock):
+            assert lock.acquire(blocking=False)
+            lock.release()
+    finally:
+        release.set()
+        thread.join(15)
+    assert not thread.is_alive() and len(results) == 1 and results[0].ok is allowed
+    h.executor.policy = denied  # Revocation succeeds after the observation ends.
+    def forbidden(*args):
+        pytest.fail("revoked preparation read filesystem")
+    monkeypatch.setattr(h.guard, "prepare_create", forbidden)
+    for requested in ("sub/absent", "sub/existing", "missing-parent/file"):
+        assert h.invoke(path=requested).result.metadata["kind"] == "permission_denied"
+
+
+@pytest.mark.parametrize("seam", ["probe", "publication"])
+def test_reconciliation_pins_read_permission_and_registration_through_publication(make, monkeypatch, seam):
+    h = make()
+    def interrupted(publish):
+        publish()
+        raise TimeoutError()
+    _publication_hook(monkeypatch, interrupted)
+    invocation = h.invoke()
+    entered, release = threading.Event(), threading.Event()
+    results = []
+    if seam == "probe":
+        original = h.guard.observe_create
+        def paused(*args):
+            entered.set()
+            assert release.wait(15)
+            return original(*args)
+        monkeypatch.setattr(h.guard, "observe_create", paused)
+    else:
+        original = h.actions.compare_and_swap
+        def paused(action_id, version, candidate):
+            if candidate.state is ActionState.SUCCEEDED:
+                entered.set()
+                assert release.wait(15)
+            return original(action_id, version, candidate)
+        monkeypatch.setattr(h.actions, "compare_and_swap", paused)
+    def worker():
+        try:
+            results.append(h.reconcile(invocation.action_id))
+        except BaseException as exc:
+            results.append(exc)
+    thread = threading.Thread(target=worker)
+    thread.start()
+    denied = PermissionPolicy(PermissionConfig(blocked_capabilities=(str(Capability.FS_READ),)))
+    try:
+        assert entered.wait(15)
+        with pytest.raises(PolicyLeaseBusyError):
+            h.executor.policy = denied
+        with pytest.raises(ToolRegistryLeaseError):
+            h.registry.unregister("write_file")
+        for lock in (h.executor._policy_lock, h.registry._lock):
+            assert lock.acquire(blocking=False)
+            lock.release()
+    finally:
+        release.set()
+        thread.join(15)
+    assert not thread.is_alive() and len(results) == 1
+    assert results[0].status is ActionReconciliationStatus.SETTLED_SUCCEEDED
+    h.executor.policy = denied
+    h.registry.unregister("write_file")  # Both leases retire after truth publication.
+
+
+def test_reconciliation_revoked_before_lease_cannot_observe_target(make, monkeypatch):
+    h = make()
+    def interrupted(publish):
+        publish()
+        raise TimeoutError()
+    _publication_hook(monkeypatch, interrupted)
+    invocation = h.invoke()
+    h.executor.policy = PermissionPolicy(PermissionConfig(blocked_capabilities=(str(Capability.FS_READ),)))
+    def forbidden(*args):
+        pytest.fail("revoked reconciliation read filesystem")
+    monkeypatch.setattr(h.guard, "observe_create", forbidden)
+    assert h.reconcile(invocation.action_id).status is ActionReconciliationStatus.PROBE_DENIED
+    h.executor.policy = PermissionPolicy()
+    h.registry.unregister("write_file")
+
+
 def test_attempt_and_protected_intent_are_durable_before_staging(make, monkeypatch):
     h = make()
     original = h.guard.create_file
