@@ -156,8 +156,11 @@ class FilesystemWriteFoundation:
                 raise ValueError("invalid write content")
             observed = self.guard.observe_create(payload, len(data))
             if observed is None:
-                return ActionReconciliationResult(EffectVerdict.CONFIRMED_NOT_APPLIED,
-                    "filesystem.absent", "Final target is absent.")
+                # Absence after an uncertain attempt is not historical proof:
+                # a cooperating process may have removed a published file.
+                return ActionReconciliationResult(EffectVerdict.OUTCOME_UNKNOWN,
+                    "filesystem.absent_unverified", "Final target is absent; prior publication cannot be excluded.",
+                    reconciliation_disposition=ReconciliationDisposition.HUMAN_CONFIRMATION_REQUIRED)
             if observed == payload["content_digest"]:
                 return ActionReconciliationResult(EffectVerdict.CONFIRMED_APPLIED,
                     "filesystem.matches", "Final file matches the intended content.")

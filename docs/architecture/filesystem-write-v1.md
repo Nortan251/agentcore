@@ -20,6 +20,8 @@ publication and cleanup, without holding their metadata mutexes across I/O.
 OBSERVE/PROPOSE refuse writes; CONFIRM requires the existing durable approval
 path, including when a host capability override requests a lower level.
 AUTONOMOUS still respects current capability denial.
+Denied writes are checked before destination preparation, so they cannot probe
+target existence or parent structure, including when resuming an action.
 
 Lexical path validation and the host sensitive policy remain in `fs`. Writes
 enforce the sensitive/no-follow/single-link posture even if read-only filesystem
@@ -43,6 +45,8 @@ On Windows, the trusted root is opened with `FILE_FLAG_OPEN_REPARSE_POINT` and
 directory semantics. Every requested child is opened with `NtCreateFile`
 relative to an inspected directory handle and `FILE_OPEN_REPARSE_POINT`.
 Reparse attributes are rejected, not followed. Data-read directory handles
+also supply canonical component names for sensitive-policy checks, so DOS
+short-name aliases cannot disguise sensitive parents. These directory handles
 exclude delete sharing; attribute-only handles do not establish that exclusion.
 Staging is exclusive and flushed with `FlushFileBuffers`.
 `NtSetInformationFile(FileRenameInformation)` publishes relative to the final
@@ -89,10 +93,16 @@ The read-only reconciler uses the same verified filesystem boundary:
 
 - Safe single-linked regular final file with exact size and content digest:
   CONFIRMED_APPLIED.
-- Final target absent in the exact bound workspace/parent: CONFIRMED_NOT_APPLIED.
+- Final target absent after an uncertain attempt:
+  OUTCOME_UNKNOWN / HUMAN_CONFIRMATION_REQUIRED. Absence cannot distinguish
+  no publication from a published file subsequently removed by a cooperating
+  process. This preserves historical effect uncertainty and authorizes no retry.
 - Unsafe/different/unverifiable final target or substituted ancestry:
   OUTCOME_UNKNOWN / HUMAN_CONFIRMATION_REQUIRED. No blind retry.
 
+Live refusal of an existing target proves CONFIRMED_NOT_APPLIED for that
+attempt; a proven interruption before staging remains NOT_INVOKED. Neither
+classification is inferred merely from absence during crash recovery.
 Staging alone is not application. No automatic write retry is requested by the
 reconciler. Existing targets cannot be overwritten on a resumed action, and
 ActionJournal guards/attempt truth fence duplicate execution. Crash residue is

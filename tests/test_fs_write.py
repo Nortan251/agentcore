@@ -215,6 +215,46 @@ def test_current_capability_block_deny(make):
     assert not h.invoke().ok and not (h.root / "sub/new.txt").exists()
 
 
+@pytest.mark.parametrize("level", [PermissionLevel.OBSERVE, PermissionLevel.PROPOSE,
+                                  PermissionLevel.AUTONOMOUS])
+def test_denied_write_cannot_probe_filesystem_even_on_resume(make, monkeypatch, level):
+    h = make(level=level)
+    h.executor.policy = PermissionPolicy(PermissionConfig(level=level,
+        blocked_capabilities=(str(Capability.FS_READ), str(Capability.FS_WRITE))))
+    (h.root / "sub/existing").write_bytes(b"private")
+    def forbidden(*args, **kwargs):
+        pytest.fail("denied write inspected the filesystem")
+    monkeypatch.setattr(h.guard, "prepare_create", forbidden)
+    for path in ("sub/absent", "sub/existing", "missing-parent/file"):
+        for context in (None, ActionInvocationContext(action_id="act_" + "1" * 12)):
+            result = h.invoke(path=path, action_context=context)
+            assert not result.ok and result.result.metadata["kind"] == "permission_denied"
+            assert result.result.error == "Permission was not granted for this action."
+    assert not h.actions.list_actions() and not h.residue()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires real NTFS DOS short-name aliases")
+@pytest.mark.parametrize("directory", [".docker", "host-sensitive-long-directory"])
+def test_windows_sensitive_parent_short_name_alias_refused(make, directory):
+    import win32file
+    import win32con
+    h = make()
+    sensitive = h.root / directory
+    sensitive.mkdir()
+    h.guard._sensitive = h.guard.sensitive_policy.extend(directories={directory})
+    handle = win32file.CreateFile(str(sensitive), win32con.GENERIC_WRITE | 0x10000, 7,
+        None, win32con.OPEN_EXISTING, win32con.FILE_FLAG_BACKUP_SEMANTICS, None)
+    try:
+        win32file.SetFileShortName(handle, "ACSEC~1")
+    finally:
+        handle.Close()
+    # Prove this is a real alias to the sensitive object, not a mocked API.
+    assert os.path.samefile(h.root / "ACSEC~1", sensitive)
+    assert h.guard.sensitive_policy.reason("ACSEC~1/new.txt") is None
+    assert not h.invoke(path="ACSEC~1/new.txt").ok
+    assert not list(sensitive.iterdir()) and not h.actions.list_actions() and not h.residue()
+
+
 @pytest.mark.parametrize("level", [PermissionLevel.OBSERVE, PermissionLevel.PROPOSE, PermissionLevel.CONFIRM])
 def test_host_capability_override_cannot_erase_write_level_or_approval_floor(make, level):
     h = make(level=level)
@@ -287,8 +327,8 @@ def test_uncertainty_and_real_read_only_reconciliation(make, monkeypatch, outcom
         external.write_bytes(b"PRIVATE_CONTENT_SENTINEL")
         _symlink(target, external)
     report = h.reconcile(result.action_id)
-    expected = {"applied": ActionReconciliationStatus.SETTLED_SUCCEEDED,
-                "absent": ActionReconciliationStatus.SETTLED_FAILED}.get(outcome, ActionReconciliationStatus.UNRESOLVED)
+    expected = (ActionReconciliationStatus.SETTLED_SUCCEEDED if outcome == "applied"
+                else ActionReconciliationStatus.UNRESOLVED)
     assert report.status is expected
     public = repr(h.logger.events) + json.dumps(result.to_dict()) + repr(h.actions.load(result.action_id))
     assert "PRIVATE_CONTENT_SENTINEL" not in public and "PRIVATE_EXCEPTION_SENTINEL" not in public
@@ -313,7 +353,30 @@ def test_staging_failure_cleans_partial_and_reconciliation_ignores_staging(make,
     result = h.invoke()
     assert not result.ok and not (h.root / "sub/new.txt").exists() and not h.residue()
     (h.root / "sub/.agentcore-stage-crash-residue").write_text("héllo\n", encoding="utf-8")
-    assert h.reconcile(result.action_id).status is ActionReconciliationStatus.SETTLED_FAILED
+    assert h.reconcile(result.action_id).status is ActionReconciliationStatus.UNRESOLVED
+
+
+def test_published_then_removed_after_interruption_remains_unknown_without_retry(make, monkeypatch):
+    from agentcore.action_journal import ReconciliationDisposition
+    h = make()
+    calls = []
+    def interrupted(publish):
+        calls.append(1)
+        publish()
+        raise TimeoutError("post-publication interruption")
+    _publication_hook(monkeypatch, interrupted)
+    result = h.invoke()
+    assert h.actions.load(result.action_id).state is ActionState.RECONCILE_REQUIRED
+    target = h.root / "sub/new.txt"
+    assert target.read_bytes() == "héllo\n".encode()
+    target.unlink()  # A cooperating process removes the proven published file.
+    report = h.reconcile(result.action_id)
+    assert report.status is ActionReconciliationStatus.UNRESOLVED
+    record = h.actions.load(result.action_id)
+    assert record.state is ActionState.RECONCILE_REQUIRED
+    assert record.reconciliation.disposition is ReconciliationDisposition.HUMAN_CONFIRMATION_REQUIRED
+    h.invoke(action_context=ActionInvocationContext(action_id=result.action_id))
+    assert calls == [1] and not target.exists() and len(record.attempts) == 1
 
 
 def test_same_action_cannot_blindly_repeat_after_uncertainty(make, monkeypatch):

@@ -55,6 +55,7 @@ def parent(guard, relative):
             from agentcore.fs import _windows_mutation as win
             handle = win.root(guard.root)
             stack.callback(win.close, handle)
+            canonical_parts = []
             for name in (None, *relative.parts[:-1]):
                 if name is not None:
                     handle = win.open_child(handle, name, directory=True)
@@ -62,6 +63,11 @@ def parent(guard, relative):
                 attrs, identity, _, _ = win.facts(handle)
                 if attrs & 0x400 or not attrs & 0x10:
                     _reject(RejectionReason.SYMLINK)
+                if name is not None:
+                    # NT also resolves DOS short-name aliases. Check the actual
+                    # opened components, not only the model's lexical spelling.
+                    canonical_parts.append(win.final_name(handle))
+                    relative_path(guard, "/".join((*canonical_parts, relative.name)))
                 identities.append(list(identity))
         elif os.name == "posix":
             flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)

@@ -2517,6 +2517,19 @@ class ToolExecutor:
     ) -> ToolInvocation:
         redacted = _redacted_args(cleaned)
         invocation_id = self._id_factory("inv")
+        # The write adapter inspects destination objects during preparation.
+        # Denied writes must not provide filesystem observations, including on
+        # a resume. Current authority is checked again at the physical seam.
+        if type(tool) is WriteFileTool:
+            decision, _ = self._current_policy_decision(
+                tool_spec, description=tool_spec.description)
+            if decision.outcome is Outcome.DENY:
+                log.warning(Events.TOOL_DENIED, **decision.to_dict())
+                return ToolInvocation(
+                    tool_spec.name, redacted,
+                    ToolResult.failure("Permission was not granted for this action.",
+                                       kind="permission_denied"),
+                    elapsed(), decision, invocation_id=invocation_id)
         try:
             trusted_context = action_context or ActionInvocationContext()
             if not isinstance(trusted_context, ActionInvocationContext):

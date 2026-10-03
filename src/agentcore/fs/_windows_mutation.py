@@ -100,9 +100,13 @@ def discard(handle):
     _check(_set(int(handle), c.byref(io), c.byref(delete), c.sizeof(delete), 13))
 
 
-def has_staging_name(handle, name):
+def final_name(handle):
     # Private kernel observation only. Never expose this absolute host path.
-    return win32file.GetFinalPathNameByHandle(handle, 0).rsplit("\\", 1)[-1] == name
+    return win32file.GetFinalPathNameByHandle(handle, 0).rsplit("\\", 1)[-1]
+
+
+def has_staging_name(handle, name):
+    return final_name(handle) == name
 
 
 def write(handle, data):
