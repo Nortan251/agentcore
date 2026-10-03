@@ -103,3 +103,13 @@ Project lead independently reviews this exact head and decides whether to author
 ## Final verdict
 
 Hotfix implementation and verification are complete and ready for independent project-lead review. PR #39 is open and unmerged. This ledger publication grants no merge authority and does not complete PR #38.
+
+## Amendment — 2026-10-03: project-lead review and merge
+
+This amendment supersedes the earlier open/unmerged status while preserving the historical snapshot above.
+
+The project lead independently verified exact head `d90eeab49b1de149a480351f28756b6291ee9f40`, the four test/helper-only changed files, six successful exact-head CI jobs, fresh Codex review, and zero unresolved review threads. PR #39 was merged with an expected-head guard as `7d9d34453ac384dc2a423600dba6a900731002c0`.
+
+PR #38 subsequently integrated that new main, passed its own fresh exact-head gates, and merged as `72a0f55be620565344b3e57667371e2a695adb0e`. The Gmail hotfix remains test-only in the integrated tree.
+
+Final status: **MERGED; Gmail Windows authority-test rendezvous hotfix complete.**
