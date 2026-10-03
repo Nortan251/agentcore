@@ -107,3 +107,28 @@ Browser capacity repair is documented and ready for Gmail-hotfix integration. PR
 Supersedes only the original snapshot's statement that Gmail-hotfix implementation/verification remains unfinished. [PR #39](https://github.com/Nortan251/agentcore/pull/39) now has six successful exact-head CI jobs, a clean exact-head Codex review and zero inline review threads at `d90eeab49b1de149a480351f28756b6291ee9f40`. See its [classified handoff](../gmail/PR-0039-windows-rendezvous-hotfix.md) for authoritative job/review links and diagnosis limits.
 
 PR #39 is still open and unmerged. PR #38 remains open at `be7f1a8340b27b8ad41d411673b77806f9142585`; this ledger task changed neither implementation PR. Hotfix merge authorization, integration into PR #38, and six green jobs plus a fresh review on the final integrated Browser head remain required. The original failed job's exact trigger remains unknown; green hotfix CI does not retrospectively prove it.
+
+## Amendment — 2026-10-03: final integration and merge
+
+This amendment supersedes the earlier open/unmerged status while preserving the historical snapshots above.
+
+PR #39 was independently reviewed and merged first as `7d9d34453ac384dc2a423600dba6a900731002c0`. PR #38 then synchronized with that authoritative `main` via normal merge commit `a404120a739d4dd0960f687ebe94cf34adebb939`, whose parents are prior Browser head `be7f1a8340b27b8ad41d411673b77806f9142585` and main `7d9d34453ac384dc2a423600dba6a900731002c0`. GitHub reported no merge conflicts; no force-push was used.
+
+Relative to the integrated main, PR #38 still changed only the ten Browser/docs/test files already classified above; Browser production changes remained limited to `src/agentcore/browser/config.py` and `src/agentcore/browser/fetch.py`. The merged Gmail rendezvous hotfix matched main and remained test-only.
+
+Fresh exact-head GitHub evidence on `a404120a739d4dd0960f687ebe94cf34adebb939`:
+
+- Linux full: SUCCESS, run `37148069605`, job `111276005295`.
+- Windows 3.11: SUCCESS, run `37148069664`, job `111276005416`.
+- Windows 3.12: SUCCESS, run `37148069664`, job `111276005523`.
+- Windows 3.13: SUCCESS, run `37148069664`, job `111276005547`.
+- Chromium Ubuntu: SUCCESS, run `37148069518`, job `111276004940`.
+- Chromium Windows: SUCCESS, run `37148069518`, job `111276004758`.
+- Fresh Codex review comment `5972744532` reported no major issues and reviewed abbreviated commit `a404120a73`, matching the final exact head.
+- Inline unresolved review threads: 0.
+
+The project lead independently rechecked the final PR metadata, exact-head CI, review, unresolved-thread state, main-relative changed-file list, and production diff. PR #38 was then merged with an expected-head guard. Merge commit: `72a0f55be620565344b3e57667371e2a695adb0e`.
+
+Authoritative `main` after merge: `72a0f55be620565344b3e57667371e2a695adb0e`.
+
+Final status: **MERGED; Browser Read v1.1 static-capacity task complete.**
