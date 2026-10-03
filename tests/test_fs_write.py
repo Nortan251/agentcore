@@ -233,6 +233,22 @@ def test_denied_write_cannot_probe_filesystem_even_on_resume(make, monkeypatch, 
     assert not h.actions.list_actions() and not h.residue()
 
 
+@pytest.mark.parametrize("approve", [False, True])
+def test_pending_write_approval_grants_no_destination_observation_when_read_blocked(make, monkeypatch, approve):
+    h = make(level=PermissionLevel.CONFIRM, approve=approve)
+    h.executor.policy = PermissionPolicy(PermissionConfig(level=PermissionLevel.CONFIRM,
+        blocked_capabilities=(str(Capability.FS_READ),)))
+    (h.root / "sub/existing").write_bytes(b"private")
+    def forbidden(*args):
+        pytest.fail("pending approval without FS_READ inspected the destination")
+    monkeypatch.setattr(h.guard, "prepare_create", forbidden)
+    for path in ("sub/absent", "sub/existing", "missing-parent/file"):
+        result = h.invoke(path=path)
+        assert not result.ok and result.result.metadata["kind"] == "permission_denied"
+        assert result.result.error == "Permission was not granted for this action."
+    assert not h.actions.list_actions() and not h.residue()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="requires real NTFS DOS short-name aliases")
 @pytest.mark.parametrize("directory", [".docker", "host-sensitive-long-directory"])
 def test_windows_sensitive_parent_short_name_alias_refused(make, directory):

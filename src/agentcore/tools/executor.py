@@ -2558,6 +2558,16 @@ class ToolExecutor:
                     leases.enter_context(self._filesystem_policy_lease())
                     decision, _ = self._current_policy_decision(
                         tool_spec, description=tool_spec.description)
+                    if decision.outcome is Outcome.REQUIRE_APPROVAL:
+                        # Pending write approval grants no observation authority.
+                        # Preflight may inspect only under independently allowed
+                        # FS_READ; approved mutation remains a later boundary.
+                        observation = self.policy.check(
+                            frozenset({Capability.FS_READ}), description="Prepare filesystem create")
+                        if not observation.allowed:
+                            decision = Decision(Outcome.DENY,
+                                "filesystem preparation requires current read authority",
+                                capability=Capability.FS_READ)
                     if decision.outcome is Outcome.DENY:
                         log.warning(Events.TOOL_DENIED, **decision.to_dict())
                         return ToolInvocation(

@@ -26,6 +26,10 @@ path, including when a host capability override requests a lower level.
 AUTONOMOUS still respects current capability denial.
 Denied writes are checked before destination preparation, so they cannot probe
 target existence or parent structure, including when resuming an action.
+When write permission requires CONFIRM approval, destination preparation needs
+independently allowed current FS_READ. Pending approval grants no observation
+authority; a host configuration blocking FS_READ therefore refuses this
+preflight uniformly before inspecting any destination.
 
 Lexical path validation and the host sensitive policy remain in `fs`. Writes
 enforce the sensitive/no-follow/single-link posture even if read-only filesystem
