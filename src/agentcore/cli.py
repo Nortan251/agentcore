@@ -2469,7 +2469,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "memory":
         return _command_memory(args, config)
     if args.command == "chat":
-        return _command_chat(args, config)
+        from agentcore.conversation.errors import SessionDomainError
+        try:
+            return _command_chat(args, config)
+        except SessionDomainError:
+            if args.as_json:
+                _emit({"ok": False, "error": "conversation_session_domain_mismatch"})
+            else:
+                print("Conversation session belongs to a different session domain.", file=sys.stderr)
+            return 2
 
     if args.command == "run":
         # An objective starts something new; --resume continues something that

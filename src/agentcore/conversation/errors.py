@@ -17,6 +17,10 @@ class ConversationValidationError(ConversationError):
     """A session or message is malformed."""
 
 
+class SessionDomainError(ConversationError):
+    """A transcript is unavailable to this conversation composition."""
+
+
 class SessionNotFoundError(ConversationError):
     """No session exists with the requested id."""
 

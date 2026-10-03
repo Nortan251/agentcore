@@ -570,10 +570,14 @@ class Agent:
             SYSTEM_PROMPT,
             ConversationRuntime,
         )
-        from agentcore.conversation.session import build_session_store
+        from agentcore.conversation.session import build_session_store, validate_session_directory
 
         store = sessions
         if store is None:
+            # Refuse the reserved domain before storage failure could degrade
+            # to an ordinary in-memory conversation with the requested ID.
+            if self.config.conversation.directory:
+                validate_session_directory(self.config.conversation.directory, domain="ordinary")
             try:
                 store = build_session_store(self.config)
             except OSError as exc:
@@ -588,6 +592,7 @@ class Agent:
             else self._build_tool_runner(), state=self.state,
             turns=self._turns,
             config=self.config.conversation,
+            session_domain="ordinary",
             system_prompt=system_prompt or SYSTEM_PROMPT,
             logger=get_logger("conversation.runtime"))
 

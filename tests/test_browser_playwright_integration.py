@@ -63,7 +63,7 @@ def unread_document_worker(pipe, config):
 
 
 def _windows_process_diagnostics(pid):
-    """Read-only, zero-timeout query after the cleanup assertion has failed."""
+    """Independent read-only, zero-timeout Windows process-state query."""
     import ctypes
     from ctypes import wintypes
 
@@ -101,8 +101,63 @@ def _windows_process_diagnostics(pid):
     return result
 
 
-def _cleanup_failure_diagnostics(backend, alive):
-    """Never retry cleanup or reconsider the already-observed test failure."""
+def _assert_owned_processes_terminated(backend):
+    """Verify original observed identities, without retrying work or cleanup."""
+    import math
+    import psutil
+
+    failures = []
+    for identity, process in backend._observed.items():
+        evidence = {"observed_identity": identity}
+        try:
+            retained_alive = process.is_running()
+        except Exception as error:
+            retained_alive = None
+            evidence["retained_error"] = type(error).__name__
+        evidence["retained_is_running"] = retained_alive
+        if os.name != "nt":
+            if retained_alive is not False:
+                failures.append(evidence)
+            continue
+
+        # Always query independently on Windows. A cached psutil observation
+        # is neither proof of life nor permission to disregard uncertainty.
+        fresh_time = None
+        absent = False
+        try:
+            fresh_time = psutil.Process(identity[0]).create_time()
+            evidence["fresh_create_time"] = fresh_time
+        except psutil.NoSuchProcess:
+            absent = True
+            evidence["fresh"] = "NoSuchProcess"
+        except Exception as error:
+            evidence["fresh_error"] = type(error).__name__
+        try:
+            native = _windows_process_diagnostics(identity[0])
+        except Exception as error:
+            native = {"query_error": type(error).__name__}
+        evidence["windows_native"] = native
+
+        if absent:
+            continue  # The original PID ceased to exist before the native query.
+        identified = all(isinstance(value, (int, float)) and math.isfinite(value)
+                         for value in (fresh_time, identity[1]))
+        if identified and fresh_time != identity[1]:
+            continue  # PID reuse: the original observed identity is dead.
+        if (identified and fresh_time == identity[1] and native.get("open_process_succeeded")
+                and native.get("wait_result") == 0):
+            continue  # WAIT_OBJECT_0 proves termination despite cached liveness.
+        evidence["classification"] = (
+            "live_matching_identity" if identified and fresh_time == identity[1]
+            and native.get("open_process_succeeded") and native.get("wait_result") == 258
+            else "inconclusive")
+        failures.append(evidence)
+    if failures:
+        pytest.fail(_cleanup_failure_diagnostics(backend, failures))
+
+
+def _cleanup_failure_diagnostics(backend, evidence):
+    """Render the exact failed observations; never retry liveness/cleanup."""
     import json
     import psutil
 
@@ -114,11 +169,10 @@ def _cleanup_failure_diagnostics(backend, alive):
 
     root = backend._root
     root_pid = root.pid if root is not None else None
-    descendant_pids = {key[0] for key in backend._observed if key[0] != root_pid}
     details = {"closed": backend._closed, "cleanup_failed": backend._cleanup_failed,
                "observed_count": len(backend._observed), "root_pid": root_pid,
                "root_create_time": read(root.create_time) if root is not None else None,
-               "offending_processes": []}
+               "offending_processes": evidence}
     worker = backend._worker
     if worker is not None:
         try:
@@ -128,34 +182,6 @@ def _cleanup_failure_diagnostics(backend, alive):
             details["worker"] = {"closed": worker._closed,
                                  "fields_unavailable": "multiprocessing.Process is closed"}
 
-    for identity, process in alive:
-        entry = {"pid": process.pid, "observed_identity": identity,
-                 "classification": ("root" if process.pid == root_pid else
-                                    "recorded_descendant" if process.pid in descendant_pids else
-                                    "neither")}
-        if os.name == "nt":
-            entry["windows_native"] = _windows_process_diagnostics(process.pid)
-        retained = {name: read(getattr(process, name))
-                    for name in ("create_time", "status", "ppid", "name", "exe", "cmdline")}
-        # This is the FIRST liveness result, not a second chance to pass.
-        retained["is_running"] = True
-        entry["retained"] = retained
-        try:
-            fresh = psutil.Process(process.pid)
-        except (psutil.NoSuchProcess, psutil.AccessDenied) as error:
-            entry["fresh"] = {"unavailable": type(error).__name__}
-        else:
-            state = {name: read(getattr(fresh, name))
-                     for name in ("create_time", "status", "ppid", "name", "is_running")}
-            entry["fresh"] = state
-            fresh_time = state["create_time"]
-            entry["fresh_matches_observed_identity"] = (
-                fresh_time == identity[1] if isinstance(fresh_time, (int, float)) else None)
-            entry["fresh_matches_retained_create_time"] = (
-                fresh_time == retained["create_time"]
-                if isinstance(fresh_time, (int, float))
-                and isinstance(retained["create_time"], (int, float)) else None)
-        details["offending_processes"].append(entry)
     return "Owned process reported running after close:\n" + json.dumps(details, indent=2)
 
 
@@ -207,7 +233,7 @@ def test_real_chromium_text_links_and_local_subresources(local_server):
         assert backend.network_isolated is False
     finally:
         backend.close()
-    assert all(not process.is_running() for process in backend._observed.values())
+    _assert_owned_processes_terminated(backend)
     backend.close()
 
 
@@ -276,7 +302,7 @@ def test_real_repeat_start_stop_no_observed_process_left():
         assert backend.current_page().url == "about:blank"
         backend.close()
         backend.close()
-        assert all(not process.is_running() for process in backend._observed.values())
+        _assert_owned_processes_terminated(backend)
 
 
 def test_real_closed_page_is_categorical_and_cleaned():
@@ -298,10 +324,7 @@ def test_owned_worker_failure_deadline_and_cleanup(worker, failure):
         backend.current_page()
     assert error.value.failure is failure
     backend.close()
-    alive = [(identity, process) for identity, process in backend._observed.items()
-             if process.is_running()]
-    if alive:
-        pytest.fail(_cleanup_failure_diagnostics(backend, alive))
+    _assert_owned_processes_terminated(backend)
 
 
 def test_direct_navigation_cannot_bypass_boundary():
@@ -323,5 +346,5 @@ def test_large_document_send_cannot_defeat_parent_timeout_or_cleanup():
     assert time.monotonic() - before < 5
     assert not backend._sender_thread.is_alive()
     assert not backend._reader_thread.is_alive()
-    assert all(not process.is_running() for process in backend._observed.values())
+    _assert_owned_processes_terminated(backend)
     backend.close()

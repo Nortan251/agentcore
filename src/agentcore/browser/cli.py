@@ -9,6 +9,7 @@ import sys
 
 from agentcore.config.loader import load_config
 from agentcore.conversation.errors import ConversationError
+from agentcore.conversation.session import BROWSER_SESSIONS_SUBDIR
 from agentcore.errors import ConfigError
 from agentcore.models.errors import ModelError
 from agentcore.models.factory import provider_from_config
@@ -116,7 +117,7 @@ def command_browser(args):
         elif args.session_id is not None and not _SESSION_ID.fullmatch(args.session_id):
             error = "browser_session_invalid"
         else:
-            directory = config.canonical_workspace() / ".browser_sessions"
+            directory = config.canonical_workspace() / BROWSER_SESSIONS_SUBDIR
             session_id = args.session_id or new_id("conv")
             # New turns also hold their lease before runtime's best-effort
             # autosave can make the transcript visible to a resume process.

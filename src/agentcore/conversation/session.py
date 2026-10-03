@@ -29,6 +29,7 @@ from typing import Any, Iterator, Mapping, Protocol, Sequence, runtime_checkable
 
 from agentcore.conversation.errors import (
     ConversationValidationError,
+    SessionDomainError,
     SessionNotFoundError,
 )
 from agentcore.models.messages import Message, Role
@@ -42,6 +43,54 @@ SESSION_SCHEMA_VERSION = 1
 
 #: Subdirectory of the workspace holding persisted sessions.
 SESSIONS_SUBDIR = "conversations"
+BROWSER_SESSIONS_SUBDIR = ".browser_sessions"
+BROWSER_SESSION_MARKER = "browser_read_isolated_v1"
+
+
+def validate_session_domain(metadata, *, domain="ordinary"):
+    """Validate host-selected domains before deserializing/replaying history."""
+    if not isinstance(metadata, Mapping):
+        raise SessionDomainError("conversation_session_domain_mismatch")
+    valid = (domain == "ordinary" and BROWSER_SESSION_MARKER not in metadata
+             or domain == "browser_read" and metadata.get(BROWSER_SESSION_MARKER) is True)
+    if not valid:
+        raise SessionDomainError("conversation_session_domain_mismatch")
+
+
+def validate_session_directory(directory, *, domain):
+    # Reserve the browser namespace before its first transcript is visible.
+    if domain == "ordinary" and directory is not None:
+        try:
+            reserved = (os.path.normcase(Path(directory).resolve().name)
+                        == os.path.normcase(BROWSER_SESSIONS_SUBDIR))
+        except (OSError, RuntimeError):
+            raise SessionDomainError("conversation_session_domain_mismatch") from None
+        if reserved:
+            raise SessionDomainError("conversation_session_domain_mismatch")
+
+
+class _SessionDomain:
+    """Bind a store to its composition without changing its identity/API."""
+
+    _session_domain = None
+
+    def bind_domain(self, *, domain):
+        if domain not in ("ordinary", "browser_read"):
+            raise SessionDomainError("conversation_session_domain_mismatch")
+        validate_session_directory(getattr(self, "directory", None), domain=domain)
+        # A single dictionary operation publishes the immutable binding even
+        # when competing composition roots share this store across threads.
+        if self.__dict__.setdefault("_session_domain", domain) != domain:
+            raise SessionDomainError("conversation_session_domain_mismatch")
+
+    def _validate_domain(self, metadata, *, requested_domain=None):
+        if (self._session_domain is not None and requested_domain is not None
+                and self._session_domain != requested_domain):
+            raise SessionDomainError("conversation_session_domain_mismatch")
+        domain = self._session_domain or requested_domain
+        if domain is not None:
+            validate_session_directory(getattr(self, "directory", None), domain=domain)
+            validate_session_domain(metadata, domain=domain)
 
 
 @dataclass
@@ -226,7 +275,7 @@ class SessionStore(Protocol):
     def delete(self, session_id: str) -> None: ...
 
 
-class InMemorySessionStore:
+class InMemorySessionStore(_SessionDomain):
     """Non-durable store, mirroring ``InMemoryStateStore``."""
 
     def __init__(self) -> None:
@@ -235,13 +284,17 @@ class InMemorySessionStore:
     def save(self, session: ConversationSession, *,
              log_session_id: str | None = None) -> None:
         # A serialised copy, so later mutation cannot alter the snapshot.
+        self._validate_domain(session.metadata)
+        if self._session_domain is not None and self.exists(session.id):
+            self.load(session.id)
         self._data[session.id] = session.to_dict()
 
-    def load(self, session_id: str) -> ConversationSession:
+    def load(self, session_id: str, *, session_domain: str | None = None) -> ConversationSession:
         payload = self._data.get(str(session_id))
         if payload is None:
             raise SessionNotFoundError("no saved conversation session",
                                        session_id=str(session_id))
+        self._validate_domain(payload.get("metadata") or {}, requested_domain=session_domain)
         return ConversationSession.from_dict(payload)
 
     def exists(self, session_id: str) -> bool:
@@ -251,12 +304,14 @@ class InMemorySessionStore:
         return sorted(self._data)
 
     def delete(self, session_id: str) -> None:
+        if self._session_domain is not None:
+            self.load(session_id)
         if self._data.pop(str(session_id), None) is None:
             raise SessionNotFoundError("no saved conversation session",
                                        session_id=str(session_id))
 
 
-class JsonFileSessionStore:
+class JsonFileSessionStore(_SessionDomain):
     """One JSON file per session, written atomically.
 
     Deliberately a *separate* store from ``JsonFileStateStore``: conversation
@@ -279,7 +334,10 @@ class JsonFileSessionStore:
 
     def save(self, session: ConversationSession, *,
              log_session_id: str | None = None) -> None:
+        self._validate_domain(session.metadata)
         path = self._path(session.id)
+        if self._session_domain is not None and path.exists():
+            self.load(session.id)
         payload = json.dumps(session.to_dict(), indent=2, default=str)
         fd, tmp = tempfile.mkstemp(dir=self.directory, suffix=".tmp")
         try:
@@ -294,7 +352,7 @@ class JsonFileSessionStore:
             fields["session_id"] = log_session_id
         self._log.debug(Events.CONVERSATION_SAVED, **fields)
 
-    def load(self, session_id: str) -> ConversationSession:
+    def load(self, session_id: str, *, session_domain: str | None = None) -> ConversationSession:
         path = self._path(session_id)
         if not path.exists():
             raise SessionNotFoundError("no saved conversation session",
@@ -305,6 +363,8 @@ class JsonFileSessionStore:
             raise ConversationValidationError(
                 "saved conversation session is corrupt",
                 session_id=str(session_id), reason=str(exc)) from exc
+        if isinstance(data, Mapping):
+            self._validate_domain(data.get("metadata") or {}, requested_domain=session_domain)
         return ConversationSession.from_dict(data)
 
     def exists(self, session_id: str) -> bool:
@@ -314,6 +374,8 @@ class JsonFileSessionStore:
         return sorted(p.stem for p in self.directory.glob("*.json"))
 
     def delete(self, session_id: str) -> None:
+        if self._session_domain is not None:
+            self.load(session_id)
         path = self._path(session_id)
         if not path.exists():
             raise SessionNotFoundError("no saved conversation session",
