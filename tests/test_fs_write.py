@@ -611,6 +611,50 @@ def test_reconciliation_revoked_before_lease_cannot_observe_target(make, monkeyp
     h.registry.unregister("write_file")
 
 
+def test_reconciliation_missing_binding_cannot_accept_unleased_reregistration(make, monkeypatch):
+    h = make()
+    def interrupted(publish):
+        publish()
+        raise TimeoutError()
+    _publication_hook(monkeypatch, interrupted)
+    invocation = h.invoke()
+    original_get = h.registry.get
+    original_observe = h.guard.observe_create
+    h.registry.unregister("write_file")
+    unavailable, release = threading.Event(), threading.Event()
+    results = []
+    def paused_lookup(name):
+        try:
+            return original_get(name)
+        except Exception:
+            unavailable.set()
+            assert release.wait(15)
+            raise
+    def forbidden(*args):
+        pytest.fail("missing preliminary binding accepted an unleased filesystem probe")
+    monkeypatch.setattr(h.registry, "get", paused_lookup)
+    monkeypatch.setattr(h.guard, "observe_create", forbidden)
+    def worker():
+        try:
+            results.append(h.reconcile(invocation.action_id))
+        except BaseException as exc:
+            results.append(exc)
+    thread = threading.Thread(target=worker)
+    thread.start()
+    try:
+        assert unavailable.wait(15)
+        h.registry.register(h.foundation.tool)  # Exact same object; genuine ABA interleave.
+    finally:
+        release.set()
+        thread.join(15)
+    assert not thread.is_alive() and len(results) == 1
+    assert results[0].status is ActionReconciliationStatus.ADAPTER_UNAVAILABLE
+    assert h.actions.load(invocation.action_id).state is ActionState.RECONCILE_REQUIRED
+    monkeypatch.setattr(h.registry, "get", original_get)
+    monkeypatch.setattr(h.guard, "observe_create", original_observe)
+    assert h.reconcile(invocation.action_id).status is ActionReconciliationStatus.SETTLED_SUCCEEDED
+
+
 def test_attempt_and_protected_intent_are_durable_before_staging(make, monkeypatch):
     h = make()
     original = h.guard.create_file

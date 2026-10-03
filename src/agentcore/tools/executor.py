@@ -95,7 +95,7 @@ from agentcore.realtime.errors import CancellationRequested
 from agentcore.tools.base import ExternalReadTool, ToolContext, ToolResult, ToolSpec
 from agentcore.tools.authenticated import AuthenticatedReadTool
 from agentcore.tools.authenticated_action import AuthenticatedActionTool
-from agentcore.tools.builtin.write_file import WriteFileTool, _WriteExecution, _ISSUER
+from agentcore.tools.builtin.write_file import WriteFileTool, _WriteExecution, _ISSUER, _KIND as _FILESYSTEM_WRITE_KIND
 from agentcore.tools.registry import ToolRegistry, ToolRegistryLeaseError
 from agentcore.util.clock import Clock, SystemClock
 from agentcore.util.ids import new_id
@@ -685,12 +685,19 @@ class ToolExecutor:
         try:
             with store.execution_guard(claim.action_id):
                 current = self._load_exact_recovery_claim(store, claim)
-                try:
-                    tool = self.registry.get(current.tool_name) if current is not None else None
-                except Exception:
-                    tool = None  # The existing boundary releases unavailable registrations.
                 with ExitStack() as leases:
-                    if type(tool) is WriteFileTool:
+                    if current is not None and current.action_kind == _FILESYSTEM_WRITE_KIND:
+                        try:
+                            tool = self.registry.get(current.tool_name)
+                            if type(tool) is not WriteFileTool:
+                                raise ValueError("filesystem reconciliation binding changed")
+                        except Exception:
+                            # Never fall through to a second lookup which could
+                            # accept a new binding without acquiring its leases.
+                            return self._release_recovery_claim(
+                                store, current, claim,
+                                status=ActionReconciliationStatus.ADAPTER_UNAVAILABLE,
+                                probe_entered=False)
                         leases.enter_context(self.registry.execution_lease(tool.name, tool))
                         leases.enter_context(self._filesystem_policy_lease())
                     return self._reconcile_under_action_guard(
