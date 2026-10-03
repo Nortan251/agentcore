@@ -392,8 +392,15 @@ class ConversationRuntime:
         Without one, the path below is exactly the pre-Task-42.3 path.
         """
         self._validate_session(session)
-        if session is not None and self.sessions is not None and self.sessions.exists(session.id):
-            self._load_session(session.id)
+        if session is not None and self.sessions is not None:
+            try:
+                exists = self.sessions.exists(session.id)
+            except ConversationValidationError:
+                # Supplied in-memory sessions historically accept IDs that
+                # storage cannot address; persistence remains best-effort.
+                exists = False
+            if exists:
+                self._load_session(session.id)
         # Streaming is explicit and requires real turn ownership.  Check this
         # before starting or mutating a session: no unowned call may fabricate
         # realtime identity or appear to be fenced.
