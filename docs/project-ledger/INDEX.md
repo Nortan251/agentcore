@@ -8,6 +8,7 @@ This branch has an independent documentation-only root commit. Its tracked tree 
 
 | PR | Area | Task | Exact head | Status | Handoff |
 |----|------|------|------------|--------|---------|
+| [#41](https://github.com/Nortan251/agentcore/pull/41) | filesystem | Explicit one-shot Workspace Agent v1 | `9c4d0123df9c3b161f81b3c1923cf35c80bd1dc2` | OPEN / UNMERGED; final local suite, six exact-head CI gates and Codex review complete; ready for project-lead review | [PR-0041-workspace-agent-v1.md](filesystem/PR-0041-workspace-agent-v1.md) |
 | [#40](https://github.com/Nortan251/agentcore/pull/40) | filesystem | Durable create-only Filesystem Write v1 | `e32a9c6a66537c4da15522e0262ee4b415fbf934` | MERGED as `67e6069e30979fea68aefd50164123a7348ada3e`; final exact-head CI/review and project-lead review complete | [PR-0040-filesystem-write-v1.md](filesystem/PR-0040-filesystem-write-v1.md) |
 | [#39](https://github.com/Nortan251/agentcore/pull/39) | gmail | Windows Gmail authority-test rendezvous hotfix | `d90eeab49b1de149a480351f28756b6291ee9f40` | MERGED as `7d9d34453ac384dc2a423600dba6a900731002c0`; superseded by Browser integration on main | [PR-0039-windows-rendezvous-hotfix.md](gmail/PR-0039-windows-rendezvous-hotfix.md) |
 | [#38](https://github.com/Nortan251/agentcore/pull/38) | browser | Browser Read v1.1 static capacity | `a404120a739d4dd0960f687ebe94cf34adebb939` | MERGED as `72a0f55be620565344b3e57667371e2a695adb0e`; final tests/CI/review recorded; handoff complete | [PR-0038-static-capacity.md](browser/PR-0038-static-capacity.md) |
