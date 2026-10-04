@@ -167,3 +167,17 @@ merge. Replacement/editing and operator lifecycle remain separate tasks.
 ## Final verdict
 
 READY FOR PROJECT-LEAD DIRECTORY CREATE V1 REVIEW
+
+## Amendment — 2026-10-04: project-lead review and merge
+
+This amendment supersedes the earlier open/unmerged status while preserving the full pre-merge handoff above.
+
+The project lead independently rechecked PR metadata, main-relative production changes, the generalized exact filesystem mutation context, POSIX/Windows native directory-create paths, journal-before-effect ordering, conservative uncertain-outcome handling, Workspace Agent five-tool integration, action-capacity/failure latching, exact-head review state, and all six GitHub Actions gates on `f8d965e6b7053b80659d3d1adde54df4ad500aa0`.
+
+All three workflow runs completed successfully on `run_attempt=1`; unresolved review threads remained 0. No additional P0/P1/P2 blocker was found. A final project-lead approval comment was posted, then PR #42 was merged with an expected-head guard so any head movement would have stopped the merge.
+
+Merge commit: `547a2f00bcfa709d907c329fbea78730dd6731f6`.
+
+Authoritative `main` after merge: `547a2f00bcfa709d907c329fbea78730dd6731f6`.
+
+Final status: **MERGED; Directory Create v1 complete.** Workspace Agent now exposes exactly five tools: inspect, list_directory, read_file, create_directory, write_file. Ordinary Agent/default chat remain read-only.
