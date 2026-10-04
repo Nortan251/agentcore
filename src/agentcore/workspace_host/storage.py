@@ -20,11 +20,12 @@ from agentcore.action_journal import (
     JsonFileProtectedActionPayloadStore, ProtectedPayloadPurpose,
 )
 from agentcore.action_journal.protected_storage import MAX_PROTECTED_ACTION_PAYLOAD_BYTES
-from agentcore.conversation.session import JsonFileSessionStore, WORKSPACE_SESSIONS_SUBDIR
+from agentcore.conversation.session import ConversationSession, JsonFileSessionStore, WORKSPACE_SESSIONS_SUBDIR
 from agentcore.credentials._protected_file import _ordinary, _windows_private_directory
 from agentcore.fs.paths import workspace_identity
 from .errors import WorkspaceHostError
 from .privacy import HostLogger
+from agentcore.tools.builtin.read_file_for_update import UPDATE_RESULT_PREFIX
 
 MAX_HOST_ENTRIES = 4096
 _SLOT_LOCK = ".workspace-host.lock"
@@ -309,7 +310,20 @@ class PrivateSessionStore(JsonFileSessionStore):
 
     def save(self, session, **kwargs):
         self.require_capacity(session.id)  # Before tempfile/publication I/O.
-        return super().save(session, **kwargs)
+        # Narrow Workspace persistence projection; the current model context
+        # and in-memory protocol keep the complete live result.
+        projected = session.to_dict()
+        for message in projected["messages"]:
+            if message["role"] == "tool" and message.get("name") == "read_file_for_update" and (
+                    message["content"].startswith(UPDATE_RESULT_PREFIX)):
+                try:
+                    body = json.loads(message["content"][len(UPDATE_RESULT_PREFIX):])
+                    if type(body) is dict and set(body) == {"revision", "content"}:
+                        body["revision"] = "<expired-revision>"
+                        message["content"] = UPDATE_RESULT_PREFIX + json.dumps(body, sort_keys=True)
+                except (ValueError, TypeError):
+                    pass
+        return super().save(ConversationSession.from_dict(projected), **kwargs)
 
 
 class WorkspaceHostServices:

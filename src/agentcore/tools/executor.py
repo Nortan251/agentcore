@@ -88,6 +88,7 @@ from agentcore.credentials.action import (
 )
 from agentcore.fs.sensitive import DEFAULT_SENSITIVE_POLICY
 from agentcore.fs.mutation import DestinationExistsError
+from agentcore.fs.replacement import RevisionRejectedError
 from agentcore.observability.events import Events
 from agentcore.observability.logging import StructuredLogger, get_logger
 from agentcore.permissions.levels import READ_ONLY_CAPABILITIES, Capability, PermissionLevel
@@ -98,6 +99,7 @@ from agentcore.tools.authenticated import AuthenticatedReadTool
 from agentcore.tools.authenticated_action import AuthenticatedActionTool
 from agentcore.tools.builtin.write_file import WriteFileTool, _KIND as _FILESYSTEM_WRITE_KIND
 from agentcore.tools.builtin.create_directory import CreateDirectoryTool, _KIND as _FILESYSTEM_DIRECTORY_KIND
+from agentcore.tools.builtin.replace_file import ReplaceFileTool, _KIND as _FILESYSTEM_REPLACE_KIND
 from agentcore.tools.builtin._filesystem_execution import _FilesystemMutationExecution, _ISSUER
 
 from agentcore.tools.registry import ToolRegistry, ToolRegistryLeaseError
@@ -108,6 +110,7 @@ from agentcore.util.ids import new_id
 _FILESYSTEM_MUTATIONS = {
     _FILESYSTEM_WRITE_KIND: WriteFileTool,
     _FILESYSTEM_DIRECTORY_KIND: CreateDirectoryTool,
+    _FILESYSTEM_REPLACE_KIND: ReplaceFileTool,
 }
 _FILESYSTEM_TOOL_TYPES = frozenset(_FILESYSTEM_MUTATIONS.values())
 _REDACTED = "***"
@@ -1630,6 +1633,9 @@ class ToolExecutor:
                 checkpoint()
             if store.load(claimed.action_id) != claimed or self.workspace is not tool._guard:
                 raise ValueError("filesystem mutation claim or workspace changed")
+            if type(tool) is ReplaceFileTool and not self.policy.check(
+                    frozenset({Capability.FS_READ}), description="Validate filesystem replacement").allowed:
+                raise ValueError("replacement read authority unavailable")
             self._validate_current_execution_authority(
                 record=claimed, tool=tool, tool_spec=tool_spec, adapter=adapter,
                 spec=spec, prepared=prepared, current_approval_receipt=current_approval_receipt)
@@ -1671,7 +1677,7 @@ class ToolExecutor:
         description: str,
     ) -> tuple[Decision, bool]:
         """Return current aggregate policy truth without boolean approval."""
-        filesystem_write = (tool_spec.name in {"write_file", "create_directory"}
+        filesystem_write = (tool_spec.name in {"write_file", "create_directory", "replace_file"}
                             and type(self.registry.get(tool_spec.name)) in _FILESYSTEM_TOOL_TYPES)
         if filesystem_write and self.policy.level in {PermissionLevel.OBSERVE, PermissionLevel.PROPOSE}:
             return Decision(Outcome.DENY, "filesystem writes require mutation authority",
@@ -2628,7 +2634,7 @@ class ToolExecutor:
                     leases.enter_context(self._filesystem_health_lease())
                     decision, _ = self._current_policy_decision(
                         tool_spec, description=tool_spec.description)
-                    if decision.outcome is Outcome.REQUIRE_APPROVAL:
+                    if decision.outcome is Outcome.REQUIRE_APPROVAL or type(tool) is ReplaceFileTool:
                         # Pending write approval grants no observation authority.
                         # Preflight may inspect only under independently allowed
                         # FS_READ; approved mutation remains a later boundary.
@@ -2651,6 +2657,15 @@ class ToolExecutor:
                 if not isinstance(prepared, PreparedActionIntent):
                     raise TypeError("adapter preflight type")
                 prepared.validate()
+        except RevisionRejectedError as exc:
+            if type(tool) is ReplaceFileTool:
+                return ToolInvocation(tool_spec.name, redacted,
+                    ToolResult.failure(exc.category, kind=exc.category,
+                        effect_verdict=EffectVerdict.CONFIRMED_NOT_APPLIED.value),
+                    elapsed(), decision, invocation_id=invocation_id)
+            return self._journal_failure(tool_spec.name, redacted, elapsed(),
+                kind="action_preflight_failed", message="The action intent could not be prepared safely.",
+                log=log, invocation_id=invocation_id)
         except DestinationExistsError:
             if type(tool) is CreateDirectoryTool:
                 # This is a trusted guard observation before admission, not an

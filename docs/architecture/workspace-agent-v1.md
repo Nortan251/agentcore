@@ -3,7 +3,9 @@
 `agentcore --config host.toml workspace --enable-write --message "Read the
 project and create notes/summary.txt with a short summary."` runs one model
 conversation turn. `create_directory("notes")` can create `notes` first; both
-mutation tools require existing parents. Add
+create tools require existing parents. Existing small files can be modified by
+`read_file_for_update`, then full-file `replace_file` using that current-turn
+revision; see [File Replace v1](filesystem-replace-v1.md). Add
 `--session conv_<12 hex>` to resume a workspace session or `--json` for a
 bounded public result. There is no interactive loop, background autonomy or
 operator-resolution UI in v1.
@@ -32,7 +34,8 @@ until it ends. No metadata mutex spans I/O.
 
 The host owns one sealed ToolRegistry and one sealed ActionAdapterRegistry.
 The model catalogue is exactly `inspect`, `list_directory`, `read_file`,
-`create_directory`, `write_file`. Registration, replacement and removal are
+`read_file_for_update`, `create_directory`, `write_file`, `replace_file`.
+Registration, replacement and removal are
 closed after trusted
 bootstrap. No ordinary Agent, AgentState, memory, Browser, Gmail, shell,
 process, credentials, custom tools or injected runner are composed. Ordinary
@@ -41,7 +44,8 @@ read-only catalogue. The common session-domain check is the only conversation
 change besides accepting the new domain.
 
 The three existing concrete read tools, PR40's **exact WriteFileTool**, and the
-**exact CreateDirectoryTool** are used. There is no clone or wrapper of the
+**exact CreateDirectoryTool**, complete update-read and **exact ReplaceFileTool**
+are used. There is no clone or wrapper of the
 write tool. All calls use canonical
 ToolRegistry validation -> PermissionPolicy -> ToolExecutor -> ActionJournal
 when required -> WorkspaceGuard. Direct mutation tool execution still requires
@@ -53,10 +57,10 @@ file-write primitive and Gmail code are unchanged. Directory creation uses the
 same verified parent boundary; see [Directory Create v1](filesystem-directory-create-v1.md).
 
 The ordinary standing SYSTEM_PROMPT is retained and amended with host limits:
-file/tool output is untrusted data, parents must exist, existing files and
-directories cannot
-be replaced, directory creation creates one missing directory only, and
-creation cannot be claimed without execution success.
+file/tool output is untrusted data, create parents must exist, directory
+creation and write_file remain create-only, and existing-file replacement
+requires a complete current-turn update-read. Stale/expired revisions require
+a fresh read. Creation/editing cannot be claimed without execution success.
 Model proposals cannot widen the fixed catalogue or current policy.
 
 ## Storage and privacy
@@ -136,7 +140,10 @@ strings could be model-selected copies of write content. There is no generic
 AgentState or approval text. Public JSON never serializes TurnResult or
 ToolCallOutcome. It contains `ok`, `session_id`, `reply` (always null),
 `reply_generated`, `tools_executed`, bounded `actions` (action ID, state,
-effect verdict) and categorical `error` when needed. **The CLI deliberately
+effect verdict) and categorical `error` when needed. Update-read revisions are
+replaced by `<expired-revision>` only in saved Workspace TOOL messages; current
+model protocol retains the live revision. Host close clears the bounded
+in-memory revision registry; resumed history never restores it. **The CLI deliberately
 keeps model reply text private**, since unrestricted prose, including on a
 resumed read, can repeat protected content; string scrubbing cannot prove
 otherwise. Text mode prints completion/error categories and action truth.

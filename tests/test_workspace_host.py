@@ -198,7 +198,7 @@ def test_fixed_catalogue_and_direct_tool_contract(setup):
         assert set(h.registry.names()) == set(WORKSPACE_TOOL_NAMES)
         assert type(h.registry.get("write_file")) is WriteFileTool
         assert h.registry.get("write_file") is h._foundation.tool
-        assert h.executor._action_adapters is h._adapters and len(h._adapters) == 2
+        assert h.executor._action_adapters is h._adapters and len(h._adapters) == 3
         for mutate in (lambda: h.registry.register(EchoTool()),
                        lambda: h.registry.register(ReadFileTool(), replace=True),
                        lambda: h.registry.unregister("read_file"),

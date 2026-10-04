@@ -1,4 +1,4 @@
-"""Executor-issued authority for the two exact reviewed filesystem mutations."""
+"""Executor-issued authority for exact reviewed filesystem mutations."""
 
 import os
 import threading

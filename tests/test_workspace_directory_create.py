@@ -23,11 +23,12 @@ def mkdir(path=PRIVATE_PATH):
     return ("create_directory", {"path": path})
 
 
-def test_exact_five_tools_defaults_and_direct_run(setup):
+def test_exact_seven_tools_defaults_and_direct_run(setup):
     root, _, config, compose = setup
-    expected = {"inspect", "list_directory", "read_file", "create_directory", "write_file"}
+    expected = {"inspect", "list_directory", "read_file", "read_file_for_update",
+                "create_directory", "write_file", "replace_file"}
     with compose() as h:
-        assert set(h.registry.names()) == expected and len(h.registry) == 5
+        assert set(h.registry.names()) == expected and len(h.registry) == 7
         tool = h.registry.get("create_directory")
         assert type(tool) is CreateDirectoryTool and tool is h._directory_foundation.tool
         assert not tool.run({"path": PRIVATE_PATH}, ToolContext(workspace=h.executor.workspace)).ok
@@ -159,7 +160,8 @@ def test_untrusted_content_cannot_widen_directory_authority(setup, capsys, monke
                                    ("shell", {"command": "mkdir unsafe"})), ModelResponse(text="success"))
     code, payload = invoke(capsys, monkeypatch, model, message=injection)
     assert code == 1 and not (root / "a").exists() and not (root / "unsafe").exists()
-    assert all({s["name"] for s in r.tools} == {"inspect", "list_directory", "read_file", "create_directory", "write_file"}
+    assert all({s["name"] for s in r.tools} == {"inspect", "list_directory", "read_file", "read_file_for_update",
+                                               "create_directory", "write_file", "replace_file"}
                for r in model.requests)
 
 
