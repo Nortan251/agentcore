@@ -118,3 +118,17 @@ Project lead independently reviews the exact PR/head and chooses the next phase.
 ## Final verdict
 
 READY FOR PROJECT-LEAD WORKSPACE AGENT V1 REVIEW
+
+## Amendment — 2026-10-04: project-lead review and merge
+
+This amendment supersedes the earlier open/unmerged status while preserving the complete pre-merge handoff above.
+
+The project lead independently rechecked PR metadata, the main-relative diff, dedicated host authority, fixed four-tool catalogue, session-domain isolation, private out-of-workspace storage, recovery-before-model ordering, public-output privacy, the three repaired review findings, final exact-head review state, and all six GitHub Actions gates on `9c4d0123df9c3b161f81b3c1923cf35c80bd1dc2`.
+
+All three workflow runs completed successfully on `run_attempt=1`; unresolved review threads remained 0. No additional P0/P1/P2 blocker was found. A final project-lead approval comment was posted, then PR #41 was merged with an expected-head guard so any head movement would have stopped the merge.
+
+Merge commit: `d6acae41e95059289956a4a2acde33d170a537cf`.
+
+Authoritative `main` after merge: `d6acae41e95059289956a4a2acde33d170a537cf`.
+
+Final status: **MERGED; Workspace Agent v1 complete.** The dedicated one-shot host requires explicit current opt-in plus AUTONOMOUS FS_READ + FS_WRITE. Ordinary Agent/default tools/chat remain read-only.
