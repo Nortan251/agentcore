@@ -278,6 +278,17 @@ class PrivateSessionStore(JsonFileSessionStore):
             _validate_private(path)
         return path
 
+    def require_capacity(self, session_id):
+        path = self._path(session_id)
+        # The enclosing host slot lock serializes admission and every save.
+        # Existing transcripts can still be updated at the directory limit.
+        if not path.exists() and len(self._storage._entries(self.directory)) >= MAX_HOST_ENTRIES:
+            raise WorkspaceHostError("workspace_session_capacity_exhausted")
+
+    def save(self, session, **kwargs):
+        self.require_capacity(session.id)  # Before tempfile/publication I/O.
+        return super().save(session, **kwargs)
+
 
 class WorkspaceHostServices:
     def __init__(self, workspace, *, directory=None):

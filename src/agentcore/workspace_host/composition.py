@@ -11,7 +11,7 @@ from agentcore.conversation.tool_use import ConversationToolRunner
 from agentcore.fs.guard import WorkspaceGuard
 from agentcore.models.messages import Role
 from agentcore.permissions.policy import PermissionPolicy
-from agentcore.recovery.action import ActionRecoveryCoordinator
+from agentcore.recovery.action import ActionRecoveryCoordinator, MAX_STARTUP_ACTIONS
 from agentcore.tools.builtin import InspectTool, ListDirectoryTool, ReadFileTool
 from agentcore.tools.builtin.write_file import FilesystemWriteFoundation
 from agentcore.tools.executor import ToolExecutor
@@ -72,6 +72,16 @@ class _WorkspaceExecutor(ToolExecutor):
         # narrower leases remain in force; no metadata mutex spans I/O.
         with self._filesystem_policy_lease():
             require_authority(True, self.policy)
+            if name == "write_file":
+                # The whole-lifetime slot lock and owning-thread fence make
+                # this capacity reservation exclusive until canonical create.
+                # Never publish an effect which the final/startup audit cannot
+                # enumerate, including multiple writes in the same turn.
+                records = self._host._services.actions.audit(
+                    maximum_records=MAX_STARTUP_ACTIONS)
+                if len(records) >= MAX_STARTUP_ACTIONS:
+                    self._host._mutation_failed = True
+                    raise WorkspaceHostError("workspace_action_capacity_exhausted")
             invocation = super().invoke(name, args, **kwargs)
         self._host._invocations.append(invocation)
         if name == "write_file" and (not invocation.ok or
@@ -141,6 +151,7 @@ class _WorkspaceConversation(ConversationRuntime):
         else:
             session = ConversationSession(scope_key="workspace-files-v1",
                 metadata={WORKSPACE_SESSION_MARKER: True})
+        self.sessions.require_capacity(session.id)
         return _WorkspaceTranscript.from_dict(session.to_dict())
 
     def save(self, session, **kwargs):
@@ -158,6 +169,7 @@ class _WorkspaceConversation(ConversationRuntime):
         if session is None:
             session = self.start(session_id=session_id)
         self._validate_session(session)
+        self.sessions.require_capacity(session.id)
         self._host._used = True
         self._host._active = True
         try:
@@ -210,7 +222,7 @@ class WorkspaceAgentComposition:
                 raise WorkspaceHostError("workspace_recovery_failed")
             # One read-only probe per currently claimable action, never invoke
             # or resume a create. PROBE_LATER left unresolved also blocks v1.
-            for claim in recovery.claim_next(limit=256):
+            for claim in recovery.claim_next(limit=MAX_STARTUP_ACTIONS):
                 recovery.reconcile(claim)
             pending = [record.action_id for record in self._services.actions.list_nonterminal()
                        if record.state is ActionState.RECONCILE_REQUIRED]
@@ -246,7 +258,7 @@ class WorkspaceAgentComposition:
         self._owner()
         # Current-turn durable truth survives a later model/session exception.
         # Include all new records even if invoke was interrupted before return.
-        records = self._services.actions.audit(maximum_records=256)
+        records = self._services.actions.audit(maximum_records=MAX_STARTUP_ACTIONS)
         return [{"action_id": record.action_id, "state": record.state.value,
                  "effect": (record.terminal_outcome.verdict.value if record.terminal_outcome
                             else "outcome_unknown")}

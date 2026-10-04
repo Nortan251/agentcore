@@ -80,8 +80,14 @@ Corrupt keys, actions or protected objects refuse the model turn. Even orphan
 and terminal payload objects undergo bounded authentication at startup.
 Unexpected payload files (including crash temporary files) fail closed for
 operator investigation. Enumeration is bounded at 4096 entries per directory;
-the existing recovery audit is bounded at 256 total actions. Reaching that
-bound refuses further turns rather than silently skipping historical state.
+the existing recovery audit is bounded at 256 total actions. Before each write,
+the host reserves capacity under its exclusive slot ownership, refusing any
+257th record before canonical preparation or physical effect. Prior successful
+creates remain auditable, including when a later write in the same turn reaches
+the bound. Reads remain available at the action limit. New session admission
+also checks directory capacity before the model; saves independently refuse a
+4,097th transcript before temporary-file or publication I/O. Existing sessions
+can still be resumed and updated at the limit. No historical state is pruned.
 
 POSIX host directories are owner-private, and files are 0600. Existing foreign
 owners, group/other permissions, links, special files, and unsafe writable

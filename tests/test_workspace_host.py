@@ -705,3 +705,79 @@ def test_bad_session_ids_fail_before_provider_storage(setup, capsys, monkeypatch
     assert cli.main(["workspace", "--enable-write", "--message", "hi", "--session", session, "--json"]) == 1
     assert json.loads(capsys.readouterr().out)["error"] == "workspace_session_invalid"
     assert not private.exists()
+
+
+def _private_fixture_json(path, payload):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+
+
+@pytest.mark.parametrize("existing", [255, 256])
+def test_action_capacity_refuses_257th_write_and_preserves_last_effect_truth(
+        setup, capsys, monkeypatch, existing):
+    root, _, _, compose = setup
+    from test_task_43_2a_action_journal_core import _new_record, _id, NOW
+
+    with compose() as h:
+        slot = h._services.storage.directory
+    # Valid immutable terminal core records, with no live protected dependency.
+    for number in range(1, existing + 1):
+        record = _new_record(number).transition(ActionState.CANCELLED,
+            transition_id=_id("atx", number + 1000), at=NOW)
+        _private_fixture_json(slot / "actions" / f"{record.action_id}.json", record.to_dict())
+    capsys.readouterr()  # Fixture bootstrap precedes the public CLI invocation.
+    model = Model(calls(
+        ("write_file", {"path": "notes/last.txt", "content": CONTENT}),
+        ("write_file", {"path": "notes/over-cap.txt", "content": CONTENT}),
+        ("read_file", {"path": "README.txt"})), ModelResponse(text="Everything succeeded."))
+    code, payload = invoke(capsys, monkeypatch, model)
+    assert not (root / "notes/over-cap.txt").exists()
+    assert code == 1 and payload["error"] == "workspace_tool_failed"
+    assert payload["tools_executed"] == 256 - existing
+    assert len(payload["actions"]) == 256 - existing
+    if existing == 255:
+        assert (root / "notes/last.txt").read_bytes() == CONTENT.encode()
+        assert payload["actions"][0]["state"] == "succeeded"
+        assert payload["actions"][0]["effect"] == "confirmed_applied"
+    else:
+        assert not (root / "notes/last.txt").exists()
+    with compose(Model(calls(("read_file", {"path": "README.txt"})),
+                       ModelResponse(text="read completed"))) as reopened:
+        records = reopened._services.actions.audit(maximum_records=256)
+        assert len(records) == 256
+        result = reopened.conversation().send("read-only follow-up")
+        assert result.ok and result.tools_executed == 1
+
+
+def test_session_capacity_admitted_before_model_and_save_and_resume_stays_usable(
+        setup, capsys, monkeypatch):
+    root, _, _, compose = setup
+    from agentcore.workspace_host.storage import MAX_HOST_ENTRIES
+
+    with compose() as h:
+        directory = h._services.sessions.directory
+    for number in range(MAX_HOST_ENTRIES - 1):
+        session = ConversationSession(id=f"conv_{number:012x}",
+            metadata={WORKSPACE_SESSION_MARKER: True})
+        _private_fixture_json(directory / f"{session.id}.json", session.to_dict())
+    capsys.readouterr()
+    code, payload = invoke(capsys, monkeypatch, Model())
+    assert code == 0 and len(list(directory.iterdir())) == MAX_HOST_ENTRIES
+    saved_id = payload["session_id"]
+    model = Model(write("notes/must-not-create.txt"), ModelResponse(text="done"))
+    code, payload = invoke(capsys, monkeypatch, model)
+    assert code == 1 and payload["error"] == "workspace_session_capacity_exhausted"
+    assert not model.requests and not (root / "notes/must-not-create.txt").exists()
+    assert len(list(directory.iterdir())) == MAX_HOST_ENTRIES
+    code, payload = invoke(capsys, monkeypatch, Model(), session=saved_id)
+    assert code == 0 and payload["session_id"] == saved_id
+    model = Model()
+    with compose(model) as h:
+        new_session = ConversationSession(metadata={WORKSPACE_SESSION_MARKER: True})
+        with pytest.raises(WorkspaceHostError, match="workspace_session_capacity_exhausted"):
+            h._services.sessions.save(new_session)
+        with pytest.raises(WorkspaceHostError, match="workspace_session_capacity_exhausted"):
+            h.conversation().send("bypass start", session=new_session)
+        assert not model.requests
+    assert len(list(directory.iterdir())) == MAX_HOST_ENTRIES
