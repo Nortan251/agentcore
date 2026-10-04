@@ -90,3 +90,164 @@ Restore Actions availability, then execute the diagnosed blocked runs on this ex
 ## Final verdict
 
 STOPPED at required verification. Implementation PR exists and remains open/unmerged. Not ready for project-lead approval until exact-head platform gates and review are complete.
+
+## 2026-10-04 amendment — P1 repairs and final-head verification
+
+The preceding initial snapshot is preserved. The initial exact-head Codex
+[review](https://github.com/Nortan251/agentcore/pull/43#pullrequestreview-5407935802)
+identified two P1 defects in the new feature, not merged foundations:
+[update-read argument logging](https://github.com/Nortan251/agentcore/pull/43#discussion_r4179126041)
+and [unpreserved inode flags](https://github.com/Nortan251/agentcore/pull/43#discussion_r4179126045).
+
+FINAL IMPLEMENTATION HEAD: `40b6024f04db899aecbbfdcd8921afb2e833ca8a`
+PARENT: `09ff3643a90b0b7ceab007862bd9bdbd17be1604`
+AUTHORITATIVE BASE: `547a2f00bcfa709d907c329fbea78730dd6731f6`
+
+[Repair commit](https://github.com/Nortan251/agentcore/commit/40b6024f04db899aecbbfdcd8921afb2e833ca8a)
+adds the executor's existing private-argument tag, a generic logging regression,
+Linux descriptor inode/extended policy queries, refusal of unsupported policy
+flags/project IDs/extent hints, stage flag comparison and a real nodump
+refusal regression. Unsupported querying/filesystems/ABIs and non-Linux POSIX
+fail closed. A local control reproduced the old raw-argument log and confirmed
+the repaired spec removed it. Native Linux proof remains unavailable locally.
+Both original threads were resolved after the repair was pushed.
+
+Final-source local Windows Python 3.13 validation:
+
+- Focused replacement/path/private-argument suites: **194 passed, 75 skipped**.
+- Full repository suite after production stabilized: **6450 passed, 319 skipped,
+  89 warnings**, exit 0, 491.72 seconds. This includes all named affected suites.
+- Compileall and base-relative diff checks passed. Implementation tree clean;
+  local/remote/PR SHA match. No new production changes followed validation.
+- Earlier surrounding counts above remain historical, not substitute final-head
+  evidence. Ordinary-token Windows and POSIX/native platform gaps remain explicit.
+
+All six new normal jobs on this final head were again refused **before start**
+for the same independently verified GitHub payment/spending-limit annotation.
+The user requested recording blocked gates for now. No manual reruns occurred.
+
+- Linux full: [run 37231833132 / job 111523044220](https://github.com/Nortan251/agentcore/actions/runs/37231833132/job/111523044220).
+- Windows 3.11: [run 37231833085 / job 111523044238](https://github.com/Nortan251/agentcore/actions/runs/37231833085/job/111523044238).
+- Windows 3.12: [run 37231833085 / job 111523044502](https://github.com/Nortan251/agentcore/actions/runs/37231833085/job/111523044502).
+- Windows 3.13: [run 37231833085 / job 111523044544](https://github.com/Nortan251/agentcore/actions/runs/37231833085/job/111523044544).
+- Chromium Ubuntu: [run 37231833128 / job 111523044096](https://github.com/Nortan251/agentcore/actions/runs/37231833128/job/111523044096).
+- Chromium Windows: [run 37231833128 / job 111523044481](https://github.com/Nortan251/agentcore/actions/runs/37231833128/job/111523044481).
+
+Fresh final-head review: [request](https://github.com/Nortan251/agentcore/pull/43#issuecomment-5984028403), acknowledged; result pending. No clean final-head review claim. Original two threads resolved; no other threads observed at last query.
+
+CURRENT VERDICT: STOPPED at required platform verification and fresh review.
+PR remains OPEN / UNMERGED. Restore Actions availability and validate this exact
+head, then append native/platform/review evidence; do not merge the ledger into main.
+
+## 2026-10-04 amendment — private staging and final residue repair
+
+The preceding snapshots are historical and preserved. Subsequent exact-head
+Codex reviews found two further P1s in the new feature:
+[early partial-stage disclosure](https://github.com/Nortan251/agentcore/pull/43#discussion_r4179197558)
+at `40b6024f04db899aecbbfdcd8921afb2e833ca8a`, and
+[failed Windows stage cleanup disclosure](https://github.com/Nortan251/agentcore/pull/43#discussion_r4179290371)
+at `4d3ea0278071d03e0417201609fc30810280be49`.
+
+FINAL IMPLEMENTATION HEAD: `a5f1c52447d69784847f9e75f7502e09a842c65c`
+PARENT: `4d3ea0278071d03e0417201609fc30810280be49`
+AUTHORITATIVE BASE: `547a2f00bcfa709d907c329fbea78730dd6731f6`
+
+[Private-stage repair](https://github.com/Nortan251/agentcore/commit/4d3ea0278071d03e0417201609fc30810280be49)
+keeps POSIX staging at owner-private 0600 while writing, atomically publishes
+complete bytes, then restores/verifies the old mode through the owned descriptor.
+Restoration failure remains uncertain; unsafe metadata cannot settle as applied.
+Windows replacement stages gained exclusive handles.
+
+[Residue repair](https://github.com/Nortan251/agentcore/commit/a5f1c52447d69784847f9e75f7502e09a842c65c)
+creates Windows stages with a protected current-user DACL, then sets a protected
+empty DACL before any content exists. Owned-handle rights survive; later data-read
+opens fail even after failed discard/close. Full original descriptor restoration
+occurs after complete write/flush/final comparison with the old target pinned.
+The uncertainty boundary starts before that restoration because it can disclose
+complete bytes. Post-restoration failures are UNKNOWN, even before native rename.
+The target handle still closes immediately before rename; the external same-user
+race remains excluded rather than claimed as perfect CAS. Existing create
+primitives, Gmail/Browser, governance and global budgets are unchanged.
+
+All four historical P1 threads were resolved after their repairs were pushed.
+No confirmed P0/P1 merged-foundation defect was identified.
+
+Final exact-head Windows Python 3.13 evidence, reused without ledger test reruns:
+
+- Focused replacement/path/private-argument suites: **195 passed, 79 skipped**
+  in 2.90 seconds; 46 unavailable full-descriptor Windows cases and 33 POSIX/Linux
+  cases. Native protected-empty-DACL regression passes on this ordinary token.
+- Full repository suite: **6451 passed, 323 skipped, 89 warnings**, exit 0,
+  529.62 seconds. Includes all named affected suites. Compileall and base-relative
+  diff check passed; implementation worktree clean, local/remote/PR head match.
+- An earlier full run at the staging repair had one unchanged Gmail claim-acquisition
+  assertion failure. Its isolated reconciliation suite passed 38 tests, and a
+  diagnostic full run passed 6450 tests with 322 skips. The final-head full run
+  above also passed. The cause was not established; source/assertions were not
+  changed. Scratch diagnostics trace exception categories only, without changing
+  behavior. Existing Gmail fake-response warnings remain.
+- Full native Windows replacement/descriptor success, Linux and Chromium platform
+  proof remain unavailable; local successes do not replace these gates.
+
+All six normal jobs at the final head were refused **before runner start** with
+the independently checked annotation that account payments failed or the spending
+limit needs increasing. No tests ran. The user requested recording blocked gates
+for now, and no manual reruns occurred.
+
+- Linux: [job 111532676802](https://github.com/Nortan251/agentcore/actions/runs/37235155186/job/111532676802).
+- Windows 3.11: [job 111532677216](https://github.com/Nortan251/agentcore/actions/runs/37235155254/job/111532677216).
+- Windows 3.12: [job 111532677185](https://github.com/Nortan251/agentcore/actions/runs/37235155254/job/111532677185).
+- Windows 3.13: [job 111532677093](https://github.com/Nortan251/agentcore/actions/runs/37235155254/job/111532677093).
+- Chromium Ubuntu: [job 111532677011](https://github.com/Nortan251/agentcore/actions/runs/37235155160/job/111532677011).
+- Chromium Windows: [job 111532676821](https://github.com/Nortan251/agentcore/actions/runs/37235155160/job/111532676821).
+
+Fresh exact-head [Codex review 5408261737](https://github.com/Nortan251/agentcore/pull/43#pullrequestreview-5408261737) reviewed `a5f1c52447d69784847f9e75f7502e09a842c65c` and found a fifth P1: [stage pathname substitution](https://github.com/Nortan251/agentcore/pull/43#discussion_r4179362899). That thread remains unresolved. This supersedes the earlier no-foundation-defect observation.
+
+CURRENT VERDICT: STOPPED at required platform verification. PR remains OPEN /
+UNMERGED. Restore Actions availability and validate this exact head, then append
+platform evidence; never merge ledger into main or force-push it.
+
+## 2026-10-04 stopped-state amendment — merged foundation P1 exposed
+
+STOPPED under the user's explicit rule to report merged-foundation P0/P1 defects
+before hiding a repair inside this feature. No production edits followed the
+latest review. Implementation head and parent above remain final for this stop.
+
+The replacement finding exposes the same flaw in unchanged merged create-only
+foundation code at authoritative base `547a2f00bcfa709d907c329fbea78730dd6731f6`:
+[parent traversal](https://github.com/Nortan251/agentcore/blob/547a2f00bcfa709d907c329fbea78730dd6731f6/src/agentcore/fs/mutation.py#L58)
+checks directory type/identity but does not exclude other-principal namespace
+write authority; [publication](https://github.com/Nortan251/agentcore/blob/547a2f00bcfa709d907c329fbea78730dd6731f6/src/agentcore/fs/mutation.py#L189)
+links the stage pathname after comparing its inode, and cleanup compares only
+the restored stage name. A different principal with search/write access to a
+non-sticky parent can rename the stage despite its private file mode, as specified
+by [POSIX rename permissions](https://pubs.opengroup.org/onlinepubs/9799919799/functions/rename.html).
+This is outside neither the same-user nor administrator/root host exclusion.
+
+Deterministic sequence: move verified stage aside immediately before link;
+create a substitute at its name; publish that substitute; remove its stage name
+and restore the original before cleanup. Cleanup then passes and the primitive
+returns applied with substitute final bytes. The unchanged
+[write adapter](https://github.com/Nortan251/agentcore/blob/547a2f00bcfa709d907c329fbea78730dd6731f6/src/agentcore/tools/builtin/write_file.py#L123)
+maps applied to CONFIRMED_APPLIED. An ordinary attacker-owned substitute can
+allow host read/write access to avoid Linux protected-hardlink restrictions.
+
+An exact-base control-flow reproduction confirmed both normal publication and
+substitution: the normal case returned applied with intended bytes; substitution
+returned applied with a different synthetic digest, a single final link and zero
+recognized stage residue. Foundation source was verified unchanged. This used
+actual Windows file writes/identities/hardlinks/renames/unlinks with directory-FD
+resolution/fsync adaptation and delete sharing to model POSIX open-file renaming.
+It is **not native POSIX or a second-principal integration test**. Linux native
+proof remains unavailable; no platform success is invented.
+
+FINAL REVIEW STATUS: five historical feature P1 findings; four repaired/resolved,
+one unresolved staging-integrity P1 at final head. A merged-foundation integrity
+P1 is exposed and remains unpatched. No clean final-head review or readiness claim.
+
+FINAL VERDICT: STOPPED at the explicit merged-foundation security boundary, plus
+six exact-head platform jobs blocked by Actions billing. PR remains OPEN /
+UNMERGED. Required next work is a separately scoped foundation repair and native
+Linux regression before resuming File Replace, then final-head local tests,
+fresh review and six platform gates. Restore Actions availability for those gates.
+Preserve this stop and earlier snapshots; never merge ledger into main.
