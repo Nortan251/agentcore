@@ -524,6 +524,68 @@ def test_windows_partial_stage_cannot_be_opened_for_read_by_another_handle(make,
     assert h.actions.load(result.action_id).attempts[0].status is ActionAttemptStatus.NOT_INVOKED
 
 
+@pytest.mark.skipif(os.name != "nt", reason="native Windows private residual DACL")
+def test_windows_private_dacl_denies_data_read_after_owned_handle_closes(tmp_path):
+    import pywintypes, win32con, win32file, win32security
+    from agentcore.fs import _windows_mutation as win
+    path = tmp_path / "private-residue"
+    opened = win32file.CreateFile(str(path), win32file.FILE_ALL_ACCESS, 0,
+        None, win32con.CREATE_NEW, win32con.FILE_ATTRIBUTE_NORMAL, None)
+    original = win32security.GetSecurityInfo(opened, win32security.SE_FILE_OBJECT, 1 | 2 | 4)
+    closed = False
+    try:
+        initial = win.private_stage_descriptor({"security": bytes(original).hex()}, initial=True)
+        assert initial.GetSecurityDescriptorDacl().GetAceCount() == 1
+        assert initial.GetSecurityDescriptorControl()[0] & 0x1000
+        private = win.private_stage_descriptor({"security": bytes(original).hex()})
+        win32security.SetKernelObjectSecurity(opened, 4 | win32security.PROTECTED_DACL_SECURITY_INFORMATION, private)
+        win32file.WriteFile(opened, b"synthetic partial fixture")
+        opened.Close()
+        closed = True
+        with pytest.raises(pywintypes.error) as error:
+            reader = win32file.CreateFile(str(path), win32con.GENERIC_READ, 7,
+                None, win32con.OPEN_EXISTING, 0, None)
+            reader.Close()
+        assert error.value.winerror == 5
+        # Owner READ_CONTROL remains available but does not grant data access.
+        observed = win32security.GetFileSecurity(str(path), 4)
+        assert observed.GetSecurityDescriptorDacl().GetAceCount() == 0
+        assert observed.GetSecurityDescriptorControl()[0] & 0x1000
+    finally:
+        if not closed:
+            opened.Close()
+        win32security.SetFileSecurity(str(path), 4 | win32security.PROTECTED_DACL_SECURITY_INFORMATION, original)
+        path.unlink()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows failed-write and failed-delete stage privacy")
+def test_windows_failed_write_and_delete_leave_unreadable_residue(make, monkeypatch):
+    import pywintypes, win32con, win32file, win32security
+    from agentcore.fs import _windows_mutation as win
+    h = make(); revision = h.revision()
+    write = win.write
+    def partial(handle, data):
+        write(handle, data[:3]); raise OSError("partial private stage interrupted")
+    monkeypatch.setattr(win, "write", partial)
+    monkeypatch.setattr(win, "discard", lambda *a: (_ for _ in ()).throw(OSError("cleanup interrupted")))
+    result = h.invoke(revision)
+    stage = h.residue()[0]
+    try:
+        assert not result.ok and h.target.read_bytes() == "héllo\n".encode()
+        assert h.actions.load(result.action_id).attempts[0].status is ActionAttemptStatus.NOT_INVOKED
+        with pytest.raises(pywintypes.error) as error:
+            reader = win32file.CreateFile(str(stage), win32con.GENERIC_READ, 7,
+                None, win32con.OPEN_EXISTING, 0, None)
+            reader.Close()
+        assert error.value.winerror == 5
+    finally:
+        # Synthetic fixture teardown only; production never reopens a residue
+        # to grant authority or retries a possibly published action.
+        source = win32security.GetFileSecurity(str(h.target), 4)
+        win32security.SetFileSecurity(str(stage), 4 | win32security.PROTECTED_DACL_SECURITY_INFORMATION, source)
+        stage.unlink()
+
+
 @pytest.mark.skipif(not __import__("sys").platform.startswith("linux"), reason="Linux native inode flags")
 def test_linux_nodump_flag_refused_without_replacement_or_flag_loss(make):
     import ctypes, fcntl, struct
@@ -579,7 +641,7 @@ def test_windows_unsupported_metadata_and_data_refused(make, kind):
 def test_windows_restricted_dacl_and_audit_sacl_preserved(make, native_security):
     if not native_security:
         pytest.skip("test token lacks assigned SeSecurityPrivilege")
-    import win32api, win32con, win32security
+    import win32api, win32con, win32file, win32security
     h = make()
     token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
     try:
@@ -587,13 +649,14 @@ def test_windows_restricted_dacl_and_audit_sacl_preserved(make, native_security)
     finally:
         token.Close()
     acl = win32security.ACL()
-    acl.AddAccessAllowedAce(win32security.ACL_REVISION, win32con.FILE_ALL_ACCESS, user)
+    acl.AddAccessAllowedAce(win32security.ACL_REVISION, win32file.FILE_ALL_ACCESS, user)
     audit = win32security.ACL()
     audit.AddAuditAccessAce(win32security.ACL_REVISION, win32con.GENERIC_READ, user, True, True)
     sd = win32security.GetFileSecurity(str(h.target), 1 | 2 | 4 | 8)
     sd.SetSecurityDescriptorDacl(True, acl, False)
     sd.SetSecurityDescriptorSacl(True, audit, False)
-    win32security.SetFileSecurity(str(h.target), 4 | 8 | 0x80000000 | 0x40000000, sd)
+    win32security.SetFileSecurity(str(h.target), 4 | 8 | win32security.PROTECTED_DACL_SECURITY_INFORMATION
+        | win32security.PROTECTED_SACL_SECURITY_INFORMATION, sd)
     revision = h.revision()
     captured = h.revisions._snapshots[revision]["metadata"]["security"]
     assert h.invoke(revision).ok

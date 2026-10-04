@@ -132,16 +132,26 @@ Only current-token owner/default-owner ordinary single-link disk files with
 bounded complete descriptors are eligible. Readonly/system, encrypted,
 compressed, reparse, sparse/offline/integrity/recall and other unusual attributes
 are refused. Bounded native EA/stream queries refuse extended attributes and
-alternate data streams. The stage receives the old owner/group/DACL/full SACL
-at creation before content, then security/control semantics are set and exact
-descriptor equality required. Ordinary allowed attributes are preserved and
-verified. Replacement stages use zero sharing, so a preserved broad DACL cannot
-expose partial staged bytes through another data-read/execute handle. The owned
-handle stays open through complete publication/flush and then releases sharing.
+alternate data streams. The empty stage is created with a protected current-user
+DACL, then locked with an empty protected DACL before writing through the
+already-granted owned handle. New data-read/execute handles are denied even
+after close, so failed deletion or process death cannot expose partial residue.
+Old owner/group/full SACL are carried into the private descriptor. Only after
+complete writing/flush and final validation does possible-publication truth
+begin, before restoring the full old DACL/control semantics and ordinary allowed
+attributes. Exact descriptor/metadata equality is required before native rename.
+Replacement stages additionally use zero sharing. The old target remains pinned
+without write/delete sharing through restoration and is closed just before
+rename. The owned stage handle stays open through publication/flush.
 Unsupported rights/APIs/security semantics fail closed.
 
 After exact writes and FlushFileBuffers, the second comparison and current
-authority checks precede handle-relative FileRenameInformation replacement.
+authority checks precede full target metadata restoration and handle-relative
+FileRenameInformation replacement. Uncertainty begins at descriptor restoration
+because a completed residue could become readable after cleanup/close fails;
+it is never definite no-effect. Pre-restoration residue remains unreadable even
+when discard fails. Complete post-restoration crash residue can inherit the old
+target's access policy; that possible disclosure remains journaled uncertainty.
 Traditional NT replacement requires closing the inspected target handle before
 publication. That loses the target's no-write/no-delete sharing protection at
 the close-to-rename seam. No arbitrary DOS-path fallback is used. Stages and

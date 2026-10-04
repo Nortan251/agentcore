@@ -204,19 +204,42 @@ def update_facts(handle):
             "change": [basic.CreationTime, basic.LastWriteTime, basic.ChangeTime]}
 
 
+def private_stage_descriptor(metadata, *, initial=False):
+    sd = win32security.SECURITY_DESCRIPTOR(bytes.fromhex(metadata["security"]))
+    acl = win32security.ACL()
+    if initial:
+        token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
+        try:
+            user = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
+        finally:
+            token.Close()
+        acl.AddAccessAllowedAce(win32security.ACL_REVISION, win32file.FILE_ALL_ACCESS, user)
+    sd.SetSecurityDescriptorDacl(True, acl, False)
+    sd.SetSecurityDescriptorControl(0x1500, 0x1000)  # protected, no auto inheritance
+    return sd
+
+
+def _set_update_security(handle, sd):
+    control = sd.GetSecurityDescriptorControl()[0]
+    flags = 1 | 2 | 4 | 8
+    flags |= (win32security.PROTECTED_DACL_SECURITY_INFORMATION if control & 0x1000
+              else win32security.UNPROTECTED_DACL_SECURITY_INFORMATION)
+    flags |= (win32security.PROTECTED_SACL_SECURITY_INFORMATION if control & 0x2000
+              else win32security.UNPROTECTED_SACL_SECURITY_INFORMATION)
+    win32security.SetKernelObjectSecurity(handle, flags, sd)
+
+
 def create_update_stage(parent, name, metadata):
-    # Supply the target descriptor at exclusive creation, before content can
-    # ever exist under a broader inherited ACL. Then preserve/verify all ACLs.
-    opened = open_child(parent, name, create=True, _update=True,
-                        _security=bytes.fromhex(metadata["security"]))
+    # At creation only the current user can open the empty object. Before any
+    # bytes exist, deny future data opens with an empty protected DACL. The
+    # already-granted owned handle retains its write/security/query rights.
+    sd = private_stage_descriptor(metadata, initial=True)
+    opened = open_child(parent, name, create=True, _update=True, _security=bytes(sd))
     try:
-        sd = win32security.SECURITY_DESCRIPTOR(bytes.fromhex(metadata["security"]))
-        control = sd.GetSecurityDescriptorControl()[0]
-        flags = 1 | 2 | 4 | 8
-        flags |= 0x80000000 if control & 0x1000 else 0x20000000
-        flags |= 0x40000000 if control & 0x2000 else 0x10000000
-        win32security.SetKernelObjectSecurity(opened, flags, sd)
-        if _update_security(opened) != metadata["security"]:
+        _set_update_security(opened, private_stage_descriptor(metadata))
+        observed = win32security.SECURITY_DESCRIPTOR(bytes.fromhex(_update_security(opened)))
+        dacl = observed.GetSecurityDescriptorDacl()
+        if dacl is None or dacl.GetAceCount() or not observed.GetSecurityDescriptorControl()[0] & 0x1000:
             raise ValueError("unsupported_file_metadata")
     except BaseException:
         try:
@@ -234,6 +257,7 @@ class _Basic(c.Structure):
 
 
 def preserve_update_metadata(handle, metadata):
+    _set_update_security(handle, win32security.SECURITY_DESCRIPTOR(bytes.fromhex(metadata["security"])))
     value, io = _Basic(0, 0, 0, 0, metadata["attributes"]), _IO()
     _check(_set(int(handle), c.byref(io), c.byref(value), c.sizeof(value), 4))
     if update_facts(handle)["metadata"] != metadata:
