@@ -655,6 +655,28 @@ def test_reconciliation_missing_binding_cannot_accept_unleased_reregistration(ma
     assert h.reconcile(invocation.action_id).status is ActionReconciliationStatus.SETTLED_SUCCEEDED
 
 
+def test_reconciliation_unavailable_claim_cannot_fall_through_to_unleased_probe(make, monkeypatch):
+    h = make()
+    def interrupted(publish):
+        publish()
+        raise TimeoutError()
+    _publication_hook(monkeypatch, interrupted)
+    invocation = h.invoke()
+    claim = h.recovery.claim(invocation.action_id,
+        expected_version=h.actions.load(invocation.action_id).version)
+    original = h.executor._load_exact_recovery_claim
+    calls = []
+    def unavailable_once(*args):
+        calls.append(1)
+        return None if len(calls) == 1 else original(*args)
+    def forbidden(*args):
+        pytest.fail("unavailable claim fell through to an unleased target probe")
+    monkeypatch.setattr(h.executor, "_load_exact_recovery_claim", unavailable_once)
+    monkeypatch.setattr(h.guard, "observe_create", forbidden)
+    assert h.executor.reconcile_action(claim).status is ActionReconciliationStatus.STALE_CLAIM
+    assert calls == [1] and h.actions.load(invocation.action_id).state is ActionState.RECONCILE_REQUIRED
+
+
 def test_attempt_and_protected_intent_are_durable_before_staging(make, monkeypatch):
     h = make()
     original = h.guard.create_file

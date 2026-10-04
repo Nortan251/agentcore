@@ -21,8 +21,8 @@ The same leases cover destination preparation and read-only reconciliation,
 including publication of reconciled journal truth. Revocation/removal fails
 busy while an observation is leased and succeeds after it ends; a revocation
 completed before leasing prevents filesystem access.
-An unavailable filesystem reconciliation binding returns immediately; a
-later re-registration must start a fresh probe and acquire its own leases.
+An unavailable claim or filesystem reconciliation binding returns immediately;
+a later re-registration must start a fresh probe and acquire its own leases.
 OBSERVE/PROPOSE refuse writes; CONFIRM requires the existing durable approval
 path, including when a host capability override requests a lower level.
 AUTONOMOUS still respects current capability denial.

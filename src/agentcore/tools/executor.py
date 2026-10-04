@@ -685,8 +685,11 @@ class ToolExecutor:
         try:
             with store.execution_guard(claim.action_id):
                 current = self._load_exact_recovery_claim(store, claim)
+                if current is None:
+                    return self._observed_reconciliation_report(
+                        store, claim, ActionReconciliationStatus.STALE_CLAIM)
                 with ExitStack() as leases:
-                    if current is not None and current.action_kind == _FILESYSTEM_WRITE_KIND:
+                    if current.action_kind == _FILESYSTEM_WRITE_KIND:
                         try:
                             tool = self.registry.get(current.tool_name)
                             if type(tool) is not WriteFileTool:
