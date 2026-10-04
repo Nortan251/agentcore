@@ -16,7 +16,7 @@ import threading
 import time
 import agentcore.errors as framework_errors
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, ExitStack
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -89,12 +89,13 @@ from agentcore.credentials.action import (
 from agentcore.fs.sensitive import DEFAULT_SENSITIVE_POLICY
 from agentcore.observability.events import Events
 from agentcore.observability.logging import StructuredLogger, get_logger
-from agentcore.permissions.levels import READ_ONLY_CAPABILITIES, Capability
+from agentcore.permissions.levels import READ_ONLY_CAPABILITIES, Capability, PermissionLevel
 from agentcore.permissions.policy import Decision, Outcome, PermissionPolicy
 from agentcore.realtime.errors import CancellationRequested
 from agentcore.tools.base import ExternalReadTool, ToolContext, ToolResult, ToolSpec
 from agentcore.tools.authenticated import AuthenticatedReadTool
 from agentcore.tools.authenticated_action import AuthenticatedActionTool
+from agentcore.tools.builtin.write_file import WriteFileTool, _WriteExecution, _ISSUER, _KIND as _FILESYSTEM_WRITE_KIND
 from agentcore.tools.registry import ToolRegistry, ToolRegistryLeaseError
 from agentcore.util.clock import Clock, SystemClock
 from agentcore.util.ids import new_id
@@ -160,6 +161,10 @@ class _CurrentAuthorityBlocked(Exception):
         self.safe_message = message
         self.request_id = request_id
         self.decision = decision
+
+
+class _FilesystemWriteNotInvoked(_CredentialActionNotInvoked):
+    """The live executor proved no filesystem staging boundary was entered."""
 
 
 def _safe_args_for_log(args: Mapping[str, Any]) -> dict[str, Any]:
@@ -254,6 +259,7 @@ class ToolExecutor:
         self._policy_generation = 0
         self._credential_policy_leases = 0
         self._external_read_policy_leases = 0
+        self._filesystem_policy_leases = 0
         self.policy = policy
         self.workspace = workspace
         self.workspace_dir = (str(workspace.root) if workspace is not None
@@ -278,6 +284,9 @@ class ToolExecutor:
         if credential_runtime is not None:
             credential_runtime._attach_executor(self._credential_authority)
         self._action_domain_health_lock = threading.Lock()
+        self._action_domain_health_condition = threading.Condition(self._action_domain_health_lock)
+        self._filesystem_health_owners: dict[int, int] = {}
+        self._pending_action_quarantine: ActionDomainHealth | None = None
         self._action_domain_health = (
             ActionDomainHealth.validation_pending()
             if action_store is not None
@@ -315,14 +324,59 @@ class ToolExecutor:
                 raise CredentialError(CredentialFailure.BUSY)
             if self._external_read_policy_leases:
                 raise PolicyLeaseBusyError("Permission policy is in use by an external read.")
+            if self._filesystem_policy_leases:
+                raise PolicyLeaseBusyError("Permission policy is in use by a filesystem operation.")
             self._policy = policy
             self._policy_generation += 1
+
+    @contextmanager
+    def _filesystem_policy_lease(self):
+        """Pin current authority before checks and through filesystem I/O."""
+        self._require_policy_owner()
+        with self._policy_lock:
+            self._require_policy_owner()
+            self._filesystem_policy_leases += 1
+        try:
+            yield
+        finally:
+            self._require_policy_owner()
+            with self._policy_lock:
+                self._filesystem_policy_leases -= 1
 
     @property
     def action_domain_health(self) -> ActionDomainHealth:
         """Return an immutable snapshot of the startup mutation gate."""
+        self._require_policy_owner()
         with self._action_domain_health_lock:
+            if self._pending_action_quarantine is not None and (
+                    threading.get_ident() not in self._filesystem_health_owners):
+                return self._pending_action_quarantine
             return self._action_domain_health
+
+    @contextmanager
+    def _filesystem_health_lease(self):
+        """Order admitted filesystem I/O before completion of quarantine."""
+        self._require_policy_owner()
+        owner = threading.get_ident()
+        with self._action_domain_health_condition:
+            if self._pending_action_quarantine is not None or (
+                    self._action_domain_health.state is not ActionDomainHealthState.HEALTHY):
+                raise ValueError("filesystem action domain is unavailable")
+            self._filesystem_health_owners[owner] = self._filesystem_health_owners.get(owner, 0) + 1
+        try:
+            yield
+        finally:
+            self._require_policy_owner()
+            with self._action_domain_health_condition:
+                remaining = self._filesystem_health_owners[owner] - 1
+                if remaining:
+                    self._filesystem_health_owners[owner] = remaining
+                else:
+                    del self._filesystem_health_owners[owner]
+                if not self._filesystem_health_owners and self._pending_action_quarantine is not None:
+                    self._action_domain_health = self._pending_action_quarantine
+                    self._pending_action_quarantine = None
+                    self._action_domain_health_condition.notify_all()
 
     def _mark_action_startup_healthy(self, store: ActionStore) -> bool:
         """Accept one exact coordinator/store startup proof.
@@ -331,23 +385,36 @@ class ToolExecutor:
         never clear a quarantine, and a coordinator for a different store
         cannot authorize this executor's mutation domain.
         """
+        self._require_policy_owner()
         with self._action_domain_health_lock:
             if store is not self._action_store:
                 return False
-            if self._action_domain_health.state is (
+            if self._pending_action_quarantine is not None or self._action_domain_health.state is (
                     ActionDomainHealthState.QUARANTINED):
                 return False
             self._action_domain_health = ActionDomainHealth.healthy()
             return True
 
     def quarantine_action_mutations(self, category: str) -> None:
-        """Fail future mutations closed after startup journal quarantine."""
-        with self._action_domain_health_lock:
+        """Deny new admissions, then complete after leased filesystem I/O.
+
+        A reentrant request cannot wait for its own lease: fail busy while
+        latching quarantine for automatic publication when that lease retires.
+        """
+        self._require_policy_owner()
+        with self._action_domain_health_condition:
             if self._action_domain_health.state is (
                     ActionDomainHealthState.QUARANTINED):
                 return
-            self._action_domain_health = ActionDomainHealth.quarantined(
-                category)
+            if self._pending_action_quarantine is None:
+                self._pending_action_quarantine = ActionDomainHealth.quarantined(category)
+            if threading.get_ident() in self._filesystem_health_owners:
+                raise PolicyLeaseBusyError("Quarantine is pending this filesystem operation's completion.")
+            while self._filesystem_health_owners:
+                self._action_domain_health_condition.wait()
+            if self._pending_action_quarantine is not None:
+                self._action_domain_health = self._pending_action_quarantine
+                self._pending_action_quarantine = None
 
     def validate_action_protected_storage(self, record: ActionRecord) -> None:
         """Validate every protected reference needed by one action.
@@ -457,6 +524,7 @@ class ToolExecutor:
         *,
         action_execution_permit: ActionExecutionPermit | None = None,
         credential_execution: CredentialExecution | CredentialActionExecution | None = None,
+        filesystem_write_execution: Any = None,
     ) -> ToolContext:
         return ToolContext(
             config=dict(self._tool_settings.get(tool_name, {})),
@@ -465,6 +533,7 @@ class ToolExecutor:
             workspace=self.workspace,
             action_execution_permit=action_execution_permit,
             credential_execution=credential_execution,
+            filesystem_write_execution=filesystem_write_execution,
         )
 
     def invoke(
@@ -660,11 +729,28 @@ class ToolExecutor:
             )
         try:
             with store.execution_guard(claim.action_id):
-                return self._reconcile_under_action_guard(
-                    store,
-                    claim,
-                    checkpoint=checkpoint,
-                )
+                current = self._load_exact_recovery_claim(store, claim)
+                if current is None:
+                    return self._observed_reconciliation_report(
+                        store, claim, ActionReconciliationStatus.STALE_CLAIM)
+                with ExitStack() as leases:
+                    if current.action_kind == _FILESYSTEM_WRITE_KIND:
+                        try:
+                            tool = self.registry.get(current.tool_name)
+                            if type(tool) is not WriteFileTool:
+                                raise ValueError("filesystem reconciliation binding changed")
+                        except Exception:
+                            # Never fall through to a second lookup which could
+                            # accept a new binding without acquiring its leases.
+                            return self._release_recovery_claim(
+                                store, current, claim,
+                                status=ActionReconciliationStatus.ADAPTER_UNAVAILABLE,
+                                probe_entered=False)
+                        leases.enter_context(self.registry.execution_lease(tool.name, tool))
+                        leases.enter_context(self._filesystem_policy_lease())
+                        leases.enter_context(self._filesystem_health_lease())
+                    return self._reconcile_under_action_guard(
+                        store, claim, checkpoint=checkpoint)
         except CancellationRequested:
             raise
         except Exception:
@@ -1524,6 +1610,47 @@ class ToolExecutor:
         # No provider exception or secret-bearing context leaves this method.
         raise _CredentialActionNotInvoked()
 
+    def _run_filesystem_write(self, *, store, claimed, tool, tool_spec, cleaned,
+                              adapter, spec, prepared, current_approval_receipt, checkpoint):
+        execution = None
+
+        def validate():
+            if checkpoint is not None:
+                checkpoint()
+            if store.load(claimed.action_id) != claimed or self.workspace is not tool._guard:
+                raise ValueError("filesystem write claim or workspace changed")
+            self._validate_current_execution_authority(
+                record=claimed, tool=tool, tool_spec=tool_spec, adapter=adapter,
+                spec=spec, prepared=prepared, current_approval_receipt=current_approval_receipt)
+
+        @contextmanager
+        def authorize():
+            tool.validate_contract()
+            with self._filesystem_policy_lease(), self._filesystem_health_lease():
+                validate()
+                yield
+
+        try:
+            payload, _ = self._resolve_action_protected_storage(claimed)
+            if payload is None or not self._protected_intent_matches(claimed, prepared):
+                raise ValueError("verified filesystem intent unavailable")
+            execution = _WriteExecution(_ISSUER, tool, payload, authorize, validate)
+            result = tool.run(cleaned, self._context(tool_spec.name, filesystem_write_execution=execution))
+            return adapter.normalize_effect(result).validate(spec), None
+        except (CancellationRequested, KeyboardInterrupt, SystemExit) as exc:
+            if execution is not None and execution.entered:
+                return self._unknown_effect(spec, "filesystem.interrupted"), exc
+            if isinstance(exc, CancellationRequested):
+                raise _FilesystemWriteNotInvoked(cancellation=exc) from None
+            raise _FilesystemWriteNotInvoked(interruption=type(exc)) from None
+        except Exception:
+            if execution is not None and execution.entered:
+                return self._unknown_effect(spec, "filesystem.uncertain"), None
+            raise _FilesystemWriteNotInvoked() from None
+        finally:
+            if execution is not None:
+                execution.active = False
+
     def _current_policy_decision(
         self,
         tool_spec: ToolSpec,
@@ -1531,6 +1658,11 @@ class ToolExecutor:
         description: str,
     ) -> tuple[Decision, bool]:
         """Return current aggregate policy truth without boolean approval."""
+        filesystem_write = (tool_spec.name == "write_file" and
+                            type(self.registry.get(tool_spec.name)) is WriteFileTool)
+        if filesystem_write and self.policy.level in {PermissionLevel.OBSERVE, PermissionLevel.PROPOSE}:
+            return Decision(Outcome.DENY, "filesystem writes require mutation authority",
+                            capability=Capability.FS_WRITE), False
         authenticated_send_caps = frozenset({Capability.EMAIL_SEND, Capability.NET_WRITE, Capability.CREDENTIAL_ACCESS})
         current_tool = self.registry.get(tool_spec.name) if tool_spec.capabilities == authenticated_send_caps else None
         if type(current_tool) is AuthenticatedActionTool:
@@ -1551,6 +1683,9 @@ class ToolExecutor:
                 tool_spec.capabilities, description=description)
             if not isinstance(decision, Decision):
                 raise TypeError("permission policy returned an invalid decision")
+            if filesystem_write and self.policy.level is PermissionLevel.CONFIRM and decision.allowed:
+                return Decision(Outcome.REQUIRE_APPROVAL, "filesystem write requires durable approval",
+                                capability=Capability.FS_WRITE), True
             return decision, decision.outcome is Outcome.REQUIRE_APPROVAL
         evaluation = self.policy.evaluate_all(tool_spec.capabilities)
         if evaluation.outcome is Outcome.DENY:
@@ -1564,6 +1699,9 @@ class ToolExecutor:
                 capability=capability,
                 required_level=self.policy.required_level(capability),
             ), True
+        if filesystem_write and self.policy.level is PermissionLevel.CONFIRM:
+            return Decision(Outcome.REQUIRE_APPROVAL, "filesystem write requires durable approval",
+                            capability=Capability.FS_WRITE), True
         return Decision(Outcome.ALLOW, "all capabilities permitted"), False
 
     def _authorize_approval(
@@ -2468,12 +2606,38 @@ class ToolExecutor:
                 log=log, invocation_id=invocation_id)
 
         try:
-            if type(tool) is AuthenticatedActionTool:
-                tool.validate_action_context(trusted_context, repeat=duplicate_risk_context is not None)
-            prepared = adapter.prepare_intent(cleaned, trusted_context)
-            if not isinstance(prepared, PreparedActionIntent):
-                raise TypeError("adapter preflight type")
-            prepared.validate()
+            with ExitStack() as leases:
+                # Preparation observes the destination; pin permission and
+                # exact registration before checking either and through I/O.
+                if type(tool) is WriteFileTool:
+                    leases.enter_context(self.registry.execution_lease(tool_spec.name, tool))
+                    leases.enter_context(self._filesystem_policy_lease())
+                    leases.enter_context(self._filesystem_health_lease())
+                    decision, _ = self._current_policy_decision(
+                        tool_spec, description=tool_spec.description)
+                    if decision.outcome is Outcome.REQUIRE_APPROVAL:
+                        # Pending write approval grants no observation authority.
+                        # Preflight may inspect only under independently allowed
+                        # FS_READ; approved mutation remains a later boundary.
+                        observation = self.policy.check(
+                            frozenset({Capability.FS_READ}), description="Prepare filesystem create")
+                        if not observation.allowed:
+                            decision = Decision(Outcome.DENY,
+                                "filesystem preparation requires current read authority",
+                                capability=Capability.FS_READ)
+                    if decision.outcome is Outcome.DENY:
+                        log.warning(Events.TOOL_DENIED, **decision.to_dict())
+                        return ToolInvocation(
+                            tool_spec.name, redacted,
+                            ToolResult.failure("Permission was not granted for this action.",
+                                               kind="permission_denied"),
+                            elapsed(), decision, invocation_id=invocation_id)
+                if type(tool) is AuthenticatedActionTool:
+                    tool.validate_action_context(trusted_context, repeat=duplicate_risk_context is not None)
+                prepared = adapter.prepare_intent(cleaned, trusted_context)
+                if not isinstance(prepared, PreparedActionIntent):
+                    raise TypeError("adapter preflight type")
+                prepared.validate()
         except Exception:
             return self._journal_failure(
                 tool_spec.name, redacted, elapsed(),
@@ -3425,20 +3589,27 @@ class ToolExecutor:
                 raise exc.cancellation
             published = self._publish_confirmed_no_effect(
                 store, claimed, attempt_status=ActionAttemptStatus.NOT_INVOKED,
-                result_class="gmail.send.not_invoked",
-                summary="The authenticated send provider was not entered.")
+                result_class=("filesystem.not_invoked" if isinstance(exc, _FilesystemWriteNotInvoked)
+                              else "gmail.send.not_invoked"),
+                summary=("The filesystem staging boundary was not entered."
+                         if isinstance(exc, _FilesystemWriteNotInvoked)
+                         else "The authenticated send provider was not entered."))
             if exc.interruption is not None:
                 raise exc.interruption() from None
             return self._published_or_uncertain(
                 tool_spec.name, redacted, published, decision, invocation_id, attempt_id,
-                elapsed(), log, fallback_kind="action_credential_unavailable",
+                elapsed(), log, fallback_kind=("filesystem_write_unavailable"
+                    if isinstance(exc, _FilesystemWriteNotInvoked) else "action_credential_unavailable"),
                 fallback_action_id=claimed.action_id)
         except _CurrentAuthorityBlocked as exc:
-            if type(tool) is AuthenticatedActionTool:
+            if type(tool) in {AuthenticatedActionTool, WriteFileTool}:
                 published = self._publish_confirmed_no_effect(
                     store, claimed, attempt_status=ActionAttemptStatus.NOT_INVOKED,
-                    result_class="gmail.send.authority_denied",
-                    summary="Current authority prevented entry to the send provider.")
+                    result_class=("filesystem.authority_denied" if type(tool) is WriteFileTool
+                                  else "gmail.send.authority_denied"),
+                    summary=("Current authority prevented entry to filesystem staging."
+                             if type(tool) is WriteFileTool else
+                             "Current authority prevented entry to the send provider."))
                 return self._published_or_uncertain(
                     tool_spec.name, redacted, published, exc.decision or decision,
                     invocation_id, attempt_id, elapsed(), log, fallback_kind=exc.kind,
@@ -3625,6 +3796,12 @@ class ToolExecutor:
                 cancellation: BaseException | None = None
                 if type(tool) is AuthenticatedActionTool:
                     normalized, cancellation = self._run_authenticated_action(
+                        store=store, claimed=claimed, tool=tool, tool_spec=tool_spec,
+                        cleaned=cleaned, adapter=adapter, spec=spec, prepared=prepared,
+                        current_approval_receipt=current_approval_receipt, checkpoint=checkpoint)
+                    return normalized, cancellation, final_decision
+                if type(tool) is WriteFileTool:
+                    normalized, cancellation = self._run_filesystem_write(
                         store=store, claimed=claimed, tool=tool, tool_spec=tool_spec,
                         cleaned=cleaned, adapter=adapter, spec=spec, prepared=prepared,
                         current_approval_receipt=current_approval_receipt, checkpoint=checkpoint)

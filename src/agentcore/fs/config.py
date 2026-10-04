@@ -14,6 +14,10 @@ from dataclasses import dataclass
 
 from agentcore.errors import ConfigError
 
+# Worst-case JSON escaping costs six bytes per UTF-8 payload byte. 128 KiB
+# leaves >256 KiB of the 1 MiB protected-record ceiling for path and envelope.
+MAX_WRITE_FILE_BYTES = 131_072
+
 #: Reasoning for the defaults below is inline on each field. They are chosen to
 #: be *generous for source code* and *hostile to bulk exfiltration*.
 
@@ -33,6 +37,7 @@ class FilesystemConfig:
     #: Enforced *during* reading, chunk by chunk — never by reading then
     #: trimming.
     max_file_bytes: int = 1_048_576
+    max_write_bytes: int = MAX_WRITE_FILE_BYTES
     #: Bytes per read chunk. Small enough that the ceiling is honoured
     #: promptly, large enough to avoid syscall churn.
     read_chunk_bytes: int = 65_536
@@ -87,6 +92,8 @@ class FilesystemConfig:
         return min(self.read_chunk_bytes, self.max_file_bytes)
 
     def validate(self) -> None:
+        if type(self.max_write_bytes) is not int or not 1 <= self.max_write_bytes <= MAX_WRITE_FILE_BYTES:
+            raise ConfigError("filesystem.max_write_bytes is outside the durable write bound")
         for name in ("max_file_bytes", "read_chunk_bytes",
                      "max_directory_entries", "max_result_chars",
                      "max_path_length", "max_path_depth"):

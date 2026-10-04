@@ -291,6 +291,8 @@ def _build_conversation(data: Mapping[str, Any]) -> ConversationConfig:
 def _build_filesystem(data: Mapping[str, Any]) -> FilesystemConfig:
     d = FilesystemConfig()
     return FilesystemConfig(
+        max_write_bytes=_coerce(int, data.get("max_write_bytes", d.max_write_bytes),
+                               "filesystem.max_write_bytes"),
         max_file_bytes=_coerce(int, data.get("max_file_bytes",
                                              d.max_file_bytes),
                                "filesystem.max_file_bytes"),
