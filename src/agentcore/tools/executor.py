@@ -87,6 +87,7 @@ from agentcore.credentials.action import (
     CredentialActionExecution, CredentialActionIdentity, action_execution, action_snapshot,
 )
 from agentcore.fs.sensitive import DEFAULT_SENSITIVE_POLICY
+from agentcore.fs.mutation import DestinationExistsError
 from agentcore.observability.events import Events
 from agentcore.observability.logging import StructuredLogger, get_logger
 from agentcore.permissions.levels import READ_ONLY_CAPABILITIES, Capability, PermissionLevel
@@ -95,12 +96,20 @@ from agentcore.realtime.errors import CancellationRequested
 from agentcore.tools.base import ExternalReadTool, ToolContext, ToolResult, ToolSpec
 from agentcore.tools.authenticated import AuthenticatedReadTool
 from agentcore.tools.authenticated_action import AuthenticatedActionTool
-from agentcore.tools.builtin.write_file import WriteFileTool, _WriteExecution, _ISSUER, _KIND as _FILESYSTEM_WRITE_KIND
+from agentcore.tools.builtin.write_file import WriteFileTool, _KIND as _FILESYSTEM_WRITE_KIND
+from agentcore.tools.builtin.create_directory import CreateDirectoryTool, _KIND as _FILESYSTEM_DIRECTORY_KIND
+from agentcore.tools.builtin._filesystem_execution import _FilesystemMutationExecution, _ISSUER
+
 from agentcore.tools.registry import ToolRegistry, ToolRegistryLeaseError
 from agentcore.util.clock import Clock, SystemClock
 from agentcore.util.ids import new_id
 
 
+_FILESYSTEM_MUTATIONS = {
+    _FILESYSTEM_WRITE_KIND: WriteFileTool,
+    _FILESYSTEM_DIRECTORY_KIND: CreateDirectoryTool,
+}
+_FILESYSTEM_TOOL_TYPES = frozenset(_FILESYSTEM_MUTATIONS.values())
 _REDACTED = "***"
 _SENSITIVE_FAILURE_REASONS = frozenset({"sensitive", "sensitive_target"})
 _DUPLICATE_RISK_APPROVAL_ACTION_KIND = "agentcore.duplicate_risk.v1"
@@ -164,7 +173,7 @@ class _CurrentAuthorityBlocked(Exception):
 
 
 class _FilesystemWriteNotInvoked(_CredentialActionNotInvoked):
-    """The live executor proved no filesystem staging boundary was entered."""
+    """The live executor proved no filesystem mutation boundary was entered."""
 
 
 def _safe_args_for_log(args: Mapping[str, Any]) -> dict[str, Any]:
@@ -525,6 +534,7 @@ class ToolExecutor:
         action_execution_permit: ActionExecutionPermit | None = None,
         credential_execution: CredentialExecution | CredentialActionExecution | None = None,
         filesystem_write_execution: Any = None,
+        filesystem_mutation_execution: Any = None,
     ) -> ToolContext:
         return ToolContext(
             config=dict(self._tool_settings.get(tool_name, {})),
@@ -534,6 +544,7 @@ class ToolExecutor:
             action_execution_permit=action_execution_permit,
             credential_execution=credential_execution,
             filesystem_write_execution=filesystem_write_execution,
+            filesystem_mutation_execution=filesystem_mutation_execution,
         )
 
     def invoke(
@@ -734,10 +745,10 @@ class ToolExecutor:
                     return self._observed_reconciliation_report(
                         store, claim, ActionReconciliationStatus.STALE_CLAIM)
                 with ExitStack() as leases:
-                    if current.action_kind == _FILESYSTEM_WRITE_KIND:
+                    if current.action_kind in _FILESYSTEM_MUTATIONS:
                         try:
                             tool = self.registry.get(current.tool_name)
-                            if type(tool) is not WriteFileTool:
+                            if type(tool) is not _FILESYSTEM_MUTATIONS[current.action_kind]:
                                 raise ValueError("filesystem reconciliation binding changed")
                         except Exception:
                             # Never fall through to a second lookup which could
@@ -1610,7 +1621,7 @@ class ToolExecutor:
         # No provider exception or secret-bearing context leaves this method.
         raise _CredentialActionNotInvoked()
 
-    def _run_filesystem_write(self, *, store, claimed, tool, tool_spec, cleaned,
+    def _run_filesystem_mutation(self, *, store, claimed, tool, tool_spec, cleaned,
                               adapter, spec, prepared, current_approval_receipt, checkpoint):
         execution = None
 
@@ -1618,7 +1629,7 @@ class ToolExecutor:
             if checkpoint is not None:
                 checkpoint()
             if store.load(claimed.action_id) != claimed or self.workspace is not tool._guard:
-                raise ValueError("filesystem write claim or workspace changed")
+                raise ValueError("filesystem mutation claim or workspace changed")
             self._validate_current_execution_authority(
                 record=claimed, tool=tool, tool_spec=tool_spec, adapter=adapter,
                 spec=spec, prepared=prepared, current_approval_receipt=current_approval_receipt)
@@ -1634,8 +1645,10 @@ class ToolExecutor:
             payload, _ = self._resolve_action_protected_storage(claimed)
             if payload is None or not self._protected_intent_matches(claimed, prepared):
                 raise ValueError("verified filesystem intent unavailable")
-            execution = _WriteExecution(_ISSUER, tool, payload, authorize, validate)
-            result = tool.run(cleaned, self._context(tool_spec.name, filesystem_write_execution=execution))
+            execution = _FilesystemMutationExecution(_ISSUER, tool, payload, authorize, validate)
+            result = tool.run(cleaned, self._context(tool_spec.name,
+                filesystem_mutation_execution=execution,
+                filesystem_write_execution=execution if type(tool) is WriteFileTool else None))
             return adapter.normalize_effect(result).validate(spec), None
         except (CancellationRequested, KeyboardInterrupt, SystemExit) as exc:
             if execution is not None and execution.entered:
@@ -1658,8 +1671,8 @@ class ToolExecutor:
         description: str,
     ) -> tuple[Decision, bool]:
         """Return current aggregate policy truth without boolean approval."""
-        filesystem_write = (tool_spec.name == "write_file" and
-                            type(self.registry.get(tool_spec.name)) is WriteFileTool)
+        filesystem_write = (tool_spec.name in {"write_file", "create_directory"}
+                            and type(self.registry.get(tool_spec.name)) in _FILESYSTEM_TOOL_TYPES)
         if filesystem_write and self.policy.level in {PermissionLevel.OBSERVE, PermissionLevel.PROPOSE}:
             return Decision(Outcome.DENY, "filesystem writes require mutation authority",
                             capability=Capability.FS_WRITE), False
@@ -2609,7 +2622,7 @@ class ToolExecutor:
             with ExitStack() as leases:
                 # Preparation observes the destination; pin permission and
                 # exact registration before checking either and through I/O.
-                if type(tool) is WriteFileTool:
+                if type(tool) in _FILESYSTEM_TOOL_TYPES:
                     leases.enter_context(self.registry.execution_lease(tool_spec.name, tool))
                     leases.enter_context(self._filesystem_policy_lease())
                     leases.enter_context(self._filesystem_health_lease())
@@ -2638,6 +2651,19 @@ class ToolExecutor:
                 if not isinstance(prepared, PreparedActionIntent):
                     raise TypeError("adapter preflight type")
                 prepared.validate()
+        except DestinationExistsError:
+            if type(tool) is CreateDirectoryTool:
+                # This is a trusted guard observation before admission, not an
+                # attempted mutation. Do not fabricate an absent pre-state or
+                # create a journal action just to record a definite refusal.
+                return ToolInvocation(tool_spec.name, redacted,
+                    ToolResult.failure("Existing destination refused.", kind="filesystem_exists",
+                        effect_verdict=EffectVerdict.CONFIRMED_NOT_APPLIED.value),
+                    elapsed(), decision, invocation_id=invocation_id)
+            return self._journal_failure(
+                tool_spec.name, redacted, elapsed(), kind="action_preflight_failed",
+                message="The action intent could not be prepared safely.",
+                log=log, invocation_id=invocation_id)
         except Exception:
             return self._journal_failure(
                 tool_spec.name, redacted, elapsed(),
@@ -3591,7 +3617,7 @@ class ToolExecutor:
                 store, claimed, attempt_status=ActionAttemptStatus.NOT_INVOKED,
                 result_class=("filesystem.not_invoked" if isinstance(exc, _FilesystemWriteNotInvoked)
                               else "gmail.send.not_invoked"),
-                summary=("The filesystem staging boundary was not entered."
+                summary=("The filesystem mutation boundary was not entered."
                          if isinstance(exc, _FilesystemWriteNotInvoked)
                          else "The authenticated send provider was not entered."))
             if exc.interruption is not None:
@@ -3602,13 +3628,13 @@ class ToolExecutor:
                     if isinstance(exc, _FilesystemWriteNotInvoked) else "action_credential_unavailable"),
                 fallback_action_id=claimed.action_id)
         except _CurrentAuthorityBlocked as exc:
-            if type(tool) in {AuthenticatedActionTool, WriteFileTool}:
+            if type(tool) in _FILESYSTEM_TOOL_TYPES or type(tool) is AuthenticatedActionTool:
                 published = self._publish_confirmed_no_effect(
                     store, claimed, attempt_status=ActionAttemptStatus.NOT_INVOKED,
-                    result_class=("filesystem.authority_denied" if type(tool) is WriteFileTool
+                    result_class=("filesystem.authority_denied" if type(tool) in _FILESYSTEM_TOOL_TYPES
                                   else "gmail.send.authority_denied"),
-                    summary=("Current authority prevented entry to filesystem staging."
-                             if type(tool) is WriteFileTool else
+                    summary=("Current authority prevented entry to the filesystem mutation boundary."
+                             if type(tool) in _FILESYSTEM_TOOL_TYPES else
                              "Current authority prevented entry to the send provider."))
                 return self._published_or_uncertain(
                     tool_spec.name, redacted, published, exc.decision or decision,
@@ -3800,8 +3826,8 @@ class ToolExecutor:
                         cleaned=cleaned, adapter=adapter, spec=spec, prepared=prepared,
                         current_approval_receipt=current_approval_receipt, checkpoint=checkpoint)
                     return normalized, cancellation, final_decision
-                if type(tool) is WriteFileTool:
-                    normalized, cancellation = self._run_filesystem_write(
+                if type(tool) in _FILESYSTEM_TOOL_TYPES:
+                    normalized, cancellation = self._run_filesystem_mutation(
                         store=store, claimed=claimed, tool=tool, tool_spec=tool_spec,
                         cleaned=cleaned, adapter=adapter, spec=spec, prepared=prepared,
                         current_approval_receipt=current_approval_receipt, checkpoint=checkpoint)

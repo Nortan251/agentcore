@@ -64,15 +64,20 @@ def open_child(parent, name, *, directory=False, create=False, read=False):
     access = 0x00100000 | 0x80  # SYNCHRONIZE | FILE_READ_ATTRIBUTES
     if directory or read:
         access |= win32con.GENERIC_READ
-    if create:
+    if create and not directory:
         access |= win32con.GENERIC_READ | win32con.GENERIC_WRITE | 0x10000  # DELETE for rename
     # Directory handles exclude delete sharing. Inspection handles permit
     # cooperating access; the newly created staging handle excludes writers.
     share = 3 if directory else (1 if create or read else 7)
     options = 0x00200000 | 0x20 | (1 if directory else 0)  # OPEN_REPARSE | SYNCHRONOUS | DIRECTORY
-    _check(_open(c.byref(handle), access, c.byref(attributes), c.byref(io), None,
-                 0x80, share, 2 if create else 1, options, None, 0))
-    return handle.value
+    try:
+        _check(_open(c.byref(handle), access, c.byref(attributes), c.byref(io), None,
+                     0x10 if directory else 0x80, share, 2 if create else 1, options, None, 0))
+        return handle.value
+    except BaseException:
+        if handle.value:
+            close(handle.value)
+        raise
 
 
 def close(handle):

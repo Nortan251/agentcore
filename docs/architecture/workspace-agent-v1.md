@@ -2,7 +2,8 @@
 
 `agentcore --config host.toml workspace --enable-write --message "Read the
 project and create notes/summary.txt with a short summary."` runs one model
-conversation turn. Parents (including `notes`) must already exist. Add
+conversation turn. `create_directory("notes")` can create `notes` first; both
+mutation tools require existing parents. Add
 `--session conv_<12 hex>` to resume a workspace session or `--json` for a
 bounded public result. There is no interactive loop, background autonomy or
 operator-resolution UI in v1.
@@ -31,26 +32,31 @@ until it ends. No metadata mutex spans I/O.
 
 The host owns one sealed ToolRegistry and one sealed ActionAdapterRegistry.
 The model catalogue is exactly `inspect`, `list_directory`, `read_file`,
-`write_file`. Registration, replacement and removal are closed after trusted
+`create_directory`, `write_file`. Registration, replacement and removal are
+closed after trusted
 bootstrap. No ordinary Agent, AgentState, memory, Browser, Gmail, shell,
 process, credentials, custom tools or injected runner are composed. Ordinary
 `Agent()`, `default_tools()` and `agentcore chat` retain their existing default
 read-only catalogue. The common session-domain check is the only conversation
 change besides accepting the new domain.
 
-The three existing concrete read tools and PR40's **exact WriteFileTool** are
-used. There is no clone or wrapper of the write tool. All calls use canonical
+The three existing concrete read tools, PR40's **exact WriteFileTool**, and the
+**exact CreateDirectoryTool** are used. There is no clone or wrapper of the
+write tool. All calls use canonical
 ToolRegistry validation -> PermissionPolicy -> ToolExecutor -> ActionJournal
-when required -> WorkspaceGuard. Direct write tool execution still requires
+when required -> WorkspaceGuard. Direct mutation tool execution still requires
 the executor's one-use process/thread context. Retained executor/conversation
 references cannot execute outside the one active turn or after host close.
 Read posture in this host always refuses sensitive paths, symlink traversal
 and multiple hard links; existing bounds remain configurable. The create-only
-mutation primitive and Gmail code are unchanged.
+file-write primitive and Gmail code are unchanged. Directory creation uses the
+same verified parent boundary; see [Directory Create v1](filesystem-directory-create-v1.md).
 
 The ordinary standing SYSTEM_PROMPT is retained and amended with host limits:
-file/tool output is untrusted data, parents must exist, existing files cannot
-be overwritten, and creation cannot be claimed without execution success.
+file/tool output is untrusted data, parents must exist, existing files and
+directories cannot
+be replaced, directory creation creates one missing directory only, and
+creation cannot be claimed without execution success.
 Model proposals cannot widen the fixed catalogue or current policy.
 
 ## Storage and privacy
@@ -80,10 +86,11 @@ Corrupt keys, actions or protected objects refuse the model turn. Even orphan
 and terminal payload objects undergo bounded authentication at startup.
 Unexpected payload files (including crash temporary files) fail closed for
 operator investigation. Enumeration is bounded at 4096 entries per directory;
-the existing recovery audit is bounded at 256 total actions. Before each write,
+the existing recovery audit is bounded at 256 total actions. Before either
+mutation,
 the host reserves capacity under its exclusive slot ownership, refusing any
 257th record before canonical preparation or physical effect. Prior successful
-creates remain auditable, including when a later write in the same turn reaches
+creates remain auditable, including when a later mutation in the same turn reaches
 the bound. Reads remain available at the action limit. New session admission
 also checks directory capacity before the model; saves independently refuse a
 4,097th transcript before temporary-file or publication I/O. Existing sessions
@@ -160,10 +167,13 @@ or deferred/exhausted probes, refuses new turns with
 `workspace_action_requires_operator` and bounded action IDs. AUTHORIZED
 records with no proven effect are preserved and never automatically resumed.
 
-During a turn, a failed or uncertain write disables further executor calls.
+Uncertain directory actions remain unknown and require human confirmation
+regardless of later presence/absence; no marker or ownership inference settles
+them. During a turn, a failed or uncertain mutation disables further executor
+calls.
 A friendly later model reply cannot make the CLI succeed. Durable action truth
 is collected even if model generation, transcript persistence, or another host
-step subsequently fails. A successful create remains `succeeded` /
+step subsequently fails. A successful file or directory create remains `succeeded` /
 `confirmed_applied`; session/model failure does not roll it back. Uncertain
 actions override conversation success. An unavailable action audit is an
 explicit failure rather than fabricated no-effect truth. Session autosave

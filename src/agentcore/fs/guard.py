@@ -173,6 +173,10 @@ class WorkspaceGuard:
         from agentcore.fs.mutation import create
         return create(self, intent, data, validate)
 
+    def create_directory(self, intent: Any, validate: Any) -> str:
+        from agentcore.fs.mutation import create_directory
+        return create_directory(self, intent, validate)
+
     def observe_create(self, intent: Any, size: int) -> str | None:
         from agentcore.fs.mutation import observe
         return observe(self, intent, size)
