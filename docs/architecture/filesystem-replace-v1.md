@@ -105,12 +105,19 @@ old flags before publication. Unsupported ioctl/filesystem/architecture or
 non-Linux POSIX metadata querying fails closed rather than losing policy state.
 
 An exclusive random 0600 stage is created in the same verified parent after
-durable intent and attempt claim. Required ownership/mode are applied, exact
-bounded bytes written and stage fsynced. The final target is reopened and fully
+durable intent and attempt claim. Required ownership is applied, but the stage
+remains 0600 while exact bounded bytes are written and fsynced. Stage metadata
+must match that private mode and permitted old metadata. The final target is reopened and fully
 compared against the snapshot a second time. Parent/stage identities and current
 authority are revalidated before descriptor-relative atomic `os.replace`.
-The parent directory is fsynced after rename. The final name never exposes a
-partially written body.
+After rename, the final file temporarily remains owner-private while the
+original mode is restored through the owned descriptor, verified and fsynced.
+Then the parent directory is fsynced. Other principals cannot read/execute a
+partial stage under a public target mode. The final name never exposes a
+partially written body. Failure after rename, including mode restoration,
+requires reconciliation; a complete final file with unrestored metadata remains
+UNKNOWN/HUMAN rather than applied. Temporary restriction can deny reads until
+successful restoration; it does not broaden access.
 
 On Windows, targets/stages use `NtCreateFile` relative to verified parents.
 Target read handles omit write/delete sharing. Full security descriptor
@@ -128,7 +135,10 @@ are refused. Bounded native EA/stream queries refuse extended attributes and
 alternate data streams. The stage receives the old owner/group/DACL/full SACL
 at creation before content, then security/control semantics are set and exact
 descriptor equality required. Ordinary allowed attributes are preserved and
-verified. Unsupported rights/APIs/security semantics fail closed.
+verified. Replacement stages use zero sharing, so a preserved broad DACL cannot
+expose partial staged bytes through another data-read/execute handle. The owned
+handle stays open through complete publication/flush and then releases sharing.
+Unsupported rights/APIs/security semantics fail closed.
 
 After exact writes and FlushFileBuffers, the second comparison and current
 authority checks precede handle-relative FileRenameInformation replacement.

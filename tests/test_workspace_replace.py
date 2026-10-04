@@ -94,8 +94,12 @@ def test_recovery_precedes_model_and_never_retries_uncertain_replace(setup, monk
     root, _, _, compose = setup
     def replacement_request(request):
         return calls(("replace_file", {"path": "README.txt", "revision": get_revision(request), "content": "NEW"}))
+    old_mode = (root / "README.txt").stat().st_mode & 0o777
     def uncertain(publish):
-        if state == "new": publish()
+        if state == "new":
+            publish()
+            if os.name == "posix":
+                os.chmod(root / "README.txt", old_mode)
         raise TimeoutError()
     publication_hook(monkeypatch, uncertain)
     with compose(Model(update(), replacement_request, ModelResponse(text="done"))) as h:

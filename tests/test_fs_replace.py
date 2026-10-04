@@ -347,8 +347,13 @@ def test_prepublication_failure_old_intact_and_stage_cleaned(make, monkeypatch, 
 @pytest.mark.parametrize("state", ["new", "old", "absent", "other", "directory", "hardlink"])
 def test_uncertain_publication_reconciles_only_exact_new_state(make, monkeypatch, state):
     h = make(); revision = h.revision()
+    old_mode = h.target.stat().st_mode & 0o777
     def uncertain(publish):
-        if state != "old": publish()
+        if state != "old":
+            publish()
+            if os.name == "posix":
+                # Model a lost return after complete metadata restoration.
+                os.chmod(h.target, old_mode)
         raise TimeoutError("PRIVATE_ERROR_SENTINEL")
     publication_hook(monkeypatch, uncertain)
     result = h.invoke(revision, content="PRIVATE_NEW_BODY")
@@ -445,6 +450,78 @@ def test_update_read_paths_never_enter_generic_executor_logs(make):
     assert "private_arguments" in h.foundation.read_tool.spec.tags
     assert "sub/old.txt" not in repr(h.logger.events)
     assert "sub/old.txt" not in repr(result.args)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX stage confidentiality")
+def test_partial_stage_write_failure_never_exposes_target_mode(make, monkeypatch):
+    import stat
+    h = make(); h.target.chmod(0o755); (h.root / "sub").chmod(0o755)
+    revision = h.revision()
+    original = h.guard.replace_file
+    observed = []
+    def fail(*args):
+        with monkeypatch.context() as patch:
+            write = os.write
+            def partial(fd, data):
+                observed.append(stat.S_IMODE(os.fstat(fd).st_mode))
+                assert observed[-1] == 0o600
+                write(fd, data[:3])
+                assert stat.S_IMODE(os.fstat(fd).st_mode) == 0o600
+                raise OSError("partial private stage interrupted")
+            patch.setattr(replacement.os, "write", partial)
+            return original(*args)
+    monkeypatch.setattr(h.guard, "replace_file", fail)
+    result = h.invoke(revision)
+    assert observed and not result.ok and not h.residue()
+    assert h.target.read_bytes() == "héllo\n".encode() and h.target.stat().st_mode & 0o777 == 0o755
+    assert h.actions.load(result.action_id).attempts[0].status is ActionAttemptStatus.NOT_INVOKED
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX post-publication mode restoration")
+def test_mode_restoration_failure_keeps_complete_private_final_and_unknown_truth(make, monkeypatch):
+    h = make(); h.target.chmod(0o755); revision = h.revision()
+    original = h.guard.replace_file
+    def fail(*args):
+        with monkeypatch.context() as patch:
+            chmod = os.fchmod
+            def fail_restore(fd, mode):
+                if mode == 0o755:
+                    assert h.target.read_bytes() == b"new complete content"
+                    assert h.target.stat().st_mode & 0o777 == 0o600
+                    raise OSError("post-publication metadata uncertainty")
+                return chmod(fd, mode)
+            patch.setattr(replacement.os, "fchmod", fail_restore)
+            return original(*args)
+    monkeypatch.setattr(h.guard, "replace_file", fail)
+    result = h.invoke(revision)
+    assert not result.ok and not h.residue()
+    assert h.target.read_bytes() == b"new complete content" and h.target.stat().st_mode & 0o777 == 0o600
+    assert h.actions.load(result.action_id).state is ActionState.RECONCILE_REQUIRED
+    assert h.reconcile(result.action_id).status is ActionReconciliationStatus.UNRESOLVED
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows exclusive staging share")
+def test_windows_partial_stage_cannot_be_opened_for_read_by_another_handle(make, monkeypatch):
+    import pywintypes, win32con, win32file
+    from agentcore.fs import _windows_mutation as win
+    h = make(); revision = h.revision()
+    write = win.write
+    observed = []
+    def partial(handle, data):
+        write(handle, data[:3])
+        stage = h.residue()[0]
+        with pytest.raises(pywintypes.error) as error:
+            opened = win32file.CreateFile(str(stage), win32con.GENERIC_READ, 7,
+                None, win32con.OPEN_EXISTING, 0, None)
+            opened.Close()
+        assert error.value.winerror == 32
+        observed.append(True)
+        raise OSError("partial private stage interrupted")
+    monkeypatch.setattr(win, "write", partial)
+    result = h.invoke(revision)
+    assert observed and not result.ok and not h.residue()
+    assert h.target.read_bytes() == "héllo\n".encode()
+    assert h.actions.load(result.action_id).attempts[0].status is ActionAttemptStatus.NOT_INVOKED
 
 
 @pytest.mark.skipif(not __import__("sys").platform.startswith("linux"), reason="Linux native inode flags")

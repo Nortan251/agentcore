@@ -188,7 +188,7 @@ def replace(guard, intent, data, validate, publication):
             try:
                 metadata = old["metadata"]
                 os.fchown(owned, metadata["uid"], metadata["gid"])
-                os.fchmod(owned, metadata["mode"])
+                os.fchmod(owned, 0o600)
                 if os.listxattr(owned):
                     raise RevisionRejectedError("unsupported_file_metadata")
                 offset = 0
@@ -197,7 +197,7 @@ def replace(guard, intent, data, validate, publication):
                     if count <= 0:
                         raise OSError("staging write failed")
                     offset += count
-                if facts(guard, owned, relative)["metadata"] != metadata:
+                if facts(guard, owned, relative)["metadata"] != {**metadata, "mode": 0o600}:
                     raise RevisionRejectedError("unsupported_file_metadata")
                 os.fsync(owned)
                 _same_stage(handle, stage, owned)
@@ -206,6 +206,13 @@ def replace(guard, intent, data, validate, publication):
                 validate()
                 publication()
                 os.replace(stage, relative.name, src_dir_fd=handle, dst_dir_fd=handle)
+                # Keep the discoverable stage private until rename. The final
+                # file temporarily remains owner-private; restoration failures
+                # occur after possible publication and require reconciliation.
+                os.fchmod(owned, metadata["mode"])
+                if facts(guard, owned, relative)["metadata"] != metadata:
+                    raise RevisionRejectedError("unsupported_file_metadata")
+                os.fsync(owned)
                 os.fsync(handle)
             finally:
                 try:

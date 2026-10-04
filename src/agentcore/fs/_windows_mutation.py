@@ -79,6 +79,10 @@ def open_child(parent, name, *, directory=False, create=False, read=False,
     # Directory handles exclude delete sharing. Inspection handles permit
     # cooperating access; the newly created staging handle excludes writers.
     share = 3 if directory else (1 if create or read else 7)
+    if create and not directory and _update:
+        # Full preserved DACL may permit other principals to read. Exclusive
+        # sharing keeps staged bytes private until complete publication/close.
+        share = 0
     options = 0x00200000 | 0x20 | (1 if directory else 0)  # OPEN_REPARSE | SYNCHRONOUS | DIRECTORY
     try:
         _check(_open(c.byref(handle), access, c.byref(attributes), c.byref(io), None,
