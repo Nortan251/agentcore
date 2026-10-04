@@ -14,6 +14,13 @@ import stat
 from agentcore.fs.paths import PathRejectedError, RejectionReason, check_relative_form
 
 
+class DestinationExistsError(PathRejectedError):
+    """Trusted preflight proves that no create attempt should be admitted."""
+
+    def __init__(self):
+        super().__init__(RejectionReason.CHANGED_UNDERFOOT, "existing destination refused")
+
+
 def _reject(reason=RejectionReason.CHANGED_UNDERFOOT):
     raise PathRejectedError(reason, "filesystem create refused")
 
@@ -103,7 +110,7 @@ def prepare(guard, requested):
     relative = relative_path(guard, requested)
     with parent(guard, relative) as (handle, identities):
         if _exists(handle, relative.name):
-            _reject()
+            raise DestinationExistsError()
     return {"path": relative.as_posix(), "directories": identities,
             "workspace": hashlib.sha256(guard.identity.encode("utf-8")).hexdigest()}
 
@@ -194,6 +201,63 @@ def create(guard, intent, data, validate):
                 finally:
                     os.close(owned)
             os.fsync(handle)
+        return "applied"
+
+
+def create_directory(guard, intent, validate):
+    """Create one final directory relative to a verified parent, without markers.
+
+    validate marks possible physical entry immediately before native create.
+    Exceptions after it retain uncertainty, including post-check/fsync failures.
+    No cleanup removes a possibly created final directory.
+    """
+    relative = relative_path(guard, intent["path"])
+    with parent(guard, relative) as (handle, identities):
+        _check(guard, intent, relative, identities)
+        if _exists(handle, relative.name):
+            return "not_applied"
+        validate()
+        if os.name == "nt":
+            from agentcore.fs import _windows_mutation as win
+            try:
+                owned = win.open_child(handle, relative.name, directory=True, create=True)
+            except FileExistsError:
+                return "not_applied"
+            try:
+                attrs, identity, _, _ = win.facts(owned)
+                if attrs & 0x400 or not attrs & 0x10:
+                    _reject()
+                # Inspect the returned create handle, then prove that the final
+                # name still denotes that same directory under the parent.
+                named = win.open_child(handle, relative.name, directory=True)
+                try:
+                    current_attrs, current_identity, _, _ = win.facts(named)
+                    if current_attrs & 0x400 or not current_attrs & 0x10 or identity != current_identity:
+                        _reject()
+                finally:
+                    win.close(named)
+                _check(guard, intent, relative, identities)
+            finally:
+                win.close(owned)
+            # Windows directory handles have no supported parent-fsync promise.
+        else:
+            try:
+                os.mkdir(relative.name, mode=0o700, dir_fd=handle)
+            except FileExistsError:
+                return "not_applied"
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+            owned = os.open(relative.name, flags, dir_fd=handle)
+            try:
+                info = os.fstat(owned)
+                named = os.stat(relative.name, dir_fd=handle, follow_symlinks=False)
+                if not stat.S_ISDIR(info.st_mode) or not stat.S_ISDIR(named.st_mode) or (
+                        info.st_dev, info.st_ino) != (named.st_dev, named.st_ino):
+                    _reject()
+                _check(guard, intent, relative, identities)
+                os.fsync(owned)
+                os.fsync(handle)
+            finally:
+                os.close(owned)
         return "applied"
 
 

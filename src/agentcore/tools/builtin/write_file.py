@@ -22,26 +22,11 @@ from agentcore.permissions.levels import Capability
 from agentcore.tools.base import Tool, ToolParameter, ParamType, ToolResult, tool_spec
 
 
-_ISSUER = object()
+from agentcore.tools.builtin._filesystem_execution import (
+    _FilesystemMutationExecution as _WriteExecution, _ISSUER,
+)
+
 _KIND = "filesystem.create.v1"
-
-
-class _WriteExecution:
-    """One-use, thread/process-local executor context; never serialized authority."""
-
-    def __init__(self, issuer, tool, payload, authorize, validate):
-        if issuer is not _ISSUER:
-            raise ValueError("executor write context required")
-        self.tool, self.payload = tool, payload
-        self.authorize, self.validate = authorize, validate
-        self.pid, self.thread = os.getpid(), threading.get_ident()
-        self.used, self.active, self.entered = False, True, False
-
-    def __repr__(self):
-        return "<executor filesystem write context>"
-
-    def __reduce__(self):
-        raise TypeError("write context cannot be serialized")
 
 
 class WriteFileTool(Tool):

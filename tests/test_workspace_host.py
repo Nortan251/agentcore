@@ -126,7 +126,8 @@ def test_ordinary_chat_config_and_previous_host_cannot_enable_writes(setup, caps
     root, private, config, compose = setup
     with compose(Model(write(), ModelResponse(text="Created."))) as h:
         h.conversation().send("create summary")
-    model = Model(write("notes/ordinary.txt"), ModelResponse(text="done"))
+    model = Model(calls(("write_file", {"path": "notes/ordinary.txt", "content": CONTENT}),
+                        ("create_directory", {"path": "ordinary-directory"})), ModelResponse(text="done"))
     config = replace(config, conversation=ConversationConfig(tools_enabled=True))
     original = cli.Agent
     monkeypatch.setattr(cli, "load_config", lambda _: config)
@@ -134,7 +135,9 @@ def test_ordinary_chat_config_and_previous_host_cannot_enable_writes(setup, caps
     assert cli.main(["chat", "--message", "create file", "--json"]) == 0
     capsys.readouterr()
     assert "write_file" not in {s["name"] for s in model.requests[0].tools}
+    assert "create_directory" not in {s["name"] for s in model.requests[0].tools}
     assert not (root / "notes/ordinary.txt").exists()
+    assert not (root / "ordinary-directory").exists()
 
 
 def test_cli_missing_opt_in_precedes_config_provider_and_storage(setup, capsys, monkeypatch):
@@ -195,7 +198,7 @@ def test_fixed_catalogue_and_direct_tool_contract(setup):
         assert set(h.registry.names()) == set(WORKSPACE_TOOL_NAMES)
         assert type(h.registry.get("write_file")) is WriteFileTool
         assert h.registry.get("write_file") is h._foundation.tool
-        assert h.executor._action_adapters is h._adapters and len(h._adapters) == 1
+        assert h.executor._action_adapters is h._adapters and len(h._adapters) == 2
         for mutate in (lambda: h.registry.register(EchoTool()),
                        lambda: h.registry.register(ReadFileTool(), replace=True),
                        lambda: h.registry.unregister("read_file"),
