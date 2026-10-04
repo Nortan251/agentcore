@@ -23,6 +23,15 @@ busy while an observation is leased and succeeds after it ends; a revocation
 completed before leasing prevents filesystem access.
 An unavailable claim or filesystem reconciliation binding returns immediately;
 a later re-registration must start a fresh probe and acquire its own leases.
+An immutable health lease also spans preparation, staging/publication/cleanup,
+and reconciliation through truth publication. Quarantine immediately denies
+new admissions, then waits without holding metadata mutexes for previously
+leased filesystem work to finish. That work precedes completed quarantine;
+its owning thread retains the healthy snapshot until exit. A same-thread
+quarantine request raises busy instead of waiting for itself, but is latched
+and becomes sticky quarantine when the final lease exits. Startup validation
+cannot clear a pending or completed quarantine. Ownership is checked before
+accessing health mutexes inherited across a process fork.
 OBSERVE/PROPOSE refuse writes; CONFIRM requires the existing durable approval
 path, including when a host capability override requests a lower level.
 AUTONOMOUS still respects current capability denial.

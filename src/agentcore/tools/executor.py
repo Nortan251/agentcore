@@ -284,6 +284,9 @@ class ToolExecutor:
         if credential_runtime is not None:
             credential_runtime._attach_executor(self._credential_authority)
         self._action_domain_health_lock = threading.Lock()
+        self._action_domain_health_condition = threading.Condition(self._action_domain_health_lock)
+        self._filesystem_health_owners: dict[int, int] = {}
+        self._pending_action_quarantine: ActionDomainHealth | None = None
         self._action_domain_health = (
             ActionDomainHealth.validation_pending()
             if action_store is not None
@@ -343,8 +346,37 @@ class ToolExecutor:
     @property
     def action_domain_health(self) -> ActionDomainHealth:
         """Return an immutable snapshot of the startup mutation gate."""
+        self._require_policy_owner()
         with self._action_domain_health_lock:
+            if self._pending_action_quarantine is not None and (
+                    threading.get_ident() not in self._filesystem_health_owners):
+                return self._pending_action_quarantine
             return self._action_domain_health
+
+    @contextmanager
+    def _filesystem_health_lease(self):
+        """Order admitted filesystem I/O before completion of quarantine."""
+        self._require_policy_owner()
+        owner = threading.get_ident()
+        with self._action_domain_health_condition:
+            if self._pending_action_quarantine is not None or (
+                    self._action_domain_health.state is not ActionDomainHealthState.HEALTHY):
+                raise ValueError("filesystem action domain is unavailable")
+            self._filesystem_health_owners[owner] = self._filesystem_health_owners.get(owner, 0) + 1
+        try:
+            yield
+        finally:
+            self._require_policy_owner()
+            with self._action_domain_health_condition:
+                remaining = self._filesystem_health_owners[owner] - 1
+                if remaining:
+                    self._filesystem_health_owners[owner] = remaining
+                else:
+                    del self._filesystem_health_owners[owner]
+                if not self._filesystem_health_owners and self._pending_action_quarantine is not None:
+                    self._action_domain_health = self._pending_action_quarantine
+                    self._pending_action_quarantine = None
+                    self._action_domain_health_condition.notify_all()
 
     def _mark_action_startup_healthy(self, store: ActionStore) -> bool:
         """Accept one exact coordinator/store startup proof.
@@ -353,23 +385,36 @@ class ToolExecutor:
         never clear a quarantine, and a coordinator for a different store
         cannot authorize this executor's mutation domain.
         """
+        self._require_policy_owner()
         with self._action_domain_health_lock:
             if store is not self._action_store:
                 return False
-            if self._action_domain_health.state is (
+            if self._pending_action_quarantine is not None or self._action_domain_health.state is (
                     ActionDomainHealthState.QUARANTINED):
                 return False
             self._action_domain_health = ActionDomainHealth.healthy()
             return True
 
     def quarantine_action_mutations(self, category: str) -> None:
-        """Fail future mutations closed after startup journal quarantine."""
-        with self._action_domain_health_lock:
+        """Deny new admissions, then complete after leased filesystem I/O.
+
+        A reentrant request cannot wait for its own lease: fail busy while
+        latching quarantine for automatic publication when that lease retires.
+        """
+        self._require_policy_owner()
+        with self._action_domain_health_condition:
             if self._action_domain_health.state is (
                     ActionDomainHealthState.QUARANTINED):
                 return
-            self._action_domain_health = ActionDomainHealth.quarantined(
-                category)
+            if self._pending_action_quarantine is None:
+                self._pending_action_quarantine = ActionDomainHealth.quarantined(category)
+            if threading.get_ident() in self._filesystem_health_owners:
+                raise PolicyLeaseBusyError("Quarantine is pending this filesystem operation's completion.")
+            while self._filesystem_health_owners:
+                self._action_domain_health_condition.wait()
+            if self._pending_action_quarantine is not None:
+                self._action_domain_health = self._pending_action_quarantine
+                self._pending_action_quarantine = None
 
     def validate_action_protected_storage(self, record: ActionRecord) -> None:
         """Validate every protected reference needed by one action.
@@ -703,6 +748,7 @@ class ToolExecutor:
                                 probe_entered=False)
                         leases.enter_context(self.registry.execution_lease(tool.name, tool))
                         leases.enter_context(self._filesystem_policy_lease())
+                        leases.enter_context(self._filesystem_health_lease())
                     return self._reconcile_under_action_guard(
                         store, claim, checkpoint=checkpoint)
         except CancellationRequested:
@@ -1580,7 +1626,7 @@ class ToolExecutor:
         @contextmanager
         def authorize():
             tool.validate_contract()
-            with self._filesystem_policy_lease():
+            with self._filesystem_policy_lease(), self._filesystem_health_lease():
                 validate()
                 yield
 
@@ -2566,6 +2612,7 @@ class ToolExecutor:
                 if type(tool) is WriteFileTool:
                     leases.enter_context(self.registry.execution_lease(tool_spec.name, tool))
                     leases.enter_context(self._filesystem_policy_lease())
+                    leases.enter_context(self._filesystem_health_lease())
                     decision, _ = self._current_policy_decision(
                         tool_spec, description=tool_spec.description)
                     if decision.outcome is Outcome.REQUIRE_APPROVAL:

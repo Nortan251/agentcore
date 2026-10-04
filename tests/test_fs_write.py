@@ -1,10 +1,13 @@
 """Real create-only filesystem effects through the durable executor boundary."""
 
 from contextlib import contextmanager
+import gc
 import json
 import os
 from pathlib import Path
 import subprocess
+import sys
+import tempfile
 import threading
 
 import pytest
@@ -677,6 +680,107 @@ def test_reconciliation_unavailable_claim_cannot_fall_through_to_unleased_probe(
     assert calls == [1] and h.actions.load(invocation.action_id).state is ActionState.RECONCILE_REQUIRED
 
 
+@pytest.mark.parametrize("seam", ["write", "probe", "truth"])
+def test_quarantine_completion_is_ordered_after_leased_filesystem_effect(make, monkeypatch, seam):
+    from agentcore.action_journal import ActionDomainHealthState
+    h = make()
+    entered, release, completed_effect = threading.Event(), threading.Event(), threading.Event()
+    waiting, quarantine_completed = threading.Event(), threading.Event()
+    results, quarantine_errors = [], []
+    if seam == "write":
+        def paused(publish):
+            entered.set()  # Final mutation validation has already returned.
+            assert release.wait(15)
+            value = publish()
+            completed_effect.set()
+            return value
+        _publication_hook(monkeypatch, paused)
+        operation = h.invoke
+    else:
+        def interrupted(publish):
+            publish()
+            raise TimeoutError()
+        _publication_hook(monkeypatch, interrupted)
+        invocation = h.invoke()
+        original_cas = h.actions.compare_and_swap
+        def cas(action_id, version, candidate):
+            if candidate.state is ActionState.SUCCEEDED and seam == "truth":
+                entered.set()
+                assert release.wait(15)
+            value = original_cas(action_id, version, candidate)
+            if candidate.state is ActionState.SUCCEEDED:
+                completed_effect.set()
+            return value
+        monkeypatch.setattr(h.actions, "compare_and_swap", cas)
+        if seam == "probe":
+            original_observe = h.guard.observe_create
+            def observe(*args):
+                entered.set()
+                assert release.wait(15)
+                return original_observe(*args)
+            monkeypatch.setattr(h.guard, "observe_create", observe)
+        operation = lambda: h.reconcile(invocation.action_id)
+    condition = getattr(h.executor, "_action_domain_health_condition", None)
+    if condition is not None:
+        original_wait = condition.wait
+        def wait(*args, **kwargs):
+            waiting.set()  # Request is latched; quarantine must wait for the lease.
+            return original_wait(*args, **kwargs)
+        monkeypatch.setattr(condition, "wait", wait)
+    def worker():
+        try:
+            results.append(operation())
+        except BaseException as exc:
+            results.append(exc)
+    def quarantine():
+        try:
+            h.executor.quarantine_action_mutations("journal_corrupt")
+        except BaseException as exc:
+            quarantine_errors.append(exc)
+        finally:
+            quarantine_completed.set()
+            waiting.set()  # Also detects the unfenced old API's early return.
+    thread = threading.Thread(target=worker)
+    quarantiner = threading.Thread(target=quarantine)
+    thread.start()
+    try:
+        assert entered.wait(15)
+        quarantiner.start()
+        assert waiting.wait(15)
+        assert not quarantine_completed.is_set() and not completed_effect.is_set()
+        assert h.executor.action_domain_health.state is ActionDomainHealthState.QUARANTINED
+        assert not h.executor._mark_action_startup_healthy(h.actions)
+        assert not h.invoke(path="sub/new-admission").ok
+        for lock in (h.executor._policy_lock, h.registry._lock, h.executor._action_domain_health_lock):
+            assert lock.acquire(timeout=15)
+            lock.release()
+    finally:
+        release.set()
+        thread.join(15)
+        if quarantiner.ident is not None:
+            quarantiner.join(15)
+    assert not thread.is_alive() and not quarantiner.is_alive()
+    assert not quarantine_errors and completed_effect.is_set() and quarantine_completed.is_set()
+    assert len(results) == 1 and not isinstance(results[0], BaseException)
+    assert results[0].ok if seam == "write" else results[0].status is ActionReconciliationStatus.SETTLED_SUCCEEDED
+    assert h.executor.action_domain_health.state is ActionDomainHealthState.QUARANTINED
+    assert not h.residue()
+
+
+def test_reentrant_quarantine_fails_busy_without_deadlock_or_losing_request(make, monkeypatch):
+    from agentcore.action_journal import ActionDomainHealthState
+    h = make()
+    def quarantine_then_publish(publish):
+        with pytest.raises(PolicyLeaseBusyError):
+            h.executor.quarantine_action_mutations("journal_corrupt")
+        return publish()  # Existing lease precedes quarantine completion.
+    _publication_hook(monkeypatch, quarantine_then_publish)
+    assert h.invoke().ok
+    assert h.executor.action_domain_health.state is ActionDomainHealthState.QUARANTINED
+    assert not h.executor._mark_action_startup_healthy(h.actions)
+    assert not h.invoke(path="sub/denied").ok and not h.residue()
+
+
 def test_attempt_and_protected_intent_are_durable_before_staging(make, monkeypatch):
     h = make()
     original = h.guard.create_file
@@ -807,6 +911,19 @@ def test_reconciliation_needs_only_current_fs_read(make, monkeypatch):
 
 
 def test_owned_handles_are_released_after_success_and_stage_failure(make, monkeypatch):
+    # Process-wide counts include unrelated full-suite cleanup. Keep exact
+    # equality assertions, but run this real boundary in a fresh process.
+    if os.environ.get("_AGENTCORE_WRITE_HANDLE_PROBE") != "1":
+        repository = Path(__file__).resolve().parent.parent
+        with tempfile.TemporaryDirectory(prefix=".pytest_write_handles_", dir=repository) as probe:
+            assert Path(probe).resolve().is_relative_to(repository)
+            result = subprocess.run([sys.executable, "-m", "pytest", "-o", "addopts=", "-q",
+                str(Path(__file__).resolve()) + "::test_owned_handles_are_released_after_success_and_stage_failure",
+                "--basetemp", str(Path(probe) / "pytest")], cwd=repository,
+                env={**os.environ, "_AGENTCORE_WRITE_HANDLE_PROBE": "1"},
+                capture_output=True, text=True, timeout=60)
+            assert result.returncode == 0, result.stdout + result.stderr
+        return
     h = make()
     if os.name == "nt":
         import ctypes
@@ -824,6 +941,7 @@ def test_owned_handles_are_released_after_success_and_stage_failure(make, monkey
         pytest.skip("descriptor inventory unavailable")
     # Warm lazy imports, logging, and native API bindings before measuring.
     assert h.invoke(path="sub/warm").ok
+    gc.collect()
     before = count()
     for index in range(8):
         assert h.invoke(path=f"sub/file-{index}").ok
