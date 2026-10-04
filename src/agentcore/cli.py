@@ -242,6 +242,13 @@ def _build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--json", action="store_true", dest="as_json",
                       help="emit the turn as JSON (requires --message)")
 
+    workspace = sub.add_parser("workspace", help="one explicitly enabled create-only workspace turn")
+    workspace.add_argument("--enable-write", action="store_true",
+                           help="opt in for this invocation; requires AUTONOMOUS FS_READ + FS_WRITE")
+    workspace.add_argument("--message", required=True, metavar="TEXT")
+    workspace.add_argument("--session", dest="session_id", metavar="ID")
+    workspace.add_argument("--json", action="store_true", dest="as_json")
+
     browser = sub.add_parser("browser", help="read explicitly granted web pages")
     browser.add_argument("--allow-url", action="append", required=True,
                          metavar="URL", help="grant one exact URL for this turn; repeatable")
@@ -2441,6 +2448,11 @@ def _chat_loop(agent: Any, runtime: Any, session: Any,
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    if args.command == "workspace":
+        from agentcore.workspace_host.cli import command_workspace
+
+        _quiet_logging()
+        return command_workspace(args)
     if args.command == "browser":
         # Keep even configuration errors inside the browser's categorical output
         # boundary, before ordinary Agent construction or its logging setup.

@@ -260,7 +260,7 @@ class ConversationRuntime:
         self.capture = capture
         self.resolver = resolver
         self.sessions = sessions
-        if session_domain not in ("ordinary", "browser_read"):
+        if session_domain not in ("ordinary", "browser_read", "workspace_files"):
             raise SessionDomainError("conversation_session_domain_mismatch")
         self._session_domain = session_domain
         bind = getattr(sessions, "bind_domain", None)
