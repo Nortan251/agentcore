@@ -87,7 +87,14 @@ creates remain auditable, including when a later write in the same turn reaches
 the bound. Reads remain available at the action limit. New session admission
 also checks directory capacity before the model; saves independently refuse a
 4,097th transcript before temporary-file or publication I/O. Existing sessions
-can still be resumed and updated at the limit. No historical state is pruned.
+can still be resumed and updated at the limit. Startup reserves one additional
+bounded scan slot for a crashed atomic transcript save. It removes only
+validated owner-private regular files matching the inherited session store's
+`tmp<8 lowercase/digit/underscore characters>.tmp` names in the pinned private
+session directory, without reading, replaying or promoting their content.
+All entries are validated before any cleanup; unknown overflow, unsafe files
+and links refuse startup. Saved transcripts, actions and protected payloads
+are never pruned. Action/payload temporary-file handling remains fail closed.
 
 POSIX host directories are owner-private, and files are 0600. Existing foreign
 owners, group/other permissions, links, special files, and unsafe writable

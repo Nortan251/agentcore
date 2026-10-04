@@ -781,3 +781,132 @@ def test_session_capacity_admitted_before_model_and_save_and_resume_stays_usable
             h.conversation().send("bypass start", session=new_session)
         assert not model.requests
     assert len(list(directory.iterdir())) == MAX_HOST_ENTRIES
+
+
+@pytest.mark.parametrize("pause_at", ["created", "before_replace"])
+def test_killed_full_session_save_reopens_effect_truth_and_reads(setup, pause_at):
+    root, private, _, compose = setup
+    from agentcore.workspace_host.storage import MAX_HOST_ENTRIES
+
+    with compose() as h:
+        directory = h._services.sessions.directory
+    for number in range(MAX_HOST_ENTRIES):
+        session = ConversationSession(id=f"conv_{number:012x}",
+            metadata={WORKSPACE_SESSION_MARKER: True})
+        _private_fixture_json(directory / f"{session.id}.json", session.to_dict())
+    source = '''
+from pathlib import Path
+import os, sys, tempfile, threading
+from agentcore.config.schema import AgentConfig
+from agentcore.permissions.config import PermissionConfig
+from agentcore.permissions.levels import PermissionLevel
+from agentcore.models.messages import ModelResponse, ToolCall
+from agentcore.workspace_host.composition import WorkspaceAgentComposition
+class Model:
+    def __init__(self): self.first = True
+    def generate(self, request):
+        if self.first:
+            self.first = False
+            return ModelResponse(text="", tool_calls=[ToolCall("call_1", "write_file",
+                {"path": "notes/crash-save.txt", "content": "created before killed save"})])
+        return ModelResponse(text="done")
+config = AgentConfig(workspace_dir=sys.argv[1],
+    permissions=PermissionConfig(level=PermissionLevel.AUTONOMOUS))
+with WorkspaceAgentComposition(config=config, enable_write=True, model=Model(),
+        _host_directory=Path(sys.argv[2])) as host:
+    directory = host._services.sessions.directory
+    def pause():
+        assert host.action_truth()[0]["state"] == "succeeded"
+        print("session-temp-created", flush=True)
+        threading.Event().wait(60)
+        raise RuntimeError("parent kill watchdog expired")
+    mkstemp, replace = tempfile.mkstemp, os.replace
+    def after_create(*args, **kwargs):
+        result = mkstemp(*args, **kwargs)
+        if Path(result[1]).parent == directory and sys.argv[3] == "created": pause()
+        return result
+    def before_replace(source, target, *args, **kwargs):
+        if Path(source).parent == directory and sys.argv[3] == "before_replace": pause()
+        return replace(source, target, *args, **kwargs)
+    tempfile.mkstemp, os.replace = after_create, before_replace
+    host.conversation().send("create", session_id="conv_000000000000")
+'''
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
+    child = subprocess.Popen([sys.executable, "-c", source, str(root), str(private), pause_at],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    reached = threading.Event()
+    output = []
+    def observe():
+        output.append(child.stdout.readline().strip())
+        reached.set()
+    observer = threading.Thread(target=observe)
+    observer.start()
+    try:
+        assert reached.wait(30), "child publication watchdog expired"
+        assert output == ["session-temp-created"], output
+        assert (root / "notes/crash-save.txt").read_text() == "created before killed save"
+        child.kill()
+        child.wait(timeout=30)
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=30)
+        observer.join(30)
+        child.stdout.close()
+        child.stderr.close()
+    assert not observer.is_alive()
+    assert len(list(directory.iterdir())) == MAX_HOST_ENTRIES + 1
+    with compose(Model(calls(("read_file", {"path": "notes/crash-save.txt"})),
+                       ModelResponse(text="read completed"))) as reopened:
+        records = reopened._services.actions.audit(maximum_records=256)
+        assert len(records) == 1 and records[0].state is ActionState.SUCCEEDED
+        assert records[0].terminal_outcome.verdict.value == "confirmed_applied"
+        assert len(list(directory.iterdir())) == MAX_HOST_ENTRIES
+        result = reopened.conversation().send("read", session_id="conv_000000000000")
+        assert result.ok and result.tools_executed == 1
+    assert len(list(directory.iterdir())) == MAX_HOST_ENTRIES
+
+
+def test_session_recovery_never_discards_unknown_overflow(setup, monkeypatch):
+    _, _, _, compose = setup
+    from agentcore.workspace_host import storage
+
+    with compose() as h:
+        directory = h._services.sessions.directory
+    monkeypatch.setattr(storage, "MAX_HOST_ENTRIES", 2)
+    for number in range(2):
+        session = ConversationSession(id=f"conv_{number:012x}",
+            metadata={WORKSPACE_SESSION_MARKER: True})
+        _private_fixture_json(directory / f"{session.id}.json", session.to_dict())
+    _private_fixture_json(directory / "foreign.tmp", {})
+    model = Model()
+    with pytest.raises(WorkspaceHostError, match="workspace_storage_failed"):
+        compose(model)
+    assert not model.requests and len(list(directory.iterdir())) == 3
+
+
+def test_session_recovery_validates_all_entries_before_discarding_any_temp(setup):
+    _, _, _, compose = setup
+    with compose() as h:
+        directory = h._services.sessions.directory
+    temporary = directory / "tmp00000000.tmp"
+    unsafe = directory / "unsafe.json"
+    _private_fixture_json(temporary, {})
+    _private_fixture_json(unsafe, {})
+    if os.name == "nt":
+        import ntsecuritycon
+        import win32security
+        sd = win32security.GetFileSecurity(str(unsafe), win32security.DACL_SECURITY_INFORMATION)
+        acl = sd.GetSecurityDescriptorDacl()
+        everyone = win32security.CreateWellKnownSid(win32security.WinWorldSid, None)
+        acl.AddAccessAllowedAceEx(win32security.ACL_REVISION_DS, 0,
+            ntsecuritycon.FILE_GENERIC_READ, everyone)
+        win32security.SetNamedSecurityInfo(str(unsafe), win32security.SE_FILE_OBJECT,
+            win32security.DACL_SECURITY_INFORMATION | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+            None, None, acl, None)
+    else:
+        unsafe.chmod(0o644)
+    model = Model()
+    with pytest.raises(WorkspaceHostError, match="workspace_storage_unsafe"):
+        compose(model)
+    assert not model.requests and temporary.exists() and unsafe.exists()

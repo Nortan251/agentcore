@@ -187,8 +187,11 @@ class WorkspaceHostStorage:
             for name in ("actions", "payloads", WORKSPACE_SESSIONS_SUBDIR):
                 path = self.directory / name
                 self._pin_directory(path, _new_private_directory(path), private=True)
-                for entry in self._entries(path):
-                    _validate_private(entry)
+                if name == WORKSPACE_SESSIONS_SUBDIR:
+                    self._recover_session_temporaries(path)
+                else:
+                    for entry in self._entries(path):
+                        _validate_private(entry)
             _private_lock_file(self.directory / "actions" / ".agentcore-action-store.lock")
             _private_lock_file(self.directory / "payloads" / ".agentcore-protected-payload-store.lock")
             self.check()
@@ -197,14 +200,33 @@ class WorkspaceHostStorage:
             raise
 
     @staticmethod
-    def _entries(path):
+    def _entries(path, *, maximum=MAX_HOST_ENTRIES):
         from itertools import islice
 
         with os.scandir(path) as scan:
-            entries = [Path(entry.path) for entry in islice(scan, MAX_HOST_ENTRIES + 1)]
-        if len(entries) > MAX_HOST_ENTRIES:
+            entries = [Path(entry.path) for entry in islice(scan, maximum + 1)]
+        if len(entries) > maximum:
             raise WorkspaceHostError("workspace_storage_failed")
         return entries
+
+    def _recover_session_temporaries(self, path):
+        # JsonFileSessionStore uses mkstemp's default tmp<8 chars>.tmp names.
+        # One extra scan slot reserves crash headroom for its atomic save,
+        # even when replacing a transcript at the durable-entry limit. These
+        # unpublished files are inert: never replay or promote their content.
+        # Only this private session directory has this recovery exception;
+        # action/protected-payload temporaries still fail closed unchanged.
+        entries = self._entries(path, maximum=MAX_HOST_ENTRIES + 1)
+        for entry in entries:
+            _validate_private(entry)
+        temporary = [entry for entry in entries
+                     if re.fullmatch(r"tmp[a-z0-9_]{8}\.tmp", entry.name)]
+        if len(entries) - len(temporary) > MAX_HOST_ENTRIES:
+            raise WorkspaceHostError("workspace_storage_failed")
+        self.check()  # Pinned private directory identities before cleanup.
+        for entry in temporary:
+            entry.unlink()
+        self._entries(path)  # Restore the ordinary durable directory bound.
 
     def _pin_directory(self, path, identity, *, private):
         if os.name == "nt":
