@@ -9,6 +9,7 @@ import hashlib
 import os
 import secrets
 import stat
+import sys
 
 from agentcore.fs.mutation import parent, relative_path, _check
 
@@ -17,6 +18,32 @@ class RevisionRejectedError(ValueError):
     def __init__(self, category="stale_revision"):
         self.category = category
         super().__init__(category)
+
+
+def _inode_metadata(opened):
+    # Linux UAPI fs.h: GETFLAGS is _IOR('f', 1, long); FSGETXATTR
+    # is _IOR('X', 31, struct fsxattr). Only generic ioctl ABIs are supported.
+    # Non-Linux/unsupported filesystems fail closed instead of losing flags.
+    import platform
+    if not sys.platform.startswith("linux") or platform.machine().lower() not in {
+            "x86_64", "amd64", "aarch64", "arm64", "i386", "i686", "armv7l"}:
+        raise RevisionRejectedError("unsupported_file_metadata")
+    import ctypes
+    import fcntl
+    import struct
+    flags = bytearray(ctypes.sizeof(ctypes.c_long))
+    fcntl.ioctl(opened, 0x80006601 | (len(flags) << 16), flags, True)
+    value = struct.unpack_from("=I", flags)[0]
+    # EXTENT describes the storage mapping, not an access/backup policy.
+    # Require it to match the stage too; refuse every other inode flag.
+    if value & ~0x80000:
+        raise RevisionRejectedError("unsupported_file_metadata")
+    extended = bytearray(28)
+    fcntl.ioctl(opened, 0x801C581F, extended, True)
+    xflags, extent_size, _, project_id, cow_extent_size = struct.unpack("=5I8x", extended)
+    if xflags or extent_size or project_id or cow_extent_size:
+        raise RevisionRejectedError("unsupported_file_metadata")
+    return value
 
 
 @contextmanager
@@ -53,7 +80,8 @@ def facts(guard, opened, relative):
     if not hasattr(os, "listxattr") or os.listxattr(opened):
         raise RevisionRejectedError("unsupported_file_metadata")
     return {"identity": [info.st_dev, info.st_ino], "size": info.st_size,
-            "metadata": {"mode": mode, "uid": info.st_uid, "gid": info.st_gid},
+            "metadata": {"mode": mode, "uid": info.st_uid, "gid": info.st_gid,
+                         "inode_flags": _inode_metadata(opened)},
             "change": [info.st_mtime_ns, info.st_ctime_ns]}
 
 
@@ -169,6 +197,8 @@ def replace(guard, intent, data, validate, publication):
                     if count <= 0:
                         raise OSError("staging write failed")
                     offset += count
+                if facts(guard, owned, relative)["metadata"] != metadata:
+                    raise RevisionRejectedError("unsupported_file_metadata")
                 os.fsync(owned)
                 _same_stage(handle, stage, owned)
                 check_snapshot(guard, old)

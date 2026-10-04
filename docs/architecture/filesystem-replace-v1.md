@@ -95,6 +95,15 @@ empty; ACLs/capabilities/security xattrs fail closed rather than being dropped.
 A stage inheriting a default ACL is also refused. Platforms unable to prove
 this metadata posture refuse the target.
 
+Linux additionally requires bounded descriptor queries for `FS_IOC_GETFLAGS`
+and `FS_IOC_FSGETXATTR`, as defined by the
+[Linux filesystem UAPI](https://github.com/torvalds/linux/blob/master/include/uapi/linux/fs.h).
+Every inode flag except the ordinary extent-storage flag is refused, including
+nodump, immutable, append, noatime and nocow. Extended flags, nonzero project IDs
+and extent-size policy hints are refused. The stage must match the permitted
+old flags before publication. Unsupported ioctl/filesystem/architecture or
+non-Linux POSIX metadata querying fails closed rather than losing policy state.
+
 An exclusive random 0600 stage is created in the same verified parent after
 durable intent and attempt claim. Required ownership/mode are applied, exact
 bounded bytes written and stage fsynced. The final target is reopened and fully

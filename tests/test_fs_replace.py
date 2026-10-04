@@ -439,6 +439,41 @@ def test_update_read_handles_close_on_success_and_refusal(make):
     assert not h.residue()
 
 
+def test_update_read_paths_never_enter_generic_executor_logs(make):
+    h = make()
+    result = h.read()
+    assert "private_arguments" in h.foundation.read_tool.spec.tags
+    assert "sub/old.txt" not in repr(h.logger.events)
+    assert "sub/old.txt" not in repr(result.args)
+
+
+@pytest.mark.skipif(not __import__("sys").platform.startswith("linux"), reason="Linux native inode flags")
+def test_linux_nodump_flag_refused_without_replacement_or_flag_loss(make):
+    import ctypes, fcntl, struct
+    h = make(); revision = h.revision()
+    old = h.target.read_bytes()
+    identity = h.target.stat().st_ino
+    opened = os.open(h.target, os.O_RDONLY | os.O_NOFOLLOW)
+    size = ctypes.sizeof(ctypes.c_long)
+    flags = bytearray(size)
+    fcntl.ioctl(opened, 0x80006601 | (size << 16), flags, True)
+    saved = flags[:]
+    struct.pack_into("=I", flags, 0, struct.unpack_from("=I", flags)[0] | 0x40)
+    try:
+        fcntl.ioctl(opened, 0x40006602 | (size << 16), flags, True)
+        result = h.read()
+        assert not result.ok and result.result.metadata["kind"] == "unsupported_file_metadata"
+        assert not h.invoke(revision).ok and not h.actions.list_actions()
+        assert h.target.stat().st_ino == identity and h.target.read_bytes() == old
+        fcntl.ioctl(opened, 0x80006601 | (size << 16), flags, True)
+        assert struct.unpack_from("=I", flags)[0] & 0x40
+    finally:
+        try:
+            fcntl.ioctl(opened, 0x40006602 | (size << 16), saved, True)
+        finally:
+            os.close(opened)
+
+
 @pytest.mark.skipif(os.name != "nt", reason="native Windows security and alternate-stream semantics")
 @pytest.mark.parametrize("kind", ["readonly", "stream", "compressed"])
 def test_windows_unsupported_metadata_and_data_refused(make, kind):
