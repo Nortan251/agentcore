@@ -8,6 +8,7 @@ This branch has an independent documentation-only root commit. Its tracked tree 
 
 | PR | Area | Task | Exact head | Status | Handoff |
 |----|------|------|------------|--------|---------|
+| [#42](https://github.com/Nortan251/agentcore/pull/42) | filesystem | Journal-bound create-only Directory Create v1 | `f8d965e6b7053b80659d3d1adde54df4ad500aa0` | OPEN / UNMERGED; final exact-head tests, six CI gates and Codex review complete | [PR-0042-directory-create-v1.md](filesystem/PR-0042-directory-create-v1.md) |
 | [#41](https://github.com/Nortan251/agentcore/pull/41) | filesystem | Explicit one-shot Workspace Agent v1 | `9c4d0123df9c3b161f81b3c1923cf35c80bd1dc2` | MERGED as `d6acae41e95059289956a4a2acde33d170a537cf`; project-lead review and exact-head gates complete | [PR-0041-workspace-agent-v1.md](filesystem/PR-0041-workspace-agent-v1.md) |
 | [#40](https://github.com/Nortan251/agentcore/pull/40) | filesystem | Durable create-only Filesystem Write v1 | `e32a9c6a66537c4da15522e0262ee4b415fbf934` | MERGED as `67e6069e30979fea68aefd50164123a7348ada3e`; final exact-head CI/review and project-lead review complete | [PR-0040-filesystem-write-v1.md](filesystem/PR-0040-filesystem-write-v1.md) |
 | [#39](https://github.com/Nortan251/agentcore/pull/39) | gmail | Windows Gmail authority-test rendezvous hotfix | `d90eeab49b1de149a480351f28756b6291ee9f40` | MERGED as `7d9d34453ac384dc2a423600dba6a900731002c0`; superseded by Browser integration on main | [PR-0039-windows-rendezvous-hotfix.md](gmail/PR-0039-windows-rendezvous-hotfix.md) |
