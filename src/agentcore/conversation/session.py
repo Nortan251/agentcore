@@ -45,24 +45,35 @@ SESSION_SCHEMA_VERSION = 1
 SESSIONS_SUBDIR = "conversations"
 BROWSER_SESSIONS_SUBDIR = ".browser_sessions"
 BROWSER_SESSION_MARKER = "browser_read_isolated_v1"
+WORKSPACE_SESSIONS_SUBDIR = ".workspace_sessions"
+WORKSPACE_SESSION_MARKER = "workspace_files_isolated_v1"
+SESSION_DOMAINS = ("ordinary", "browser_read", "workspace_files")
 
 
 def validate_session_domain(metadata, *, domain="ordinary"):
     """Validate host-selected domains before deserializing/replaying history."""
     if not isinstance(metadata, Mapping):
         raise SessionDomainError("conversation_session_domain_mismatch")
-    valid = (domain == "ordinary" and BROWSER_SESSION_MARKER not in metadata
-             or domain == "browser_read" and metadata.get(BROWSER_SESSION_MARKER) is True)
+    browser = BROWSER_SESSION_MARKER in metadata
+    workspace = WORKSPACE_SESSION_MARKER in metadata
+    valid = (domain == "ordinary" and not browser and not workspace
+             or domain == "browser_read" and not workspace
+             and metadata.get(BROWSER_SESSION_MARKER) is True
+             or domain == "workspace_files" and not browser
+             and metadata.get(WORKSPACE_SESSION_MARKER) is True)
     if not valid:
         raise SessionDomainError("conversation_session_domain_mismatch")
 
 
 def validate_session_directory(directory, *, domain):
     # Reserve the browser namespace before its first transcript is visible.
-    if domain == "ordinary" and directory is not None:
+    if directory is not None:
         try:
-            reserved = (os.path.normcase(Path(directory).resolve().name)
-                        == os.path.normcase(BROWSER_SESSIONS_SUBDIR))
+            name = os.path.normcase(Path(directory).resolve().name)
+            reserved = (name == os.path.normcase(BROWSER_SESSIONS_SUBDIR)
+                        and domain != "browser_read"
+                        or name == os.path.normcase(WORKSPACE_SESSIONS_SUBDIR)
+                        and domain != "workspace_files")
         except (OSError, RuntimeError):
             raise SessionDomainError("conversation_session_domain_mismatch") from None
         if reserved:
@@ -75,7 +86,7 @@ class _SessionDomain:
     _session_domain = None
 
     def bind_domain(self, *, domain):
-        if domain not in ("ordinary", "browser_read"):
+        if domain not in SESSION_DOMAINS:
             raise SessionDomainError("conversation_session_domain_mismatch")
         validate_session_directory(getattr(self, "directory", None), domain=domain)
         # A single dictionary operation publishes the immutable binding even
