@@ -123,3 +123,17 @@ Project lead reviews the exact PR/head and explicitly decides the next phase. No
 ## Final verdict
 
 READY FOR PROJECT-LEAD FILESYSTEM WRITE V1 REVIEW
+
+## Amendment — 2026-10-04: project-lead review and merge
+
+This amendment supersedes the earlier open/unmerged status while preserving the complete pre-merge handoff above.
+
+The project lead independently rechecked PR metadata, the main-relative production diff, the create-only native filesystem boundary, journal/current-authority integration, reconciliation behavior, documented host exclusions, final review state, and the six exact-head GitHub Actions gates on `e32a9c6a66537c4da15522e0262ee4b415fbf934`. All three workflow runs were successful on `run_attempt=1`; unresolved review threads remained 0 and no additional P0/P1/P2 blocker was found.
+
+A final project-lead approval comment was posted on PR #40, then the PR was merged with an expected-head guard so any head movement would have stopped the merge.
+
+Merge commit: `67e6069e30979fea68aefd50164123a7348ada3e`.
+
+Authoritative `main` after merge: `67e6069e30979fea68aefd50164123a7348ada3e`.
+
+Final status: **MERGED; Filesystem Write v1 create-only foundation complete.** Default Agent construction remains read-only; ordinary JARVIS write enablement is a separate future task.
