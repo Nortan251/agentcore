@@ -8,6 +8,7 @@ This branch has an independent documentation-only root commit. Its tracked tree 
 
 | PR | Area | Task | Exact head | Status | Handoff |
 |----|------|------|------------|--------|---------|
+| [#44](https://github.com/Nortan251/agentcore/pull/44) | filesystem | POSIX staged-create publication integrity hotfix | `cb60193466ecfb8ea0abe71b1c08ad2810bad978` | STOPPED / OPEN / UNMERGED; native Linux proof missing; six gates billing-blocked; review pending | [PR-0044-fs-stage-publication-integrity-hotfix.md](filesystem/PR-0044-fs-stage-publication-integrity-hotfix.md) |
 | [#43](https://github.com/Nortan251/agentcore/pull/43) | filesystem | Revision-bound File Replace v1 | `a5f1c52447d69784847f9e75f7502e09a842c65c` | OPEN / UNMERGED; STOPPED merged-foundation P1; one review P1 unresolved; six gates billing-blocked | [PR-0043-file-replace-v1.md](filesystem/PR-0043-file-replace-v1.md) |
 | [#42](https://github.com/Nortan251/agentcore/pull/42) | filesystem | Journal-bound create-only Directory Create v1 | `f8d965e6b7053b80659d3d1adde54df4ad500aa0` | MERGED as `547a2f00bcfa709d907c329fbea78730dd6731f6`; project-lead review and exact-head gates complete | [PR-0042-directory-create-v1.md](filesystem/PR-0042-directory-create-v1.md) |
 | [#41](https://github.com/Nortan251/agentcore/pull/41) | filesystem | Explicit one-shot Workspace Agent v1 | `9c4d0123df9c3b161f81b3c1923cf35c80bd1dc2` | MERGED as `d6acae41e95059289956a4a2acde33d170a537cf`; project-lead review and exact-head gates complete | [PR-0041-workspace-agent-v1.md](filesystem/PR-0041-workspace-agent-v1.md) |
