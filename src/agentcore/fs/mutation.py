@@ -10,6 +10,7 @@ import hashlib
 import os
 import secrets
 import stat
+import sys
 
 from agentcore.fs.paths import PathRejectedError, RejectionReason, check_relative_form
 
@@ -123,6 +124,48 @@ def _check(guard, intent, relative, identities):
             _reject()
 
 
+def _linux_parent_filesystem(handle):
+    """Read f_type from the opened directory, never from a resolved pathname.
+
+    Limit the libc ABI to 64-bit Linux. The aligned buffer exceeds struct
+    statfs; only its first native long (f_type) is consumed. Unknown platforms,
+    ABIs, filesystems and native errors are refusals, not mode-only fallbacks.
+    """
+    import ctypes
+    import platform
+    if sys.platform != "linux" or platform.machine() not in {"x86_64", "aarch64"} or (
+            ctypes.sizeof(ctypes.c_long) != 8):
+        _reject()
+    try:
+        native = ctypes.CDLL(None, use_errno=True).fstatfs
+        native.argtypes = (ctypes.c_int, ctypes.c_void_p)
+        native.restype = ctypes.c_int
+        facts = (ctypes.c_long * 32)()
+        if native(handle, ctypes.byref(facts)) != 0:
+            _reject()
+        return facts[0]
+    except (AttributeError, OSError):
+        _reject()
+
+
+def _safe_stage_parent(handle):
+    """File-create only: exclude other ordinary principals' namespace writes.
+
+    On these local Linux filesystems, POSIX ACL write grants to named users or
+    groups are bounded by the group-class mode bits (the ACL mask). Owner UID
+    equality plus no group/other write therefore also excludes ACL write access.
+    NFS, CIFS, FUSE, overlay and unknown permission models remain unsupported.
+    Same-user/privileged permission changes remain outside the host boundary.
+    """
+    info = os.fstat(handle)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or (
+            info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+        _reject()
+    # ext2/3/4, XFS, Btrfs, tmpfs: kernel local DAC / POSIX ACL semantics.
+    if _linux_parent_filesystem(handle) not in {0xEF53, 0x58465342, 0x9123683E, 0x01021994}:
+        _reject()
+
+
 def create(guard, intent, data, validate):
     """Return 'applied' / 'not_applied'; exceptions preserve uncertainty.
 
@@ -139,6 +182,11 @@ def create(guard, intent, data, validate):
         stage = ".agentcore-stage-" + secrets.token_hex(16)
         if stage.casefold() == relative.name.casefold():
             _reject()
+        if os.name == "posix":
+            # The actual opened publication parent, at execution time, before
+            # validate marks possible physical entry and before any stage exists.
+            # prepare_create is shared with mkdir and deliberately unchanged.
+            _safe_stage_parent(handle)
         validate()
         published = False
         if os.name == "nt":

@@ -53,12 +53,42 @@ closed; the model cannot select identities, roots, journal classes, temporary
 names or recovery policy.
 
 On POSIX, traversal opens components relative to directory descriptors with
-`O_DIRECTORY | O_NOFOLLOW`. A host-generated exclusive 0600 staging file is
+`O_DIRECTORY | O_NOFOLLOW`. Staged file creation requires the **opened target
+parent** to be owned by the effective AgentCore UID and to have neither group
+nor world write permission. The descriptor is checked during execution before
+the callback that marks possible physical entry and before staging can begin;
+the shared `prepare_create` / Directory Create path is not restricted by this
+file-specific rule. An unsafe parent produces no stage, staged bytes, final
+target, or physical mutation. Parent safety is host policy, never a model option.
+
+User-owned `0700`, `0750`, `0755`, etc. remain admitted. `0770`, `0775`, `0777`
+and sticky shared writable parents such as `01777` are deliberately refused.
+Parents owned by another UID are refused even with restrictive mode bits.
+This is a conservative compatibility restriction, not a sticky-bit policy.
+
+The supported POSIX permission model in this version is local Linux ext2/3/4,
+XFS, Btrfs or tmpfs on the 64-bit x86-64 / AArch64 libc ABI. `fstatfs` identifies
+the filesystem using that same open directory descriptor. Other POSIX systems,
+unknown ABIs, native inspection errors, NFS, CIFS, FUSE, overlay and other
+unproven permission models fail closed. Under Linux POSIX ACL semantics the
+reported group permission bits bound named-user/group access via the ACL mask;
+with no group write bit, an ACL cannot silently grant another ordinary UID
+directory-entry write authority. Default ACLs do not grant access to the parent.
+See [Linux acl(5)](https://man7.org/linux/man-pages/man5/acl.5.html) and
+[fstatfs(2)](https://man7.org/linux/man-pages/man2/statfs.2.html).
+This hotfix does not add general ACL evaluation or alternate publication APIs.
+
+A host-generated exclusive 0600 staging file is
 written exactly, fsynced, and published via descriptor-relative `link` with no
 replacement semantics. The owned staging name is then unlinked and the parent
 directory fsynced. Unsupported publication fails closed. This does not require
 `openat2` or Linux 5.6. The briefly double-linked final file is not reported as
 success until staging cleanup and directory flush complete.
+Publication still uses the staging pathname: admission prevents a different
+ordinary principal from substituting that name in supported parents, rather
+than attempting another check-then-use pathname comparison. The object
+published must be the staging object AgentCore wrote and verified. Directory
+Create uses a direct final-name mkdir, with no staging-file publication window.
 
 On Windows, the trusted root is opened with `FILE_FLAG_OPEN_REPARSE_POINT` and
 directory semantics. Every requested child is opened with `NtCreateFile`
@@ -140,7 +170,10 @@ unsafe workspace path objects.
 
 AgentCore does not defend the workspace namespace against a separate malicious
 process already running with the same user's filesystem authority or an
-administrator/root concurrently relocating authorized directories.
+administrator/root (or equivalent privileged authority) concurrently relocating
+authorized directories or changing their permission model. Different ordinary
+principals are within the boundary: supported staged-create parents deny them
+the namespace authority needed for staging-path substitution.
 
 In particular, POSIX directory descriptors remain attached to directory objects
 after hostile relocation outside the workspace. Component no-follow traversal
