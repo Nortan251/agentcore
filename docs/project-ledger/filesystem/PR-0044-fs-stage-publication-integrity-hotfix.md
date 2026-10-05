@@ -86,3 +86,20 @@ Restore Actions account availability, then run all six exact-head gates and veri
 ## Final verdict
 
 **STOPPED / OPEN / UNMERGED.** Implementation and available local validation are complete; native security proof, CI and review gates prevent a mergeable or fully validated claim.
+
+## 2026-10-05 amendment — exact-head review returned two P1 findings
+
+The preceding snapshot is preserved and superseded where it says review is pending or describes the admission rule as sufficient. Implementation head remains `cb60193466ecfb8ea0abe71b1c08ad2810bad978`; no implementation changes or test reruns followed this review.
+
+DIRECTLY OBSERVED REVIEW FACTS: [review 5419036616](https://github.com/Nortan251/agentcore/pull/44#pullrequestreview-5419036616) was published against the exact full head SHA above. Two threads remain unresolved:
+
+- [P1: reject idmapped mounts before trusting owner bits](https://github.com/Nortan251/agentcore/pull/44#discussion_r4187472896). Whitelisted filesystem magic does not distinguish an idmapped mount. The review identifies a different ordinary UID accessing another idmapped alias as owner of the same parent, bypassing the owner/mode admission assumptions and retaining staging-path substitution. This undermines the current production repair; no two-mount native reproduction is claimed observed locally.
+- [P1: load the helper before dropping runtime access](https://github.com/Nortan251/agentcore/pull/44#discussion_r4187472904). The reviewer reports all four native worker cases failing with `ModuleNotFoundError: subprocess` when the interpreter/checkout is behind an invoking user's private ancestor. The worker drops UID before loading that runtime. These are reviewer-reported Linux failures, separate from the observed Windows counts; no native success is established.
+
+DIAGNOSIS / INFERENCE: The filesystem-type allowlist and effective UID/mode check do not establish the promised safety across idmapped aliases. [Kernel idmapping documentation](https://cdn.kernel.org/doc/html/latest/filesystems/idmappings.html) describes per-mount ownership remapping for the same dentries. This is an additional merged-foundation namespace-authority P1, beyond the initially considered shared-write DAC configuration. Under the user's section 7 instruction to STOP on an additional distinct merged-foundation P0/P1, implementation stopped rather than silently expanding the mount-security model or publication architecture. The current repair is incomplete, not a validated fix.
+
+REMAINING BLOCKERS: both P1s unresolved; native two-principal and two-mount proof missing; all six exact-head gates still billing-blocked before execution. Review has returned findings, so the zero-unresolved gate fails. A completed review with findings is not a clean review or a CI waiver.
+
+NEXT REQUIRED ACTION: decide an auditable, bounded admission contract that excludes idmapped aliases (without the prohibited publication redesign), then repair that rule and the helper's runtime-loading setup; add the requested native two-mount/private-installation regressions. Any new implementation head needs appropriate focused/relevant/full validation, all six exact-head gates and fresh review. PR #43 remains unchanged and STOPPED until the independently reviewed foundation repair is merged.
+
+CURRENT VERDICT: **STOPPED / OPEN / UNMERGED; INCOMPLETE SECURITY REPAIR; TWO UNRESOLVED P1s.** No merge, force push or thread resolution was performed.
