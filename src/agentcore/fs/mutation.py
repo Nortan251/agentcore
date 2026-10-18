@@ -149,12 +149,13 @@ def _linux_parent_filesystem(handle):
 
 
 def _safe_stage_parent(handle):
-    """File-create only: exclude other ordinary principals' namespace writes.
+    """File-create admission; insufficient against hostile idmapped aliases.
 
     On these local Linux filesystems, POSIX ACL write grants to named users or
-    groups are bounded by the group-class mode bits (the ACL mask). Owner UID
-    equality plus no group/other write therefore also excludes ACL write access.
+    groups are bounded by the group-class mode bits (the ACL mask). This only
+    constrains the observed mount's ownership view, not access through aliases.
     NFS, CIFS, FUSE, overlay and unknown permission models remain unsupported.
+    Pathname publication and writable-ancestor relocation remain unresolved.
     Same-user/privileged permission changes remain outside the host boundary.
     """
     info = os.fstat(handle)

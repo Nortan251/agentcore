@@ -8,6 +8,13 @@ creation, deletion, shell, browser, or Gmail capability in this composition.
 
 ## Guarantees
 
+**PR #44 security status: incomplete repair; do not merge.** The POSIX parent
+admission below does not establish exclusive namespace authority across
+idmapped mount aliases. Publication still resolves a mutable staging name.
+The [idmapped-alias P1](https://github.com/Nortan251/agentcore/pull/44#discussion_r4187472896)
+remains unresolved; native two-mount proof is missing. The restrictions below
+describe implemented checks, not a validated security guarantee.
+
 The authority path is `ToolRegistry -> argument validation -> PermissionPolicy
 -> ToolExecutor -> durable protected intent / ActionJournal attempt claim ->
 Tool.run -> WorkspaceGuard-owned mutation -> normalized effect truth`.
@@ -84,10 +91,12 @@ replacement semantics. The owned staging name is then unlinked and the parent
 directory fsynced. Unsupported publication fails closed. This does not require
 `openat2` or Linux 5.6. The briefly double-linked final file is not reported as
 success until staging cleanup and directory flush complete.
-Publication still uses the staging pathname: admission prevents a different
-ordinary principal from substituting that name in supported parents, rather
-than attempting another check-then-use pathname comparison. The object
-published must be the staging object AgentCore wrote and verified. Directory
+Publication still uses the staging pathname. Ownership, mode and filesystem
+magic on the opened parent do not rule out another ordinary UID owning the
+same backing directory through an idmapped alias. Checking the stage inode
+before `link` leaves a substitution window. The required invariant is that the
+published object is the staging object AgentCore wrote and verified; the current
+POSIX implementation does not establish it against that threat. Directory
 Create uses a direct final-name mkdir, with no staging-file publication window.
 
 On Windows, the trusted root is opened with `FILE_FLAG_OPEN_REPARSE_POINT` and
@@ -172,15 +181,19 @@ AgentCore does not defend the workspace namespace against a separate malicious
 process already running with the same user's filesystem authority or an
 administrator/root (or equivalent privileged authority) concurrently relocating
 authorized directories or changing their permission model. Different ordinary
-principals are within the boundary: supported staged-create parents deny them
-the namespace authority needed for staging-path substitution.
+principals remain within the required boundary. The current parent checks do
+not prove that boundary against hostile idmapped aliases; the unresolved gap
+is not a new host trust exclusion.
 
 In particular, POSIX directory descriptors remain attached to directory objects
 after hostile relocation outside the workspace. Component no-follow traversal
 does not freeze namespace ancestry. Tests deterministically characterize this
-excluded interleave instead of claiming to prevent it. Ordinary detectable
-parent replacements are separately tested as refusals. These are host-boundary
-limits, not promises of race-proof or sandbox-proof operation.
+excluded same-user interleave instead of claiming to prevent it. A different
+ordinary principal with write access to a containing ancestor may also relocate
+an otherwise restricted target parent. That case needs independent native
+validation and remains an outstanding boundary requirement. Ordinary detectable
+parent replacements are separately tested as refusals. Descriptor traversal
+alone is not a promise of race-proof or sandbox-proof operation.
 
 ## Explicit host composition
 

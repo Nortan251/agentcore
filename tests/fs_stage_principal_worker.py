@@ -1,14 +1,24 @@
 """Privileged test setup only; all AgentCore / attack work uses ordinary UIDs."""
 
+import ctypes  # noqa: F401 - mutation imports this lazily after the UID drop
+import fcntl  # noqa: F401 - durable stores import this lazily after the UID drop
 import json
 import os
 from pathlib import Path
+import platform  # noqa: F401 - mutation imports this lazily after the UID drop
 import pwd
 import socket
 import struct
 import sys
 import tempfile
 import traceback
+
+
+RUNTIME_ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(RUNTIME_ROOT / "tests"), str(RUNTIME_ROOT / "src")]
+# Load code before losing runtime search access; construct host state only below.
+from test_fs_write import Harness
+from agentcore.fs import mutation
 
 
 def drop(uid):
@@ -59,9 +69,6 @@ def attack(sock, uid):
 
 def agent(sock, root, uid, attacker_uid, scenario):
     drop(uid)  # Must precede all guard / journal construction and execution.
-    sys.path[:0] = [str(Path(__file__).resolve().parent), str(Path(__file__).resolve().parents[1] / "src")]
-    from test_fs_write import Harness
-    from agentcore.fs import mutation
     h = Harness(root / "host")
     os.chmod(h.base, 0o755)
     os.chmod(h.root, 0o755)
@@ -77,6 +84,7 @@ def agent(sock, root, uid, attacker_uid, scenario):
         assert target_parent.stat().st_mode & 0o777 == 0o755
     with sock.makefile("rwb") as channel:
         facts = {"agent_uid": os.geteuid(), "agent_groups": os.getgroups(),
+                 "runtime_accessible": os.access(RUNTIME_ROOT, os.X_OK),
                  "attacker_uid": attacker_uid, "attacker_groups": [],
                  "namespace_probe_substituted": False, "attack_reached": False, "attack_denied": False}
         send(channel, "identity")

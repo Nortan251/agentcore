@@ -136,9 +136,36 @@ def test_windows_publication_does_not_call_posix_admission(make, monkeypatch):
     assert (h.root / "sub/new.txt").read_bytes() == "héllo\n".encode()
 
 
+def test_worker_loads_runtime_before_dropping_access():
+    worker = Path(__file__).with_name("fs_stage_principal_worker.py")
+    script = """
+import os
+import runpy
+import sys
+import types
+
+# Exercise import ordering on Windows too, without changing any credentials.
+if os.name == "nt":
+    sys.modules["pwd"] = types.ModuleType("pwd")
+    sys.modules["fcntl"] = types.ModuleType("fcntl")
+worker = runpy.run_path(sys.argv[1])
+def dropped(uid):
+    assert callable(worker["agent"].__globals__.get("Harness"))
+    assert all(name in sys.modules for name in
+               ("ctypes", "platform", "fcntl", "pytest", "subprocess", "agentcore.fs.mutation"))
+    raise SystemExit(0)  # Stop before any guard, journal or filesystem construction.
+worker["agent"].__globals__["drop"] = dropped
+worker["agent"](None, None, 60000, 60001, "safe")
+"""
+    result = subprocess.run([sys.executable, "-c", script, str(worker)],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @linux
+@pytest.mark.parametrize("private_runtime", [False, True], ids=["checkout", "private-runtime"])
 @pytest.mark.parametrize("scenario", ["shared", "safe", "acl-masked", "foreign"])
-def test_native_linux_different_ordinary_principal(scenario):
+def test_native_linux_different_ordinary_principal(scenario, private_runtime, tmp_path):
     """sudo/root only sets up UIDs; AgentCore and attacker both drop privileges.
 
     No users/accounts are created. The helper selects two unused nonzero UIDs,
@@ -147,7 +174,7 @@ def test_native_linux_different_ordinary_principal(scenario):
     owned/named inode check, even on the vulnerable base.
     """
     worker = Path(__file__).with_name("fs_stage_principal_worker.py")
-    command = [sys.executable, str(worker), scenario]
+    prefix = []
     if os.geteuid() != 0:
         sudo = shutil.which("sudo")
         if sudo is None:
@@ -156,10 +183,23 @@ def test_native_linux_different_ordinary_principal(scenario):
                                capture_output=True, timeout=15)
         if probe.returncode != 0:
             pytest.skip("two-UID setup unavailable: noninteractive sudo cannot run the Python interpreter")
-        command = [sudo, "-n", *command]
+        prefix = [sudo, "-n"]
+    if private_runtime:
+        private = tmp_path / "private"
+        private.mkdir(mode=0o700)
+        os.chmod(private, 0o700)
+        shutil.copytree(worker.parents[1] / "src", private / "src",
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        (private / "tests").mkdir()
+        for name in (worker.name, "test_fs_write.py", "test_task_43_2b_tool_executor_action_boundary.py"):
+            shutil.copy2(worker.with_name(name), private / "tests" / name)
+        worker = private / "tests" / worker.name
+    command = [*prefix, sys.executable, str(worker), scenario]
     result = subprocess.run(command, capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stdout + result.stderr
     facts = json.loads(result.stdout)
+    if private_runtime:
+        assert not facts["runtime_accessible"], "runtime ancestor remained searchable after dropping UID"
     assert facts["agent_uid"] != facts["attacker_uid"]
     assert facts["agent_uid"] > 0 and facts["attacker_uid"] > 0
     assert facts["agent_groups"] == [] and facts["attacker_groups"] == []
