@@ -103,3 +103,51 @@ REMAINING BLOCKERS: both P1s unresolved; native two-principal and two-mount proo
 NEXT REQUIRED ACTION: decide an auditable, bounded admission contract that excludes idmapped aliases (without the prohibited publication redesign), then repair that rule and the helper's runtime-loading setup; add the requested native two-mount/private-installation regressions. Any new implementation head needs appropriate focused/relevant/full validation, all six exact-head gates and fresh review. PR #43 remains unchanged and STOPPED until the independently reviewed foundation repair is merged.
 
 CURRENT VERDICT: **STOPPED / OPEN / UNMERGED; INCOMPLETE SECURITY REPAIR; TWO UNRESOLVED P1s.** No merge, force push or thread resolution was performed.
+
+## 2026-10-18 amendment — permitted engineering resumed; native worker imports repaired
+
+The project lead authorized ordinary engineering work on the existing PR, preserving PR #43's separation and prohibiting merge. Earlier snapshots above remain historical. Their blanket engineering stop is superseded by this bounded follow-up; their production-security and native-validation blockers remain.
+
+BASE SHA: `547a2f00bcfa709d907c329fbea78730dd6731f6`
+HEAD SHA: `9f57a8edc52bbd810f9e07e63438d2eee3acda26`
+PARENT SHA: `cb60193466ecfb8ea0abe71b1c08ad2810bad978`
+BRANCH: `codex/fs-stage-publication-integrity-hotfix`
+STATUS: OPEN / UNMERGED; ordinary follow-up complete; security repair incomplete
+
+DIRECTLY VERIFIED PROVENANCE: [new implementation commit](https://github.com/Nortan251/agentcore/commit/9f57a8edc52bbd810f9e07e63438d2eee3acda26) is a single child of the prior audited head, with main as its ancestor. Local, remote and PR heads agree. Main remains the base above; PR #43 remains OPEN / UNMERGED at `a5f1c52447d69784847f9e75f7502e09a842c65c`. No merge, history rewrite, new PR or PR #43 implementation change.
+
+COMPLETED IMPLEMENTATION: the worker loads Harness/AgentCore and lazy ctypes/platform/fcntl imports before changing UID. It resolves runtime paths before losing search access, while guard/journal/executor construction remains after the drop. The ordinary fresh-process regression mocks the transition and runs on Windows and Linux without credential changes. Four native private-ancestor variants copy the source/test dependencies beneath a 0700 ancestor, then require that ancestor to be inaccessible under the agent UID while retaining the original two-principal/effect assertions.
+
+Exactly four implementation files changed: `tests/fs_stage_principal_worker.py`, `tests/test_fs_stage_parent.py`, `docs/architecture/filesystem-write-v1.md`, and the `_safe_stage_parent` docstring in `src/agentcore/fs/mutation.py` (80 insertions, 18 deletions). Executable production AST is identical to the parent after removing docstrings. The documentation now marks the idmapped-alias gap and different-principal writable-ancestor requirement explicitly. No runtime authority, schema, retry, Windows publication, Directory Create, defaults, dependencies or governance changes were made.
+
+DIRECTLY OBSERVED LOCAL VALIDATION: Windows 11 build 26300 / AMD64 / Python 3.13.15, with the final committed tree and explicit checkout source path:
+
+| Run | Passed | Failed | Skipped | Duration |
+|---|---:|---:|---:|---|
+| Intentional ordering regression before repair | 0 | 1 | 0 | 0.32s; 30 deselected |
+| Ordering regression after repair | 1 | 0 | 0 | 0.61s; 30 deselected |
+| Focused file-create / stage-parent | 80 | 0 | 33 | 8.92s |
+| Relevant filesystem / Workspace / permissions / Task 43.2a-h | 680 | 0 | 51 | 69.61s |
+| Full repository | 6429 | 0 | 293 | 467.20s; 89 warnings |
+| Explicit pinned Chromium gate | 419 | 0 | 0 | 163.14s |
+
+Focused command: `python -m pytest tests/test_fs_write.py tests/test_fs_stage_parent.py -ra`. Relevant suites additionally cover Directory Create, Workspace host/directory, permissions, and Task 43.2a-h. Full command: `python -m pytest -ra` (repository configuration supplies `-q`). All use separate short workspace temporary roots. The explicitly enabled Chromium run uses the exact twelve test modules from `browser-integration.yml`, with installed Playwright 1.62.0 / psutil 7.2.2. Compileall (`src tests`), staged/committed diff checks, changed-source review, allowed-file checks, clean status and commit/remote provenance passed. No implementation changes followed final validation.
+
+NATIVE EVIDENCE NOT ESTABLISHED: only Python 3.13 is installed locally; WSL is not installed. All eight native worker cases, including the four new private-runtime cases, were skipped on Windows. The ordinary mocked-transition pass is not Linux, private-runtime end-to-end, different-UID, two-mount or ancestor-relocation proof. No manual privileged or mount experiments were performed. Those tests need an appropriately authorized Linux environment; Windows Python 3.11/3.12 and Linux Chromium also remain unavailable locally.
+
+CURRENT-HEAD CI: all six automatic jobs concluded FAILURE with zero steps. Each annotation independently says the job was not started because recent account payments failed or the spending limit needs increasing. No assertions executed and no manual reruns or waiver occurred:
+
+- Linux full: [run 39174693957 / job 117814846542](https://github.com/Nortan251/agentcore/actions/runs/39174693957/job/117814846542).
+- Windows 3.11: [run 39174693912 / job 117814846559](https://github.com/Nortan251/agentcore/actions/runs/39174693912/job/117814846559).
+- Windows 3.12: [run 39174693912 / job 117814846409](https://github.com/Nortan251/agentcore/actions/runs/39174693912/job/117814846409).
+- Windows 3.13: [run 39174693912 / job 117814846641](https://github.com/Nortan251/agentcore/actions/runs/39174693912/job/117814846641).
+- Chromium Linux: [run 39174694083 / job 117814847414](https://github.com/Nortan251/agentcore/actions/runs/39174694083/job/117814847414).
+- Chromium Windows: [run 39174694083 / job 117814847082](https://github.com/Nortan251/agentcore/actions/runs/39174694083/job/117814847082).
+
+REVIEW: [fresh exact-head Codex review requested](https://github.com/Nortan251/agentcore/pull/44#issuecomment-6256248338); no new completed review observed at this snapshot. Both existing threads remain unresolved. The [worker finding](https://github.com/Nortan251/agentcore/pull/44#discussion_r4187472904) has a source repair and local ordering regression, but still needs native private-runtime evidence and independent review before resolution. The [idmapped-alias production P1](https://github.com/Nortan251/agentcore/pull/44#discussion_r4187472896) remains unfixed.
+
+SOURCE REVIEW / INFERENCE: mount-local ownership/mode plus filesystem magic cannot establish global namespace exclusivity for the pathname used by `os.link`. An opened target parent also remains attached after relocation through a writable containing ancestor. No native hostile-alias or different-principal relocation reproduction was performed here. These remain production boundary requirements, not supported assumptions or additional trust exclusions. No unverified production heuristic was added.
+
+NEXT REQUIRED ACTION: restore Actions account availability; obtain authorized native Linux execution for the existing/new two-UID private-runtime tests and the hostile-alias/ancestor requirements. Review a bounded object-bound staging/publication design with fail-closed unsupported semantics, without a pathname fallback or privileged production requirement. Complete independent review and all six gates on the eventual final head. Keep PR #43 separate until the foundation is independently approved and merged by the project lead.
+
+CURRENT VERDICT: **ORDINARY FOLLOW-UP COMPLETE / OPEN / UNMERGED / SECURITY REPAIR INCOMPLETE / NOT MERGEABLE.** Two review threads, production security, native proof, exact-head CI and fresh review remain blockers. This ledger amendment changes documentation only and must never be merged into main.
