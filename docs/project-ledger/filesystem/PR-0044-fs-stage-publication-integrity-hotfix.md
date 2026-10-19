@@ -209,3 +209,78 @@ REMAINING BLOCKERS / LIMITS: the [idmapped-alias production P1](https://github.c
 NEXT REQUIRED ACTION: obtain separate explicit authorization for the production publication-integrity repair and its hostile-alias/ancestor regressions. Keep PR #44 OPEN / UNMERGED and PR #43 untouched in this task. No merge or security-access circumvention was performed. This independent documentation-only ledger branch must never be merged into main.
 
 CURRENT VERDICT: **BOUNDED NATIVE HARNESS REPAIR COMPLETE / OPEN / UNMERGED / PRODUCTION SECURITY REPAIR STILL INCOMPLETE / NOT MERGEABLE.**
+
+
+## 2026-10-19 amendment — production file-publication fail-closed candidate
+
+AREA: filesystem
+TASK: production staged-file publication integrity repair in existing PR #44
+STATUS: OPEN / DRAFT / UNMERGED; READY FOR INDEPENDENT REVIEW; POSIX file creation deliberately unsupported; original P1 closure pending project lead
+
+BASE / DIVERGENCE SHA: `547a2f00bcfa709d907c329fbea78730dd6731f6`
+LIVE MAIN / CI INTEGRATION BASE: `cada2362beb43019f64dcb6395f98b136e0cd46c`
+STARTING HEAD: `144d878586837409f6141c5fdc3212220e76448f`
+PRODUCTION REPAIR: `e8bc88284934acbd99943083be5e8cc4d0497480` (parent `144d878586837409f6141c5fdc3212220e76448f`)
+HEAD SHA: `8d9a5340441789c732935316883706bdc0aaf1f7`
+PARENT SHA: `e8bc88284934acbd99943083be5e8cc4d0497480`
+SYNTHETIC CI MERGE: `085647913ecfa3248e7576ee5f7a0f5095abd769` (parents `cada2362beb43019f64dcb6395f98b136e0cd46c` and `8d9a5340441789c732935316883706bdc0aaf1f7`)
+BRANCH: `codex/fs-stage-publication-integrity-hotfix`
+
+Earlier snapshots above remain historical. The previous vulnerable POSIX publication is now removed, rather than retained behind another ownership heuristic. No finding was formally resolved in this task.
+
+### Goal, production changes and security decision
+
+The old code compared a verified staging descriptor with a pathname and then passed that pathname to `os.link`. Hostile idmapped aliases could change its binding despite observed private owner/mode bits. Open directory descriptors also follow directories relocated through writable containing ancestors. Mount-local checks did not establish the claimed authority.
+
+`_require_file_publication()` now refuses every non-native-Windows host with `unsupported_publication`. `create()` invokes it after bounded-content/lexical validation but before opening the mutation parent or calling the physical-entry callback. The POSIX inode-check/pathname-link implementation and `_safe_stage_parent` / `_linux_parent_filesystem` heuristics are removed. There is no fallback, model/configuration override, new dependency or privileged production requirement. Native Windows retains the original owned-handle no-replace publication and cleanup in the same shared foundation.
+
+`observe()` applies the same support restriction. Old uncertain POSIX file attempts cannot be promoted merely because final bytes match: they remain OUTCOME_UNKNOWN / HUMAN_CONFIRMATION_REQUIRED with no retry. A new refused durable attempt is NOT_INVOKED / CONFIRMED_NOT_APPLIED. Existing authority, permission/approval, protected intent, action identity and journal schema are unchanged. Historical terminal records and residue are not rewritten/deleted. POSIX read tools and Directory Create have separate unchanged contracts; this repair does not certify directory namespace behavior.
+
+Linux O_TMPFILE/linkat can bind the source inode, but cannot freeze destination ancestry; openat2 constrains lookup, not a later publication operation. Inspecting one mount cannot exclude hostile aliases. The implementation therefore withdraws POSIX file creation, including private ext4/XFS/Btrfs/tmpfs parents, instead of inventing an ordinary-principal trust exclusion. Windows's existing native semantics remain the supported scope; post-close immutability, privileged compromise resistance and parent-directory fsync durability are not promised.
+
+### Files changed and regression coverage
+
+Eleven files differ from the starting head: `src/agentcore/fs/mutation.py`, `src/agentcore/fs/paths.py`, `tests/test_fs_publication_support.py`, `tests/test_fs_stage_parent.py`, `tests/fs_stage_principal_worker.py`, `tests/test_fs_write.py`, `tests/test_fs_directory_create.py`, `tests/test_workspace_host.py`, `tests/test_workspace_directory_create.py`, `docs/architecture/filesystem-write-v1.md`, and `docs/architecture/workspace-agent-v1.md`. No workflow/governance, Browser, Gmail, model-execution, default-composition or PR #43 source changed.
+
+New policy/ordering tests had 9 failures and 1 pass against the starting production mutation module, then 10 passes against the repair. These controlled Windows platform-selector checks are not native Linux exploit proof. A test-draft field-access mistake was corrected before that comparison. Existing supported Windows success, authority, race, failure, uncertainty and reconciliation assertions are retained. Linux now asserts the intentionally withdrawn capability's refusal; success-path tests are explicitly Windows-specific, without a fake native implementation or globally skipping the suite.
+
+The native helper keeps real UID/GID/group/capability assertions and post-drop host construction. It adds an ancestor-relocation capability probe by the distinct ordinary attacker, restores that controlled directory, then proves that creation never reaches the retained publication seam. The committed Windows regression proves denied staging-name substitution and unchanged file identity through native publication. An additional local final-head assert check denied relocation of target parent, workspace root and containing ancestor during publication, then verified all three rename successfully after handle release. That supplementary same-UID Windows check is local evidence, not Linux or matrix-wide proof.
+
+### Directly observed local results
+
+Windows Python 3.13.15 focused: 90 passed / 27 skipped. Surrounding filesystem/workspace/permission/Task 43.2 suites: 969 passed / 127 skipped. Final changed-test subset: 13 passed. Final corrected policy-lease test: 1 passed. Full repository: **6439 passed, 288 skipped, 89 warnings in 492.16s (0:08:12)**.
+
+The local full suite began at `e8bc88284934acbd99943083be5e8cc4d0497480`; final commit changes only the host test's turn/tool-result assertions, which passed separately. Runtime source and every other test are identical. Final-head CI independently exercised the entire final tree plus current main. Compileall, working/committed/starting-head/full-PR whitespace checks and final clean status passed. Local Python 3.11/3.12 and native Linux are unavailable; platform evidence is the CI below.
+
+### Final-head CI
+
+| Gate | Conclusion | Final-head job |
+|---|---|---|
+| Chromium adapter (ubuntu-latest) | SUCCESS | [job 118303886128](https://github.com/Nortan251/agentcore/actions/runs/39323673649/job/118303886128) |
+| Chromium adapter (windows-latest) | SUCCESS | [job 118303885965](https://github.com/Nortan251/agentcore/actions/runs/39323673649/job/118303885965) |
+| Linux full suite (py3.13) | SUCCESS | [job 118303885669](https://github.com/Nortan251/agentcore/actions/runs/39323673657/job/118303885669) |
+| Windows fs verification (py3.11) | SUCCESS | [job 118303887099](https://github.com/Nortan251/agentcore/actions/runs/39323673757/job/118303887099) |
+| Windows fs verification (py3.12) | SUCCESS | [job 118303887602](https://github.com/Nortan251/agentcore/actions/runs/39323673757/job/118303887602) |
+| Windows fs verification (py3.13) | SUCCESS | [job 118303887511](https://github.com/Nortan251/agentcore/actions/runs/39323673757/job/118303887511) |
+
+Final-head Linux: native stage-parent **26 passed, 1 skipped (Windows-only), 5.75s**; surrounding **979 passed, 117 skipped, 1 warning, 17.08s**; full **6558 passed, 210 skipped, 98 warnings, 154.19s**. All ten genuine distinct-ordinary-UID cases ran successfully, including all five private-runtime variants and both ancestor-relocation probes; there were zero native setup skips. The attacker demonstrated actual shared-entry substitution and ancestor-relocation authority in controlled probes; subsequent AgentCore file creation was refused without staging or confirmed application. This is native refusal evidence, not evidence of supported Linux publication.
+
+Each Windows matrix version passed its real junction/reparse gate (1 passed, 160 deselected), its filesystem-security gate (58 passed), and the entire full-suite step. The existing full-suite command suppresses the aggregate summary through duplicate quiet flags; no unobserved Windows CI pass count is inferred. Both Chromium gates reported **419 passed**, Ubuntu in 113.59s and Windows in 163.52s. Linux compileall and committed whitespace checks passed. All six jobs checked out the synthetic merge listed above, whose parents are current main and the final PR head.
+
+Intermediate Linux [run 39323436871](https://github.com/Nortan251/agentcore/actions/runs/39323436871) passed native tests but failed surrounding (1 failed, 978 passed, 117 skipped, 1 warning) because this task incorrectly equated TurnResult.ok with tool success. Final commit preserves turn completion and separately checks the exact invocation outcome; it changes no production source. The failed run is historical and is not substituted for final-head validation.
+
+### Review, unresolved findings and limits
+
+[Final-head review request](https://github.com/Nortan251/agentcore/pull/44#issuecomment-6277174262) explicitly requested assessment of the production P1 and support restriction. [Completed receipt](https://github.com/Nortan251/agentcore/pull/44#issuecomment-6277212416) identifies `8d9a534044` and reports no major issues. The full requested SHA is the final head above and has not changed. No new review finding was returned. This is independent automated review, not project-lead acceptance or original-P1 closure.
+
+Production [P1 4187472896](https://github.com/Nortan251/agentcore/pull/44#discussion_r4187472896) has an implemented unconditional-refusal candidate; its thread remains open for independent closure and compatibility acceptance. Historical worker [P1 4187472904](https://github.com/Nortan251/agentcore/pull/44#discussion_r4187472904) was repaired before this task and its five native private-runtime cases pass; its thread also remains open. Historical whitespace [P2 4315526400](https://github.com/Nortan251/agentcore/pull/44#discussion_r4315526400) was previously repaired/resolved. GraphQL confirms exactly those two original unresolved threads; no new issue was returned by final-head review. A clean review and green CI are not treated as original-P1 closure.
+
+No hostile two-idmapped-mount experiment was attempted or claimed; no Linux publication success guarantee is offered. No manual privilege/mount workaround or unavailable security service was used. Restoring POSIX file creation requires a separately enforceable source-identity and namespace-authority design with native evidence.
+
+PR #43 remains OPEN / DRAFT / UNMERGED at `7bd7b4de98fe7cff63c577c0add2be16fb2d85dd`, unchanged. Its pathname-based `os.replace` finding is not repaired automatically. It must independently preserve source/target/revision identity, metadata/confidentiality, supported-platform refusal and uncertainty, with its own correction, regressions, reviews and CI. No feature work resumed here.
+
+### Next required action and final verdict
+
+**READY FOR INDEPENDENT REVIEW of the fail-closed candidate; no merge recommendation.** Production source no longer admits the vulnerable POSIX publication, native refusal and supported Windows identity checks passed, all six final-head gates passed, and the exact-head independent automated review completed without new findings. The project lead must assess the deliberate POSIX compatibility withdrawal and decide whether the original production P1 has sufficient closure evidence. Both original P1 threads remain open. PR #44 remains draft and unmerged; stop at this bounded milestone.
+
+This append-only amendment and the single PR #44 INDEX row are the only ledger changes. Preserve this independent documentation-only branch; never merge it into main.
