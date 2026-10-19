@@ -132,8 +132,24 @@ def test_windows_native_revision_snapshot(make, native_security):
         # Keep CI diagnostics categorical: no paths, descriptors, SIDs or content.
         frames = traceback.extract_tb(exc.__traceback__)
         location = ",".join(f"{frame.name}:{frame.lineno}" for frame in frames)
+        import win32security
+        queries = {}
+        relative = replacement.relative_path(h.guard, "sub/old.txt")
+        with replacement.parent(h.guard, relative) as (parent, _):
+            with replacement.target(h.guard, parent, relative) as opened:
+                for name, query, flags in (
+                    ("owner_group_dacl", lambda h, f: win32security.GetSecurityInfo(h, 1, f), 7),
+                    ("sacl", lambda h, f: win32security.GetSecurityInfo(h, 1, f), 8),
+                    ("backup", lambda h, f: win32security.GetSecurityInfo(h, 1, f), 0x10000),
+                    ("kernel_backup", win32security.GetKernelObjectSecurity, 0x10000),
+                ):
+                    try:
+                        query(opened, flags)
+                        queries[name] = "available"
+                    except Exception as error:
+                        queries[name] = f"{type(error).__name__}:{getattr(error, 'winerror', None)}"
         pytest.fail(f"native snapshot: {type(exc).__name__}, "
-                    f"winerror={getattr(exc, 'winerror', None)}, calls={location}", pytrace=False)
+                    f"winerror={getattr(exc, 'winerror', None)}, calls={location}, queries={queries}", pytrace=False)
     assert text == "héllo\n" and snapshot["size"] == len(text.encode())
     assert snapshot["metadata"]["security"]
     assert not h.revisions._snapshots and not h.actions.list_actions()
