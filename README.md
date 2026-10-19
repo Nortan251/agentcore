@@ -15,6 +15,7 @@ the seams described below.
 pip install -e ".[dev]"
 pytest                       # 2787 tests
 agentcore doctor             # verify wiring and integrations
+agentcore doctor --json      # bounded, versioned diagnostic checks
 agentcore tools              # echo, workspace_info, read_file, list_directory, inspect
 agentcore run "some objective"   # persists the run, prints its run_id
 agentcore approve <run_id>       # allow a pending action -> resumable
@@ -42,6 +43,12 @@ agentcore inbox --all --json
 agentcore history <run_id>       # read-only timeline of a finished run
 agentcore history <run_id> --json
 ```
+
+`doctor --json` provides [schema version 1](docs/architecture/doctor-json-v1.md)
+with fixed check identifiers, categorical outcomes and sanitized messages.
+It returns 0 for successful checks, 1 for unavailable/failed diagnostics and
+2 for configuration errors. The currently unavailable computer-control stub
+therefore yields 1. Without the option, the legacy doctor report is unchanged.
 
 ## Inspecting a run
 

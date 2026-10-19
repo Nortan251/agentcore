@@ -3,7 +3,7 @@
     agentcore status
     agentcore tools
     agentcore run "objective"
-    agentcore doctor
+    agentcore doctor [--json]
     agentcore runs
     agentcore history <run_id>
     agentcore memory list | show | correct | retire | forget
@@ -111,7 +111,9 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status", help="show agent status")
     sub.add_parser("tools", help="list registered tools")
-    sub.add_parser("doctor", help="check wiring and integrations")
+    doctor = sub.add_parser("doctor", help="check wiring and integrations")
+    doctor.add_argument("--json", action="store_true", dest="as_json",
+                        help="emit bounded, versioned diagnostic checks as JSON")
     runs = sub.add_parser("runs", help="summarise persisted runs")
     runs.add_argument("--json", action="store_true", dest="as_json",
                       help="emit the run summaries as JSON")
@@ -2446,8 +2448,96 @@ def _chat_loop(agent: Any, runtime: Any, session: Any,
         print()
 
 
+def _doctor_integrations(agent: Agent) -> list[dict[str, Any]]:
+    integrations = IntegrationRegistry()
+    integrations.add(ComputerControlAdapter())
+    integrations.connect_all(agent.registry)
+    return integrations.health()
+
+
+def _emit_doctor(outcomes: dict[str, str], code: int | None = None) -> int:
+    # Static messages exclude private values even when an exception contains them.
+    messages = {
+        "ok": "Check passed.",
+        "not_configured": "No model is configured.",
+        "unavailable": "Component is unavailable.",
+        "error": "Check failed; inspect configuration locally.",
+        "not_checked": "Check was not run.",
+    }
+    ok = all(value in {"ok", "not_configured"} for value in outcomes.values())
+    _emit({"schema_version": 1, "ok": ok, "checks": [
+        {"name": name, "outcome": outcome, "message": messages[outcome]}
+        for name, outcome in outcomes.items()
+    ]})
+    return int(not ok) if code is None else code
+
+
+def _command_doctor_json(args: argparse.Namespace) -> int:
+    from dataclasses import replace
+    from agentcore.config.schema import LoggingConfig
+
+    outcomes = dict.fromkeys(
+        ("configuration", "runtime", "computer_control", "model", "providers"),
+        "not_checked")
+    _quiet_logging()
+    try:
+        config = load_config(args.config)
+    except Exception:
+        outcomes["configuration"] = "error"
+        return _emit_doctor(outcomes, 2)
+    outcomes["configuration"] = "ok"
+    try:
+        # Agent configures logging itself; do not open a configured log file or
+        # print private provider/configuration fields during diagnostics.
+        agent = Agent(replace(config, logging=LoggingConfig(level="CRITICAL")))
+    except Exception:
+        outcomes["runtime"] = "error"
+        return _emit_doctor(outcomes)
+    outcomes["runtime"] = "ok"
+    try:
+        try:
+            health = _doctor_integrations(agent)
+            if type(health) is not list or len(health) != 1 or type(health[0]) is not dict or (
+                    health[0].get("name") != "computer_control"):
+                outcomes["computer_control"] = "error"
+            else:
+                outcomes["computer_control"] = {
+                    "connected": "ok", "unavailable": "unavailable",
+                    "disconnected": "unavailable", "error": "error",
+                }.get(health[0].get("status"), "error")
+        except Exception:
+            outcomes["computer_control"] = "error"
+        try:
+            model = agent.model_info()
+            if model is None:
+                outcomes["model"] = ("not_configured" if
+                    (config.model.provider or "").strip().lower() in {"", "none"} else "unavailable")
+            else:
+                outcomes["model"] = "ok" if type(model) is dict and (
+                    type(model.get("provider")) is str and bool(model["provider"]) and
+                    type(model.get("model")) is str and bool(model["model"])) else "error"
+        except Exception:
+            outcomes["model"] = "error"
+        try:
+            from agentcore.models.factory import available_providers
+
+            providers = available_providers()
+            outcomes["providers"] = "ok" if type(providers) is list and providers and all(
+                type(name) is str and bool(name) for name in providers) else "error"
+        except Exception:
+            outcomes["providers"] = "error"
+    finally:
+        try:
+            agent.shutdown()
+        except Exception:
+            outcomes["runtime"] = "error"
+    return _emit_doctor(outcomes)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    if args.command == "doctor" and args.as_json:
+        return _command_doctor_json(args)
     if args.command == "workspace":
         from agentcore.workspace_host.cli import command_workspace
 
@@ -2526,9 +2616,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             print(_render_run_result(payload))
     elif args.command == "doctor":
-        integrations = IntegrationRegistry()
-        integrations.add(ComputerControlAdapter())
-        integrations.connect_all(agent.registry)
+        health = _doctor_integrations(agent)
         from agentcore.models.factory import available_providers
 
         _emit({
@@ -2537,7 +2625,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "permission_level": str(agent.policy.level),
             "tools": agent.registry.names(),
             "features_enabled": list(config.features.enabled_flags()),
-            "integrations": integrations.health(),
+            "integrations": health,
             "model": agent.model_info(),
             "available_providers": available_providers(),
         })
