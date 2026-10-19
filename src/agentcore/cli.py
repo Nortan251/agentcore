@@ -2537,7 +2537,14 @@ def _command_doctor_json(args: argparse.Namespace) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.command == "doctor" and args.as_json:
-        return _command_doctor_json(args)
+        import logging
+
+        previous_disable = logging.root.manager.disable
+        logging.disable(sys.maxsize)  # Suppress critical and custom levels too.
+        try:
+            return _command_doctor_json(args)
+        finally:
+            logging.disable(previous_disable)
     if args.command == "workspace":
         from agentcore.workspace_host.cli import command_workspace
 

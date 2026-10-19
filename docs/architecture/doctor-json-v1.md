@@ -53,6 +53,7 @@ The command reuses the legacy Agent construction, adapter checks, model
 description and provider catalogue. It does not run objectives, tools or model
 generation, and adds no network probes, retries, permission changes or durable
 state actions. Existing configured runtime initialization, including memory
-initialization, retains the legacy doctor's behavior. Diagnostic mode replaces
-logging configuration with quiet console logging so private construction logs
-cannot contaminate the report and a configured log file is not opened.
+initialization, retains the legacy doctor's behavior. Logging is disabled for
+the full diagnostic lifecycle, including critical/custom-level records, and the
+previous disable threshold is restored afterward, even on failure. Diagnostic
+mode also replaces logging configuration so a configured log file is not opened.

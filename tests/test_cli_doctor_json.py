@@ -1,6 +1,7 @@
 """Bounded doctor reports reuse the existing checks without running actions."""
 
 import json
+import logging
 import socket
 
 import pytest
@@ -200,3 +201,43 @@ def test_json_diagnostics_do_not_execute_actions_or_add_io(monkeypatch, tmp_path
     assert cli.main(["doctor", "--json"]) == 1
     assert _outcomes(_read(capsys))["model"] == "ok"
     assert list(tmp_path.rglob("*")) == before
+
+
+@pytest.mark.parametrize("stage", ["configuration", "runtime", "health", "model", "shutdown"])
+@pytest.mark.parametrize("fail", [False, True])
+def test_private_critical_lifecycle_logs_are_disabled_and_threshold_restored(stage, fail, monkeypatch, capsys):
+    targets = {
+        "configuration": (cli, "load_config"), "runtime": (cli, "Agent"),
+        "health": (cli.ComputerControlAdapter, "health"),
+        "model": (cli.Agent, "model_info"), "shutdown": (cli.Agent, "shutdown"),
+    }
+    owner, name = targets[stage]
+    original = getattr(owner, name)
+    secret = "private-critical-token https://private-endpoint.invalid/private"
+    def emitting(*args, **kwargs):
+        logger = logging.getLogger("agentcore.doctor.lifecycle")
+        logger.critical(secret)
+        logger.log(logging.CRITICAL + 10, secret)
+        if fail:
+            raise RuntimeError(secret)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(owner, name, emitting)
+    previous_disable = logging.root.manager.disable
+    try:
+        logging.disable(logging.ERROR)
+        expected = 2 if stage == "configuration" and fail else 1
+        assert cli.main(["doctor", "--json"]) == expected
+        assert logging.root.manager.disable == logging.ERROR
+        _read(capsys)
+    finally:
+        logging.disable(previous_disable)
+
+
+def test_diagnostic_interruption_restores_logging(monkeypatch):
+    def interrupted(path):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(cli, "load_config", interrupted)
+    previous_disable = logging.root.manager.disable
+    with pytest.raises(KeyboardInterrupt):
+        cli.main(["doctor", "--json"])
+    assert logging.root.manager.disable == previous_disable
