@@ -171,7 +171,8 @@ def _no_extra_data(handle):
 def _update_security(handle):
     # Full descriptor, including the complete SACL, under already-granted OS
     # access. Partial owner/DACL queries are never treated as full snapshots.
-    sd = win32security.GetSecurityInfo(handle, win32security.SE_FILE_OBJECT, 0x10000)
+    # GetSecurityInfo's backup query can deny an NT-relative file handle.
+    sd = win32security.GetKernelObjectSecurity(handle, 0x10000)
     raw = bytes(sd)
     if len(raw) > 16384 or sd.GetSecurityDescriptorDacl() is None:
         raise ValueError("unsupported_file_metadata")

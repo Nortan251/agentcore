@@ -132,27 +132,34 @@ def test_windows_native_revision_snapshot(make, native_security):
         # Keep CI diagnostics categorical: no paths, descriptors, SIDs or content.
         frames = traceback.extract_tb(exc.__traceback__)
         location = ",".join(f"{frame.name}:{frame.lineno}" for frame in frames)
-        import win32security
-        queries = {}
-        relative = replacement.relative_path(h.guard, "sub/old.txt")
-        with replacement.parent(h.guard, relative) as (parent, _):
-            with replacement.target(h.guard, parent, relative) as opened:
-                for name, query, flags in (
-                    ("owner_group_dacl", lambda h, f: win32security.GetSecurityInfo(h, 1, f), 7),
-                    ("sacl", lambda h, f: win32security.GetSecurityInfo(h, 1, f), 8),
-                    ("backup", lambda h, f: win32security.GetSecurityInfo(h, 1, f), 0x10000),
-                    ("kernel_backup", win32security.GetKernelObjectSecurity, 0x10000),
-                ):
-                    try:
-                        query(opened, flags)
-                        queries[name] = "available"
-                    except Exception as error:
-                        queries[name] = f"{type(error).__name__}:{getattr(error, 'winerror', None)}"
         pytest.fail(f"native snapshot: {type(exc).__name__}, "
-                    f"winerror={getattr(exc, 'winerror', None)}, calls={location}, queries={queries}", pytrace=False)
+                    f"winerror={getattr(exc, 'winerror', None)}, calls={location}", pytrace=False)
     assert text == "héllo\n" and snapshot["size"] == len(text.encode())
     assert snapshot["metadata"]["security"]
     assert not h.revisions._snapshots and not h.actions.list_actions()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows security privilege")
+def test_windows_update_read_without_security_privilege_refused(make, native_security):
+    import win32api, win32con, win32security
+    h = make()
+    token = win32security.OpenProcessToken(win32api.GetCurrentProcess(),
+        win32con.TOKEN_QUERY | win32con.TOKEN_ADJUST_PRIVILEGES)
+    luid = win32security.LookupPrivilegeValue(None, "SeSecurityPrivilege")
+    try:
+        if native_security:
+            previous = dict(win32security.GetTokenInformation(token, win32security.TokenPrivileges))[luid]
+            win32security.AdjustTokenPrivileges(token, False, [(luid, 0)])
+        try:
+            result = h.read()
+            assert not result.ok and result.result.metadata["kind"] == "update_read_refused"
+            assert not h.revisions._snapshots and not h.actions.list_actions() and not h.residue()
+            assert h.target.read_bytes() == "héllo\n".encode()
+        finally:
+            if native_security:
+                win32security.AdjustTokenPrivileges(token, False, [(luid, previous)])
+    finally:
+        token.Close()
 
 
 def test_content_cannot_spoof_metadata(make):
