@@ -222,11 +222,13 @@ def private_stage_descriptor(metadata, *, initial=False):
 
 def _set_update_security(handle, sd):
     control = sd.GetSecurityDescriptorControl()[0]
-    flags = 1 | 2 | 4 | 8
+    flags = 1 | 2 | 4
     flags |= (win32security.PROTECTED_DACL_SECURITY_INFORMATION if control & 0x1000
               else win32security.UNPROTECTED_DACL_SECURITY_INFORMATION)
-    flags |= (win32security.PROTECTED_SACL_SECURITY_INFORMATION if control & 0x2000
-              else win32security.UNPROTECTED_SACL_SECURITY_INFORMATION)
+    # Setting SACL information for an absent SACL creates a present NULL SACL.
+    if control & 0x10:
+        flags |= 8 | (win32security.PROTECTED_SACL_SECURITY_INFORMATION if control & 0x2000
+                      else win32security.UNPROTECTED_SACL_SECURITY_INFORMATION)
     win32security.SetKernelObjectSecurity(handle, flags, sd)
 
 
