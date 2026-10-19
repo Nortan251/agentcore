@@ -94,3 +94,16 @@ Restore Actions account availability and obtain the required exact-head gates. T
 ## Final verdict
 
 **OPEN / UNMERGED — AWAITING FUTURE PROJECT-LEAD APPROVAL.** No merge before November 2026, and explicit project-lead approval is mandatory afterward. No auto-merge, force-push, history rewrite or frozen-PR changes. The ledger branch remains independent documentation-only history and must never merge into main.
+
+
+## 2026-10-19 amendment — public-repository CI recovered; PR #45 merged
+
+This dated amendment supersedes the earlier OPEN / UNMERGED, billing-blocked and November-freeze statements **for PR #45 only**. Historical observations above are intentionally preserved. The owner explicitly authorized running all required jobs and merging eligible work on 2026-10-19, superseding the earlier discretionary November hold for this verified PR.
+
+- The repository visibility changed from private to public. This did not automatically rerun any existing Actions failures; the failed jobs were manually restarted using GitHub's rerun-failed-jobs action.
+- On exact PR head `522bbb56c6c51fe3f51de7490e00b3ec0ec3e0f0`, all **six required jobs completed SUCCESS**, attempt 2, with test steps executed: [Linux full](https://github.com/Nortan251/agentcore/actions/runs/39183033764/attempts/2); [Windows Python 3.11, 3.12 and 3.13](https://github.com/Nortan251/agentcore/actions/runs/39183033757/attempts/2); [Chromium Ubuntu and Windows](https://github.com/Nortan251/agentcore/actions/runs/39183033743/attempts/2).
+- Fresh independent exact-head Codex code review was already completed with no findings, and the original private-CRITICAL-log P1 was resolved after regression and repair. There were no unresolved PR #45 review threads. GitHub reported the PR mergeable and clean against then-current `main` `547a2f00bcfa709d907c329fbea78730dd6731f6`.
+- **PR #45 merged on 2026-10-19** with merge method `merge`; resulting main/merge SHA `cada2362beb43019f64dcb6395f98b136e0cd46c`, independently read back from GitHub. [Merged PR](https://github.com/Nortan251/agentcore/pull/45).
+- **PR #43 and PR #44 remain OPEN / UNMERGED.** The new Actions results revealed distinct test failures in their respective PRs and existing foundation security findings remain unresolved. Their histories, heads, and production code were not changed by this ledger amendment. No permission was inferred to merge unsafe dependent PRs.
+
+**Updated final verdict for PR #45 only: MERGED / SIX EXACT-HEAD CI GATES PASSED / CLEAN EXACT-HEAD REVIEW.** This amendment does not waive any requirement for other PRs, and the independent ledger branch remains docs-only and never merges into main.
