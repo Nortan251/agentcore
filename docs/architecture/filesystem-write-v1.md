@@ -16,6 +16,16 @@ The [historical production P1](https://github.com/Nortan251/agentcore/pull/44#di
 requires independent review of this refusal contract; passing CI alone does not
 resolve it. Directory creation retains its separate implementation and contract.
 
+Support is platform-specific: Windows keeps the complete existing `write_file`
+implementation; Linux and macOS refuse only file publication. The tool remains
+registered for exact recovery bindings and its catalogue description declares
+this restriction. A live unsupported invocation returns the bounded
+`filesystem_publication_unsupported` error and persists
+`filesystem.unsupported_publication` with NOT_INVOKED / CONFIRMED_NOT_APPLIED.
+An error after possible physical entry still records uncertainty, regardless of
+its category. Reads, Directory Create and default read-only composition retain
+their existing contracts; this repair does not certify their separate limits.
+
 The authority path is `ToolRegistry -> argument validation -> PermissionPolicy
 -> ToolExecutor -> durable protected intent / ActionJournal attempt claim ->
 Tool.run -> WorkspaceGuard-owned mutation -> normalized effect truth`.

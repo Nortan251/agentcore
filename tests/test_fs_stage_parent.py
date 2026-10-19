@@ -74,6 +74,34 @@ def test_windows_publication_keeps_verified_owned_handle(make, monkeypatch):
     assert (h.root / "sub/new.txt").read_bytes() == "héllo\n".encode()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows handle publication")
+def test_windows_publication_blocks_ancestor_relocation_until_handles_close(tmp_path, monkeypatch):
+    from agentcore.fs import _windows_mutation as win
+    from agentcore.fs.guard import WorkspaceGuard
+    root = tmp_path / "host/workspace"
+    (root / "sub").mkdir(parents=True)
+    guard = WorkspaceGuard(root)
+    intent = guard.prepare_create("sub/new.txt")
+    original = win.publish
+    ancestors = (root / "sub", root, root.parent)
+    calls = []
+    def publish(owned, parent, name):
+        for path in ancestors:
+            with pytest.raises(PermissionError):
+                path.rename(path.with_name(path.name + "-moved"))
+        result = original(owned, parent, name)
+        calls.append(1)
+        return result
+    monkeypatch.setattr(win, "publish", publish)
+    assert guard.create_file(intent, b"verified", lambda: None) == "applied"
+    assert calls == [1] and (root / "sub/new.txt").read_bytes() == b"verified"
+    # Prove denial came from live publication handles, not fixture permissions.
+    for path in ancestors:
+        moved = path.with_name(path.name + "-moved")
+        path.rename(moved)
+        moved.rename(path)
+
+
 def test_worker_loads_runtime_before_dropping_access():
     worker = Path(__file__).with_name("fs_stage_principal_worker.py")
     script = """

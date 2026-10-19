@@ -33,6 +33,7 @@ class WriteFileTool(Tool):
     def __init__(self, guard):
         self._guard = guard
         self._spec = tool_spec("write_file", "Create one new bounded UTF-8 file in the workspace. "
+            "Requires native Windows handle publication; unavailable on Linux and macOS. "
             "Existing destinations are always refused; parents must already exist. No overwrite or append.",
             parameters=(ToolParameter("path", ParamType.STRING, "Workspace-relative target.", max_length=4096),
                         ToolParameter("content", ParamType.STRING, "Exact UTF-8 text to create.",

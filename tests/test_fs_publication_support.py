@@ -14,6 +14,14 @@ from agentcore.fs.paths import PathRejectedError, RejectionReason
 from test_fs_write import make  # noqa: F401
 
 
+def test_catalogue_declares_platform_support_without_removing_tool(make):
+    h = make()
+    description = h.registry.describe()[0]["description"]
+    assert "native Windows" in description
+    assert "Linux and macOS" in description
+    assert h.registry.get("write_file") is h.foundation.tool
+
+
 @pytest.mark.parametrize("platform", ["linux", "darwin", "freebsd14", "unknown"])
 def test_unsupported_publication_refuses_before_traversal_or_callback(make, monkeypatch, platform):
     h = make()
@@ -28,6 +36,27 @@ def test_unsupported_publication_refuses_before_traversal_or_callback(make, monk
     assert not (h.root / "sub/new.txt").exists() and not h.residue()
 
 
+@pytest.mark.parametrize("entered", [False, True])
+def test_support_error_cannot_erase_possible_physical_entry(make, monkeypatch, entered):
+    h = make()
+    def refused(intent, data, validate):
+        if entered:
+            validate()
+        raise PathRejectedError(RejectionReason.UNSUPPORTED_PUBLICATION, "private diagnostic")
+    monkeypatch.setattr(h.guard, "create_file", refused)
+    result = h.invoke()
+    record = h.actions.load(result.action_id)
+    assert not result.ok and "private diagnostic" not in str(result.result.to_dict())
+    if entered:
+        assert record.terminal_outcome is None
+        assert record.attempts[-1].effect_verdict is EffectVerdict.OUTCOME_UNKNOWN
+        assert result.result.metadata["kind"] != "filesystem_publication_unsupported"
+    else:
+        assert record.attempts[-1].status is ActionAttemptStatus.NOT_INVOKED
+        assert record.terminal_outcome.result_class == "filesystem.unsupported_publication"
+    assert not (h.root / "sub/new.txt").exists() and not h.residue()
+
+
 @pytest.mark.parametrize("mode", [0o700, 0o755, 0o777, 0o1777])
 def test_unsupported_attempt_is_durable_not_invoked_and_cannot_resume(make, monkeypatch, mode):
     h = make()
@@ -37,10 +66,13 @@ def test_unsupported_attempt_is_durable_not_invoked_and_cannot_resume(make, monk
         patch.setattr(sys, "platform", "linux")
         result = h.invoke()
         assert not result.ok
+        assert result.result.metadata["kind"] == "filesystem_publication_unsupported"
+        assert "native Windows" in result.result.error
         record = h.actions.load(result.action_id)
         assert record.intent_ref and len(record.attempts) == 1
         assert record.attempts[0].status is ActionAttemptStatus.NOT_INVOKED
         assert record.terminal_outcome.verdict is EffectVerdict.CONFIRMED_NOT_APPLIED
+        assert record.terminal_outcome.result_class == "filesystem.unsupported_publication"
         assert not h.invoke(action_context=ActionInvocationContext(action_id=result.action_id)).ok
     assert len(h.actions.load(result.action_id).attempts) == 1
     assert not (h.root / "sub/new.txt").exists() and not h.residue()
