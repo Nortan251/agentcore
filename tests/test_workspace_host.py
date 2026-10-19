@@ -624,7 +624,9 @@ def test_host_both_capability_lease_spans_canonical_validation(setup, monkeypatc
         worker = threading.Thread(target=revoke)
         worker.start()
         try:
-            assert h.conversation().send("create").ok is (os.name == "nt")
+            turn = h.conversation().send("create")
+            assert turn.ok
+            assert turn.tool_rounds[0].outcomes[0].invocation.ok is (os.name == "nt")
         finally:
             worker.join(30)
         assert not worker.is_alive() and results == ["busy"]
