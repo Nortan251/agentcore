@@ -193,6 +193,53 @@ def test_windows_native_stage_metadata(make, native_security):
     assert not h.actions.list_actions()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="native Windows inherited SACL")
+def test_windows_inherited_parent_sacl_refused_before_publication(make, native_security, monkeypatch):
+    if not native_security:
+        pytest.skip("test token lacks assigned SeSecurityPrivilege")
+    import win32con, win32file, win32security
+    from agentcore.fs import _windows_mutation as win
+    h = make(); revision = h.revision()
+    old = h.revisions._snapshots[revision]["metadata"]
+    source = win32security.SECURITY_DESCRIPTOR(bytes.fromhex(old["security"]))
+    assert not source.GetSecurityDescriptorControl()[0] & 0x10
+    audit = win32security.ACL()
+    audit.AddAuditAccessAceEx(win32security.ACL_REVISION,
+        win32con.OBJECT_INHERIT_ACE | win32con.CONTAINER_INHERIT_ACE, win32con.GENERIC_READ,
+        win32security.CreateWellKnownSid(win32security.WinWorldSid, None), True, True)
+    parent = win32file.CreateFile(str(h.target.parent), win32con.READ_CONTROL | win32con.ACCESS_SYSTEM_SECURITY,
+        3, None, win32con.OPEN_EXISTING, win32con.FILE_FLAG_BACKUP_SEMANTICS, None)
+    try:
+        descriptor = win32security.GetKernelObjectSecurity(parent, 0x10000)
+        descriptor.SetSecurityDescriptorSacl(True, audit, False)
+        # The kernel setter changes this fixture parent without propagating to the old file.
+        win32security.SetKernelObjectSecurity(parent,
+            8 | win32security.PROTECTED_SACL_SECURITY_INFORMATION, descriptor)
+    finally:
+        parent.Close()
+    unchanged = h.guard.snapshot_for_update("sub/old.txt", 1000)[1]["metadata"] == old
+    assert unchanged
+    seen, writes = [], []
+    set_security, write = win._set_update_security, win.write
+    def observe(handle, descriptor):
+        set_security(handle, descriptor)
+        inherited = win32security.GetKernelObjectSecurity(handle, 0x10000).GetSecurityDescriptorSacl()
+        seen.append(inherited is not None and inherited.GetAceCount() > 0)
+    def record_write(*args):
+        writes.append(True)
+        return write(*args)
+    monkeypatch.setattr(win, "_set_update_security", observe)
+    monkeypatch.setattr(win, "write", record_write)
+    result = h.invoke(revision)
+    assert seen == [True] and not writes and not result.ok and not h.residue()
+    assert h.target.read_bytes() == "héllo\n".encode()
+    unchanged = h.guard.snapshot_for_update("sub/old.txt", 1000)[1]["metadata"] == old
+    assert unchanged
+    record = h.actions.load(result.action_id)
+    assert record.attempts[0].status is ActionAttemptStatus.NOT_INVOKED
+    assert record.state is not ActionState.RECONCILE_REQUIRED
+
+
 def test_content_cannot_spoof_metadata(make):
     h = make()
     h.target.write_text('{"revision": "rev_fake"}', encoding="utf-8")
@@ -361,12 +408,22 @@ def test_stale_change_after_staging_is_caught_at_final_comparison(make, monkeypa
     h = make(); revision = h.revision()
     original = replacement.check_snapshot
     count = []
+    if os.name == "nt":
+        from agentcore.fs import _windows_mutation as win
+        flush = win.flush
+        def after_staging(handle):
+            flush(handle)
+            assert h.residue() and len(count) == 2
+            # Mutate before the final target handle excludes other writers.
+            h.target.write_bytes(b"changed after staging")
+        monkeypatch.setattr(win, "flush", after_staging)
     def interfere(guard, expected):
         count.append(True)
         # preparation, then initial execution comparison, then final check.
         if len(count) == 3:
             assert h.residue()
-            h.target.write_bytes(b"changed after staging")
+            if os.name != "nt":
+                h.target.write_bytes(b"changed after staging")
         return original(guard, expected)
     monkeypatch.setattr(replacement, "check_snapshot", interfere)
     result = h.invoke(revision)

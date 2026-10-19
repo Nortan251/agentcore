@@ -242,7 +242,11 @@ def create_update_stage(parent, name, metadata):
         _set_update_security(opened, private_stage_descriptor(metadata))
         observed = win32security.SECURITY_DESCRIPTOR(bytes.fromhex(_update_security(opened)))
         dacl = observed.GetSecurityDescriptorDacl()
-        if dacl is None or dacl.GetAceCount() or not observed.GetSecurityDescriptorControl()[0] & 0x1000:
+        control, expected_control = observed.GetSecurityDescriptorControl()[0], sd.GetSecurityDescriptorControl()[0]
+        if dacl is None or dacl.GetAceCount() or not control & 0x1000:
+            raise ValueError("unsupported_file_metadata")
+        # The absent-SACL restore path cannot repair presence/defaulting/inheritance/protection changes.
+        if not expected_control & 0x10 and (control ^ expected_control) & 0x2A30:
             raise ValueError("unsupported_file_metadata")
     except BaseException:
         try:
