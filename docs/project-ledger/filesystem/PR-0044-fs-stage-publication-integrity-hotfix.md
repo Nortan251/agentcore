@@ -151,3 +151,61 @@ SOURCE REVIEW / INFERENCE: mount-local ownership/mode plus filesystem magic cann
 NEXT REQUIRED ACTION: restore Actions account availability; obtain authorized native Linux execution for the existing/new two-UID private-runtime tests and the hostile-alias/ancestor requirements. Review a bounded object-bound staging/publication design with fail-closed unsupported semantics, without a pathname fallback or privileged production requirement. Complete independent review and all six gates on the eventual final head. Keep PR #43 separate until the foundation is independently approved and merged by the project lead.
 
 CURRENT VERDICT: **ORDINARY FOLLOW-UP COMPLETE / OPEN / UNMERGED / SECURITY REPAIR INCOMPLETE / NOT MERGEABLE.** Two review threads, production security, native proof, exact-head CI and fresh review remain blockers. This ledger amendment changes documentation only and must never be merged into main.
+
+## 2026-10-19 amendment — native foreign-directory fixture repaired and validated
+
+Earlier snapshots are preserved. Their missing/billing-blocked native evidence is superseded by the executed CI below; their production publication-integrity warning remains in force. This is a bounded test-harness repair, not a production security repair or merge authorization.
+
+BASE / DIVERGENCE SHA: `547a2f00bcfa709d907c329fbea78730dd6731f6`
+LIVE MAIN SHA: `cada2362beb43019f64dcb6395f98b136e0cd46c` (PR #45 merged)
+HEAD SHA: `144d878586837409f6141c5fdc3212220e76448f`
+PARENT SHA: `1fa53ee9a79f3828372ab142afc43e82e650f5e0`
+FIXTURE REPAIR SHA: `1fa53ee9a79f3828372ab142afc43e82e650f5e0`, parent `9f57a8edc52bbd810f9e07e63438d2eee3acda26`
+BRANCH: `codex/fs-stage-publication-integrity-hotfix`
+STATUS: OPEN / UNMERGED / BOUNDED HARNESS REPAIR COMPLETE / PRODUCTION P1 UNRESOLVED
+
+DIRECTLY VERIFIED FAILURE BEFORE REPAIR: the public Actions rerun [39174693957, attempt 2 / job 118130111973](https://github.com/Nortan251/agentcore/actions/runs/39174693957/job/118130111973), described in [comment 6270320916](https://github.com/Nortan251/agentcore/pull/44#issuecomment-6270320916), executed Linux tests and failed both `foreign-checkout` and `foreign-private-runtime`. At worker line 109, the already-dropped agent attempted to rename an attacker-owned 0755 directory into the workspace and received `PermissionError`. The attacker rendezvous then closed. These were fixture-preparation failures, not successful security assertions or production-exploit evidence. The other five rerun jobs succeeded; the old Linux failure is preserved as historical evidence.
+
+COMPLETED REPAIR: privileged preparation now creates agent-owned `host/workspace` ancestors and puts the attacker-owned 0755 `foreign` directory directly at its final workspace path before forking/dropping credentials. The post-drop rename is removed, and a post-drop assertion confirms the foreign owner remains the distinct attacker UID. No Harness, guard, journal, executor or tool execution is moved before `drop(uid)`. Real/effective UID/GID checks, supplementary-group clearing, zero effective capabilities, private-runtime access denial, socket publication seam, byte/entry assertions and ActionJournal effect-truth assertions all remain. Setup exceptions still cause nonzero worker/test exit; no failure is converted into a skip or success.
+
+Exactly two files differ from the supplied starting head: `tests/fs_stage_principal_worker.py` and `.github/workflows/filesystem-linux.yml`. The existing Linux job now runs focused native regressions, the surrounding filesystem/Workspace/permissions/Task 43.2 suites, the unchanged full-suite gate, compileall and a committed-diff whitespace check. Full-suite summary counts are made visible by overriding duplicate quiet options. CI permissions/triggers and production source are unchanged. The workflow governance changes were explicitly included in both fresh review requests. No new dependency, PR, history rewrite, PR #43 modification, publication primitive, mutation authority or assertion weakening was introduced.
+
+REVIEW FOLLOW-UP: [review 5573716207](https://github.com/Nortan251/agentcore/pull/44#pullrequestreview-5573716207) on intermediate head `1fa53ee9a79f3828372ab142afc43e82e650f5e0` found [P2: compare committed revisions in the whitespace check](https://github.com/Nortan251/agentcore/pull/44#discussion_r4315526400). A clean Actions checkout makes revision-less `git diff --check` ineffective. Final commit `144d878586837409f6141c5fdc3212220e76448f` fetches depth 2 and uses `git diff --check HEAD^ HEAD`: PR synthetic merge versus its main first parent, or pushed main tip versus its first parent. An isolated deterministic Git fixture proved that committed trailing whitespace passes the old command but fails the new command for both linear and PR-merge shapes. The new P2 thread was resolved only after the repairing commit, successful final-head Linux step and fresh exact-head review existed. Both original P1 threads remain unresolved.
+
+DIRECTLY OBSERVED TEST RESULTS:
+
+| Environment / run | Passed | Failed | Skipped | Warnings / duration |
+|---|---:|---:|---:|---|
+| Final-head native Linux stage-parent focused | 30 | 0 | 1 | 5.22s; only native-Windows publication skipped |
+| Final-head native Linux surrounding suite | 1024 | 0 | 67 | 1 warning; 30.94s |
+| Final-head native Linux full repository | 6603 | 0 | 160 | 98 warnings; 177.87s |
+| Local Windows 11 / Python 3.13.15 focused | 80 | 0 | 33 | 8.52s |
+| Local Windows surrounding suite | 959 | 0 | 132 | 60.40s |
+| Local Windows full repository | 6429 | 0 | 293 | 89 warnings; 482.65s |
+
+Native focused command: `python -m pytest -o addopts= tests/test_fs_stage_parent.py -v -rs`. Surrounding command: `python -m pytest -o addopts= -q -ra tests/test_fs_*.py tests/test_workspace*.py tests/test_permissions*.py tests/test_task_43_2*.py`. Full: `python -m pytest -o addopts= -q -ra`. Compileall and `git diff --check HEAD^ HEAD` passed in the final Linux job. Local compileall and committed bounded-repair/full-PR diff checks also passed; local/remote implementation trees are clean.
+
+All **eight real distinct-ordinary-UID cases PASSED with zero native setup skips**, covering shared, safe, masked ACL and foreign ownership in both checkout and unreadable-private-runtime variants. Both previously failing foreign cases reached their post-drop tool/result assertions. Native full-suite skips consist of 74 Windows-specific cases and 86 explicit Chromium-gate cases; their separate jobs are recorded below. No Windows pass or mocked credential transition is presented as native proof.
+
+Local tests used this checkout's explicit source path and separate workspace temporary roots. An initial local invocation specified a nonexistent basetemp parent and produced 79 setup errors, 1 pass and 33 skips; correcting the invocation yielded the focused result above without changing tests. The local full run started on `1fa53ee9a79f3828372ab142afc43e82e650f5e0`; final-head `src/` and `tests/` are byte-identical, verified by Git. Local Windows does not include PR #45 integration; final-head Actions does.
+
+FINAL-HEAD CI: GitHub records these pull-request runs against `144d878586837409f6141c5fdc3212220e76448f`. The Linux checkout log and fetched Git parents independently establish synthetic merge `ea82253f66cadefac387c896e30e27406a5fdaab`, parents current main `cada2362beb43019f64dcb6395f98b136e0cd46c` and final PR head. This is post-PR-#45 integration evidence, despite the PR API's older base snapshot field. Intermediate-head run 39275884993 also passed native focused/surrounding/full, but is historical, not substituted for final-head CI.
+
+| Gate | Final result | Run / job |
+|---|---|---|
+| Linux full / focused / surrounding / compile / committed whitespace | SUCCESS | [39276803695 / 118143105962](https://github.com/Nortan251/agentcore/actions/runs/39276803695/job/118143105962) |
+| Windows Python 3.11 | SUCCESS | [39276803707 / 118143106469](https://github.com/Nortan251/agentcore/actions/runs/39276803707/job/118143106469) |
+| Windows Python 3.12 | SUCCESS | [39276803707 / 118143106124](https://github.com/Nortan251/agentcore/actions/runs/39276803707/job/118143106124) |
+| Windows Python 3.13 | SUCCESS | [39276803707 / 118143106410](https://github.com/Nortan251/agentcore/actions/runs/39276803707/job/118143106410) |
+| Chromium Linux | SUCCESS | [39276803794 / 118143105836](https://github.com/Nortan251/agentcore/actions/runs/39276803794/job/118143105836) |
+| Chromium Windows | SUCCESS | [39276803794 / 118143106566](https://github.com/Nortan251/agentcore/actions/runs/39276803794/job/118143106566) |
+
+All six final-head gates completed successfully. No billing-blocked, pending, stale-head or skipped native setup result is counted as success. Windows job-detail requests intermittently returned HTTP 502; final successful conclusions were independently verified through the PR checks and workflow/job endpoints. No unobserved Windows full-suite pass/skip count is invented here.
+
+FRESH EXACT-HEAD REVIEW: requested in [comment 6270710921](https://github.com/Nortan251/agentcore/pull/44#issuecomment-6270710921); [receipt 6270751629](https://github.com/Nortan251/agentcore/pull/44#issuecomment-6270751629) reports no major issues on `144d878586`. The review summary independently records the full final SHA and completed status. This does not close or override existing production findings.
+
+REMAINING BLOCKERS / LIMITS: the [idmapped-alias production P1](https://github.com/Nortan251/agentcore/pull/44#discussion_r4187472896) remains unfixed: production still checks a staging inode then publishes a mutable pathname. Different-ordinary-principal writable-ancestor relocation also remains an outstanding boundary requirement. Neither hostile-mount nor ancestor-relocation proof was performed in this task. The [original worker-import P1 thread](https://github.com/Nortan251/agentcore/pull/44#discussion_r4187472904) is deliberately preserved unresolved; all four private-runtime cases now have successful native evidence. A fresh review finding no new major issues and passing CI do not establish repaired publication integrity or merge readiness.
+
+NEXT REQUIRED ACTION: obtain separate explicit authorization for the production publication-integrity repair and its hostile-alias/ancestor regressions. Keep PR #44 OPEN / UNMERGED and PR #43 untouched in this task. No merge or security-access circumvention was performed. This independent documentation-only ledger branch must never be merged into main.
+
+CURRENT VERDICT: **BOUNDED NATIVE HARNESS REPAIR COMPLETE / OPEN / UNMERGED / PRODUCTION SECURITY REPAIR STILL INCOMPLETE / NOT MERGEABLE.**
