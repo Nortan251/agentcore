@@ -162,6 +162,37 @@ def test_windows_update_read_without_security_privilege_refused(make, native_sec
         token.Close()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="native Windows staging metadata")
+def test_windows_native_stage_metadata(make, native_security):
+    if not native_security:
+        pytest.skip("test token lacks assigned SeSecurityPrivilege")
+    import traceback
+    from agentcore.fs import _windows_mutation as win
+    h = make()
+    metadata = h.revisions._snapshots[h.revision()]["metadata"]
+    relative = replacement.relative_path(h.guard, "sub/old.txt")
+    try:
+        with replacement.parent(h.guard, relative) as (parent, _):
+            stage = win.create_update_stage(parent, ".agentcore-stage-native-test", metadata)
+            try:
+                win.write(stage, b"complete synthetic content")
+                win.flush(stage)
+                win.preserve_update_metadata(stage, metadata)
+                assert win.update_facts(stage)["metadata"] == metadata
+            finally:
+                try:
+                    win.discard(stage)
+                finally:
+                    win.close(stage)
+    except Exception as exc:
+        frames = traceback.extract_tb(exc.__traceback__)
+        location = ",".join(f"{frame.name}:{frame.lineno}" for frame in frames)
+        pytest.fail(f"native stage: {type(exc).__name__}, "
+                    f"winerror={getattr(exc, 'winerror', None)}, calls={location}", pytrace=False)
+    assert not h.residue() and h.target.read_bytes() == "héllo\n".encode()
+    assert not h.actions.list_actions()
+
+
 def test_content_cannot_spoof_metadata(make):
     h = make()
     h.target.write_text('{"revision": "rev_fake"}', encoding="utf-8")

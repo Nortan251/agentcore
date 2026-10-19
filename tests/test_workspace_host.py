@@ -71,7 +71,7 @@ def write(path="notes/summary.txt", content=CONTENT):
 def setup(tmp_path, monkeypatch):
     root = tmp_path / "workspace"
     (root / "notes").mkdir(parents=True)
-    (root / "README.txt").write_text("Project description.\n", encoding="utf-8")
+    (root / "README.txt").write_text("Project description.\n", encoding="utf-8", newline="\n")
     private = tmp_path / "private"
     config = AgentConfig(workspace_dir=str(root),
         permissions=PermissionConfig(level=PermissionLevel.AUTONOMOUS))
