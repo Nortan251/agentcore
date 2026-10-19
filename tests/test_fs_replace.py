@@ -579,7 +579,21 @@ def test_windows_partial_stage_cannot_be_opened_for_read_by_another_handle(make,
     from agentcore.fs import _windows_mutation as win
     h = make(); revision = h.revision()
     write = win.write
-    observed = []
+    open_child = win.open_child
+    observed, sharing = [], []
+    def initial(*args, **kwargs):
+        opened = open_child(*args, **kwargs)
+        if kwargs.get("create") and kwargs.get("_update"):
+            # Check zero sharing before the empty stage's DACL is locked.
+            try:
+                reader = win32file.CreateFile(str(h.residue()[0]), win32con.GENERIC_READ, 7,
+                    None, win32con.OPEN_EXISTING, 0, None)
+            except pywintypes.error as error:
+                sharing.append(error.winerror)
+            else:
+                reader.Close()
+                sharing.append(None)
+        return opened
     def partial(handle, data):
         write(handle, data[:3])
         stage = h.residue()[0]
@@ -587,12 +601,13 @@ def test_windows_partial_stage_cannot_be_opened_for_read_by_another_handle(make,
             opened = win32file.CreateFile(str(stage), win32con.GENERIC_READ, 7,
                 None, win32con.OPEN_EXISTING, 0, None)
             opened.Close()
-        assert error.value.winerror == 32
+        assert error.value.winerror == 5
         observed.append(True)
         raise OSError("partial private stage interrupted")
+    monkeypatch.setattr(win, "open_child", initial)
     monkeypatch.setattr(win, "write", partial)
     result = h.invoke(revision)
-    assert observed and not result.ok and not h.residue()
+    assert sharing == [32] and observed and not result.ok and not h.residue()
     assert h.target.read_bytes() == "héllo\n".encode()
     assert h.actions.load(result.action_id).attempts[0].status is ActionAttemptStatus.NOT_INVOKED
 
