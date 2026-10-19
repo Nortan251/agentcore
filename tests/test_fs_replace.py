@@ -120,6 +120,25 @@ def test_complete_utf8_snapshot_and_structured_host_revision(make):
     assert not {"read_file_for_update", "replace_file", "write_file", "create_directory"} & {t.name for t in default_tools()}
 
 
+@pytest.mark.skipif(os.name != "nt", reason="native Windows revision snapshot")
+def test_windows_native_revision_snapshot(make, native_security):
+    if not native_security:
+        pytest.skip("test token lacks assigned SeSecurityPrivilege")
+    import traceback
+    h = make()
+    try:
+        text, snapshot = h.guard.snapshot_for_update("sub/old.txt", 1000)
+    except Exception as exc:
+        # Keep CI diagnostics categorical: no paths, descriptors, SIDs or content.
+        frames = traceback.extract_tb(exc.__traceback__)
+        location = ",".join(f"{frame.name}:{frame.lineno}" for frame in frames)
+        pytest.fail(f"native snapshot: {type(exc).__name__}, "
+                    f"winerror={getattr(exc, 'winerror', None)}, calls={location}", pytrace=False)
+    assert text == "héllo\n" and snapshot["size"] == len(text.encode())
+    assert snapshot["metadata"]["security"]
+    assert not h.revisions._snapshots and not h.actions.list_actions()
+
+
 def test_content_cannot_spoof_metadata(make):
     h = make()
     h.target.write_text('{"revision": "rev_fake"}', encoding="utf-8")
