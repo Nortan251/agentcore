@@ -167,17 +167,37 @@ def test_windows_native_stage_metadata(make, native_security):
     if not native_security:
         pytest.skip("test token lacks assigned SeSecurityPrivilege")
     import traceback
+    import win32security
     from agentcore.fs import _windows_mutation as win
     h = make()
     metadata = h.revisions._snapshots[h.revision()]["metadata"]
     relative = replacement.relative_path(h.guard, "sub/old.txt")
+    differences = {}
     try:
         with replacement.parent(h.guard, relative) as (parent, _):
             stage = win.create_update_stage(parent, ".agentcore-stage-native-test", metadata)
             try:
                 win.write(stage, b"complete synthetic content")
                 win.flush(stage)
-                win.preserve_update_metadata(stage, metadata)
+                try:
+                    win.preserve_update_metadata(stage, metadata)
+                except Exception:
+                    observed = win.update_facts(stage)["metadata"]
+                    expected_sd = win32security.SECURITY_DESCRIPTOR(bytes.fromhex(metadata["security"]))
+                    observed_sd = win32security.SECURITY_DESCRIPTOR(bytes.fromhex(observed["security"]))
+                    differences = {"attributes_equal": observed["attributes"] == metadata["attributes"],
+                        "expected_control": expected_sd.GetSecurityDescriptorControl()[0],
+                        "observed_control": observed_sd.GetSecurityDescriptorControl()[0]}
+                    for component in ("Owner", "Group", "Dacl", "Sacl"):
+                        left = getattr(expected_sd, "GetSecurityDescriptor" + component)()
+                        right = getattr(observed_sd, "GetSecurityDescriptor" + component)()
+                        if component in {"Dacl", "Sacl"} and left is not None and right is not None:
+                            equal = left.GetAceCount() == right.GetAceCount() and all(
+                                left.GetAce(i) == right.GetAce(i) for i in range(left.GetAceCount()))
+                        else:
+                            equal = left == right
+                        differences[component + "_equal"] = equal
+                    raise
                 assert win.update_facts(stage)["metadata"] == metadata
             finally:
                 try:
@@ -188,7 +208,8 @@ def test_windows_native_stage_metadata(make, native_security):
         frames = traceback.extract_tb(exc.__traceback__)
         location = ",".join(f"{frame.name}:{frame.lineno}" for frame in frames)
         pytest.fail(f"native stage: {type(exc).__name__}, "
-                    f"winerror={getattr(exc, 'winerror', None)}, calls={location}", pytrace=False)
+                    f"winerror={getattr(exc, 'winerror', None)}, calls={location}, "
+                    f"metadata={differences}", pytrace=False)
     assert not h.residue() and h.target.read_bytes() == "héllo\n".encode()
     assert not h.actions.list_actions()
 

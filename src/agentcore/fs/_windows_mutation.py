@@ -227,10 +227,7 @@ def _set_update_security(handle, sd):
               else win32security.UNPROTECTED_DACL_SECURITY_INFORMATION)
     flags |= (win32security.PROTECTED_SACL_SECURITY_INFORMATION if control & 0x2000
               else win32security.UNPROTECTED_SACL_SECURITY_INFORMATION)
-    # File security inheritance is handled by the file-object API.
-    win32security.SetSecurityInfo(handle, win32security.SE_FILE_OBJECT, flags,
-        sd.GetSecurityDescriptorOwner(), sd.GetSecurityDescriptorGroup(),
-        sd.GetSecurityDescriptorDacl(), sd.GetSecurityDescriptorSacl())
+    win32security.SetKernelObjectSecurity(handle, flags, sd)
 
 
 def create_update_stage(parent, name, metadata):
