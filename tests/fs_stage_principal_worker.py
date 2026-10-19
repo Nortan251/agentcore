@@ -53,6 +53,10 @@ def attack(sock, uid):
             if request == "identity":
                 send(channel, {"uid": os.geteuid(), "groups": os.getgroups()})
                 continue
+            if isinstance(request, dict):
+                os.rename(request["source"], request["destination"])
+                send(channel, {"uid": os.geteuid(), "groups": os.getgroups()})
+                continue
             path = Path(request)
             denied = False
             try:
@@ -86,7 +90,8 @@ def agent(sock, root, uid, attacker_uid, scenario):
         facts = {"agent_uid": os.geteuid(), "agent_groups": os.getgroups(),
                  "runtime_accessible": os.access(RUNTIME_ROOT, os.X_OK),
                  "attacker_uid": attacker_uid, "attacker_groups": [],
-                 "namespace_probe_substituted": False, "attack_reached": False, "attack_denied": False}
+                 "namespace_probe_substituted": False, "ancestor_probe_relocated": False,
+                 "attack_reached": False, "attack_denied": False}
         send(channel, "identity")
         identity = receive(channel)
         facts["attacker_uid"], facts["attacker_groups"] = identity["uid"], identity["groups"]
@@ -102,6 +107,17 @@ def agent(sock, root, uid, attacker_uid, scenario):
             facts["attacker_uid"], facts["attacker_groups"] = response["uid"], response["groups"]
             probe.unlink()
             (target_parent / "displaced-stage").unlink()
+        if scenario == "ancestor":
+            # A distinct UID can move the whole workspace through its parent,
+            # despite the private target parent's mode. Prove and undo the move.
+            os.chmod(h.base, 0o777)
+            moved = h.base / "outside-workspace"
+            send(channel, {"source": str(h.root), "destination": str(moved)})
+            receive(channel)
+            assert moved.is_dir() and not h.root.exists()
+            send(channel, {"source": str(moved), "destination": str(h.root)})
+            receive(channel)
+            facts["ancestor_probe_relocated"] = h.root.is_dir() and not moved.exists()
         if scenario == "foreign":
             # Root setup placed the foreign-owned directory before the UID drop.
             target_parent = h.root / "foreign"

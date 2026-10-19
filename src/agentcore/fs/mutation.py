@@ -1,8 +1,8 @@
 """WorkspaceGuard-owned create-only primitives; no tool/permission authority.
 
-Descriptor/handle-relative access protects against unsafe path objects and
-detectable substitutions. Hostile same-user/admin ancestor relocation is outside
-the host boundary. See docs/architecture/filesystem-write-v1.md.
+File publication requires Windows handle semantics; POSIX file creation is
+refused before physical entry. Directory creation retains its separate contract.
+See docs/architecture/filesystem-write-v1.md.
 """
 
 from contextlib import contextmanager, ExitStack
@@ -124,47 +124,10 @@ def _check(guard, intent, relative, identities):
             _reject()
 
 
-def _linux_parent_filesystem(handle):
-    """Read f_type from the opened directory, never from a resolved pathname.
-
-    Limit the libc ABI to 64-bit Linux. The aligned buffer exceeds struct
-    statfs; only its first native long (f_type) is consumed. Unknown platforms,
-    ABIs, filesystems and native errors are refusals, not mode-only fallbacks.
-    """
-    import ctypes
-    import platform
-    if sys.platform != "linux" or platform.machine() not in {"x86_64", "aarch64"} or (
-            ctypes.sizeof(ctypes.c_long) != 8):
-        _reject()
-    try:
-        native = ctypes.CDLL(None, use_errno=True).fstatfs
-        native.argtypes = (ctypes.c_int, ctypes.c_void_p)
-        native.restype = ctypes.c_int
-        facts = (ctypes.c_long * 32)()
-        if native(handle, ctypes.byref(facts)) != 0:
-            _reject()
-        return facts[0]
-    except (AttributeError, OSError):
-        _reject()
-
-
-def _safe_stage_parent(handle):
-    """File-create admission; insufficient against hostile idmapped aliases.
-
-    On these local Linux filesystems, POSIX ACL write grants to named users or
-    groups are bounded by the group-class mode bits (the ACL mask). This only
-    constrains the observed mount's ownership view, not access through aliases.
-    NFS, CIFS, FUSE, overlay and unknown permission models remain unsupported.
-    Pathname publication and writable-ancestor relocation remain unresolved.
-    Same-user/privileged permission changes remain outside the host boundary.
-    """
-    info = os.fstat(handle)
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or (
-            info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
-        _reject()
-    # ext2/3/4, XFS, Btrfs, tmpfs: kernel local DAC / POSIX ACL semantics.
-    if _linux_parent_filesystem(handle) not in {0xEF53, 0x58465342, 0x9123683E, 0x01021994}:
-        _reject()
+def _require_file_publication():
+    # Unnamed Linux stages bind the source inode, but cannot pin its ancestry.
+    if os.name != "nt" or sys.platform != "win32":
+        _reject(RejectionReason.UNSUPPORTED_PUBLICATION)
 
 
 def create(guard, intent, data, validate):
@@ -176,6 +139,7 @@ def create(guard, intent, data, validate):
     if type(data) is not bytes or len(data) > guard.config.max_write_bytes:
         _reject(RejectionReason.TOO_LARGE)
     relative = relative_path(guard, intent["path"])
+    _require_file_publication()
     with parent(guard, relative) as (handle, identities):
         _check(guard, intent, relative, identities)
         if _exists(handle, relative.name):
@@ -183,73 +147,34 @@ def create(guard, intent, data, validate):
         stage = ".agentcore-stage-" + secrets.token_hex(16)
         if stage.casefold() == relative.name.casefold():
             _reject()
-        if os.name == "posix":
-            # The actual opened publication parent, at execution time, before
-            # validate marks possible physical entry and before any stage exists.
-            # prepare_create is shared with mkdir and deliberately unchanged.
-            _safe_stage_parent(handle)
         validate()
         published = False
-        if os.name == "nt":
-            from agentcore.fs import _windows_mutation as win
-            owned = win.open_child(handle, stage, create=True)
-            publication_started = False
+        from agentcore.fs import _windows_mutation as win
+        owned = win.open_child(handle, stage, create=True)
+        publication_started = False
+        try:
+            win.write(owned, data)
+            win.flush(owned)
+            _check(guard, intent, relative, identities)
+            validate()
+            publication_started = True
             try:
-                win.write(owned, data)
-                win.flush(owned)
-                _check(guard, intent, relative, identities)
-                validate()
-                publication_started = True
-                try:
-                    win.publish(owned, handle, relative.name)
-                except FileExistsError:
-                    publication_started = False
-                    return "not_applied"
-                published = True
-                win.flush(owned)
-            finally:
-                try:
-                    if not published:
-                        # Never delete a final file after an ambiguous rename.
-                        # If the kernel still identifies this handle as our
-                        # staging object, cleanup can safely discard that object.
-                        if not publication_started or win.has_staging_name(owned, stage):
-                            win.discard(owned)
-                finally:
-                    win.close(owned)
-        else:
-            owned = os.open(stage, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                            0o600, dir_fd=handle)
+                win.publish(owned, handle, relative.name)
+            except FileExistsError:
+                publication_started = False
+                return "not_applied"
+            published = True
+            win.flush(owned)
+        finally:
             try:
-                offset = 0
-                while offset < len(data):
-                    count = os.write(owned, memoryview(data)[offset:])
-                    if count <= 0:
-                        raise OSError("short staging write")
-                    offset += count
-                os.fsync(owned)
-                _check(guard, intent, relative, identities)
-                validate()
-                staged = os.fstat(owned)
-                named = os.stat(stage, dir_fd=handle, follow_symlinks=False)
-                if staged.st_nlink != 1 or (named.st_dev, named.st_ino) != (staged.st_dev, staged.st_ino):
-                    _reject()
-                try:
-                    os.link(stage, relative.name, src_dir_fd=handle, dst_dir_fd=handle,
-                            follow_symlinks=False)
-                except FileExistsError:
-                    return "not_applied"
-                published = True
+                if not published:
+                    # Never delete a final file after an ambiguous rename.
+                    # If the kernel still identifies this handle as our
+                    # staging object, cleanup can safely discard that object.
+                    if not publication_started or win.has_staging_name(owned, stage):
+                        win.discard(owned)
             finally:
-                try:
-                    named, staged = os.stat(stage, dir_fd=handle, follow_symlinks=False), os.fstat(owned)
-                    if (named.st_dev, named.st_ino) == (staged.st_dev, staged.st_ino):
-                        os.unlink(stage, dir_fd=handle)
-                    else:
-                        _reject()
-                finally:
-                    os.close(owned)
-            os.fsync(handle)
+                win.close(owned)
         return "applied"
 
 
@@ -313,50 +238,24 @@ def create_directory(guard, intent, validate):
 def observe(guard, intent, size):
     """Read only the final safe object; staging names never count as effects."""
     relative = relative_path(guard, intent["path"])
+    # Legacy POSIX attempts lack verified publication identity/ancestry too.
+    _require_file_publication()
     with parent(guard, relative) as (handle, identities):
         _check(guard, intent, relative, identities)
-        if os.name == "nt":
-            from agentcore.fs import _windows_mutation as win
-            try:
-                opened = win.open_child(handle, relative.name, read=True)
-            except FileNotFoundError:
-                return None
-            try:
-                attrs, _, actual_size, links = win.facts(opened)
-                if attrs & (0x400 | 0x10) or links != 1 or actual_size != size or not win.regular(opened):
-                    _reject()
-                data = win.read(opened, size + 1)
-                if win.facts(opened)[2:] != (actual_size, links):
-                    _reject()
-            finally:
-                win.close(opened)
-        else:
-            try:
-                opened = os.open(relative.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-                                 dir_fd=handle)
-            except FileNotFoundError:
-                return None
-            try:
-                info = os.fstat(opened)
-                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size != size:
-                    _reject()
-                chunks, remaining = [], size + 1
-                while remaining:
-                    chunk = os.read(opened, min(65536, remaining))
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                    remaining -= len(chunk)
-                data = b"".join(chunks)
-                after = os.fstat(opened)
-                if (after.st_size, after.st_mtime_ns, after.st_ctime_ns, after.st_nlink) != (
-                        info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_nlink):
-                    _reject()
-                named = os.stat(relative.name, dir_fd=handle, follow_symlinks=False)
-                if (named.st_dev, named.st_ino) != (after.st_dev, after.st_ino):
-                    _reject()
-            finally:
-                os.close(opened)
+        from agentcore.fs import _windows_mutation as win
+        try:
+            opened = win.open_child(handle, relative.name, read=True)
+        except FileNotFoundError:
+            return None
+        try:
+            attrs, _, actual_size, links = win.facts(opened)
+            if attrs & (0x400 | 0x10) or links != 1 or actual_size != size or not win.regular(opened):
+                _reject()
+            data = win.read(opened, size + 1)
+            if win.facts(opened)[2:] != (actual_size, links):
+                _reject()
+        finally:
+            win.close(opened)
         _check(guard, intent, relative, identities)
         if len(data) != size:
             _reject()
