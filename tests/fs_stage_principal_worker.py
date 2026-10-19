@@ -103,11 +103,9 @@ def agent(sock, root, uid, attacker_uid, scenario):
             probe.unlink()
             (target_parent / "displaced-stage").unlink()
         if scenario == "foreign":
-            # Root setup arranged ownership on a separate existing directory.
-            target_parent = root / "foreign"
-            # Keep intent / traversal genuine: foreign lives under workspace.
-            os.rename(target_parent, h.root / "foreign")
+            # Root setup placed the foreign-owned directory before the UID drop.
             target_parent = h.root / "foreign"
+            assert target_parent.stat().st_uid == attacker_uid != os.geteuid()
         facts["parent_uid"] = target_parent.stat().st_uid
         facts["parent_mode"] = target_parent.stat().st_mode & 0o7777
         original_link = mutation.os.link
@@ -150,7 +148,11 @@ def main():
         root = Path(directory)
         os.chown(root, agent_uid, agent_uid)
         os.chmod(root, 0o755)
-        foreign = root / "foreign"
+        # Linux requires write access to a moved directory when changing its parent.
+        for parent in (root / "host", root / "host/workspace"):
+            parent.mkdir(mode=0o755)
+            os.chown(parent, agent_uid, agent_uid)
+        foreign = root / "host/workspace/foreign"
         foreign.mkdir(mode=0o755)
         os.chown(foreign, attacker_uid, attacker_uid)
         os.chmod(foreign, 0o755)
