@@ -251,3 +251,63 @@ UNMERGED. Required next work is a separately scoped foundation repair and native
 Linux regression before resuming File Replace, then final-head local tests,
 fresh review and six platform gates. Restore Actions availability for those gates.
 Preserve this stop and earlier snapshots; never merge ledger into main.
+
+## 2026-10-19 bounded Windows compatibility amendment
+
+This amendment supersedes the older Actions-availability statements for this repair. Earlier snapshots remain historical. The user authorized ordinary Windows repair of PR #43 only; the separate POSIX publication-integrity P1 remains a merge blocker.
+
+- Starting PR head: `a5f1c52447d69784847f9e75f7502e09a842c65c`.
+- Final head: `7bd7b4de98fe7cff63c577c0add2be16fb2d85dd`; parent: `ca138af8972484cc521ebe7c593e5cd97db95f18`.
+- Divergence base: `547a2f00bcfa709d907c329fbea78730dd6731f6`; main independently verified at `cada2362beb43019f64dcb6395f98b136e0cd46c`.
+- Standard Actions temporary merge commit: `dd109afdeb3642bd5d2614f33ec4e7b43b49c172`, verified parents main `cada2362...` and final head `7bd7b4d...`. No merge into the feature branch or main was performed.
+- PR #44 remains OPEN at `144d878586837409f6141c5fdc3212220e76448f`; no changes or merge were made. Its production security P1 remains unresolved.
+
+### Cause and bounded correction
+
+Started with the [requested real CI evidence](https://github.com/Nortan251/agentcore/pull/43#issuecomment-6270356517). The old Windows 3.11/3.12/3.13 rerun executed and failed revision reads; these were not billing refusals. A categorical same-handle [native diagnostic](https://github.com/Nortan251/agentcore/actions/runs/39287444393/job/118178469905) established that owner/group/DACL and SACL queries succeeded, the complete BACKUP `GetSecurityInfo` query returned WinError 5, and the complete BACKUP `GetKernelObjectSecurity` query succeeded on the unchanged handle. This identifies an API compatibility defect, not missing runner privilege.
+
+The shared full-descriptor getter now uses `GetKernelObjectSecurity(handle, 0x10000)` under the same already-granted native handle rights. Production enables no privilege. Unavailable/disabled `SeSecurityPrivilege` still causes categorical refusal before a revision, action or stage exists. No partial descriptor is accepted.
+
+Once reads ran, [native metadata diagnostics](https://github.com/Nortan251/agentcore/actions/runs/39293078436/job/118198469426) found the unconditional SACL setter changed an absent SACL into a present NULL SACL: expected control `0x8804`, observed `0x8014`, while attributes and owner/group/DACL/SACL contents otherwise matched. The setter now requests SACL restoration only when the complete source descriptor has `SE_SACL_PRESENT`; exact full metadata equality remains mandatory. An experimental setter API change at `3485b75...` failed native validation and was reverted at `0caccff...`; it is absent from the final diff.
+
+Fresh review identified [an inherited-parent SACL P2](https://github.com/Nortan251/agentcore/pull/43#discussion_r4316850301). A new early stage check refuses an absent-source SACL whose presence/defaulting/inheritance/protection control differs after creation, before any content write or publication callback. The native regression sets a real inheritable parent audit SACL without propagating it to the old source; it verifies that the inherited stage is refused, no write occurs, cleanup succeeds, the old bytes/full metadata remain unchanged and the attempt is NOT_INVOKED rather than RECONCILE_REQUIRED. No parent auditing or access check is bypassed.
+
+Three files differ from the supplied starting head:
+
+- `src/agentcore/fs/_windows_mutation.py`: full getter compatibility, absent-SACL setter correction and early unsupported-stage refusal.
+- `tests/test_fs_replace.py`: native read/stage regressions, unavailable/disabled-privilege refusal and inherited-parent regression. Existing privacy test now checks both error 32 on initial exclusive sharing and error 5 after the protected empty DACL is locked. The stale-change fixture writes after stage flush but before Windows pins the old target against other writers; original byte/stale/journal assertions remain.
+- `tests/test_workspace_host.py`: explicit LF fixture creation, preserving existing exact byte assertions on Windows.
+
+No dependencies, workflows, governance, POSIX implementation, authority, publication or recovery rules changed. Temporary detailed probes were removed; retained failure diagnostics expose only exception category, WinError and function/line locations.
+
+### Exact-head validation
+
+Local Windows Python 3.13 at the final head:
+
+- Focused: **25 passed, 62 skipped**, 1.53 seconds.
+- Surrounding filesystem/workspace/read/list suites: **621 passed, 203 skipped**, 75.04 seconds.
+- Full repository: **6452 passed, 326 skipped, 89 warnings**, exit 0, 535.09 seconds. Existing Gmail fake-response warnings remain; no warning suppression was added.
+- `python -m compileall -q src tests` and starting-head-relative `git diff --check` passed. Implementation checkout was clean; local, remote and PR head matched.
+
+The local ordinary Windows token lacks assigned `SeSecurityPrivilege`: native positive replacement/SACL cases skip explicitly; the unavailable-permission refusal runs. Local results do not stand in for privileged native Windows or Linux evidence. A long scratch basetemp caused Windows path-length setup errors in an earlier diagnostic run; using a short task-local basetemp fixed setup without changing assertions.
+
+All six gates ran for final PR head `7bd7b4de98fe7cff63c577c0add2be16fb2d85dd` on the standard temporary merge ref above (attempt 1). Workflow head provenance and checkout logs were independently checked; no workflow/assertion was weakened.
+
+| Gate | Result | Exact job |
+| --- | --- | --- |
+| Linux full Python 3.13 | SUCCESS | [118284233689](https://github.com/Nortan251/agentcore/actions/runs/39317955305/job/118284233689) |
+| Windows Python 3.11 | SUCCESS | [118284234012](https://github.com/Nortan251/agentcore/actions/runs/39317955212/job/118284234012) |
+| Windows Python 3.12 | SUCCESS | [118284234501](https://github.com/Nortan251/agentcore/actions/runs/39317955212/job/118284234501) |
+| Windows Python 3.13 | SUCCESS | [118284234278](https://github.com/Nortan251/agentcore/actions/runs/39317955212/job/118284234278) |
+| Chromium Ubuntu | SUCCESS | [118284233101](https://github.com/Nortan251/agentcore/actions/runs/39317955144/job/118284233101) |
+| Chromium Windows | SUCCESS | [118284232456](https://github.com/Nortan251/agentcore/actions/runs/39317955144/job/118284232456) |
+
+Native Windows skip summaries were inspected: the revision/stage, privilege-denial, audit-SACL preservation and inherited-parent regressions executed; only the named POSIX/Linux cases in the replacement suite skipped. Full suite jobs passed; no CI total is inferred from quiet output.
+
+### Review, blockers and next action
+
+Fresh exact-head review was requested in [comment 6276388728](https://github.com/Nortan251/agentcore/pull/43#issuecomment-6276388728). The [review receipt 6276435855](https://github.com/Nortan251/agentcore/pull/43#issuecomment-6276435855) explicitly reviewed `7bd7b4de98` and reported no major issues. This is no-new-findings evidence, not an overall clean-PR claim. After the repairing commit, all three native Windows gates and exact-head review passed, only the inherited-SACL P2 thread was resolved. The final thread inventory contains four historically resolved feature P1s, the resolved Windows P2 and one unresolved POSIX P1.
+
+The [existing POSIX publication-integrity P1](https://github.com/Nortan251/agentcore/pull/43#discussion_r4179362899) remains unresolved. Green Windows tests cannot settle that finding. PR #44's separate production P1 is also unresolved; no repair of it is bundled here. The restricted security-work boundary was respected; no restricted-service access or alternate route around access controls was used.
+
+FINAL VERDICT: the bounded Windows compatibility repair is complete and validated; PR #43 remains OPEN / UNMERGED and NOT READY TO MERGE because the separate POSIX publication-integrity P1 remains. No security-boundary expansion, separate adversarial native Linux repair/validation, PR #44 modification or merge was performed. Next work requires an explicitly scoped foundation security repair with suitable native Linux evidence, followed by fresh review and gates on any new implementation head. This ledger branch remains documentation-only and must never be merged into main.
