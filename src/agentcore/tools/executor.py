@@ -188,7 +188,7 @@ class _FilesystemPublicationUnsupported(_FilesystemWriteNotInvoked):
     """Publication was refused before possible physical entry."""
 
     result_class = "filesystem.unsupported_publication"
-    summary = "File creation requires native Windows handle publication; unavailable on this platform."
+    summary = "File publication requires native Windows handles; unavailable on this platform."
     kind = "filesystem_publication_unsupported"
 
 

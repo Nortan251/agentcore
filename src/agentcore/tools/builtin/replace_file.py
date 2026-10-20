@@ -26,7 +26,8 @@ class ReplaceFileTool(Tool):
     def __init__(self, guard):
         self._guard = guard
         self._spec = tool_spec("replace_file", "Replace an entire existing UTF-8 workspace file "
-            "using the exact current-turn revision from read_file_for_update. Stale revisions refuse.",
+            "using the exact current-turn revision from read_file_for_update. Stale revisions refuse. "
+            "Requires native Windows; unavailable on Linux and macOS.",
             parameters=(ToolParameter("path", ParamType.STRING, "Workspace-relative existing file.", max_length=4096),
                         ToolParameter("revision", ParamType.STRING, "Opaque current trusted revision.",
                                       max_length=68, pattern=r"rev_[0-9a-f]{64}"),

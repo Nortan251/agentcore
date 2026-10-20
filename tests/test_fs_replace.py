@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 import threading
 
 import pytest
@@ -14,6 +15,7 @@ from agentcore.fs.replacement import RevisionRejectedError
 from agentcore.permissions.config import PermissionConfig
 from agentcore.permissions.levels import Capability, PermissionLevel
 from agentcore.permissions.policy import PermissionPolicy
+from agentcore.realtime.errors import CancellationRequested
 from agentcore.tools.base import ToolContext
 from agentcore.tools.builtin import default_tools
 from agentcore.tools.builtin.create_directory import FilesystemDirectoryFoundation
@@ -64,6 +66,8 @@ class Harness(WriteHarness):
         return self.executor.invoke("read_file_for_update", {"path": path})
 
     def revision(self):
+        if os.name != "nt":
+            pytest.skip("replacement requires native Windows handles; POSIX refusal tested separately")
         result = self.read()
         if not result.ok and os.name == "nt" and not self.native_available:
             pytest.skip("current Windows token cannot snapshot full security descriptor")
@@ -96,16 +100,15 @@ def publication_hook(monkeypatch, hook):
         from agentcore.fs import _windows_mutation as win
         original = win.publish_update
         monkeypatch.setattr(win, "publish_update", lambda *a: hook(lambda: original(*a)))
-    else:
-        original = os.replace
-        def replace(*a, **kw):
-            return hook(lambda: original(*a, **kw)) if "src_dir_fd" in kw else original(*a, **kw)
-        monkeypatch.setattr(replacement.os, "replace", replace)
 
 
 def test_complete_utf8_snapshot_and_structured_host_revision(make):
     h = make()
     result = h.read()
+    if os.name != "nt":
+        assert not result.ok and result.result.metadata["kind"] == "filesystem_publication_unsupported"
+        assert not h.revisions._snapshots and not h.actions.list_actions() and not h.residue()
+        return
     if os.name == "nt" and not result.ok and not h.native_available:
         assert result.result.metadata["kind"] == "update_read_refused"
         assert not h.revisions._snapshots and not h.actions.list_actions()
@@ -341,7 +344,8 @@ def test_thread_registry_authority_cannot_be_reused(make):
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX fork ownership")
 def test_fork_registry_refuses_inherited_authority(make):
-    h = make(); revision = h.revision()
+    h = make(); revision = h.revisions.candidate()
+    h.revisions.issue(revision, {"path": "sub/old.txt"})
     pid = os.fork()
     if pid == 0:
         try: h.revisions.consume(revision, "sub/old.txt")
@@ -511,6 +515,7 @@ def test_current_revocation_prevents_preparation(make, monkeypatch, capability):
     assert not h.actions.list_actions()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="native Windows cross-tool publication")
 def test_direct_and_cross_tool_contexts_cannot_replace(make, monkeypatch):
     h = make()
     args = {"path": "sub/old.txt", "revision": "rev_" + "f" * 64, "content": "changed"}
@@ -524,11 +529,15 @@ def test_direct_and_cross_tool_contexts_cannot_replace(make, monkeypatch):
     assert h.target.read_bytes() == "héllo\n".encode()
 
 
-@pytest.mark.skipif(os.name != "posix", reason="POSIX permission and xattr preservation")
+@pytest.mark.skipif(os.name != "posix", reason="native POSIX refusal preserves modes")
 @pytest.mark.parametrize("mode", [0o600, 0o644, 0o700, 0o755])
-def test_posix_permissions_including_execute_preserved(make, mode):
+def test_posix_modes_categorically_refused_without_effect(make, mode):
     h = make(); h.target.chmod(mode)
-    assert h.invoke(h.revision()).ok and h.target.stat().st_mode & 0o7777 == mode
+    before = h.target.read_bytes(), h.target.stat()
+    result = h.read()
+    assert not result.ok and result.result.metadata["kind"] == "filesystem_publication_unsupported"
+    assert h.target.read_bytes() == before[0] and h.target.stat() == before[1]
+    assert not h.revisions._snapshots and not h.actions.list_actions() and not h.residue()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX unusual modes/xattrs")
@@ -580,54 +589,6 @@ def test_update_read_paths_never_enter_generic_executor_logs(make):
     assert "private_arguments" in h.foundation.read_tool.spec.tags
     assert "sub/old.txt" not in repr(h.logger.events)
     assert "sub/old.txt" not in repr(result.args)
-
-
-@pytest.mark.skipif(os.name != "posix", reason="POSIX stage confidentiality")
-def test_partial_stage_write_failure_never_exposes_target_mode(make, monkeypatch):
-    import stat
-    h = make(); h.target.chmod(0o755); (h.root / "sub").chmod(0o755)
-    revision = h.revision()
-    original = h.guard.replace_file
-    observed = []
-    def fail(*args):
-        with monkeypatch.context() as patch:
-            write = os.write
-            def partial(fd, data):
-                observed.append(stat.S_IMODE(os.fstat(fd).st_mode))
-                assert observed[-1] == 0o600
-                write(fd, data[:3])
-                assert stat.S_IMODE(os.fstat(fd).st_mode) == 0o600
-                raise OSError("partial private stage interrupted")
-            patch.setattr(replacement.os, "write", partial)
-            return original(*args)
-    monkeypatch.setattr(h.guard, "replace_file", fail)
-    result = h.invoke(revision)
-    assert observed and not result.ok and not h.residue()
-    assert h.target.read_bytes() == "héllo\n".encode() and h.target.stat().st_mode & 0o777 == 0o755
-    assert h.actions.load(result.action_id).attempts[0].status is ActionAttemptStatus.NOT_INVOKED
-
-
-@pytest.mark.skipif(os.name != "posix", reason="POSIX post-publication mode restoration")
-def test_mode_restoration_failure_keeps_complete_private_final_and_unknown_truth(make, monkeypatch):
-    h = make(); h.target.chmod(0o755); revision = h.revision()
-    original = h.guard.replace_file
-    def fail(*args):
-        with monkeypatch.context() as patch:
-            chmod = os.fchmod
-            def fail_restore(fd, mode):
-                if mode == 0o755:
-                    assert h.target.read_bytes() == b"new complete content"
-                    assert h.target.stat().st_mode & 0o777 == 0o600
-                    raise OSError("post-publication metadata uncertainty")
-                return chmod(fd, mode)
-            patch.setattr(replacement.os, "fchmod", fail_restore)
-            return original(*args)
-    monkeypatch.setattr(h.guard, "replace_file", fail)
-    result = h.invoke(revision)
-    assert not result.ok and not h.residue()
-    assert h.target.read_bytes() == b"new complete content" and h.target.stat().st_mode & 0o777 == 0o600
-    assert h.actions.load(result.action_id).state is ActionState.RECONCILE_REQUIRED
-    assert h.reconcile(result.action_id).status is ActionReconciliationStatus.UNRESOLVED
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows exclusive staging share")
@@ -731,10 +692,10 @@ def test_windows_failed_write_and_delete_leave_unreadable_residue(make, monkeypa
         stage.unlink()
 
 
-@pytest.mark.skipif(not __import__("sys").platform.startswith("linux"), reason="Linux native inode flags")
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux native inode flags")
 def test_linux_nodump_flag_refused_without_replacement_or_flag_loss(make):
     import ctypes, fcntl, struct
-    h = make(); revision = h.revision()
+    h = make()
     old = h.target.read_bytes()
     identity = h.target.stat().st_ino
     opened = os.open(h.target, os.O_RDONLY | os.O_NOFOLLOW)
@@ -746,8 +707,8 @@ def test_linux_nodump_flag_refused_without_replacement_or_flag_loss(make):
     try:
         fcntl.ioctl(opened, 0x40006602 | (size << 16), flags, True)
         result = h.read()
-        assert not result.ok and result.result.metadata["kind"] == "unsupported_file_metadata"
-        assert not h.invoke(revision).ok and not h.actions.list_actions()
+        assert not result.ok and result.result.metadata["kind"] == "filesystem_publication_unsupported"
+        assert not h.revisions._snapshots and not h.actions.list_actions() and not h.residue()
         assert h.target.stat().st_ino == identity and h.target.read_bytes() == old
         fcntl.ioctl(opened, 0x80006601 | (size << 16), flags, True)
         assert struct.unpack_from("=I", flags)[0] & 0x40
@@ -808,20 +769,73 @@ def test_windows_restricted_dacl_and_audit_sacl_preserved(make, native_security)
     assert h.guard.snapshot_for_update("sub/old.txt", 1000)[1]["metadata"]["security"] == captured
 
 
-@pytest.mark.skipif(os.name != "posix", reason="POSIX parent durability")
-def test_parent_fsync_failure_after_rename_remains_uncertain(make, monkeypatch):
-    import stat
+@pytest.mark.skipif(os.name != "nt", reason="native Windows source and namespace protection")
+def test_windows_replacement_publishes_owned_stage_and_pins_ancestors(make, monkeypatch):
+    from agentcore.fs import _windows_mutation as win
     h = make(); revision = h.revision()
-    original = h.guard.replace_file
-    def fail_directory_flush(*args):
-        with monkeypatch.context() as patch:
-            fsync = os.fsync
-            def check(fd):
-                if stat.S_ISDIR(os.fstat(fd).st_mode): raise OSError("directory flush uncertain")
-                return fsync(fd)
-            patch.setattr(replacement.os, "fsync", check)
-            return original(*args)
-    monkeypatch.setattr(h.guard, "replace_file", fail_directory_flush)
-    result = h.invoke(revision)
+    old_identity = h.revisions._snapshots[revision]["identity"]
+    original = win.publish_update
+    stages = []
+    def publish(owned, parent, name):
+        stages.append(list(win.facts(owned)[1]))
+        stage = h.residue()[0]
+        for path in (stage, h.target.parent, h.root):
+            with pytest.raises(PermissionError):
+                path.rename(path.with_name(path.name + "-moved"))
+        return original(owned, parent, name)
+    monkeypatch.setattr(win, "publish_update", publish)
+    assert h.invoke(revision).ok and len(stages) == 1 and stages[0] != old_identity
+    assert h.guard.snapshot_for_update("sub/old.txt", 1000)[1]["identity"] == stages[0]
     assert h.target.read_bytes() == b"new complete content" and not h.residue()
-    assert h.actions.load(result.action_id).state is ActionState.RECONCILE_REQUIRED
+    for path in (h.target.parent, h.root):
+        moved = path.with_name(path.name + "-moved")
+        path.rename(moved)
+        moved.rename(path)
+
+
+@pytest.mark.parametrize("level,approve,allowed", [
+    (PermissionLevel.OBSERVE, False, False), (PermissionLevel.PROPOSE, False, False),
+    (PermissionLevel.CONFIRM, False, False), (PermissionLevel.CONFIRM, True, True),
+    (PermissionLevel.AUTONOMOUS, False, True),
+])
+def test_replacement_permission_approval_and_exact_action_identity(make, level, approve, allowed):
+    h = make(level=level, approve=approve); revision = h.revision()
+    result = h.invoke(revision)
+    assert result.ok is allowed and not h.residue()
+    assert h.target.read_bytes() == (b"new complete content" if allowed else "héllo\n".encode())
+    if allowed:
+        record = h.actions.load(result.action_id)
+        assert record.tool_name == "replace_file" and record.intent_ref and len(record.attempts) == 1
+        assert record.terminal_outcome.verdict is EffectVerdict.CONFIRMED_APPLIED
+        assert not h.invoke(revision).ok and len(h.actions.list_actions()) == 1
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows cancellation boundary")
+@pytest.mark.parametrize("entered", [False, True])
+@pytest.mark.parametrize("error", [TimeoutError, CancellationRequested])
+def test_windows_replace_interruption_and_failed_cleanup_preserve_effect_truth(make, monkeypatch, entered, error):
+    from agentcore.fs import _windows_mutation as win
+    h = make(); revision = h.revision()
+    seam = "publish_update" if entered else "write"
+    def interrupted(*args):
+        raise error("synthetic interruption")
+    monkeypatch.setattr(win, seam, interrupted)
+    if entered:
+        # Restoration already broadened the completed stage; failed discard
+        # must remain uncertain even though the final target is still old.
+        monkeypatch.setattr(win, "discard", lambda *args: (_ for _ in ()).throw(OSError()))
+    if error is CancellationRequested and not entered:
+        with pytest.raises(CancellationRequested):
+            h.invoke(revision)
+    else:
+        assert not h.invoke(revision).ok
+    record = h.actions.load(h.actions.list_actions()[0])
+    assert h.target.read_bytes() == "héllo\n".encode()
+    if entered:
+        assert record.state is ActionState.RECONCILE_REQUIRED
+        assert record.attempts[-1].effect_verdict is EffectVerdict.OUTCOME_UNKNOWN
+        assert h.reconcile(record.action_id).status is ActionReconciliationStatus.UNRESOLVED
+        assert len(h.residue()) == 1
+        h.residue()[0].unlink()
+    else:
+        assert record.attempts[-1].status is ActionAttemptStatus.NOT_INVOKED and not h.residue()

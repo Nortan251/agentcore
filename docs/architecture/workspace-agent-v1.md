@@ -10,9 +10,10 @@ revision; see [File Replace v1](filesystem-replace-v1.md). Add
 bounded public result. There is no interactive loop, background autonomy or
 operator-resolution UI in v1.
 
-File creation currently requires native Windows handles. On POSIX, `write_file`
-fails closed before staging; the host reports a failed tool/action and cannot
-claim successful creation from model prose. Read tools and Directory Create
+File creation and replacement require native Windows handles. On POSIX,
+`write_file` and `replace_file` fail closed before staging, and
+`read_file_for_update` refuses without a usable revision. The host reports a
+failed tool/action and cannot claim successful publication from model prose. Read tools and Directory Create
 retain their separate contracts. Legacy uncertain POSIX file attempts require
 human confirmation and prevent startup from silently retrying. See the
 [file-publication support decision](filesystem-write-v1.md#guarantees).

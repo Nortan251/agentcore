@@ -87,37 +87,19 @@ real protected store.
 
 ## Native publication and metadata
 
-On POSIX, verified parent descriptors and `O_NOFOLLOW` opens reject links and
-special objects. Replacement requires current-user ownership and only ordinary
-permission bits, preserving UID/GID and executable bits. Setuid/setgid/sticky
-file modes are refused. Descriptor xattr enumeration must be available and
-empty; ACLs/capabilities/security xattrs fail closed rather than being dropped.
-A stage inheriting a default ACL is also refused. Platforms unable to prove
-this metadata posture refuse the target.
+File replacement and update-read require native Windows (`os.name == "nt"`
+and `sys.platform == "win32"`), following the accepted
+[file-publication support policy](filesystem-write-v1.md#guarantees).
+Linux, macOS and other unsupported hosts refuse before traversal, staging,
+metadata changes or publication. There is no POSIX staging or pathname rename
+fallback. No usable replacement revision is issued there; ordinary `read_file`,
+`inspect`, `list_directory` and Directory Create retain their existing contracts.
+Both tools remain registered with explicit platform descriptions.
 
-Linux additionally requires bounded descriptor queries for `FS_IOC_GETFLAGS`
-and `FS_IOC_FSGETXATTR`, as defined by the
-[Linux filesystem UAPI](https://github.com/torvalds/linux/blob/master/include/uapi/linux/fs.h).
-Every inode flag except the ordinary extent-storage flag is refused, including
-nodump, immutable, append, noatime and nocow. Extended flags, nonzero project IDs
-and extent-size policy hints are refused. The stage must match the permitted
-old flags before publication. Unsupported ioctl/filesystem/architecture or
-non-Linux POSIX metadata querying fails closed rather than losing policy state.
-
-An exclusive random 0600 stage is created in the same verified parent after
-durable intent and attempt claim. Required ownership is applied, but the stage
-remains 0600 while exact bounded bytes are written and fsynced. Stage metadata
-must match that private mode and permitted old metadata. The final target is reopened and fully
-compared against the snapshot a second time. Parent/stage identities and current
-authority are revalidated before descriptor-relative atomic `os.replace`.
-After rename, the final file temporarily remains owner-private while the
-original mode is restored through the owned descriptor, verified and fsynced.
-Then the parent directory is fsynced. Other principals cannot read/execute a
-partial stage under a public target mode. The final name never exposes a
-partially written body. Failure after rename, including mode restoration,
-requires reconciliation; a complete final file with unrestored metadata remains
-UNKNOWN/HUMAN rather than applied. Temporary restriction can deny reads until
-successful restoration; it does not broaden access.
+The old POSIX stage-inode check followed by `os.replace(stage, target)` could
+publish a substituted namespace binding. It is removed, rather than replaced
+with ownership, mode, mount or pathname heuristics. This containment does not
+claim a working secure POSIX writer; future POSIX support is separate work.
 
 On Windows, targets/stages use `NtCreateFile` relative to verified parents.
 Target read handles omit write/delete sharing. Full security descriptor
@@ -158,14 +140,13 @@ the close-to-rename seam. No arbitrary DOS-path fallback is used. Stages and
 parent handles close deterministically. The published file is flushed; Windows
 does not promise POSIX parent-directory fsync durability.
 
-Neither POSIX rename nor the Windows replacement flag is a perfect filesystem
+The Windows replacement flag is not a perfect filesystem
 compare-and-swap or intrinsically replace-only syscall. Workspace Host ownership
 serializes AgentCore's mutation domain. Observable changes are detected by the
 snapshot and final comparison. A noncooperating same-user process changing or
 removing the target after that final comparison/during native rename remains
 outside the existing host boundary; at that exact excluded seam native rename
-may publish after external removal. POSIX advisory locks would not defeat a
-writer ignoring them. No stronger CAS claim is made.
+may publish after external removal. No stronger CAS claim is made.
 
 ## Crash truth, cleanup and recovery
 
@@ -177,7 +158,19 @@ CONFIRMED_NOT_APPLIED. Once replacement may have happened, exceptions,
 interruption, flush failures or lost returns produce RECONCILE_REQUIRED, never
 an inference of no effect from an exception.
 
-Reconciliation under current FS_READ and exact recovery leases confirms
+Unsupported update-read reports `filesystem_publication_unsupported` without
+issuing a revision or admitting an action. A previously admitted replacement
+refused by the platform guard is NOT_INVOKED / CONFIRMED_NOT_APPLIED with
+`filesystem.unsupported_publication`, no stage and no modified target. The
+executor checks possible physical entry before classifying support errors;
+post-entry exceptions remain uncertain.
+
+Legacy uncertain POSIX replacements cannot be settled by matching current
+bytes, metadata or absence: their historical publication identity is unverified.
+They remain OUTCOME_UNKNOWN / HUMAN_CONFIRMATION_REQUIRED, without retry or
+schema/protected-evidence changes.
+
+On supported Windows, reconciliation under current FS_READ and exact recovery leases confirms
 application only when safe final ancestry, preserved metadata, size and digest
 match NEW intended state. OLD state, absence, other content, unsafe objects or
 unverifiable metadata remain OUTCOME_UNKNOWN/HUMAN_CONFIRMATION_REQUIRED. OLD

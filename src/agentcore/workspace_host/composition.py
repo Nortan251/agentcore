@@ -33,6 +33,7 @@ _PROMPT = (
     "replace_file replaces the ENTIRE file and accepts only the host revision returned in the CURRENT turn. "
     "Never replace based on a partial/truncated read. A stale revision requires a fresh update-read. "
     "Historical or expired revisions grant no authority. write_file remains create-only. "
+    "File creation, update-read and replacement require native Windows; use read_file for POSIX inspection. "
     "Existing directories cannot be replaced. Parent directories must already exist. "
     "create_directory creates one missing directory only. write_file also requires existing parents. "
     "Never claim a file or directory was created or edited unless tool execution reports success. A failed or "

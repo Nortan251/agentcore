@@ -3,6 +3,7 @@
 from dataclasses import replace
 import json
 import os
+import sys
 
 import pytest
 
@@ -26,7 +27,9 @@ def get_revision(request):
 
 
 def skip_unavailable(available):
-    if os.name == "nt" and not available:
+    if os.name != "nt":
+        pytest.skip("replacement requires native Windows handles; POSIX refusal tested separately")
+    if not available:
         pytest.skip("current Windows token cannot snapshot full security descriptor")
 
 
@@ -179,3 +182,16 @@ def test_supported_catalogue_cannot_be_changed(setup):
         assert set(h.registry.names()) == {"inspect", "list_directory", "read_file", "read_file_for_update",
                                            "create_directory", "write_file", "replace_file"}
         assert len(h._adapters) == 3
+
+
+def test_unsupported_update_read_preserves_inspection_and_reports_cli_failure(setup, capsys, monkeypatch):
+    root, _, _, _ = setup
+    model = Model(calls(("read_file", {"path": "README.txt"}),
+                        ("read_file_for_update", {"path": "README.txt"})),
+                  ModelResponse(text="Everything succeeded."))
+    monkeypatch.setattr(sys, "platform", "linux")
+    code, payload = invoke(capsys, monkeypatch, model)
+    assert code == 1 and payload["error"] == "workspace_tool_failed" and not payload["ok"]
+    assert payload["tools_executed"] == 1 and not payload["actions"]
+    assert root.joinpath("README.txt").read_bytes() == b"Project description.\n"
+    assert not (root / "later").exists() and not list(root.rglob(".agentcore-stage-*"))
