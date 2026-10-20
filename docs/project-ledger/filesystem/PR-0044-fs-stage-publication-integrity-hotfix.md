@@ -363,3 +363,68 @@ PR #43 remains OPEN / DRAFT / UNMERGED at `7bd7b4de98fe7cff63c577c0add2be16fb2d8
 **READY FOR INDEPENDENT REVIEW of this Windows-supported / POSIX-refusal candidate.** Windows functionality is preserved with native before/after evidence, unsupported publication is categorically and durably refused, all six exact-head gates pass, and fresh exact-head automated review has no new finding. Original security closure, compatibility acceptance and merge remain project-lead decisions. PR #44 stays Draft and unmerged. No second PR, main push, history rewrite or merge occurred. Stop after this bounded milestone.
 
 Only this existing PR #44 record receives the append-only amendment and its single INDEX row is updated. Preserve all earlier snapshots and unrelated records. This independent documentation-only branch must never be merged into main.
+
+## 2026-10-20 amendment — final PR #44 release integration
+
+Earlier snapshots remain historical. The project lead explicitly accepted retaining all supported Windows functionality, categorical refusal of unsupported POSIX file publication, and separate future work in [Issue #46](https://github.com/Nortan251/agentcore/issues/46). This task authorized merging PR #44 only after live verification; it did not authorize PR #43 work, Issue #46 implementation, governance changes, or history rewriting.
+
+STATUS: MERGED AND VERIFIED; all six PR and post-merge CI jobs successful
+STARTING MAIN: `cada2362beb43019f64dcb6395f98b136e0cd46c`
+INDEPENDENTLY REVIEWED / MERGED PR HEAD: `f5d7e3bd3a21f49ee64affda61dbc520382c3907`
+PR HEAD PARENT: `8d9a5340441789c732935316883706bdc0aaf1f7`
+PR DIVERGENCE BASE: `547a2f00bcfa709d907c329fbea78730dd6731f6`
+PRE-MERGE CI SYNTHETIC MERGE: `a644f7b5255f0ad37b837c874b90299e502e9de9`
+FINAL MAIN / MERGE COMMIT: `de8432528042e5775a83d2091849c0a87cacf67c`
+MERGE TREE: `a8b4af436ab5c0088cbcf21faafe791561a44396`
+IMPLEMENTATION BRANCH: `codex/fs-stage-publication-integrity-hotfix`
+
+### Release conditions and merge provenance
+
+Live GitHub reconfirmed the supplied main, PR #44 and PR #43 SHAs. The PR #44 head was unchanged from the independently reviewed head. All six required jobs were completed/successful, all three historical review threads were resolved, and the PR was conflict-free with mergeability CLEAN. The legacy Commit Status endpoint had no statuses; the six successful GitHub Actions Check Runs are the actual gates, not a missing or failed status context.
+
+Main had no legacy branch protection (the endpoint returned Branch not protected), its only configured ruleset was already disabled, and the applicable branch-rules endpoint returned an empty list. No protection/rule was changed or bypassed. Repository settings allowed merge commits, squash and rebase; AGENTS.md prohibits rewriting an audited repair, so a merge commit preserved both audited parents. The only workflow change in the reviewed PR strengthens Linux verification with native/surrounding tests, compileall and committed-revision whitespace; review had explicitly covered that governance change. This integration task changed no implementation or governance file.
+
+After rechecking the live main/head and all gates, PR #44 was marked ready and merged with an expected-head constraint on the full reviewed SHA. GitHub confirmed merged=true at **2026-10-20 00:00:18 UTC**. [Merge commit](https://github.com/Nortan251/agentcore/commit/de8432528042e5775a83d2091849c0a87cacf67c) has exactly two parents, in order: starting main and the reviewed PR head. Its tree is byte-identical to the synthetic integration tree that all six PR jobs checked out. The only integration additions beyond the reviewed branch are the already-merged PR #45 doctor files; no manual conflict resolution occurred. No implementation branch was pushed, force-pushed, squashed, rebased or amended.
+
+### Security review and historical findings
+
+The [completed independent code review](https://github.com/Nortan251/agentcore/pull/44#issuecomment-6278616986) and [machine-readable summary](https://github.com/Nortan251/agentcore/pull/44#issuecomment-6256250605) identified exact head `f5d7e3bd3a21f49ee64affda61dbc520382c3907` and no findings before the ready transition. No unresolved current-head P0/P1 or other review thread remained at merge. This is exact-head code review and a source/closure assessment, not an invented separate Codex Security scan.
+
+- Historical production [P1 4187472896](https://github.com/Nortan251/agentcore/pull/44#discussion_r4187472896) is resolved with the [independent closure explanation](https://github.com/Nortan251/agentcore/pull/44#discussion_r4319637313). Source inspection confirms `_require_file_publication()` rejects non-native-Windows execution before mutation-parent traversal, staging and the physical-entry callback; POSIX stage/link publication and the owner/mode/filesystem admission fallback are absent. Legacy POSIX uncertain observation also refuses. Closure removes the affected operation; it does not prove a secure POSIX publisher or hostile-idmapped-mount support.
+- Historical worker [P1 4187472904](https://github.com/Nortan251/agentcore/pull/44#discussion_r4187472904) is resolved with the [independent native-evidence explanation](https://github.com/Nortan251/agentcore/pull/44#discussion_r4319638338). Imports precede real UID/GID/group/capability drop, while guard/journal/executor construction follows it. Pre-merge Linux logs directly show all ten real distinct-UID cases passed, including all five private-runtime variants and both ancestor cases; native setup skips are not counted as passes.
+- Historical whitespace [P2 4315526400](https://github.com/Nortan251/agentcore/pull/44#discussion_r4315526400) remains repaired/resolved. The checked-in workflow uses fetch-depth 2 and `git diff --check HEAD^ HEAD`.
+
+The Windows native implementation blob is unchanged from starting main (`5281d68ca85fa2d78528438162f3a84f6e3038c9`). It continues publishing the owned staging handle through NtSetInformationFile/FileRenameInformation with ReplaceIfExists=false and the pinned parent handle, excluding competing writers/deleters and cleaning staging by handle. Native Windows stage-substitution/identity and ancestor relocation/release tests pass. Directory Create and shared parent traversal have identical ASTs to starting main; read production paths are unchanged.
+
+Unsupported admitted attempts return bounded `filesystem_publication_unsupported`, persist `filesystem.unsupported_publication`, and record NOT_INVOKED / CONFIRMED_NOT_APPLIED. The regression injects the same categorical exception before and after possible physical entry; post-entry truth stays OUTCOME_UNKNOWN. Legacy uncertain POSIX attempts remain OUTCOME_UNKNOWN / HUMAN_CONFIRMATION_REQUIRED, retain one historical attempt, and cannot automatically retry even when final bytes match. Historical terminal records and residue are not rewritten or deleted. Current permission/approval, exact registry binding, protected intent, durable claims and leases remain required.
+
+### Six required CI jobs
+
+Every PR job below is attributed to the exact reviewed head, and its checkout log names synthetic merge `a644f7b5255f0ad37b837c874b90299e502e9de9` with current main and reviewed head as parents. Post-merge jobs target exact final main `de8432528042e5775a83d2091849c0a87cacf67c`.
+
+| Required gate | PR conclusion / job | Post-merge conclusion / job |
+|---|---|---|
+| Linux full suite (py3.13) | SUCCESS — [118337737846](https://github.com/Nortan251/agentcore/actions/runs/39333673733/job/118337737846) | SUCCESS — [118375405875](https://github.com/Nortan251/agentcore/actions/runs/39345012755/job/118375405875) |
+| Windows fs verification (py3.11) | SUCCESS — [118337737939](https://github.com/Nortan251/agentcore/actions/runs/39333673717/job/118337737939) | SUCCESS — [118375405638](https://github.com/Nortan251/agentcore/actions/runs/39345012412/job/118375405638) |
+| Windows fs verification (py3.12) | SUCCESS — [118337738125](https://github.com/Nortan251/agentcore/actions/runs/39333673717/job/118337738125) | SUCCESS — [118375405845](https://github.com/Nortan251/agentcore/actions/runs/39345012412/job/118375405845) |
+| Windows fs verification (py3.13) | SUCCESS — [118337737618](https://github.com/Nortan251/agentcore/actions/runs/39333673717/job/118337737618) | SUCCESS — [118375405751](https://github.com/Nortan251/agentcore/actions/runs/39345012412/job/118375405751) |
+| Chromium adapter (ubuntu-latest) | SUCCESS — [118337737628](https://github.com/Nortan251/agentcore/actions/runs/39333673728/job/118337737628) | SUCCESS — [118375405470](https://github.com/Nortan251/agentcore/actions/runs/39345012379/job/118375405470) |
+| Chromium adapter (windows-latest) | SUCCESS — [118337738164](https://github.com/Nortan251/agentcore/actions/runs/39333673728/job/118337738164) | SUCCESS — [118375405892](https://github.com/Nortan251/agentcore/actions/runs/39345012379/job/118375405892) |
+
+Directly re-read pre-merge Linux results: focused **26 passed / 2 Windows skips**, surrounding **982 passed / 118 skipped / 1 warning**, full **6561 passed / 211 skipped / 98 warnings**. Windows Python 3.11/3.12/3.13 each completed junction (1 passed / 160 deselected), filesystem security (58 passed) and full-suite steps successfully; their quiet full commands suppress aggregate counts, which are not inferred. Chromium Ubuntu and Windows each passed 419 tests. Linux compileall and committed-whitespace steps passed.
+
+### Local and post-merge checks
+
+This task's fresh pre-merge local Windows/Python 3.13 smoke (`test_fs_publication_support`, `test_fs_stage_parent`, `test_fs_write`): **94 passed / 27 platform skips in 16.67s**. Compileall and full-PR/integration committed-diff whitespace checks passed; checkout was clean. Linux skips on Windows are not Linux proof; the native CI results above supply that evidence.
+
+Fresh local tests on exact merged main included publication support, stage-parent, file-create, Directory Create, Workspace Directory Create/Host and doctor JSON modules: **274 passed / 36 explicit platform skips in 58.16s**. Compileall, merged `git diff --check HEAD^ HEAD`, identical-tree comparison and clean checkout checks passed. The ready-triggered independent review completed at 2026-10-20 00:01:18 UTC against the same full reviewed head with no findings; no separate security-scan result is claimed. Post-merge Linux repeated 26 passed / 2 Windows skips, all ten real distinct-UID cases passed, surrounding 982 passed / 118 skipped / 1 warning, and full 6561 passed / 211 skipped / 98 warnings. Linux compile/committed-whitespace passed. All three Windows versions repeated successful junction/security/full-suite steps; full aggregate counts remain suppressed by existing quiet flags. Both Chromium jobs repeated 419 passed. Every post-merge checkout names the full final main SHA. All six check conclusions and zero unresolved PR44 threads were rechecked after completion.
+
+### Supported platforms, limitations and next action
+
+Native Windows retains complete existing bounded UTF-8 create-only `write_file` publication, collision refusal, path/reparse/sensitive checks, permission/approval, recovery, cleanup and uncertainty behavior. Linux/macOS/other non-native-Windows hosts retain the registered tool with an explicit platform description but refuse file publication categorically. Existing reads and Directory Create remain available under their separate contracts; default Agent composition remains read-only. No tool was globally removed for platform parity.
+
+No native macOS run or hostile two-idmapped-mount experiment is claimed. Safe Linux/macOS file publication remains future [Issue #46](https://github.com/Nortan251/agentcore/issues/46), which is not implemented here. Windows publication does not promise post-close content immutability, administrator/kernel resistance or POSIX parent-directory fsync durability. Directory Create/read namespace limits are separate and are not newly certified by this release.
+
+[PR #43](https://github.com/Nortan251/agentcore/pull/43) remains OPEN / DRAFT / UNMERGED at unchanged `7bd7b4de98fe7cff63c577c0add2be16fb2d85dd`. Next milestone is a separate, focused File Replace repair against the newly verified main: inspect and integrate the new foundation without restoring removed POSIX helpers; preserve supported Windows replacement using object-bound verified source, exact target/revision binding and metadata/confidentiality guarantees; categorically refuse unsupported POSIX replacement before physical entry; retain protected intent, current approval/permission and legacy uncertainty without blind retry. Reproduce/fix the [separate replacement P1](https://github.com/Nortan251/agentcore/pull/43#discussion_r4179362899), add deterministic regressions and native Windows proof, run focused/relevant/full suites and all six current-integration CI gates, obtain fresh exact-head independent review, then assess closure and request separate merge authorization. No PR #43 modification or merge is performed by this milestone.
+
+FINAL VERDICT: **MERGED AND VERIFIED**. Stop after PR #44 integration and its independent ledger publication; this documentation-only branch must never merge into main. Only this existing PR #44 record and its single INDEX row are amended; all prior snapshots and unrelated records are preserved.
