@@ -429,3 +429,54 @@ No POSIX replacement support, native macOS validation, hostile two-idmapped-moun
 Next required action is a separately scoped repair and deterministic regression for the identical-content/pre-rename uncertain-outcome case, followed by exact-head focused/relevant/full/native CI evidence, fresh independent review, security-thread closure and a new release-gate assessment. No such repair or further release action is performed in this milestone.
 
 FINAL VERDICT: **BLOCKED** — new unresolved exact-head P1 4324256953; PR #43 restored to Draft and unmerged; main unchanged; no post-merge verification claimed.
+
+## 2026-10-20 amendment — durable replacement reconciliation P1 repair
+
+An interrupted replacement cannot be proven from current file contents, metadata or native identity. An untouched original can already contain the requested bytes; even a different matching host-owned file can have been moved into place by another principal with parent namespace rights. `replacement.observe()` now retains uncertainty because protected intent has no action-specific published-stage identity or completion receipt. It cannot promote ambiguous history to success or fabricate confirmed non-application/retry permission.
+
+**PR #43 remains Draft / OPEN / UNMERGED. No ready transition, merge, auto-merge or main modification is authorized. Both [original P1 4324256953](https://github.com/Nortan251/agentcore/pull/43#discussion_r4324256953) and [follow-up P1 4327061408](https://github.com/Nortan251/agentcore/pull/43#discussion_r4327061408) remain formally open for explicit assessment.**
+
+- Starting reviewed head: `64433667360f657fa64b62613bee3f4c95d97f36`.
+- Final repair head: `4fb1b32c255ab07e37f1f6d8f4f1ce67eb4c6bdd`; direct parent: `ac93ee6ea67d23214b0bc17b6ee169ccae3eecda`.
+- Unchanged main / merged PR #44: `de8432528042e5775a83d2091849c0a87cacf67c`.
+- Standard PR integration checkout: `5f7457672e9e628dec88f3066b938c0b90e01574`, ordered parents unchanged main and final repair head. Its tree `956e89b49b2aef4f2f29e17c01a44a36b7af539c` equals the repair tree. All six job checkout logs were verified; this synthetic merge is not a release merge.
+
+The first identity-exclusion candidate `ac93ee6` blocked unchanged originals but was insufficient. [Independent review](https://github.com/Nortan251/agentcore/pull/43#pullrequestreview-5587714301) correctly identified matching-sibling substitution by a different principal. The final correction removes optimistic recovery inference entirely, without rewriting that history or broadening concurrency exclusions.
+
+Successful ordinary Windows replacement still uses the owned native stage/rename/flush path and confirms success, including identical-content replacement. A genuine post-publication interruption without durable success now remains OUTCOME_UNKNOWN / HUMAN_CONFIRMATION_REQUIRED. This is an explicit recovery availability tradeoff until authenticated action-specific publication evidence is designed separately. Current matching bytes, a changed identity and current-token ownership are insufficient historical proof; exclusive AgentCore host ownership does not serialize other principals' namespace operations. No stronger filesystem CAS or close-to-rename guarantee is claimed.
+
+`observe` is the sole changed runtime function relative to the starting head. Native APIs, snapshot/revision binding, metadata/ACL/SACL/attributes, stage privacy/cleanup, executor/permission/approval checks, protected intent and journal schemas remain unchanged. Reads, file creation, Directory Create, POSIX fail-closed restrictions and legacy uncertainty retain their implementation. No Issue #46 or governance/workflow work is included.
+
+Changed files: `src/agentcore/fs/replacement.py` (`observe`); `tests/test_fs_replace.py` (native execution/recovery and uncertain-publication regressions); `tests/test_fs_replace_support.py` (synthetic provenance/durable regression); `tests/test_workspace_replace.py` (startup recovery); `docs/architecture/filesystem-replace-v1.md` (recovery evidence contract).
+
+Validation:
+
+- Original reviewed runtime: **2 failed / 2 passed** in the synthetic predicate/durable regression, including false success for identical bytes on the original identity. The expanded provenance regression on `ac93ee6` also produced **2 failed / 2 passed**, exposing false success for changed identity. All four pass after the final correction. Synthetic facts are not native OS proof.
+- Final local focused: **62 passed / 81 skipped**. Surrounding filesystem/Workspace/permissions/recovery/ActionJournal: **1105 passed / 208 skipped**.
+- Full local Windows Python 3.13: **6533 passed / 369 skipped / 89 warnings**, exit 0 in 459.28 seconds.
+- Compileall, committed `HEAD^ HEAD` and starting-head-relative whitespace, AST scope and clean-status checks pass.
+- Ten native Windows tests cover identical/different bytes with marker-before-restoration failure, pre-rename failure, real matching-sibling substitution after failure, real rename followed by lost return, and normal success. They assert identity/metadata/content, exact HCR/unknown without terminal success/no-effect after uncertainty, normal confirmed success, cleanup and no second physical replacement. Sibling interference uses native filesystem I/O under controlled injection; it is not claimed execution as a distinct Windows user.
+- Workspace startup blocks ambiguous old/new history, including identical bytes, before model calls or retry. Existing native metadata/ACL/SACL/privacy/stale/authority assertions remain. Positive recovery expectations were replaced with exact HCR/unknown assertions because current-state evidence does not identify this action's publication; ordinary successful execution assertions remain.
+- Local privileged replacement skips are explicit because this ordinary token lacks assigned SeSecurityPrivilege. Native platform evidence is below. Initial surrounding path-length failures were corrected with a short test directory without source/assertion changes.
+
+Commands: focused `python -m pytest tests/test_fs_replace.py tests/test_fs_replace_support.py tests/test_workspace_replace.py tests/test_fs_publication_support.py -ra -o addopts= --basetemp=../p2`; surrounding `python -m pytest` over filesystem, Workspace, permissions, recovery, ToolExecutor and Task 43 suites with `-ra -o addopts= --basetemp=../r2`; full `python -m pytest -ra -o addopts= --basetemp=../u2`; `python -m compileall -q src tests`; `git diff --check HEAD^ HEAD`; `git diff --check 64433667360f657fa64b62613bee3f4c95d97f36 HEAD`. Initial oversized-basetemp run was 62 failed / 1043 passed / 206 skipped; the complete short-path reruns pass without test weakening.
+
+| Required final-head gate | Result | Exact job |
+|---|---|---|
+| Linux full suite (py3.13) | SUCCESS (attempt 2) | [job](https://github.com/Nortan251/agentcore/actions/runs/39452798963/job/118733387640) |
+| Windows fs verification (py3.11) | SUCCESS | [job](https://github.com/Nortan251/agentcore/actions/runs/39452798998/job/118731776360) |
+| Windows fs verification (py3.12) | SUCCESS | [job](https://github.com/Nortan251/agentcore/actions/runs/39452798998/job/118731776273) |
+| Windows fs verification (py3.13) | SUCCESS | [job](https://github.com/Nortan251/agentcore/actions/runs/39452798998/job/118731776270) |
+| Chromium adapter (ubuntu-latest) | SUCCESS | [job](https://github.com/Nortan251/agentcore/actions/runs/39452798954/job/118731769121) |
+| Chromium adapter (windows-latest) | SUCCESS | [job](https://github.com/Nortan251/agentcore/actions/runs/39452798954/job/118731768737) |
+
+
+Native Linux attempt 2: stage-parent **26 passed / 2 Windows-only skips**, including **10/10 genuine distinct-UID scenarios**; surrounding **1035 passed / 195 skipped / 1 warning**; full **6614 passed / 288 skipped / 98 warnings**, 165.16 seconds. Compileall and committed whitespace passed. Attempt 1 failed an unchanged fork-test `waitpid(WNOHANG)` timing assertion after the child had sent the expected rejection and EOF (1 failed / 1034 passed / 195 skipped); no replacement assertion failed. The unchanged exact-head rerun passed; the failure is retained as an unrelated test-timing limitation, not hidden or repaired here.
+
+All three native Windows jobs passed their security and full suites. Their replacement skip summaries contain only the existing 10 POSIX-only cases: the ten new native cases and privileged snapshot/stage/ACL/SACL/privacy/ownership/approval/cancellation/cleanup and Workspace replacement cases did not skip. Aggregate Windows full-suite totals are suppressed by existing quiet flags and are not invented. Both Chromium jobs passed **419 tests**. Linux evidence validates refusal/legacy uncertainty and the existing foundation, not supported POSIX replacement. No native macOS or distinct-principal Windows execution is claimed.
+
+[Fresh independent review requested](https://github.com/Nortan251/agentcore/pull/43#issuecomment-6295108020) on the full final SHA, explicitly asking to reassess both P1s. [Final-head receipt](https://github.com/Nortan251/agentcore/pull/43#issuecomment-6295154862) reports no major issues; the [machine-readable summary](https://github.com/Nortan251/agentcore/pull/43#issuecomment-6272463554) identifies the full final SHA, completed status and no new findings. This is code-review evidence, not a separate security-scan claim or formal finding closure. Final thread inventory: **8 total, 6 earlier resolved, 2 P1 threads unresolved**; neither original P1 4324256953 nor provenance follow-up 4327061408 was resolved by this task.
+
+No no-new-findings review automatically closes either P1. The earlier six resolved findings retain their resolutions. The independent ledger remains documentation-only and must never merge into main.
+
+Remaining limits: ambiguous replacement recovery requires human confirmation; existing Windows close-to-rename, directory-flush/power-loss and full-descriptor-access limits remain. No POSIX/macOS writer, native macOS verification or stronger filesystem CAS is claimed. **READY FOR INDEPENDENT REVIEW** of this bounded repair; retain Draft/unmerged and the explicit release hold. Any finding closure or release decision remains separate.
