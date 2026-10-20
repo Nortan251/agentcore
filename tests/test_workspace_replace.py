@@ -114,15 +114,9 @@ def test_recovery_precedes_model_and_never_retries_uncertain_replace(setup, monk
         assert h._services.actions.load(action).state is ActionState.RECONCILE_REQUIRED
     monkeypatch.setattr(WorkspaceGuard, "replace_file", lambda *a: pytest.fail("recovery retried replacement"))
     model = Model()
-    if state == "old":
-        with pytest.raises(WorkspaceHostError, match="workspace_action_requires_operator"):
-            compose(model)
-        assert not model.requests
-    else:
-        with compose(model) as h:
-            assert h._services.actions.load(action).state is ActionState.SUCCEEDED
-            assert not model.requests
-            assert h.conversation().send("read recovered").ok
+    with pytest.raises(WorkspaceHostError, match="workspace_action_requires_operator"):
+        compose(model)
+    assert not model.requests
 
 
 @pytest.mark.parametrize("existing", [255, 256])

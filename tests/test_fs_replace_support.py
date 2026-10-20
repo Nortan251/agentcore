@@ -30,7 +30,7 @@ def prior_revision(h, monkeypatch):
 
 @pytest.mark.parametrize("same_identity", [False, True])
 @pytest.mark.parametrize("identical_content", [False, True])
-def test_reconciliation_excludes_original_identity(make, monkeypatch, same_identity, identical_content):
+def test_matching_observation_cannot_prove_replacement(make, monkeypatch, same_identity, identical_content):
     # Synthetic snapshot facts test the predicate/durable contract on every OS;
     # native Windows marker/rename interruptions are tested separately.
     h = make()
@@ -50,13 +50,9 @@ def test_reconciliation_excludes_original_identity(make, monkeypatch, same_ident
     monkeypatch.setattr(replacement, "snapshot", lambda *args: (content, observed))
     report = h.reconcile(result.action_id)
     record = h.actions.load(result.action_id)
-    assert report.status is (ActionReconciliationStatus.UNRESOLVED if same_identity
-                             else ActionReconciliationStatus.SETTLED_SUCCEEDED)
-    if same_identity:
-        assert record.state is ActionState.RECONCILE_REQUIRED and record.terminal_outcome is None
-        assert record.reconciliation.disposition is ReconciliationDisposition.HUMAN_CONFIRMATION_REQUIRED
-    else:
-        assert record.terminal_outcome.verdict is EffectVerdict.CONFIRMED_APPLIED
+    assert report.status is ActionReconciliationStatus.UNRESOLVED
+    assert record.state is ActionState.RECONCILE_REQUIRED and record.terminal_outcome is None
+    assert record.reconciliation.disposition is ReconciliationDisposition.HUMAN_CONFIRMATION_REQUIRED
     assert record.attempts[0].effect_verdict is EffectVerdict.OUTCOME_UNKNOWN
     assert not h.invoke(revision, content=content,
                         action_context=ActionInvocationContext(action_id=result.action_id)).ok

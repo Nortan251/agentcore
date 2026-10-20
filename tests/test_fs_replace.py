@@ -394,13 +394,17 @@ def test_real_replacement_has_journal_truth_and_preserves_metadata(make, monkeyp
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows replacement identity and interruption")
-@pytest.mark.parametrize("seam", ["restore", "rename", "after_rename", "success"])
+@pytest.mark.parametrize("seam", ["restore", "rename", "sibling_substitution", "after_rename", "success"])
 @pytest.mark.parametrize("identical_content", [False, True])
-def test_windows_replacement_identity_proves_reconciliation(make, monkeypatch, seam, identical_content):
+def test_windows_replacement_execution_and_recovery_truth(make, monkeypatch, seam, identical_content):
     from agentcore.fs import _windows_mutation as win
     h = make(); revision = h.revision()
     old = h.revisions._snapshots[revision]
     content = h.target.read_text(encoding="utf-8") if identical_content else "NEW"
+    sibling = h.target.with_name("sibling.txt")
+    if seam == "sibling_substitution":
+        sibling.write_bytes(content.encode())
+        assert h.guard.snapshot_for_update("sub/sibling.txt", 1000)[1]["metadata"] == old["metadata"]
     replace, restore, publish = h.guard.replace_file, win.preserve_update_metadata, win.publish_update
     entries, markers, renames = [], [], []
     def attempt(intent, data, validate, publication):
@@ -416,7 +420,7 @@ def test_windows_replacement_identity_proves_reconciliation(make, monkeypatch, s
         return restore(*args)
     def publishing(*args):
         assert markers == [1]
-        if seam == "rename":
+        if seam in {"rename", "sibling_substitution"}:
             raise TimeoutError()
         publish(*args)
         renames.append(1)
@@ -427,12 +431,18 @@ def test_windows_replacement_identity_proves_reconciliation(make, monkeypatch, s
     monkeypatch.setattr(win, "publish_update", publishing)
     result = h.invoke(revision, content=content)
     record = h.actions.load(result.action_id)
+    if seam == "sibling_substitution":
+        assert h.guard.snapshot_for_update("sub/old.txt", 1000)[1] == old
+        # Native competing namespace move, not this action's stage publication;
+        # this injection does not claim execution as a distinct Windows user.
+        os.replace(sibling, h.target)
     observed_content, observed = h.guard.snapshot_for_update("sub/old.txt", 1000)
     applied = seam in {"after_rename", "success"}
-    assert observed_content == (content if applied else "héllo\n")
-    assert (observed["identity"] != old["identity"]) is applied
+    matches = applied or seam == "sibling_substitution"
+    assert observed_content == (content if matches else "héllo\n")
+    assert (observed["identity"] != old["identity"]) is matches
     assert observed["metadata"] == old["metadata"] and not h.residue()
-    if not applied:
+    if not matches:
         assert observed == old  # The original native object and snapshot are untouched.
     assert result.ok is (seam == "success")
     if seam != "success":
@@ -441,9 +451,8 @@ def test_windows_replacement_identity_proves_reconciliation(make, monkeypatch, s
         assert record.attempts[0].effect_verdict is EffectVerdict.OUTCOME_UNKNOWN
         report = h.reconcile(result.action_id)
         record = h.actions.load(result.action_id)
-        assert report.status is (ActionReconciliationStatus.SETTLED_SUCCEEDED if applied
-                                 else ActionReconciliationStatus.UNRESOLVED)
-    if applied:
+        assert report.status is ActionReconciliationStatus.UNRESOLVED
+    if seam == "success":
         assert record.terminal_outcome.verdict is EffectVerdict.CONFIRMED_APPLIED
     else:
         assert record.state is ActionState.RECONCILE_REQUIRED and record.terminal_outcome is None
@@ -544,7 +553,7 @@ def test_prepublication_failure_old_intact_and_stage_cleaned(make, monkeypatch, 
 
 
 @pytest.mark.parametrize("state", ["new", "old", "absent", "other", "directory", "hardlink"])
-def test_uncertain_publication_reconciles_only_exact_new_state(make, monkeypatch, state):
+def test_uncertain_publication_requires_human_confirmation(make, monkeypatch, state):
     h = make(); revision = h.revision()
     old_mode = h.target.stat().st_mode & 0o777
     def uncertain(publish):
@@ -562,8 +571,10 @@ def test_uncertain_publication_reconciles_only_exact_new_state(make, monkeypatch
     elif state == "directory": h.target.unlink(); h.target.mkdir()
     elif state == "hardlink": os.link(h.target, h.base / "alias")
     report = h.reconcile(result.action_id)
-    assert report.status is (ActionReconciliationStatus.SETTLED_SUCCEEDED if state == "new"
-                             else ActionReconciliationStatus.UNRESOLVED)
+    assert report.status is ActionReconciliationStatus.UNRESOLVED
+    record = h.actions.load(result.action_id)
+    assert record.state is ActionState.RECONCILE_REQUIRED and record.terminal_outcome is None
+    assert record.reconciliation.disposition is ReconciliationDisposition.HUMAN_CONFIRMATION_REQUIRED
     assert not h.invoke(revision).ok
     public = json.dumps(result.to_dict()) + repr(h.actions.load(result.action_id)) + repr(h.logger.events)
     for secret in ("PRIVATE_NEW_BODY", "PRIVATE_ERROR_SENTINEL", revision, "sub/old.txt", str(h.root)):

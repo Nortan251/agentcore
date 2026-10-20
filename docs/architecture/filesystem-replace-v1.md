@@ -170,26 +170,31 @@ bytes, metadata or absence: their historical publication identity is unverified.
 They remain OUTCOME_UNKNOWN / HUMAN_CONFIRMATION_REQUIRED, without retry or
 schema/protected-evidence changes.
 
-On supported Windows, reconciliation under current FS_READ and exact recovery
-leases additionally requires the observed native identity (volume serial and
-file index) to differ from the authenticated original identity, with safe final
-ancestry, preserved metadata, size and digest matching NEW intended state.
-An unchanged original object cannot satisfy this predicate even when OLD and
-NEW bytes are identical. In-place edits of that object also cannot prove
-replacement. Ordinary successful identical-content replacement remains allowed:
-native rename publishes a distinct owned stage object, without a no-op shortcut.
+On supported Windows, uncertain replacement history always remains
+OUTCOME_UNKNOWN/HUMAN_CONFIRMATION_REQUIRED under current FS_READ and exact
+recovery leases. The protected intent authenticates the original snapshot but
+contains no action-specific published-stage identity or completion receipt.
+The reconciler therefore does not infer historical application from current
+filesystem observations, and does not traverse the target to make that inference.
+The original object cannot be falsely confirmed even when OLD and NEW bytes
+are identical; a distinct matching object is also insufficient evidence.
 
-Identity inequality alone is not a receipt identifying this action's stage.
-Confirmation relies on the existing exclusive Workspace Host mutation ownership,
-current-token file ownership checks and trusted same-user boundary, together
-with all the snapshot checks above. An arbitrary independent same-user replacement
-could reproduce those facts; this does not add protection against such writers
-or strengthen the documented close-to-rename interval into filesystem CAS.
-Identity reuse can conservatively prevent confirmation, never justify retry.
-The original identity, OLD state, absence, other content, unsafe objects and
-unverifiable metadata remain OUTCOME_UNKNOWN/HUMAN_CONFIRMATION_REQUIRED. OLD
-could have been restored after publication; absence could follow removal.
-No automated retry uses history, the action ID or an old revision.
+The exclusive Workspace Host lock serializes AgentCore, not other principals
+with parent namespace rights. Such a principal could move a pre-existing
+host-owned sibling with matching bytes and security into place after this
+action failed before native rename. Current-token ownership, changed identity,
+preserved metadata, ancestry and matching content would all pass without this
+action having published. No broader concurrency exclusion is introduced.
+OLD could also have been restored after publication; absence could follow
+removal. No observation proves non-application or authorizes automatic retry.
+
+Normal native execution still confirms success after owned-handle publication
+and flush return successfully, including identical-content replacements. There
+is no no-op rejection or content shortcut. A genuine post-publication interruption
+without a durable success result now requires human confirmation, even if the
+new stage is currently at the target. Automatic crash confirmation would require
+separately designed authenticated action-specific publication evidence; the
+journal schema and protected intent format are unchanged in this repair.
 
 Startup reconciliation precedes model execution. Unresolved replacement blocks
 the new mutation turn; historical AUTHORIZED actions are never automatically
