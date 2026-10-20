@@ -8,6 +8,24 @@ creation, deletion, shell, browser, or Gmail capability in this composition.
 
 ## Guarantees
 
+**File creation now requires native Windows handle publication. POSIX file
+creation is unsupported and fails closed, including private local Linux
+directories.** This is an intentional compatibility restriction. The former
+owner/mode/filesystem allowlist and pathname publication have been removed.
+The [historical production P1](https://github.com/Nortan251/agentcore/pull/44#discussion_r4187472896)
+requires independent review of this refusal contract; passing CI alone does not
+resolve it. Directory creation retains its separate implementation and contract.
+
+Support is platform-specific: Windows keeps the complete existing `write_file`
+implementation; Linux and macOS refuse only file publication. The tool remains
+registered for exact recovery bindings and its catalogue description declares
+this restriction. A live unsupported invocation returns the bounded
+`filesystem_publication_unsupported` error and persists
+`filesystem.unsupported_publication` with NOT_INVOKED / CONFIRMED_NOT_APPLIED.
+An error after possible physical entry still records uncertainty, regardless of
+its category. Reads, Directory Create and default read-only composition retain
+their existing contracts; this repair does not certify their separate limits.
+
 The authority path is `ToolRegistry -> argument validation -> PermissionPolicy
 -> ToolExecutor -> durable protected intent / ActionJournal attempt claim ->
 Tool.run -> WorkspaceGuard-owned mutation -> normalized effect truth`.
@@ -52,13 +70,49 @@ relative target are bound into protected intent. Detectable substitutions fail
 closed; the model cannot select identities, roots, journal classes, temporary
 names or recovery policy.
 
-On POSIX, traversal opens components relative to directory descriptors with
-`O_DIRECTORY | O_NOFOLLOW`. A host-generated exclusive 0600 staging file is
-written exactly, fsynced, and published via descriptor-relative `link` with no
-replacement semantics. The owned staging name is then unlinked and the parent
-directory fsynced. Unsupported publication fails closed. This does not require
-`openat2` or Linux 5.6. The briefly double-linked final file is not reported as
-success until staging cleanup and directory flush complete.
+The shared parent preparation still validates target absence and binds the
+directory identities for both mutation tools. File execution then validates the
+bounded content and lexical path and checks publication support **before opening
+the mutation parent, staging, or calling the physical-entry callback**. Any host
+other than native Windows is refused with `unsupported_publication`. A claimed
+durable attempt records NOT_INVOKED / CONFIRMED_NOT_APPLIED; no stage or final
+file is created. Existing permission and approval checks still precede this
+execution boundary. The policy is host-owned, unconditional, and has no model,
+configuration, environment-variable or pathname fallback override.
+
+On POSIX this refusal is independent of UID, ACL, mode, filesystem, ABI, mount
+mapping or ancestor layout. No local mount inspection is treated as proof that
+another alias of the backing directory is harmless. Native tests exercise
+ordinary distinct UIDs, masked ACLs, foreign ownership, shared/private parents,
+and a writable containing ancestor; these demonstrate refusal, not supported
+Linux publication. A hostile two-idmapped-mount experiment is not required by
+the implementation and is not claimed as tested.
+
+### Why Linux unnamed staging alone is insufficient
+
+`O_TMPFILE` without `O_EXCL` plus `linkat` can bind publication to an unnamed
+source inode. `AT_EMPTY_PATH` requires CAP_DAC_READ_SEARCH; a procfs descriptor
+link with `AT_SYMLINK_FOLLOW` can avoid that privilege, but depends on verified
+procfs/descriptor semantics and filesystem support. Neither method freezes the
+destination directory's namespace ancestry. An opened parent remains attached
+to the directory after a different principal relocates a containing ancestor;
+another final pathname check leaves a further check/use interval. `openat2`
+resolution restrictions govern lookup, not a later independent publication.
+Idmapped aliases also prevent mount-local owner bits from proving global
+namespace exclusivity. Refusing unknown filesystem magic or idmapped status on
+only the observed mount would not close that authority gap.
+
+Consequently this repair does not add an unproven native binding, a privileged
+production requirement, a cooperative lock, or an exclusion of other ordinary
+principals from the threat model. Restoring POSIX file creation requires a
+separate enforceable source-identity **and namespace-authority** contract with
+native adversarial evidence. More random names, mode checks and post-effect
+digest comparisons cannot replace it.
+
+Platform references: [open(2)](https://man7.org/linux/man-pages/man2/open.2.html),
+[linkat(2)](https://man7.org/linux/man-pages/man2/link.2.html),
+[openat2(2)](https://man7.org/linux/man-pages/man2/openat2.2.html),
+and [kernel idmapping documentation](https://docs.kernel.org/filesystems/idmappings.html).
 
 On Windows, the trusted root is opened with `FILE_FLAG_OPEN_REPARSE_POINT` and
 directory semantics. Every requested child is opened with `NtCreateFile`
@@ -108,7 +162,7 @@ The live executor distinguishes a proven pre-staging interruption (NOT_INVOKED)
 from exceptions/cancellation/interruptions once staging may have started
 (RECONCILE_REQUIRED). An exception never implies no final effect.
 
-The read-only reconciler uses the same verified filesystem boundary:
+On Windows the read-only reconciler uses the same verified filesystem boundary:
 
 - Safe single-linked regular final file with exact size and content digest:
   CONFIRMED_APPLIED.
@@ -124,12 +178,19 @@ attempt; a proven interruption before staging remains NOT_INVOKED. Neither
 classification is inferred merely from absence during crash recovery.
 Staging alone is not application. No automatic write retry is requested by the
 reconciler. Existing targets cannot be overwritten on a resumed action, and
-ActionJournal guards/attempt truth fence duplicate execution. Crash residue is
-bounded to one random `.agentcore-stage-<32 hex>` object per physical attempt;
-there is no startup cleanup subsystem. On POSIX an interruption between link
-publication and staging unlink can leave two links; reconciliation remains
-unknown until an operator resolves that residue. Protected-store orphan objects
-retain the existing operator-managed lifecycle.
+ActionJournal guards/attempt truth fence duplicate execution. Windows crash
+residue remains bounded to one random `.agentcore-stage-<32 hex>` object per
+physical attempt; there is no startup cleanup subsystem. Protected-store orphan
+objects retain the existing operator-managed lifecycle.
+
+For legacy uncertain file attempts reconciled on POSIX, observation refuses
+before target traversal. Even an exact matching content digest does not restore
+the missing publication guarantee. The adapter records OUTCOME_UNKNOWN /
+HUMAN_CONFIRMATION_REQUIRED, keeps the original attempt, and never retries it.
+Previously terminal journal records are not rewritten. Operators must review
+historical POSIX effects and existing residue separately; this repair neither
+deletes nor reclassifies their files. Schemas, action identity, protected intent,
+approval decisions and persisted authority semantics are unchanged.
 
 ## Host trust assumptions / non-guarantees
 
@@ -138,16 +199,30 @@ The configured workspace is trusted host configuration.
 AgentCore protects the mutation from untrusted model/page/file content and
 unsafe workspace path objects.
 
-AgentCore does not defend the workspace namespace against a separate malicious
-process already running with the same user's filesystem authority or an
-administrator/root concurrently relocating authorized directories.
+File publication's supported Windows boundary uses the existing pinned,
+no-delete-sharing directory and staging handles and native no-replace rename.
+The successfully published object is the handle-owned object that received the
+verified content. This does not promise immutable contents after handles close,
+protection from administrator/kernel compromise, or POSIX-like directory fsync
+durability on Windows. Native/filesystem errors after physical entry preserve
+uncertainty; they never authorize a blind retry.
 
-In particular, POSIX directory descriptors remain attached to directory objects
-after hostile relocation outside the workspace. Component no-follow traversal
-does not freeze namespace ancestry. Tests deterministically characterize this
-excluded interleave instead of claiming to prevent it. Ordinary detectable
-parent replacements are separately tested as refusals. These are host-boundary
-limits, not promises of race-proof or sandbox-proof operation.
+Other ordinary principals, hostile idmapped aliases and writable-ancestor
+relocation are not newly excluded from the POSIX threat model. POSIX file
+publication is refused because this implementation cannot enforce that model.
+The shared POSIX traversal remains available for Directory Create under its
+separate documented contract; this repair does not certify its namespace
+behavior or repair File Replace.
+
+## File Replace dependency
+
+PR #43 must not reuse the removed POSIX staging or owner/mode helpers or bypass
+the file-publication support boundary. Its separate `os.replace(stage, ...)`
+source-substitution finding is not repaired by this create-only change.
+Replacement must independently bind its verified source and admitted target,
+preserve metadata/confidentiality and revision checks, define fail-closed
+platform support and uncertainty boundaries, and obtain its own regressions,
+exact-head review and all required CI. No PR #43 code is changed here.
 
 ## Explicit host composition
 

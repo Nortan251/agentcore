@@ -8,6 +8,13 @@ mutation tools require existing parents. Add
 bounded public result. There is no interactive loop, background autonomy or
 operator-resolution UI in v1.
 
+File creation currently requires native Windows handles. On POSIX, `write_file`
+fails closed before staging; the host reports a failed tool/action and cannot
+claim successful creation from model prose. Read tools and Directory Create
+retain their separate contracts. Legacy uncertain POSIX file attempts require
+human confirmation and prevent startup from silently retrying. See the
+[file-publication support decision](filesystem-write-v1.md#guarantees).
+
 ## Current host authority
 
 Both an explicit `--enable-write` on **this invocation** and current
@@ -49,7 +56,7 @@ the executor's one-use process/thread context. Retained executor/conversation
 references cannot execute outside the one active turn or after host close.
 Read posture in this host always refuses sensitive paths, symlink traversal
 and multiple hard links; existing bounds remain configurable. The create-only
-file-write primitive and Gmail code are unchanged. Directory creation uses the
+file-write primitive enforces the platform support boundary described above. Directory creation uses the
 same verified parent boundary; see [Directory Create v1](filesystem-directory-create-v1.md).
 
 The ordinary standing SYSTEM_PROMPT is retained and amended with host limits:

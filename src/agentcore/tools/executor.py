@@ -88,6 +88,7 @@ from agentcore.credentials.action import (
 )
 from agentcore.fs.sensitive import DEFAULT_SENSITIVE_POLICY
 from agentcore.fs.mutation import DestinationExistsError
+from agentcore.fs.paths import PathRejectedError, RejectionReason
 from agentcore.observability.events import Events
 from agentcore.observability.logging import StructuredLogger, get_logger
 from agentcore.permissions.levels import READ_ONLY_CAPABILITIES, Capability, PermissionLevel
@@ -174,6 +175,18 @@ class _CurrentAuthorityBlocked(Exception):
 
 class _FilesystemWriteNotInvoked(_CredentialActionNotInvoked):
     """The live executor proved no filesystem mutation boundary was entered."""
+
+    result_class = "filesystem.not_invoked"
+    summary = "The filesystem mutation boundary was not entered."
+    kind = "filesystem_write_unavailable"
+
+
+class _FilesystemPublicationUnsupported(_FilesystemWriteNotInvoked):
+    """Publication was refused before possible physical entry."""
+
+    result_class = "filesystem.unsupported_publication"
+    summary = "File creation requires native Windows handle publication; unavailable on this platform."
+    kind = "filesystem_publication_unsupported"
 
 
 def _safe_args_for_log(args: Mapping[str, Any]) -> dict[str, Any]:
@@ -1656,9 +1669,11 @@ class ToolExecutor:
             if isinstance(exc, CancellationRequested):
                 raise _FilesystemWriteNotInvoked(cancellation=exc) from None
             raise _FilesystemWriteNotInvoked(interruption=type(exc)) from None
-        except Exception:
+        except Exception as exc:
             if execution is not None and execution.entered:
                 return self._unknown_effect(spec, "filesystem.uncertain"), None
+            if isinstance(exc, PathRejectedError) and exc.reason is RejectionReason.UNSUPPORTED_PUBLICATION:
+                raise _FilesystemPublicationUnsupported() from None
             raise _FilesystemWriteNotInvoked() from None
         finally:
             if execution is not None:
@@ -3615,16 +3630,16 @@ class ToolExecutor:
                 raise exc.cancellation
             published = self._publish_confirmed_no_effect(
                 store, claimed, attempt_status=ActionAttemptStatus.NOT_INVOKED,
-                result_class=("filesystem.not_invoked" if isinstance(exc, _FilesystemWriteNotInvoked)
+                result_class=(exc.result_class if isinstance(exc, _FilesystemWriteNotInvoked)
                               else "gmail.send.not_invoked"),
-                summary=("The filesystem mutation boundary was not entered."
+                summary=(exc.summary
                          if isinstance(exc, _FilesystemWriteNotInvoked)
                          else "The authenticated send provider was not entered."))
             if exc.interruption is not None:
                 raise exc.interruption() from None
             return self._published_or_uncertain(
                 tool_spec.name, redacted, published, decision, invocation_id, attempt_id,
-                elapsed(), log, fallback_kind=("filesystem_write_unavailable"
+                elapsed(), log, fallback_kind=(exc.kind
                     if isinstance(exc, _FilesystemWriteNotInvoked) else "action_credential_unavailable"),
                 fallback_action_id=claimed.action_id)
         except _CurrentAuthorityBlocked as exc:

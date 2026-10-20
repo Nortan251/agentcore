@@ -84,6 +84,7 @@ def make(tmp_path):
         h.close()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_create_through_real_durable_executor_and_default_stays_read_only(make):
     h = make()
     result = h.invoke()
@@ -184,12 +185,14 @@ def test_invalid_or_oversized_payload_has_no_effect(make, content):
 
 
 @pytest.mark.parametrize("content", ["", "a" * 16, "é" * 8])
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_exact_small_bound_and_empty_text(make, content):
     h = make(limit=16)
     assert h.invoke(content=content).ok
     assert (h.root / "sub/new.txt").read_bytes() == content.encode()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_maximum_worst_escaping_fits_real_protected_record_and_n_plus_one_refused(make):
     h = make()
     assert h.invoke(content="\x00" * MAX_WRITE_FILE_BYTES).ok
@@ -206,6 +209,7 @@ def test_maximum_worst_escaping_fits_real_protected_record_and_n_plus_one_refuse
 def test_permission_and_existing_approval_path(make, level, approve, allowed):
     h = make(level=level, approve=approve)
     result = h.invoke()
+    allowed = allowed and os.name == "nt"
     assert result.ok is allowed
     assert (h.root / "sub/new.txt").exists() is allowed
     assert not h.residue()
@@ -309,6 +313,7 @@ def _publication_hook(monkeypatch, hook):
         monkeypatch.setattr(mutation.os, "link", link)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_appearing_target_refused_at_native_publication_without_overwrite(make, monkeypatch):
     h = make()
     def interfere(publish):
@@ -323,6 +328,7 @@ def test_appearing_target_refused_at_native_publication_without_overwrite(make, 
 
 
 @pytest.mark.parametrize("outcome", ["applied", "absent", "changed", "directory", "hardlink", "symlink"])
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_uncertainty_and_real_read_only_reconciliation(make, monkeypatch, outcome):
     h = make()
     def uncertain(publish):
@@ -354,6 +360,7 @@ def test_uncertainty_and_real_read_only_reconciliation(make, monkeypatch, outcom
     assert str(h.root) not in public
 
 
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_staging_failure_cleans_partial_and_reconciliation_ignores_staging(make, monkeypatch):
     h = make()
     if os.name == "nt":
@@ -375,6 +382,7 @@ def test_staging_failure_cleans_partial_and_reconciliation_ignores_staging(make,
     assert h.reconcile(result.action_id).status is ActionReconciliationStatus.UNRESOLVED
 
 
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_published_then_removed_after_interruption_remains_unknown_without_retry(make, monkeypatch):
     from agentcore.action_journal import ReconciliationDisposition
     h = make()
@@ -398,6 +406,7 @@ def test_published_then_removed_after_interruption_remains_unknown_without_retry
     assert calls == [1] and not target.exists() and len(record.attempts) == 1
 
 
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_same_action_cannot_blindly_repeat_after_uncertainty(make, monkeypatch):
     h = make()
     calls = []
@@ -439,6 +448,7 @@ def test_cancellation_after_claim_before_physical_seam_is_not_invoked(make):
     assert not (h.root / "sub/new.txt").exists() and not h.residue()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_cancellation_at_guard_final_pre_staging_check_is_not_invoked(make, monkeypatch):
     h = make()
     at_guard = []
@@ -459,6 +469,7 @@ def test_cancellation_at_guard_final_pre_staging_check_is_not_invoked(make, monk
 
 
 @pytest.mark.parametrize("interruption", [CancellationRequested, KeyboardInterrupt, SystemExit])
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_interruption_after_publish_keeps_final_and_uncertain_truth(make, monkeypatch, interruption):
     h = make()
     def interrupted(publish):
@@ -473,6 +484,7 @@ def test_interruption_after_publish_keeps_final_and_uncertain_truth(make, monkey
     assert h.reconcile(record.action_id).status is ActionReconciliationStatus.SETTLED_SUCCEEDED
 
 
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_permission_and_registration_leases_at_publication_hold_without_mutex_io(make, monkeypatch):
     h = make()
     entered, release = threading.Event(), threading.Event()
@@ -538,7 +550,7 @@ def test_preparation_pins_permission_and_registration_through_destination_probe(
     finally:
         release.set()
         thread.join(15)
-    assert not thread.is_alive() and len(results) == 1 and results[0].ok is allowed
+    assert not thread.is_alive() and len(results) == 1 and results[0].ok is (allowed and os.name == "nt")
     h.executor.policy = denied  # Revocation succeeds after the observation ends.
     def forbidden(*args):
         pytest.fail("revoked preparation read filesystem")
@@ -548,6 +560,7 @@ def test_preparation_pins_permission_and_registration_through_destination_probe(
 
 
 @pytest.mark.parametrize("seam", ["probe", "publication"])
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_reconciliation_pins_read_permission_and_registration_through_publication(make, monkeypatch, seam):
     h = make()
     def interrupted(publish):
@@ -598,6 +611,7 @@ def test_reconciliation_pins_read_permission_and_registration_through_publicatio
     h.registry.unregister("write_file")  # Both leases retire after truth publication.
 
 
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_reconciliation_revoked_before_lease_cannot_observe_target(make, monkeypatch):
     h = make()
     def interrupted(publish):
@@ -614,6 +628,7 @@ def test_reconciliation_revoked_before_lease_cannot_observe_target(make, monkeyp
     h.registry.unregister("write_file")
 
 
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_reconciliation_missing_binding_cannot_accept_unleased_reregistration(make, monkeypatch):
     h = make()
     def interrupted(publish):
@@ -658,6 +673,7 @@ def test_reconciliation_missing_binding_cannot_accept_unleased_reregistration(ma
     assert h.reconcile(invocation.action_id).status is ActionReconciliationStatus.SETTLED_SUCCEEDED
 
 
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_reconciliation_unavailable_claim_cannot_fall_through_to_unleased_probe(make, monkeypatch):
     h = make()
     def interrupted(publish):
@@ -681,6 +697,7 @@ def test_reconciliation_unavailable_claim_cannot_fall_through_to_unleased_probe(
 
 
 @pytest.mark.parametrize("seam", ["write", "probe", "truth"])
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_quarantine_completion_is_ordered_after_leased_filesystem_effect(make, monkeypatch, seam):
     from agentcore.action_journal import ActionDomainHealthState
     h = make()
@@ -767,6 +784,7 @@ def test_quarantine_completion_is_ordered_after_leased_filesystem_effect(make, m
     assert not h.residue()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_reentrant_quarantine_fails_busy_without_deadlock_or_losing_request(make, monkeypatch):
     from agentcore.action_journal import ActionDomainHealthState
     h = make()
@@ -791,7 +809,7 @@ def test_attempt_and_protected_intent_are_durable_before_staging(make, monkeypat
         assert h.payloads.load(record.intent_ref, action_id=record.action_id).payload["content"] == "héllo\n"
         return original(intent, data, validate)
     monkeypatch.setattr(h.guard, "create_file", check)
-    assert h.invoke().ok
+    assert h.invoke().ok is (os.name == "nt")
 
 
 def test_startup_pending_and_corrupt_protected_payload_fail_closed(make, monkeypatch):
@@ -804,23 +822,6 @@ def test_startup_pending_and_corrupt_protected_payload_fail_closed(make, monkeyp
     monkeypatch.setattr(other.payloads, "load", corrupt)
     assert not other.invoke().ok and not (other.root / "sub/new.txt").exists()
     assert not other.actions.list_actions()
-
-
-@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor namespace semantics")
-def test_excluded_hostile_ancestor_relocation_is_characterized_not_claimed_safe(make, monkeypatch):
-    h = make()
-    moved = h.base / "hostile-outside"
-    def relocate(publish):
-        os.rename(h.root / "sub", moved)
-        (h.root / "sub").mkdir()
-        return publish()
-    _publication_hook(monkeypatch, relocate)
-    # The explicit host exclusion: descriptor-relative publication follows the
-    # originally authorized directory object after a hostile same-user move.
-    result = h.invoke()
-    assert (moved / "new.txt").read_bytes() == "héllo\n".encode()
-    assert not (h.root / "sub/new.txt").exists()
-    assert result.ok
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX parent substitution")
@@ -873,6 +874,7 @@ def test_policy_change_during_protected_resolution_is_not_invoked(make, monkeypa
     assert not (h.root / "sub/new.txt").exists()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_two_cooperating_actions_cannot_overwrite_each_other(make, monkeypatch):
     h = make()
     ready = threading.Barrier(2, timeout=15)
@@ -898,6 +900,7 @@ def test_two_cooperating_actions_cannot_overwrite_each_other(make, monkeypatch):
     assert not h.residue()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_reconciliation_needs_only_current_fs_read(make, monkeypatch):
     h = make()
     def uncertain(publish):
@@ -910,6 +913,7 @@ def test_reconciliation_needs_only_current_fs_read(make, monkeypatch):
     assert h.reconcile(result.action_id).status is ActionReconciliationStatus.SETTLED_SUCCEEDED
 
 
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_owned_handles_are_released_after_success_and_stage_failure(make, monkeypatch):
     # Process-wide counts include unrelated full-suite cleanup. Keep exact
     # equality assertions, but run this real boundary in a fresh process.
@@ -951,18 +955,3 @@ def test_owned_handles_are_released_after_success_and_stage_failure(make, monkey
     _publication_hook(monkeypatch, fail)
     assert not h.invoke(path="sub/failed").ok
     assert count() == before
-
-
-@pytest.mark.skipif(os.name != "posix", reason="requires POSIX hard-link staging publication")
-def test_staging_alias_after_cleanup_failure_is_unknown_not_success(make, monkeypatch):
-    h = make()
-    original = os.unlink
-    def fail(path, *args, **kwargs):
-        if str(path).startswith(".agentcore-stage-"):
-            raise OSError("owned staging cleanup failure")
-        return original(path, *args, **kwargs)
-    monkeypatch.setattr(mutation.os, "unlink", fail)
-    result = h.invoke()
-    assert not result.ok and h.residue()
-    assert (h.root / "sub/new.txt").stat().st_nlink == 2
-    assert h.reconcile(result.action_id).status is ActionReconciliationStatus.UNRESOLVED
