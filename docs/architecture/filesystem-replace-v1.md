@@ -170,9 +170,23 @@ bytes, metadata or absence: their historical publication identity is unverified.
 They remain OUTCOME_UNKNOWN / HUMAN_CONFIRMATION_REQUIRED, without retry or
 schema/protected-evidence changes.
 
-On supported Windows, reconciliation under current FS_READ and exact recovery leases confirms
-application only when safe final ancestry, preserved metadata, size and digest
-match NEW intended state. OLD state, absence, other content, unsafe objects or
+On supported Windows, reconciliation under current FS_READ and exact recovery
+leases additionally requires the observed native identity (volume serial and
+file index) to differ from the authenticated original identity, with safe final
+ancestry, preserved metadata, size and digest matching NEW intended state.
+An unchanged original object cannot satisfy this predicate even when OLD and
+NEW bytes are identical. In-place edits of that object also cannot prove
+replacement. Ordinary successful identical-content replacement remains allowed:
+native rename publishes a distinct owned stage object, without a no-op shortcut.
+
+Identity inequality alone is not a receipt identifying this action's stage.
+Confirmation relies on the existing exclusive Workspace Host mutation ownership,
+current-token file ownership checks and trusted same-user boundary, together
+with all the snapshot checks above. An arbitrary independent same-user replacement
+could reproduce those facts; this does not add protection against such writers
+or strengthen the documented close-to-rename interval into filesystem CAS.
+Identity reuse can conservatively prevent confirmation, never justify retry.
+The original identity, OLD state, absence, other content, unsafe objects and
 unverifiable metadata remain OUTCOME_UNKNOWN/HUMAN_CONFIRMATION_REQUIRED. OLD
 could have been restored after publication; absence could follow removal.
 No automated retry uses history, the action ID or an old revision.

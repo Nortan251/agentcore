@@ -7,7 +7,10 @@ import threading
 
 import pytest
 
-from agentcore.action_journal import ActionAttemptStatus, ActionReconciliationStatus, ActionState, EffectVerdict
+from agentcore.action_journal import (
+    ActionAttemptStatus, ActionInvocationContext, ActionReconciliationStatus,
+    ActionState, EffectVerdict, ReconciliationDisposition,
+)
 from agentcore.errors import PolicyLeaseBusyError
 from agentcore.fs import replacement
 from agentcore.fs.revisions import FileRevisionRegistry
@@ -388,6 +391,68 @@ def test_real_replacement_has_journal_truth_and_preserves_metadata(make, monkeyp
     assert h.actions.load(result.action_id).terminal_outcome.verdict is EffectVerdict.CONFIRMED_APPLIED
     assert h.guard.snapshot_for_update("sub/old.txt", 1000)[1]["metadata"] == old
     assert not h.residue()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows replacement identity and interruption")
+@pytest.mark.parametrize("seam", ["restore", "rename", "after_rename", "success"])
+@pytest.mark.parametrize("identical_content", [False, True])
+def test_windows_replacement_identity_proves_reconciliation(make, monkeypatch, seam, identical_content):
+    from agentcore.fs import _windows_mutation as win
+    h = make(); revision = h.revision()
+    old = h.revisions._snapshots[revision]
+    content = h.target.read_text(encoding="utf-8") if identical_content else "NEW"
+    replace, restore, publish = h.guard.replace_file, win.preserve_update_metadata, win.publish_update
+    entries, markers, renames = [], [], []
+    def attempt(intent, data, validate, publication):
+        entries.append(1)
+        def marked():
+            publication()
+            markers.append(1)
+        return replace(intent, data, validate, marked)
+    def restoring(*args):
+        assert markers == [1]
+        if seam == "restore":
+            raise TimeoutError()
+        return restore(*args)
+    def publishing(*args):
+        assert markers == [1]
+        if seam == "rename":
+            raise TimeoutError()
+        publish(*args)
+        renames.append(1)
+        if seam == "after_rename":
+            raise TimeoutError()
+    monkeypatch.setattr(h.guard, "replace_file", attempt)
+    monkeypatch.setattr(win, "preserve_update_metadata", restoring)
+    monkeypatch.setattr(win, "publish_update", publishing)
+    result = h.invoke(revision, content=content)
+    record = h.actions.load(result.action_id)
+    observed_content, observed = h.guard.snapshot_for_update("sub/old.txt", 1000)
+    applied = seam in {"after_rename", "success"}
+    assert observed_content == (content if applied else "héllo\n")
+    assert (observed["identity"] != old["identity"]) is applied
+    assert observed["metadata"] == old["metadata"] and not h.residue()
+    if not applied:
+        assert observed == old  # The original native object and snapshot are untouched.
+    assert result.ok is (seam == "success")
+    if seam != "success":
+        assert record.state is ActionState.RECONCILE_REQUIRED and record.terminal_outcome is None
+        assert record.attempts[0].status is ActionAttemptStatus.INVOKED
+        assert record.attempts[0].effect_verdict is EffectVerdict.OUTCOME_UNKNOWN
+        report = h.reconcile(result.action_id)
+        record = h.actions.load(result.action_id)
+        assert report.status is (ActionReconciliationStatus.SETTLED_SUCCEEDED if applied
+                                 else ActionReconciliationStatus.UNRESOLVED)
+    if applied:
+        assert record.terminal_outcome.verdict is EffectVerdict.CONFIRMED_APPLIED
+    else:
+        assert record.state is ActionState.RECONCILE_REQUIRED and record.terminal_outcome is None
+        assert record.reconciliation.disposition is ReconciliationDisposition.HUMAN_CONFIRMATION_REQUIRED
+    h.recovery.recover_startup()
+    assert not h.invoke(revision, content=content,
+                        action_context=ActionInvocationContext(action_id=result.action_id)).ok
+    assert entries == markers == [1] and renames == ([1] if applied else [])
+    assert len(h.actions.load(result.action_id).attempts) == 1
 
 
 @pytest.mark.parametrize("late", ["content", "missing", "hardlink", "directory", "symlink"])

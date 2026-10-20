@@ -6,7 +6,7 @@ import sys
 import pytest
 
 from agentcore.action_journal import (
-    ActionAttemptStatus, ActionInvocationContext, ActionReconciliationStatus,
+    ActionAttemptStatus, ActionInvocationContext, ActionReconciliationStatus, ActionState,
     EffectVerdict, ReconciliationDisposition,
 )
 from agentcore.fs import replacement
@@ -26,6 +26,41 @@ def prior_revision(h, monkeypatch):
     h.revisions.issue(revision, old)
     monkeypatch.setattr(h.guard, "check_revision_snapshot", lambda snapshot: None)
     return revision
+
+
+@pytest.mark.parametrize("same_identity", [False, True])
+@pytest.mark.parametrize("identical_content", [False, True])
+def test_reconciliation_excludes_original_identity(make, monkeypatch, same_identity, identical_content):
+    # Synthetic snapshot facts test the predicate/durable contract on every OS;
+    # native Windows marker/rename interruptions are tested separately.
+    h = make()
+    revision = prior_revision(h, monkeypatch)
+    old = h.revisions._snapshots[revision]
+    content = h.target.read_text(encoding="utf-8") if identical_content else "NEW"
+    calls = []
+    def interrupted(intent, data, validate, publication):
+        publication()
+        calls.append(1)
+        h.target.write_bytes(data)
+        raise TimeoutError()
+    monkeypatch.setattr(h.guard, "replace_file", interrupted)
+    result = h.invoke(revision, content=content)
+    observed = dict(old, identity=old["identity"] if same_identity else [1, 3],
+                    size=len(content.encode()), digest=hashlib.sha256(content.encode()).hexdigest())
+    monkeypatch.setattr(replacement, "snapshot", lambda *args: (content, observed))
+    report = h.reconcile(result.action_id)
+    record = h.actions.load(result.action_id)
+    assert report.status is (ActionReconciliationStatus.UNRESOLVED if same_identity
+                             else ActionReconciliationStatus.SETTLED_SUCCEEDED)
+    if same_identity:
+        assert record.state is ActionState.RECONCILE_REQUIRED and record.terminal_outcome is None
+        assert record.reconciliation.disposition is ReconciliationDisposition.HUMAN_CONFIRMATION_REQUIRED
+    else:
+        assert record.terminal_outcome.verdict is EffectVerdict.CONFIRMED_APPLIED
+    assert record.attempts[0].effect_verdict is EffectVerdict.OUTCOME_UNKNOWN
+    assert not h.invoke(revision, content=content,
+                        action_context=ActionInvocationContext(action_id=result.action_id)).ok
+    assert calls == [1] and len(h.actions.load(result.action_id).attempts) == 1
 
 
 @pytest.mark.parametrize("platform", ["linux", "darwin", "freebsd14", "unknown"])

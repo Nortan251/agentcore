@@ -92,11 +92,14 @@ def test_stale_revision_latches_cli_failure_preserving_earlier_effects(setup, ca
 
 
 @pytest.mark.parametrize("state", ["new", "old"])
-def test_recovery_precedes_model_and_never_retries_uncertain_replace(setup, monkeypatch, native_security, state):
+@pytest.mark.parametrize("identical_content", [False, True])
+def test_recovery_precedes_model_and_never_retries_uncertain_replace(setup, monkeypatch, native_security, state,
+                                                                  identical_content):
     skip_unavailable(native_security)
     root, _, _, compose = setup
+    content = (root / "README.txt").read_text(encoding="utf-8") if identical_content else "NEW"
     def replacement_request(request):
-        return calls(("replace_file", {"path": "README.txt", "revision": get_revision(request), "content": "NEW"}))
+        return calls(("replace_file", {"path": "README.txt", "revision": get_revision(request), "content": content}))
     old_mode = (root / "README.txt").stat().st_mode & 0o777
     def uncertain(publish):
         if state == "new":

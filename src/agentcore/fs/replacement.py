@@ -131,7 +131,9 @@ def replace(guard, intent, data, validate, publication):
 def observe(guard, intent):
     _, observed = snapshot(guard, intent["path"], guard.config.max_write_bytes)
     old = intent["old"]
-    return (observed["workspace"] == old["workspace"]
+    # Matching bytes on the original object cannot prove a historical replacement.
+    return (observed["identity"] != old["identity"]
+            and observed["workspace"] == old["workspace"]
             and observed["directories"] == old["directories"]
             and observed["metadata"] == old["metadata"]
             and observed["size"] == intent["size"]
