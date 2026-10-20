@@ -183,6 +183,8 @@ def test_windows_native_stage_metadata(make, native_security):
             try:
                 win.write(stage, b"complete synthetic content")
                 win.flush(stage)
+                win.publish_update(stage, parent, "native-metadata.txt")
+                assert win.final_name(stage) == "native-metadata.txt"
                 win.preserve_update_metadata(stage, metadata)
                 assert win.update_facts(stage)["metadata"] == metadata
             finally:
@@ -398,6 +400,7 @@ def test_real_replacement_has_journal_truth_and_preserves_metadata(make, monkeyp
 @pytest.mark.parametrize("identical_content", [False, True])
 def test_windows_replacement_execution_and_recovery_truth(make, monkeypatch, seam, identical_content):
     from agentcore.fs import _windows_mutation as win
+    from test_fs_replace_confidentiality import assert_unreadable, restore_fixture_access
     h = make(); revision = h.revision()
     old = h.revisions._snapshots[revision]
     content = h.target.read_text(encoding="utf-8") if identical_content else "NEW"
@@ -436,12 +439,18 @@ def test_windows_replacement_execution_and_recovery_truth(make, monkeypatch, sea
         # Native competing namespace move, not this action's stage publication;
         # this injection does not claim execution as a distinct Windows user.
         os.replace(sibling, h.target)
+    private = seam in {"restore", "after_rename"}
+    if private:
+        assert_unreadable(h.target)
+        restore_fixture_access(h.target, old["metadata"])
     observed_content, observed = h.guard.snapshot_for_update("sub/old.txt", 1000)
-    applied = seam in {"after_rename", "success"}
+    applied = seam in {"restore", "after_rename", "success"}
     matches = applied or seam == "sibling_substitution"
     assert observed_content == (content if matches else "héllo\n")
     assert (observed["identity"] != old["identity"]) is matches
-    assert observed["metadata"] == old["metadata"] and not h.residue()
+    if not private:
+        assert observed["metadata"] == old["metadata"]
+    assert not h.residue()
     if not matches:
         assert observed == old  # The original native object and snapshot are untouched.
     assert result.ok is (seam == "success")
@@ -554,7 +563,9 @@ def test_prepublication_failure_old_intact_and_stage_cleaned(make, monkeypatch, 
 
 @pytest.mark.parametrize("state", ["new", "old", "absent", "other", "directory", "hardlink"])
 def test_uncertain_publication_requires_human_confirmation(make, monkeypatch, state):
+    from test_fs_replace_confidentiality import assert_unreadable, restore_fixture_access
     h = make(); revision = h.revision()
+    old = h.revisions._snapshots[revision]["metadata"]
     old_mode = h.target.stat().st_mode & 0o777
     def uncertain(publish):
         if state != "old":
@@ -566,6 +577,10 @@ def test_uncertain_publication_requires_human_confirmation(make, monkeypatch, st
     publication_hook(monkeypatch, uncertain)
     result = h.invoke(revision, content="PRIVATE_NEW_BODY")
     assert h.actions.load(result.action_id).state is ActionState.RECONCILE_REQUIRED
+    if os.name == "nt" and state != "old":
+        assert_unreadable(h.target)
+        # Fixture-only access repair precedes constructing alternate recovery states.
+        restore_fixture_access(h.target, old)
     if state == "absent": h.target.unlink()
     elif state == "other": h.target.write_bytes(b"different")
     elif state == "directory": h.target.unlink(); h.target.mkdir()
@@ -892,13 +907,14 @@ def test_replacement_permission_approval_and_exact_action_identity(make, level, 
 def test_windows_replace_interruption_and_failed_cleanup_preserve_effect_truth(make, monkeypatch, entered, error):
     from agentcore.fs import _windows_mutation as win
     h = make(); revision = h.revision()
+    old = h.revisions._snapshots[revision]["metadata"]
     seam = "publish_update" if entered else "write"
     def interrupted(*args):
         raise error("synthetic interruption")
     monkeypatch.setattr(win, seam, interrupted)
     if entered:
-        # Restoration already broadened the completed stage; failed discard
-        # must remain uncertain even though the final target is still old.
+        # The rename attempt leaves a private stage; failed discard cannot
+        # settle history even though the final target is still old.
         monkeypatch.setattr(win, "discard", lambda *args: (_ for _ in ()).throw(OSError()))
     if error is CancellationRequested and not entered:
         with pytest.raises(CancellationRequested):
@@ -912,6 +928,9 @@ def test_windows_replace_interruption_and_failed_cleanup_preserve_effect_truth(m
         assert record.attempts[-1].effect_verdict is EffectVerdict.OUTCOME_UNKNOWN
         assert h.reconcile(record.action_id).status is ActionReconciliationStatus.UNRESOLVED
         assert len(h.residue()) == 1
+        from test_fs_replace_confidentiality import assert_unreadable, restore_fixture_access
+        assert_unreadable(h.residue()[0])
+        restore_fixture_access(h.residue()[0], old)
         h.residue()[0].unlink()
     else:
         assert record.attempts[-1].status is ActionAttemptStatus.NOT_INVOKED and not h.residue()

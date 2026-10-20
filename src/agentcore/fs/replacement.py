@@ -106,18 +106,16 @@ def replace(guard, intent, data, validate, publication):
         try:
             win.write(owned, data)
             win.flush(owned)
-            # Keep the old target pinned through metadata restoration.
-            # Broadening the completed stage's DACL is possible disclosure,
-            # so uncertainty begins before that operation, not only rename.
+            # Keep the old target pinned through the final authority checks.
             with target(guard, handle, relative):
                 check_snapshot(guard, old)
                 _check(guard, old, relative, identities)
                 validate()
                 publication()
-                win.preserve_update_metadata(owned, old["metadata"])
-                win.flush(owned)
             started = True
             win.publish_update(owned, handle, relative.name)
+            # Restore only after a successful rename, through the same handle.
+            win.preserve_update_metadata(owned, old["metadata"])
             win.flush(owned)
         finally:
             try:

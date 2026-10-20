@@ -118,22 +118,33 @@ alternate data streams. The empty stage is created with a protected current-user
 DACL, then locked with an empty protected DACL before writing through the
 already-granted owned handle. New data-read/execute handles are denied even
 after close, so failed deletion or process death cannot expose partial residue.
-Old owner/group/full SACL are carried into the private descriptor. Only after
-complete writing/flush and final validation does possible-publication truth
-begin, before restoring the full old DACL/control semantics and ordinary allowed
-attributes. Exact descriptor/metadata equality is required before native rename.
-Replacement stages additionally use zero sharing. The old target remains pinned
-without write/delete sharing through restoration and is closed just before
-rename. The owned stage handle stays open through publication/flush.
+Old owner/group/full SACL are carried into the private descriptor. After complete
+writing/flush and final validation, possible-publication truth begins before
+native rename. The stage keeps its empty protected DACL until that rename returns
+successfully. Only then does the same owned handle restore the full old
+DACL/control semantics and ordinary allowed attributes, require exact
+descriptor/metadata equality, and flush. Replacement stages additionally use
+zero sharing, retained through rename, restoration, verification and final flush.
+The old target remains pinned without write/delete sharing through final
+validation and is closed just before rename.
 Unsupported rights/APIs/security semantics fail closed.
 
 After exact writes and FlushFileBuffers, the second comparison and current
-authority checks precede full target metadata restoration and handle-relative
-FileRenameInformation replacement. Uncertainty begins at descriptor restoration
-because a completed residue could become readable after cleanup/close fails;
-it is never definite no-effect. Pre-restoration residue remains unreadable even
-when discard fails. Complete post-restoration crash residue can inherit the old
-target's access policy; that possible disclosure remains journaled uncertainty.
+authority checks precede handle-relative FileRenameInformation replacement.
+Every unpublished stage retains its private DACL, including failed flush,
+failed/uncertain rename, failed discard, cancellation and process termination
+without cleanup callbacks. No security restoration broadens a staging name.
+An uncertain native rename return skips restoration: its object stays private,
+whether it still has its staging name or has reached the final target name.
+
+Rename and metadata restoration are separate OS operations, not one transaction.
+A failure or process exit after rename can leave the new final target private
+or with partially restored metadata. It remains OUTCOME_UNKNOWN /
+HUMAN_CONFIRMATION_REQUIRED; it is never reported as successful and is not
+automatically retried, deleted or repaired. Successful replacement requires
+exact metadata restoration, verification and final flush to return. The guarantee
+is exact metadata on confirmed success, not original permissions at every
+interrupted native rename. No rollback of an already published target is attempted.
 Traditional NT replacement requires closing the inspected target handle before
 publication. That loses the target's no-write/no-delete sharing protection at
 the close-to-rename seam. No arbitrary DOS-path fallback is used. Stages and
@@ -188,8 +199,9 @@ action having published. No broader concurrency exclusion is introduced.
 OLD could also have been restored after publication; absence could follow
 removal. No observation proves non-application or authorizes automatic retry.
 
-Normal native execution still confirms success after owned-handle publication
-and flush return successfully, including identical-content replacements. There
+Normal native execution still confirms success after owned-handle publication,
+exact metadata restoration/verification and flush return successfully, including
+identical-content replacements. There
 is no no-op rejection or content shortcut. A genuine post-publication interruption
 without a durable success result now requires human confirmation, even if the
 new stage is currently at the target. Automatic crash confirmation would require

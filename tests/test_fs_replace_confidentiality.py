@@ -8,7 +8,10 @@ import sys
 
 import pytest
 
-from agentcore.action_journal import ActionAttemptStatus, ActionState, EffectVerdict
+from agentcore.action_journal import (
+    ActionAttemptStatus, ActionInvocationContext, ActionReconciliationStatus,
+    ActionState, EffectVerdict, ReconciliationDisposition,
+)
 from test_fs_replace import Harness, make, native_security
 
 
@@ -113,9 +116,95 @@ def test_windows_process_exit_cannot_expose_unpublished_stage(tmp_path, native_s
             assert_unreadable(residue[0])
         else:
             assert seam != "before_rename"
+            if seam in {"renamed", "before_restore"}:
+                assert_unreadable(target)
+            else:
+                assert target.read_bytes() == b"replacement fixture"
     finally:
         for path in [*residue, target]:
             restore_fixture_access(path, old)
+
+
+@pytest.mark.parametrize("seam", ["before", "after", "mismatch"])
+def test_windows_metadata_failure_after_rename_never_reports_success(make, monkeypatch, seam):
+    from agentcore.fs import _windows_mutation as win
+    h = make(); revision = h.revision()
+    old = h.revisions._snapshots[revision]
+    restore, set_security = win.preserve_update_metadata, win._set_update_security
+    entries = []
+    def restoring(handle, metadata):
+        entries.append(list(win.facts(handle)[1]))
+        assert entries[0] != old["identity"] and win.final_name(handle) == h.target.name
+        assert not h.residue()
+        if seam == "before":
+            raise TimeoutError("PRIVATE_RESTORATION_FAILURE")
+        if seam == "mismatch":
+            # Real native metadata mismatch must fail the production equality check.
+            monkeypatch.setattr(win, "_set_update_security",
+                lambda opened, sd: set_security(opened, win.private_stage_descriptor(metadata)))
+        restore(handle, metadata)
+        raise TimeoutError("PRIVATE_RESTORATION_FAILURE")
+    monkeypatch.setattr(win, "preserve_update_metadata", restoring)
+    result = h.invoke(revision, content="replacement fixture")
+    try:
+        record = h.actions.load(result.action_id)
+        assert not result.ok and record.state is ActionState.RECONCILE_REQUIRED
+        assert record.terminal_outcome is None and not h.residue() and len(entries) == 1
+        assert record.attempts[0].effect_verdict is EffectVerdict.OUTCOME_UNKNOWN
+        if seam == "after":
+            assert h.target.read_bytes() == b"replacement fixture"
+            assert h.guard.snapshot_for_update("sub/old.txt", 1000)[1]["metadata"] == old["metadata"]
+        else:
+            assert_unreadable(h.target)
+        assert h.reconcile(result.action_id).status is ActionReconciliationStatus.UNRESOLVED
+        record = h.actions.load(result.action_id)
+        assert record.reconciliation.disposition is ReconciliationDisposition.HUMAN_CONFIRMATION_REQUIRED
+        h.recovery.recover_startup()
+        assert not h.invoke(revision, action_context=ActionInvocationContext(action_id=result.action_id)).ok
+        assert len(entries) == len(h.actions.load(result.action_id).attempts) == 1
+        public = json.dumps(result.to_dict()) + repr(record) + repr(h.logger.events)
+        for secret in ("PRIVATE_RESTORATION_FAILURE", "replacement fixture", revision, "sub/old.txt", str(h.root)):
+            assert secret not in public
+    finally:
+        restore_fixture_access(h.target, old["metadata"])
+
+
+@pytest.mark.parametrize("attributes", [0x20, 0x22, 0x2020])
+@pytest.mark.parametrize("identical", [False, True])
+def test_windows_private_publication_then_exact_metadata_success(make, monkeypatch, attributes, identical):
+    import win32file, win32security
+    from agentcore.fs import _windows_mutation as win
+    h = make()
+    win32file.SetFileAttributes(str(h.target), attributes)
+    revision = h.revision()
+    old = h.revisions._snapshots[revision]
+    content = h.target.read_text(encoding="utf-8") if identical else "replacement fixture"
+    publish, restore = win.publish_update, win.preserve_update_metadata
+    events, identity = [], []
+    def private(handle):
+        sd = win32security.GetKernelObjectSecurity(handle, 4)
+        assert sd.GetSecurityDescriptorDacl().GetAceCount() == 0
+        assert sd.GetSecurityDescriptorControl()[0] & 0x1000
+    def publishing(handle, parent, name):
+        private(handle)
+        identity.append(list(win.facts(handle)[1]))
+        publish(handle, parent, name)
+        private(handle)
+        assert win.final_name(handle) == h.target.name and not h.residue()
+        events.append("renamed")
+    def restoring(handle, metadata):
+        assert events == ["renamed"]
+        restore(handle, metadata)
+        assert win.update_facts(handle)["metadata"] == old["metadata"]
+        events.append("restored")
+    monkeypatch.setattr(win, "publish_update", publishing)
+    monkeypatch.setattr(win, "preserve_update_metadata", restoring)
+    result = h.invoke(revision, content=content)
+    assert result.ok and events == ["renamed", "restored"] and not h.residue()
+    text, observed = h.guard.snapshot_for_update("sub/old.txt", 1000)
+    assert text == content and observed["identity"] == identity[0] != old["identity"]
+    assert observed["metadata"] == old["metadata"]
+    assert h.actions.load(result.action_id).terminal_outcome.verdict is EffectVerdict.CONFIRMED_APPLIED
 
 
 def crash_worker(base, seam):

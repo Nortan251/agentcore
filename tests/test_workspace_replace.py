@@ -97,6 +97,9 @@ def test_recovery_precedes_model_and_never_retries_uncertain_replace(setup, monk
                                                                   identical_content):
     skip_unavailable(native_security)
     root, _, _, compose = setup
+    import win32security
+    from test_fs_replace_confidentiality import assert_unreadable, restore_fixture_access
+    metadata = {"security": bytes(win32security.GetFileSecurity(str(root / "README.txt"), 1 | 2 | 4 | 8)).hex()}
     content = (root / "README.txt").read_text(encoding="utf-8") if identical_content else "NEW"
     def replacement_request(request):
         return calls(("replace_file", {"path": "README.txt", "revision": get_revision(request), "content": content}))
@@ -114,9 +117,15 @@ def test_recovery_precedes_model_and_never_retries_uncertain_replace(setup, monk
         assert h._services.actions.load(action).state is ActionState.RECONCILE_REQUIRED
     monkeypatch.setattr(WorkspaceGuard, "replace_file", lambda *a: pytest.fail("recovery retried replacement"))
     model = Model()
-    with pytest.raises(WorkspaceHostError, match="workspace_action_requires_operator"):
-        compose(model)
-    assert not model.requests
+    try:
+        with pytest.raises(WorkspaceHostError, match="workspace_action_requires_operator"):
+            compose(model)
+        assert not model.requests
+        if state == "new":
+            assert_unreadable(root / "README.txt")
+    finally:
+        if state == "new":
+            restore_fixture_access(root / "README.txt", metadata)
 
 
 @pytest.mark.parametrize("existing", [255, 256])
