@@ -169,6 +169,22 @@ class WorkspaceGuard:
         from agentcore.fs.mutation import prepare
         return prepare(self, requested)
 
+    def snapshot_for_update(self, requested, limit):
+        from agentcore.fs.replacement import snapshot
+        return snapshot(self, requested, limit)
+
+    def check_revision_snapshot(self, snapshot):
+        from agentcore.fs.replacement import check_snapshot
+        return check_snapshot(self, snapshot)
+
+    def replace_file(self, intent, data, validate, publication):
+        from agentcore.fs.replacement import replace
+        return replace(self, intent, data, validate, publication)
+
+    def observe_replace(self, intent):
+        from agentcore.fs.replacement import observe
+        return observe(self, intent)
+
     def create_file(self, intent: Any, data: bytes, validate: Any) -> str:
         from agentcore.fs.mutation import create
         return create(self, intent, data, validate)

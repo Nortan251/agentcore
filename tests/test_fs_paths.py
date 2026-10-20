@@ -928,9 +928,16 @@ def test_read_primitives_never_call_write_apis():
     for path in sorted(package_dir.glob("*.py")):
         # V1 explicitly adds the guard-owned mutation boundary. Keep the
         # structural read guarantee on every pre-existing filesystem module.
-        if path.name in {"mutation.py", "_windows_mutation.py"}:
+        if path.name in {"mutation.py", "_windows_mutation.py", "replacement.py"}:
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"))
+        if path.name == "guard.py":
+            # Only the newly reviewed guard-owned replacement dispatch is a
+            # mutation. Continue scanning every ordinary guard read method.
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef) and node.name == "WorkspaceGuard":
+                    node.body = [method for method in node.body if not (
+                        isinstance(method, ast.FunctionDef) and method.name == "replace_file")]
         for node in ast.walk(tree):
             if isinstance(node, ast.Attribute) and node.attr in banned:
                 offenders.append(f"{path.name}:{node.lineno}:{node.attr}")
