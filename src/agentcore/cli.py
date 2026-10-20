@@ -25,7 +25,7 @@ from agentcore.config.schema import AgentConfig
 from agentcore.core.agent import Agent, AgentDependencies
 from agentcore.errors import AgentError
 from agentcore.fs.paths import WorkspaceMismatchError
-from agentcore.integrations.base import IntegrationRegistry
+from agentcore.integrations.base import IntegrationRegistry, IntegrationStatus
 from agentcore.integrations.computer_control import ComputerControlAdapter
 from agentcore.observability.events import Events
 from agentcore.observability.logging import get_logger, redact
@@ -243,6 +243,8 @@ def _build_parser() -> argparse.ArgumentParser:
                            "that id instead of requiring it to exist")
     chat.add_argument("--json", action="store_true", dest="as_json",
                       help="emit the turn as JSON (requires --message)")
+    chat.add_argument("--enable-desktop", action="store_true",
+                      help="enable the local Windows 11 Notepad service for this chat")
 
     workspace = sub.add_parser("workspace", help="one explicitly enabled create-only workspace turn")
     workspace.add_argument("--enable-write", action="store_true",
@@ -2131,8 +2133,14 @@ def _render_turn(result: Any) -> list[str]:
     elif getattr(result, "error", None):
         # A structured failure, not a traceback, and never a fabricated reply.
         lines.append(f"[Error] {result.error}")
-    lines.extend(_memory_notices(result))
+    lines.extend(_chat_notices(result))
     return lines
+
+
+def _chat_notices(result: Any) -> list[str]:
+    from agentcore.desktop.chat import desktop_notices
+
+    return _memory_notices(result) + desktop_notices(result)
 
 
 def _turn_payload(result: Any) -> dict[str, Any]:
@@ -2149,7 +2157,7 @@ def _turn_payload(result: Any) -> dict[str, Any]:
         "memory_error": result.memory_error,
         "correction": getattr(getattr(result, "correction", None), "status",
                               None) and result.correction.status.value,
-        "notices": _memory_notices(result),
+        "notices": _chat_notices(result),
     }
 
 
@@ -2204,11 +2212,42 @@ def _command_chat(args: argparse.Namespace, config: AgentConfig) -> int:
               "a single JSON document", file=sys.stderr)
         return 2
 
-    agent = Agent(config, AgentDependencies(
-        state_store=JsonFileStateStore(_runs_dir(config, args.runs_dir))))
+    deps = AgentDependencies(state_store=JsonFileStateStore(_runs_dir(config, args.runs_dir)))
+    desktop = None
+    if args.enable_desktop:
+        from agentcore.action_journal.adapters import ActionAdapterRegistry
+        from agentcore.desktop.chat import ConsoleNotepadApproval
+        from agentcore.integrations.computer_control import NotepadActionAdapter
+
+        if not config.conversation.tools_enabled:
+            print("--enable-desktop requires conversation.tools_enabled = true", file=sys.stderr)
+            return 2
+        desktop = ComputerControlAdapter({"enabled": True})
+        if desktop.connect() is not IntegrationStatus.CONNECTED:
+            print("[Desktop] " + desktop.detail, file=sys.stderr)
+            return 2
+        deps.action_adapters = ActionAdapterRegistry()
+        deps.action_adapters.register(desktop.provided_tools()[0], NotepadActionAdapter())
+        if not args.as_json and sys.stdin.isatty():
+            deps.approval_gate = ConsoleNotepadApproval()
+
+    agent = Agent(config, deps)
     # Constructing an Agent reconfigures logging; keep it off the transcript.
     _quiet_logging()
-    runtime = agent.conversation()
+    tools = None
+    if desktop is not None:
+        from agentcore.desktop.chat import NotepadConversationRunner
+
+        if desktop.register_into(agent.registry) != 1:
+            agent.shutdown()
+            print("[Desktop] open_notepad is disabled by tool configuration.", file=sys.stderr)
+            return 2
+        tools = NotepadConversationRunner(
+            agent.executor, agent.registry, notepad_tool=desktop.provided_tools()[0],
+            max_result_chars=config.conversation.max_tool_result_chars,
+            max_calls_per_round=config.conversation.max_tool_calls_per_round,
+        )
+    runtime = agent.conversation(tools=tools)
 
     session, banner = _chat_session(runtime, args)
     if session is None:
@@ -2218,9 +2257,14 @@ def _command_chat(args: argparse.Namespace, config: AgentConfig) -> int:
               file=sys.stderr)
         return 2
 
-    if getattr(args, "message", None):
-        return _chat_once(runtime, session, args)
-    return _chat_loop(agent, runtime, session, banner)
+    try:
+        if getattr(args, "message", None):
+            return _chat_once(runtime, session, args)
+        return _chat_loop(agent, runtime, session, banner)
+    finally:
+        agent.shutdown()
+        if desktop is not None:
+            desktop.disconnect()
 
 
 def _chat_once(runtime: Any, session: Any, args: argparse.Namespace) -> int:

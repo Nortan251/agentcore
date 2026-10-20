@@ -67,8 +67,8 @@ def test_duplicate_integration_rejected():
         integrations.add(FakeIntegration())
 
 
-def test_computer_control_is_declared_but_unimplemented():
-    """Scope boundary: the adapter must expose no automation capability."""
+def test_computer_control_is_disabled_by_default():
+    """Ordinary composition must not implicitly enable desktop automation."""
     adapter = ComputerControlAdapter()
     assert adapter.connect() is IntegrationStatus.UNAVAILABLE
     assert adapter.provided_tools() == ()
