@@ -66,6 +66,7 @@ class RejectionReason(str, Enum):
     UNREADABLE = "unreadable"
     TOO_LARGE = "too_large"
     CHANGED_UNDERFOOT = "changed_underfoot"
+    UNSUPPORTED_PUBLICATION = "unsupported_publication"
     #: A regular file with more than one hard link. Containment is a property
     #: of pathnames, and a hardlink gives one inode several names — possibly
     #: including one outside the workspace.

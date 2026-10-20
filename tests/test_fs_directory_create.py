@@ -98,8 +98,12 @@ def test_real_empty_directory_and_file_workflow(make):
     assert not {"write_file", "create_directory"} & {t.name for t in default_tools()}
     if os.name == "posix":
         assert (h.root / "sub/new").stat().st_mode & 0o777 == 0o700
-    assert h.executor.invoke("write_file", {"path": "sub/new/note.txt", "content": "summary"}).ok
-    assert (h.root / "sub/new/note.txt").read_text() == "summary"
+    file_result = h.executor.invoke("write_file", {"path": "sub/new/note.txt", "content": "summary"})
+    assert file_result.ok is (os.name == "nt")
+    if os.name == "nt":
+        assert (h.root / "sub/new/note.txt").read_text() == "summary"
+    else:
+        assert not (h.root / "sub/new/note.txt").exists()
 
 
 @pytest.mark.parametrize("kind", ["directory", "file", "symlink", "dangling"])
@@ -289,7 +293,8 @@ def test_exact_context_cannot_be_consumed_by_other_tool_or_twice(make, monkeypat
     monkeypatch.setattr(origin, "run", intercept)
     result = (h.invoke() if source == "create_directory" else
               h.executor.invoke("write_file", {"path": "sub/file", "content": "x"}))
-    assert result.ok and captured[0].used and not captured[0].active
+    assert result.ok is (source == "create_directory" or os.name == "nt")
+    assert captured[0].used and not captured[0].active
     assert not (h.root / "sub/cross").exists()
 
 

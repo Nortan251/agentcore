@@ -1,6 +1,7 @@
 """Directory actions share the accepted Workspace Host admission and privacy."""
 
 import json
+import os
 
 import pytest
 
@@ -37,6 +38,7 @@ def test_exact_seven_tools_defaults_and_direct_run(setup):
     assert not (root / PRIVATE_PATH).exists()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_model_creates_directory_then_file_in_same_turn(setup, capsys, monkeypatch):
     root, private, _, _ = setup
     model = Model(calls(mkdir(), ("write_file", {"path": PRIVATE_PATH + "/summary.txt", "content": "summary"})),
@@ -119,6 +121,7 @@ def test_historical_authorized_directory_action_never_executes_on_startup(setup,
 
 
 @pytest.mark.parametrize("existing", [254, 255, 256])
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_shared_capacity_preserves_earlier_directory_and_file_truth(setup, capsys, monkeypatch, existing):
     root, _, _, compose = setup
     from test_task_43_2a_action_journal_core import _new_record, _id, NOW

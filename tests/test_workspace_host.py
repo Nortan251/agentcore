@@ -216,6 +216,7 @@ def test_fixed_catalogue_and_direct_tool_contract(setup):
             h.executor.invoke("write_file", {"path": "notes/direct.txt", "content": CONTENT})
 
 
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_real_model_inspect_list_read_and_multiple_utf8_creates(setup, capsys, monkeypatch):
     root, private, _, _ = setup
     model = Model(calls(("inspect", {"path": "."}), ("list_directory", {"path": "."}),
@@ -367,6 +368,7 @@ def test_corrupt_storage_prevents_model_turn(setup, capsys, monkeypatch, corrupt
 
 
 @pytest.mark.parametrize("published", [False, True])
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_startup_reconciles_before_model_and_never_retries_create(setup, monkeypatch, published):
     root, _, _, compose = setup
     def crash(publish):
@@ -395,6 +397,7 @@ def test_startup_reconciles_before_model_and_never_retries_create(setup, monkeyp
         assert not model.requests and not (root / "notes/summary.txt").exists()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_uncertain_write_blocks_later_calls_and_friendly_cli_success(setup, capsys, monkeypatch):
     root, _, _, _ = setup
     _publication_hook(monkeypatch, lambda publish: (_ for _ in ()).throw(TimeoutError(CONTENT)))
@@ -407,6 +410,7 @@ def test_uncertain_write_blocks_later_calls_and_friendly_cli_success(setup, caps
 
 
 @pytest.mark.parametrize("failure", ["model", "save"])
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_created_file_truth_survives_model_or_save_failure(setup, capsys, monkeypatch, failure):
     root, _, _, _ = setup
     if failure == "save":
@@ -420,6 +424,7 @@ def test_created_file_truth_survives_model_or_save_failure(setup, capsys, monkey
     assert CONTENT not in json.dumps(payload)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_public_output_never_renders_model_prose_host_paths_or_arguments(setup, capsys, monkeypatch):
     root, private, _, _ = setup
     model = Model(write(), ModelResponse(text=CONTENT + str(private)))
@@ -619,15 +624,21 @@ def test_host_both_capability_lease_spans_canonical_validation(setup, monkeypatc
         worker = threading.Thread(target=revoke)
         worker.start()
         try:
-            assert h.conversation().send("create").ok
+            turn = h.conversation().send("create")
+            assert turn.ok
+            assert turn.tool_rounds[0].outcomes[0].invocation.ok is (os.name == "nt")
         finally:
             worker.join(30)
         assert not worker.is_alive() and results == ["busy"]
         h.executor.policy = PermissionPolicy(PermissionConfig(level=PermissionLevel.AUTONOMOUS,
             blocked_capabilities=(str(Capability.FS_READ),)))
-    assert (root / "notes/summary.txt").read_bytes() == CONTENT.encode()
+    if os.name == "nt":
+        assert (root / "notes/summary.txt").read_bytes() == CONTENT.encode()
+    else:
+        assert not (root / "notes/summary.txt").exists()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_human_recovery_block_public_cli_action_ids_only(setup, capsys, monkeypatch):
     root, _, _, compose = setup
     with monkeypatch.context() as scoped:
@@ -644,6 +655,7 @@ def test_human_recovery_block_public_cli_action_ids_only(setup, capsys, monkeypa
     assert CONTENT not in json.dumps(payload) and str(root) not in json.dumps(payload)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_session_failure_stays_sticky_and_cleanup_failure_is_honest(setup, capsys, monkeypatch):
     root, _, _, _ = setup
     original = PrivateSessionStore.save
@@ -669,6 +681,7 @@ def test_session_failure_stays_sticky_and_cleanup_failure_is_honest(setup, capsy
     assert payload["actions"][0]["state"] == "succeeded" and (root / "notes/cleanup.txt").exists()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_provider_factory_and_wire_protocol_create_only(setup, capsys, monkeypatch):
     root, _, config, _ = setup
     from agentcore.config.schema import ModelConfig
@@ -717,6 +730,7 @@ def _private_fixture_json(path, payload):
 
 
 @pytest.mark.parametrize("existing", [255, 256])
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_action_capacity_refuses_257th_write_and_preserves_last_effect_truth(
         setup, capsys, monkeypatch, existing):
     root, _, _, compose = setup
@@ -787,6 +801,7 @@ def test_session_capacity_admitted_before_model_and_save_and_resume_stays_usable
 
 
 @pytest.mark.parametrize("pause_at", ["created", "before_replace"])
+@pytest.mark.skipif(os.name != "nt", reason="file publication requires native Windows handles")
 def test_killed_full_session_save_reopens_effect_truth_and_reads(setup, pause_at):
     root, private, _, compose = setup
     from agentcore.workspace_host.storage import MAX_HOST_ENTRIES
@@ -913,3 +928,18 @@ def test_session_recovery_validates_all_entries_before_discarding_any_temp(setup
     with pytest.raises(WorkspaceHostError, match="workspace_storage_unsafe"):
         compose(model)
     assert not model.requests and temporary.exists() and unsafe.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires native unsupported POSIX file publication")
+def test_unsupported_file_write_cannot_claim_cli_success_or_run_later_calls(setup, capsys, monkeypatch):
+    root, _, _, _ = setup
+    model = Model(calls(("write_file", {"path": "notes/new.txt", "content": CONTENT}),
+                        ("create_directory", {"path": "later"})),
+                  ModelResponse(text="Everything succeeded."))
+    code, payload = invoke(capsys, monkeypatch, model)
+    assert code == 1 and payload["error"] == "workspace_tool_failed" and not payload["ok"]
+    assert len(payload["actions"]) == 1
+    assert payload["actions"][0]["state"] == "failed"
+    assert payload["actions"][0]["effect"] == "confirmed_not_applied"
+    assert not (root / "notes/new.txt").exists() and not (root / "later").exists()
+    assert CONTENT not in json.dumps(payload)
