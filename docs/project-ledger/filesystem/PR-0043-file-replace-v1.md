@@ -368,3 +368,64 @@ The original vulnerability's POSIX publication operation is absent and unsupport
 Limitations: no POSIX/macOS writer; no native macOS or hostile idmapped-mount execution claimed. Refusal does not depend on filesystem/mount ownership heuristics. Windows retains its documented external same-user target-close/native-rename race and full-security-access availability requirement; no stronger filesystem CAS or directory-fsync promise. Directory/read contracts are regression-tested, not newly certified against every namespace attack. No restricted-service workaround was attempted.
 
 FINAL VERDICT: **READY FOR INDEPENDENT REVIEW** of the bounded Windows-supported/POSIX-refusal milestone; six exact-head gates and fresh exact-head code review passed. Original-P1 formal closure and any release/merge remain project-lead decisions. PR stays Draft and unmerged. The independent ledger branch remains documentation-only and must never be merged into main.
+
+## 2026-10-20 amendment — controlled release BLOCKED by new exact-head P1
+
+All earlier snapshots remain historical. The [project engineering release approval](https://github.com/Nortan251/agentcore/pull/43#issuecomment-6289122793) and this release task authorized merging PR #43 only after live checks, with a stop condition for changed commits or a new P0/P1. No implementation repair, other PR merge or Issue #46 work was authorized.
+
+STATUS: **BLOCKED / DRAFT / OPEN / UNMERGED**
+EXACT REVIEWED PR HEAD: `64433667360f657fa64b62613bee3f4c95d97f36`
+PR HEAD PARENT: `fc092daf973de45563b17f7678b39de8a75a80c3`
+STARTING AND FINAL MAIN: `de8432528042e5775a83d2091849c0a87cacf67c`
+PR #43 RELEASE MERGE SHA / PARENTS: none; no merge request was issued
+PRE-MERGE CI INTEGRATION COMMIT: `2b1ba9dc0c743283e9e79bf7246434cffb8cbdb7`
+INTEGRATION AND PR HEAD TREE: `95a847f0ce988ef958846bacef8799b9d1d716de`
+
+### Live verification and stopped release
+
+Before changing PR metadata, live GitHub confirmed the approved head and main were unchanged, PR #43 was Draft/open/unmerged and CLEAN, all six exact-head CI jobs succeeded, all six historical review threads were resolved, and the existing exact-head code review was completed without findings. PR #44 was already merged as starting main. The release approval was read and rechecked unchanged. AGENTS.md, current PR description, security threads, architecture, native runner logs and this independent ledger were read. No workflow or governance difference exists between current main and this PR.
+
+All six PR job checkout logs identify the integration commit above. Its ordered parents are starting main and the reviewed PR head; its tree is identical to the reviewed head. Windows logs show the native replacement/Workspace cases were not skipped: the only replacement skips are 10 POSIX cases per Windows job. Native Linux logs show stage-parent 26 passed / 2 Windows-only skips, surrounding 1031 passed / 183 skipped / 1 warning, and full 6610 passed / 276 skipped / 98 warnings; all ten genuine distinct-UID foundation scenarios ran. Both Chromium jobs passed 419 tests. Windows junction/security/full-suite steps succeeded on all three versions; aggregate full-suite counts are suppressed by existing quiet flags and are not inferred.
+
+At **2026-10-20 11:03:32 UTC**, the passing preflight allowed the authorized ready transition. That transition automatically started another code review on the same full head. The immediately repeated release gate detected the review was running and stopped before any merge API request. No pending review was treated as a pass.
+
+At **2026-10-20 11:06:52 UTC**, [review 5584173610](https://github.com/Nortan251/agentcore/pull/43#pullrequestreview-5584173610) completed against the unchanged full head with a new **P1**, [discussion_r4324256953](https://github.com/Nortan251/agentcore/pull/43#discussion_r4324256953). The [machine-readable review summary](https://github.com/Nortan251/agentcore/pull/43#issuecomment-6272463554) now reports completed with findings and unresolved findings. The release stopped, and PR #43 was restored to Draft at **11:07:51 UTC**. Final live GitHub reads confirm merged=false, merged_at=null, unchanged head/main, CLEAN mergeability, seven total review threads with the new P1 unresolved and the original six resolved. CLEAN and green CI do not override the security blocker.
+
+The PR API's `merge_commit_sha` while unmerged is the synthetic integration commit above, not an actual release merge. No new main commit or PR #43 merge parents exist. Existing main remains the PR #44 merge, with ordered parents `cada2362beb43019f64dcb6395f98b136e0cd46c` and `f5d7e3bd3a21f49ee64affda61dbc520382c3907`, tree `a8b4af436ab5c0088cbcf21faafe791561a44396`.
+
+### New blocking security finding
+
+The reviewer found that `replacement.observe()` compares current workspace, ancestry, metadata, size and content digest without excluding the original target identity. When new content equals old bytes, an exception after the possible-publication callback but before native rename can leave the original target unchanged while reconciliation nevertheless reports success. This violates durable effect truth: current matching bytes do not prove that this uncertain replacement occurred. The reviewed predicate was reread and matches that concern. This task did not perform a new native exploit reproduction, implement a repair, add a regression, resolve the thread or weaken its priority.
+
+The six earlier findings remain resolved, including the original POSIX mutable-stage finding under the approved Windows-supported/POSIX-refusal scope. That closure does not close this distinct new reconciliation P1. The prior release approval and earlier no-findings review cannot override the later exact-head result.
+
+### Six CI conclusions and local checks
+
+These are **pre-merge PR results**, attributed to the full reviewed head and verified integration checkout. There is no PR #43 post-merge run because PR #43 was not merged. Historical CI on unchanged main is not relabeled as post-merge release evidence.
+
+| Required gate | PR conclusion / verified job | PR #43 post-merge conclusion |
+|---|---|---|
+| Linux full suite (py3.13) | SUCCESS — [118488465856](https://github.com/Nortan251/agentcore/actions/runs/39380556980/job/118488465856) | NOT RUN — release not merged |
+| Windows fs verification (py3.11) | SUCCESS — [118488466376](https://github.com/Nortan251/agentcore/actions/runs/39380556790/job/118488466376) | NOT RUN — release not merged |
+| Windows fs verification (py3.12) | SUCCESS — [118488466191](https://github.com/Nortan251/agentcore/actions/runs/39380556790/job/118488466191) | NOT RUN — release not merged |
+| Windows fs verification (py3.13) | SUCCESS — [118488466576](https://github.com/Nortan251/agentcore/actions/runs/39380556790/job/118488466576) | NOT RUN — release not merged |
+| Chromium adapter (ubuntu-latest) | SUCCESS — [118488465457](https://github.com/Nortan251/agentcore/actions/runs/39380556794/job/118488465457) | NOT RUN — release not merged |
+| Chromium adapter (windows-latest) | SUCCESS — [118488465262](https://github.com/Nortan251/agentcore/actions/runs/39380556794/job/118488465262) | NOT RUN — release not merged |
+
+Fresh local Windows Python 3.13 checks in the clean exact-head release checkout:
+
+- Replacement/support/Workspace replacement/publication support smoke: **58 passed / 69 skipped**, 5.27 seconds.
+- Surrounding filesystem/Workspace/permission/durable-execution suites, already running when the new review arrived: **1018 passed / 196 skipped**, 55.04 seconds.
+- `python -m compileall -q src tests`, full-PR committed-diff whitespace check and implementation clean status: passed.
+- Local token lacks assigned SeSecurityPrivilege; positive privileged replacement skips are explicit. Native Windows CI supplies positive-path evidence. Local Windows skips are not native Linux/macOS proof.
+- Post-merge smoke: **NOT RUN**, because no PR #43 merge exists. No local full-suite rerun or separate security scan is claimed; exact-head native full CI was verified above.
+
+### Capabilities, limitations and next action
+
+Current main retains PR #44 native Windows create-only `write_file`, ordinary filesystem reads and Directory Create under their existing contracts. Unmerged PR #43 retains native Windows update-read/replacement with exact revision binding, complete security-descriptor/metadata eligibility and already-granted security access. It remains blocked from release by the new reconciliation P1. Ordinary tokens without full descriptor access refuse safely; production does not enable privileges. Linux/macOS/other unsupported platforms refuse file publication and, in the candidate, replacement/update-read before traversal/staging/publication. Ordinary reads and Directory Create retain their separate contracts; ordinary Agent defaults remain read-only.
+
+No POSIX replacement support, native macOS validation, hostile two-idmapped-mount proof or stronger Windows filesystem CAS is claimed. The documented Windows same-user target-close/native-rename seam and durability/rights limits remain. [Issue #46](https://github.com/Nortan251/agentcore/issues/46) was not implemented. No production source, implementation branch, main, workflow, governance or other PR was changed. Only this existing record and its single INDEX row are updated; all historical record content is preserved. The independent documentation-only ledger must never merge into main.
+
+Next required action is a separately scoped repair and deterministic regression for the identical-content/pre-rename uncertain-outcome case, followed by exact-head focused/relevant/full/native CI evidence, fresh independent review, security-thread closure and a new release-gate assessment. No such repair or further release action is performed in this milestone.
+
+FINAL VERDICT: **BLOCKED** — new unresolved exact-head P1 4324256953; PR #43 restored to Draft and unmerged; main unchanged; no post-merge verification claimed.
