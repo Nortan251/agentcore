@@ -311,3 +311,60 @@ Fresh exact-head review was requested in [comment 6276388728](https://github.com
 The [existing POSIX publication-integrity P1](https://github.com/Nortan251/agentcore/pull/43#discussion_r4179362899) remains unresolved. Green Windows tests cannot settle that finding. PR #44's separate production P1 is also unresolved; no repair of it is bundled here. The restricted security-work boundary was respected; no restricted-service access or alternate route around access controls was used.
 
 FINAL VERDICT: the bounded Windows compatibility repair is complete and validated; PR #43 remains OPEN / UNMERGED and NOT READY TO MERGE because the separate POSIX publication-integrity P1 remains. No security-boundary expansion, separate adversarial native Linux repair/validation, PR #44 modification or merge was performed. Next work requires an explicitly scoped foundation security repair with suitable native Linux evidence, followed by fresh review and gates on any new implementation head. This ledger branch remains documentation-only and must never be merged into main.
+
+## 2026-10-20 final integration and POSIX replacement containment amendment
+
+This supersedes the earlier PR #43 foundation-blocked status. PR #44 is merged at main `de8432528042e5775a83d2091849c0a87cacf67c`, with reviewed implementation head `f5d7e3bd3a21f49ee64affda61dbc520382c3907`. PR #43 remains Draft / OPEN / UNMERGED; no merge is authorized.
+
+BASE SHA (starting main): `de8432528042e5775a83d2091849c0a87cacf67c`.
+STARTING PR HEAD: `7bd7b4de98fe7cff63c577c0add2be16fb2d85dd`.
+HISTORICAL DIVERGENCE: `547a2f00bcfa709d907c329fbea78730dd6731f6`.
+HEAD SHA: `64433667360f657fa64b62613bee3f4c95d97f36`.
+PARENT SHA / NORMAL MERGE: `fc092daf973de45563b17f7678b39de8a75a80c3`; its parents are starting PR head and starting main, respectively.
+BRANCH: `codex/file-replace-v1`.
+
+### Goal, integration and production decision
+
+A normal merge preserves audited history and integrates the merged PR #44 foundation. The sole textual conflict was the executor import block; both revision validation and foundation path rejection types are retained. The combined control flow preserves replacement authority checks and the foundation's pre-entry unsupported-publication reporting. The authoritative creation primitive, path rejection enum and all governance/workflow files match main; no removed POSIX staging/ownership mechanism was restored.
+
+The original P1 checked a stage inode then resolved a mutable pathname in `os.replace`, allowing false confirmed success with a substituted object. The POSIX stage/rename/metadata implementation is removed. PR #44's native Windows guard now protects update snapshots, snapshot validation and replacement before traversal or staging. Unsupported update-read issues no revision; ordinary reads and Directory Create retain their existing contracts. No Issue #46 implementation or new POSIX publication experiment was added.
+
+Milestone production files/functions: `fs/replacement.py` (`snapshot`, `check_snapshot`, `replace`, `observe`, Windows-only helpers); `tools/builtin/read_file_for_update.py` (`__init__`, `run` catalogue/refusal); `tools/builtin/replace_file.py` (`__init__` catalogue); `tools/executor.py` (merged imports and `_FilesystemPublicationUnsupported` summary); `workspace_host/composition.py` (platform prompt). Existing native Windows, revision-registry, execution-context, guard-delegation and expired-token-storage source remains unchanged from starting PR head. Tests: `test_fs_replace.py`, new `test_fs_replace_support.py`, `test_workspace_replace.py`. Docs: replacement and Workspace architecture.
+
+Windows retains full descriptor/ACL/SACL and metadata equality, bounded complete reads, current-turn trusted revisions, stale checks, native owned-stage publication, private zero-sharing handles, target/ancestor protection, current permission/approval/claim leases and cleanup/recovery. Production enables no privilege; already-granted full-security access is still required. The Windows publication/cleanup body is AST-identical to starting PR head; native CI provides runtime proof, not that structural check alone.
+
+### Durable truth and original finding
+
+Unsupported update-read admits no action. An already-admitted unsupported replacement records NOT_INVOKED / CONFIRMED_NOT_APPLIED with `filesystem.unsupported_publication`, no stage and unchanged target. Possible physical entry is checked first: even a support-category post-entry exception remains uncertain. Legacy POSIX uncertain replacement remains OUTCOME_UNKNOWN / HUMAN_CONFIRMATION_REQUIRED for NEW, OLD and absent states, without retry or fabricated success. Protected schemas/evidence are unchanged.
+
+The new unsupported-boundary regression failed at snapshot traversal on the integrated pre-repair merge, then passed after containment. Tests distinguish local platform-identity simulation from native Linux execution and synthetic historical journal attempts from kernel publication proof. Native Windows regressions add final owned-stage identity, live stage/ancestor rename denial and post-close handle release, permissions/approval, cancellation/timeout and post-restoration failed cleanup. Existing native security/privacy assertions remain.
+
+### Validation and CI
+
+- Local focused source checks: 58 passed / 69 skipped.
+- Local surrounding filesystem/Workspace/permission/durable suites: 1018 passed / 196 skipped, 63.35 seconds.
+- Local final-head full suite: **6529 passed, 357 skipped, 89 warnings**, exit 0 in 431.73 seconds.
+- Compileall, committed `HEAD^ HEAD` whitespace, starting-head diff whitespace and clean implementation status: passed.
+- Local ordinary Windows token lacks assigned SeSecurityPrivilege; positive privileged replacement cases skip explicitly and require native CI. Other local skips are POSIX/Linux/fork-specific.
+- Native Linux: stage-parent 26 passed / 2 Windows-only skips, including 10/10 genuine distinct-UID foundation cases; surrounding 1031 passed / 183 skipped / 1 warning; full 6610 passed / 276 skipped / 98 warnings, 145.29 seconds. Windows-positive replacement tests skip explicitly on unsupported Linux; refusal tests execute.
+
+All jobs report exact PR head above. The standard PR merge checkout is `2b1ba9dc0c743283e9e79bf7246434cffb8cbdb7`, parents verified main and exact PR head; Linux logs confirm checkout. No stale-head gate is counted. All three native Windows logs confirm the exact merge checkout and exactly 10 POSIX-only replacement skips; native positive snapshot/stage/ACL/SACL/identity/approval/cancellation/cleanup and Workspace replacement cases ran. Quiet output is not used to invent suite totals.
+
+| Gate | Conclusion | Exact job |
+| --- | --- | --- |
+| Linux Python 3.13 | SUCCESS | [118488465856](https://github.com/Nortan251/agentcore/actions/runs/39380556980/job/118488465856) |
+| Windows Python 3.11 | SUCCESS | [118488466376](https://github.com/Nortan251/agentcore/actions/runs/39380556790/job/118488466376) |
+| Windows Python 3.12 | SUCCESS | [118488466191](https://github.com/Nortan251/agentcore/actions/runs/39380556790/job/118488466191) |
+| Windows Python 3.13 | SUCCESS | [118488466576](https://github.com/Nortan251/agentcore/actions/runs/39380556790/job/118488466576) |
+| Chromium Ubuntu | SUCCESS | [118488465457](https://github.com/Nortan251/agentcore/actions/runs/39380556794/job/118488465457) |
+| Chromium Windows | SUCCESS | [118488465262](https://github.com/Nortan251/agentcore/actions/runs/39380556794/job/118488465262) |
+
+### Review, limitations and next action
+
+Fresh independent review was [requested with the full final SHA](https://github.com/Nortan251/agentcore/pull/43#issuecomment-6284874474), explicitly including original P1 discussion_r4179362899. [Receipt](https://github.com/Nortan251/agentcore/pull/43#issuecomment-6284905376) reports no major issues; the [machine-readable summary](https://github.com/Nortan251/agentcore/pull/43#issuecomment-6272463554) identifies the complete final SHA, completed status and no new findings. This is not automatic original-P1 closure.
+
+The original vulnerability's POSIX publication operation is absent and unsupported hosts stop before staging. The original vulnerability is unreachable under the documented supported scope: `snapshot` and `replace` call the shared platform guard before any traversal/staging, and no POSIX stage or pathname publication code remains. Native Linux refusal/legacy tests, all three native Windows suites and exact-head independent review now pass. Recommend closing the original P1 for this restricted design after project-lead assessment; its formal thread remains OPEN and was not auto-resolved. This is not certification of a future POSIX writer. Historical resolved threads were not reopened and no thread was automatically resolved. Next action is independent project-lead assessment of the contained original P1 and documented compatibility tradeoff; retain Draft and do not merge.
+
+Limitations: no POSIX/macOS writer; no native macOS or hostile idmapped-mount execution claimed. Refusal does not depend on filesystem/mount ownership heuristics. Windows retains its documented external same-user target-close/native-rename race and full-security-access availability requirement; no stronger filesystem CAS or directory-fsync promise. Directory/read contracts are regression-tested, not newly certified against every namespace attack. No restricted-service workaround was attempted.
+
+FINAL VERDICT: **READY FOR INDEPENDENT REVIEW** of the bounded Windows-supported/POSIX-refusal milestone; six exact-head gates and fresh exact-head code review passed. Original-P1 formal closure and any release/merge remain project-lead decisions. PR stays Draft and unmerged. The independent ledger branch remains documentation-only and must never be merged into main.
