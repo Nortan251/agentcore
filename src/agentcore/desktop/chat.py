@@ -3,6 +3,7 @@
 from agentcore.conversation.tool_use import ConversationToolRunner, ToolCallOutcome
 from agentcore.permissions.levels import Capability
 from agentcore.integrations.computer_control import APP_NAMES, OBSERVATION_TEXT, STATUS_TEXT
+from agentcore.desktop.service import UNKNOWN_REASONS
 
 
 _PRE_DISPATCH_REFUSALS = frozenset({
@@ -99,4 +100,7 @@ def desktop_observations(result):
             observations.append({"status": "observed", "app": output["app"]})
         else:
             observations.append({"status": category if category in OBSERVATION_TEXT else "not_observed", "app": None})
+            reason = invocation.result.metadata.get("observation_reason") if invocation is not None else None
+            if category == "unknown" and type(reason) is str and reason in UNKNOWN_REASONS:
+                observations[-1]["reason"] = reason
     return observations

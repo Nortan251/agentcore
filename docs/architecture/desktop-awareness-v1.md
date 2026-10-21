@@ -80,11 +80,13 @@ and unknown operations are rejected. Both endpoints reject malformed JSON.
 The adapter captures at most 257 bytes before rejecting excess output; the
 10-second timeout kills and reaps the owned service and joins its I/O worker.
 
-Observation responses contain exactly `v`, `status`, `app`:
+Observation responses contain `v`, `status`, `app`; `unknown` may additionally
+carry a strictly validated `reason` from a fixed operator-diagnostic enum:
 
 ```json
 {"v":1,"status":"observed","app":"Notepad"}
 {"v":1,"status":"unknown","app":null}
+{"v":1,"status":"unknown","app":null,"reason":"foreground_changed"}
 ```
 
 Only `observed` may carry one of the six fixed labels. Every other status has
@@ -94,6 +96,24 @@ Only `observed` may carry one of the six fixed labels. Every other status has
 meanings. Lost, malformed, oversized or nonzero-exit service responses become
 `service_unavailable`, with no app identity inferred. Invalid launch responses
 still become `launch_unknown` and latch against retries.
+
+Unknown reasons distinguish `no_foreground_window`, `window_process_unavailable`,
+`image_query_invalid`, `executable_not_allowlisted`, `shared_application_host`,
+`console_host`, `explorer_shell`, `foreground_changed`, and
+`foreground_process_exited`. No executable name outside the app allowlist,
+window class, title, path or PID is exposed. Only unknown responses may carry
+one of these reasons; extra fields, other statuses with a reason, arbitrary
+strings and wrong types fail closed. Legacy three-field unknown responses
+remain accepted. The adapter retains the reason in typed tool metadata and
+the operator's JSON `desktop_observations`; model-visible tool content keeps
+only `{status, app}`. These reasons never grant authority or trigger retries.
+
+The final stability check compares the returned thread ID and process ID
+individually. Comparing the native return sequence directly to a Python tuple
+can falsely report a focus change despite identical IDs. Regressions cover
+both list and tuple return sequences, actual changes, process exit, and modern
+packaged Notepad image-path classification. Shared hosts are still unknown;
+the service never guesses their hosted application from a title or class.
 
 The console's `[Desktop]` observation notices are derived from tool evidence,
 independently of generated model prose. JSON turns containing observation calls

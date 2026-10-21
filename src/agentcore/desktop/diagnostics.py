@@ -125,7 +125,7 @@ def endpoint_check():
 
 
 def native_check(config, *, enabled):
-    from agentcore.desktop.service import APP_NAMES, OBSERVATION_STATUSES
+    from agentcore.desktop.service import APP_NAMES, OBSERVATION_STATUSES, UNKNOWN_REASONS
     from agentcore.integrations.computer_control import ComputerControlAdapter
     from agentcore.integrations.base import IntegrationStatus
     from agentcore.permissions.policy import PermissionPolicy
@@ -151,7 +151,11 @@ def native_check(config, *, enabled):
         app = (output.get("app") if result.ok and category == "observed" and type(output) is dict else None)
         if app is not None and app not in APP_NAMES.values():
             return {"category": "native_failure"}
-        return {"category": category, "desktop_observations": [{"status": category, "app": app}],
+        observation = {"status": category, "app": app}
+        reason = result.metadata.get("observation_reason")
+        if category == "unknown" and type(reason) is str and reason in UNKNOWN_REASONS:
+            observation["reason"] = reason
+        return {"category": category, "desktop_observations": [observation],
                 "model_used": False, "operator_confirmed": False}
     finally:
         adapter.disconnect()

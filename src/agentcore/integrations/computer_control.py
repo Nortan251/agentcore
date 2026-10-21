@@ -16,7 +16,7 @@ import threading
 
 from agentcore.action_journal.adapters import ActionAdapterSpec
 from agentcore.action_journal.models import ActionJournalEligibility
-from agentcore.desktop.service import APP_NAMES, OBSERVATION_STATUSES, decode_message, service_environment
+from agentcore.desktop.service import APP_NAMES, OBSERVATION_STATUSES, UNKNOWN_REASONS, decode_message, service_environment
 from agentcore.integrations.base import Integration, IntegrationStatus
 from agentcore.permissions.levels import Capability
 from agentcore.tools.base import ExternalReadTool, Tool, ToolResult, ToolSpec
@@ -147,7 +147,7 @@ class ComputerControlAdapter(Integration):
             payload = decode_message(completed.stdout)
             if observation:
                 if (completed.returncode != 0 or type(payload) is not dict
-                        or set(payload) != {"v", "status", "app"}
+                        or set(payload) not in ({"v", "status", "app"}, {"v", "status", "app", "reason"})
                         or type(payload["v"]) is not int or payload["v"] != 1
                         or type(payload["status"]) is not str
                         or payload["status"] not in OBSERVATION_STATUSES):
@@ -157,7 +157,13 @@ class ComputerControlAdapter(Integration):
                         return fallback
                 elif payload["app"] is not None:
                     return fallback
-                return {"status": payload["status"], "app": payload["app"]}
+                result = {"status": payload["status"], "app": payload["app"]}
+                if "reason" in payload:
+                    if (payload["status"] != "unknown" or type(payload["reason"]) is not str
+                            or payload["reason"] not in UNKNOWN_REASONS):
+                        return fallback
+                    result["reason"] = payload["reason"]
+                return result
             allowed = ({"ready", "unsupported_os", "desktop_unavailable", "service_unavailable"}
                        if operation == "health" else set(STATUS_TEXT) - {"ready"})
             if completed.returncode != 0 or type(payload) is not dict or set(payload) != {"v", "status"}:
@@ -183,7 +189,10 @@ class ComputerControlAdapter(Integration):
                   else {"status": "service_unavailable", "app": None})
         category = result["status"]
         if category in {"observed", "unknown"}:
-            return ToolResult.success(result, kind=category)
+            metadata = {"kind": category}
+            if "reason" in result:
+                metadata["observation_reason"] = result["reason"]
+            return ToolResult.success({"status": category, "app": result["app"]}, **metadata)
         return ToolResult.failure(OBSERVATION_TEXT[category], kind=category, retryable=False)
 
     def open_notepad(self) -> ToolResult:

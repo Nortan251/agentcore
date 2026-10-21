@@ -25,6 +25,11 @@ OBSERVATION_STATUSES = frozenset({
     "observed", "unknown", "inaccessible", "desktop_unavailable",
     "unsupported_os", "service_unavailable",
 })
+UNKNOWN_REASONS = frozenset({
+    "no_foreground_window", "window_process_unavailable", "executable_not_allowlisted",
+    "shared_application_host", "console_host", "image_query_invalid", "explorer_shell",
+    "foreground_changed", "foreground_process_exited",
+})
 
 
 def decode_message(raw):
@@ -118,7 +123,7 @@ def _launch_notepad():
         return "launch_unknown"
 
 
-def _process_app(process):
+def _process_identity(process):
     import ctypes
     from ctypes import wintypes
 
@@ -132,9 +137,13 @@ def _process_app(process):
     if not query(int(process), 0, buffer, ctypes.byref(size)):
         raise ctypes.WinError(ctypes.get_last_error())
     if not 0 < size.value < len(buffer):
-        return None
+        return None, "image_query_invalid"
     # This is an executable-name label, never publisher authentication or authority.
-    return APP_NAMES.get(PureWindowsPath(buffer.value).name.casefold())
+    name = PureWindowsPath(buffer.value).name.casefold()
+    app = APP_NAMES.get(name)
+    reason = {"applicationframehost.exe": "shared_application_host",
+              "openconsole.exe": "console_host", "conhost.exe": "console_host"}.get(name, "executable_not_allowlisted")
+    return app, None if app else reason
 
 
 def _foreground_app():
@@ -147,10 +156,10 @@ def _foreground_app():
 
     window = win32gui.GetForegroundWindow()
     if not window:
-        return {"status": "unknown", "app": None}
+        return {"status": "unknown", "app": None, "reason": "no_foreground_window"}
     thread, pid = win32process.GetWindowThreadProcessId(window)
     if not thread or not pid:
-        return {"status": "unknown", "app": None}
+        return {"status": "unknown", "app": None, "reason": "window_process_unavailable"}
     # Query only this process, with no memory-read, control or privilege rights.
     process = win32api.OpenProcess(0x1000, False, pid)
     try:
@@ -160,19 +169,22 @@ def _foreground_app():
                 return {"status": "inaccessible", "app": None}
         finally:
             token.Close()
-        app = _process_app(process)
+        app, reason = _process_identity(process)
         if app == "File Explorer" and win32gui.GetClassName(window) not in {"CabinetWClass", "ExploreWClass"}:
             app = None
+            reason = "explorer_shell"
         # Refuse a changed/locked desktop or a focus change instead of guessing.
         if not _desktop_available():
             return {"status": "desktop_unavailable", "app": None}
+        current_thread, current_pid = win32process.GetWindowThreadProcessId(window)
         if (win32gui.GetForegroundWindow() != window
-                or win32process.GetWindowThreadProcessId(window) != (thread, pid)
-                or win32process.GetExitCodeProcess(process) != 259):
-            return {"status": "unknown", "app": None}
+                or current_thread != thread or current_pid != pid):
+            return {"status": "unknown", "app": None, "reason": "foreground_changed"}
+        if win32process.GetExitCodeProcess(process) != 259:
+            return {"status": "unknown", "app": None, "reason": "foreground_process_exited"}
     finally:
         process.Close()
-    return {"status": "observed" if app else "unknown", "app": app}
+    return {"status": "observed", "app": app} if app else {"status": "unknown", "app": None, "reason": reason}
 
 
 def handle_request(request):

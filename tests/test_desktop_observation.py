@@ -117,8 +117,8 @@ def native(monkeypatch):
     for name, module in modules.items(): monkeypatch.setitem(sys.modules, name, module)
     def app(process):
         state.queried.append(True)
-        return state.app
-    monkeypatch.setattr(service, "_process_app", app)
+        return state.app, None if state.app else "executable_not_allowlisted"
+    monkeypatch.setattr(service, "_process_identity", app)
     monkeypatch.setattr(service, "_desktop_available", lambda: state.available)
     monkeypatch.setattr(service, "availability", lambda: "ready")
     return state, modules
@@ -140,7 +140,10 @@ def test_native_unknown_and_session_refusals(native, case, expected):
     if case == "no_window": state.window = 0
     if case == "cross_session": state.process_session = 4
     if case == "locked": state.available = False
-    assert service.handle_request({"v": 1, "operation": "get_foreground_app"}) == {"status": expected, "app": None}
+    result = {"status": expected, "app": None}
+    if case in {"unrecognized", "no_window"}:
+        result["reason"] = "executable_not_allowlisted" if case == "unrecognized" else "no_foreground_window"
+    assert service.handle_request({"v": 1, "operation": "get_foreground_app"}) == result
     if case in {"cross_session", "no_window"}: assert not state.queried
 
 
@@ -148,12 +151,12 @@ def test_native_focus_changes_and_shell_are_unknown(native, monkeypatch):
     state, modules = native
     def change_focus(process):
         state.window = 102
-        return "Notepad"
-    monkeypatch.setattr(service, "_process_app", change_focus)
-    assert service._foreground_app() == {"status": "unknown", "app": None}
-    monkeypatch.setattr(service, "_process_app", lambda _: "File Explorer")
+        return "Notepad", None
+    monkeypatch.setattr(service, "_process_identity", change_focus)
+    assert service._foreground_app() == {"status": "unknown", "app": None, "reason": "foreground_changed"}
+    monkeypatch.setattr(service, "_process_identity", lambda _: ("File Explorer", None))
     modules["win32gui"].GetClassName = lambda _: "Shell_TrayWnd"
-    assert service._foreground_app() == {"status": "unknown", "app": None}
+    assert service._foreground_app() == {"status": "unknown", "app": None, "reason": "explorer_shell"}
 
 
 def test_inaccessible_native_errors_never_expose_details(native):
@@ -351,6 +354,7 @@ def test_service_stdio_closed_response(monkeypatch, capsys):
 
 
 @pytest.mark.parametrize("image,expected", [(r"C:\Windows\System32\NOTEPAD.EXE", "Notepad"),
+    (r"C:\Program Files\WindowsApps\Microsoft.WindowsNotepad_11.2508_x64__8wekyb3d8bbwe\Notepad\Notepad.exe", "Notepad"),
     (r"C:\private\chrome.exe", "Google Chrome"), (r"C:\private\msedge.exe", "Microsoft Edge"),
     (r"C:\private\Code.exe", "Visual Studio Code"), (r"C:\Windows\explorer.exe", "File Explorer"),
     (r"C:\private\WindowsTerminal.exe", "Windows Terminal"), (r"C:\private\secret-document.exe", None)])
@@ -363,7 +367,57 @@ def test_native_query_reduces_image_to_closed_label(monkeypatch, image, expected
             size._obj.value = len(image)
             return 1
     monkeypatch.setattr(ctypes, "WinDLL", lambda *a, **k: SimpleNamespace(QueryFullProcessImageNameW=Query()), raising=False)
-    assert service._process_app(42) == expected
+    assert service._process_identity(42) == (expected, None if expected else "executable_not_allowlisted")
+
+
+@pytest.mark.parametrize("reason", sorted(service.UNKNOWN_REASONS))
+def test_reason_is_operator_metadata_not_model_content(monkeypatch, reason):
+    adapter = control.ComputerControlAdapter({"enabled": True})
+    adapter.status = IntegrationStatus.CONNECTED
+    monkeypatch.setattr(adapter, "_request", lambda _: {"status": "unknown", "app": None, "reason": reason})
+    executor = executor_for(adapter)
+    runner = NotepadConversationRunner(executor, executor.registry, notepad_tool=adapter.provided_tools()[0])
+    outcome = runner.run_calls([ToolCall("observe", "get_foreground_app", {})]).outcomes[0]
+    assert outcome.ok and reason not in outcome.content
+    assert outcome.invocation.result.output == {"status": "unknown", "app": None}
+    assert cli._turn_payload(SimpleNamespace(session=SimpleNamespace(id="test"), ok=True, reply=None,
+        error=None, memories_created=[], memories_updated=[], memories_used=0, conflicts=[], memory_error=None,
+        tool_outcomes=[outcome]))["desktop_observations"] == [{"status": "unknown", "app": None, "reason": reason}]
+
+
+@pytest.mark.parametrize("reason,status", [("C:/private/secret", "unknown"), ([], "unknown"),
+    ("foreground_changed", "observed"), ("no_foreground_window", "inaccessible")])
+def test_invalid_or_misplaced_reason_is_refused(monkeypatch, reason, status):
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", 0, raising=False)
+    raw = json.dumps({"v": 1, "status": status, "app": "Notepad" if status == "observed" else None,
+                      "reason": reason}).encode()
+    monkeypatch.setattr(control, "_run_service", lambda *a, **k: SimpleNamespace(returncode=0, stdout=raw))
+    assert control.ComputerControlAdapter()._request("get_foreground_app") == {"status": "service_unavailable", "app": None}
+
+
+def test_valid_reason_survives_strict_transport_validation(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", 0, raising=False)
+    raw = b'{"v":1,"status":"unknown","app":null,"reason":"foreground_changed"}'
+    monkeypatch.setattr(control, "_run_service", lambda *a, **k: SimpleNamespace(returncode=0, stdout=raw))
+    assert control.ComputerControlAdapter()._request("get_foreground_app") == {
+        "status": "unknown", "app": None, "reason": "foreground_changed"}
+
+
+def test_process_exit_and_missing_window_identity_are_distinct(native):
+    state, modules = native
+    modules["win32process"].GetExitCodeProcess = lambda _: 0
+    assert service._foreground_app() == {"status": "unknown", "app": None, "reason": "foreground_process_exited"}
+    state.pid = 0
+    assert service._foreground_app() == {"status": "unknown", "app": None, "reason": "window_process_unavailable"}
+
+
+@pytest.mark.parametrize("sequence", [list, tuple], ids=["native-list", "tuple"])
+def test_stable_native_identity_compares_ids_independently_of_sequence_type(native, sequence):
+    state, modules = native
+    modules["win32process"].GetWindowThreadProcessId = lambda _: sequence((state.thread, state.pid))
+    assert service._foreground_app() == {"status": "observed", "app": "Notepad"}
 
 
 @pytest.mark.parametrize("change", ["session0", "inactive", "station", "locked", "detached"])
@@ -436,6 +490,6 @@ def test_native_self_process_query_and_handle_cleanup():
             assert type(win32security.GetTokenInformation(token, win32security.TokenSessionId)) is int
         finally:
             token.Close()
-        assert service._process_app(process) is None  # pytest's Python process is not a recognized app.
+        assert service._process_identity(process) == (None, "executable_not_allowlisted")  # pytest's Python process is not a recognized app.
     finally:
         process.Close()
