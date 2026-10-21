@@ -81,8 +81,8 @@ class ModelProviderError(ModelError):
             self.retryable = status_code >= 500
 
 
-def model_error_category(error: BaseException | None) -> str:
-    """Closed error vocabulary for operator output; never exception/provider text."""
+def model_error_category(error: BaseException | None, *, error_type: Any = None) -> str:
+    """Closed vocabulary from a cause or sanitized type identifier, never text."""
     if isinstance(error, ModelResponseError) and error.details.get("finish_reason") == "length":
         return "model_response_budget_exhausted"
     for kind, category in (
@@ -91,6 +91,8 @@ def model_error_category(error: BaseException | None) -> str:
         (ModelConfigError, "model_configuration"), (ModelResponseError, "model_response_invalid"),
         (ModelProviderError, "model_http_error"),
     ):
-        if isinstance(error, kind):
+        if (isinstance(error, kind)
+                or (error is None and type(error_type) is str
+                    and error_type == kind.__name__)):
             return category
     return "model_failure"

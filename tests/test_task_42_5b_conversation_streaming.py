@@ -33,6 +33,11 @@ from agentcore.conversation.turns import (
     TurnBridge,
     TurnSuperseded,
 )
+from agentcore.models.errors import (
+    ModelAuthError, ModelConfigError, ModelConnectionError, ModelError,
+    ModelProviderError, ModelRateLimitError, ModelResponseError, ModelTimeoutError,
+    model_error_category,
+)
 from agentcore.models.messages import (
     FinishReason,
     ModelResponse,
@@ -680,6 +685,90 @@ def test_iterator_exception_is_categorical_and_never_discloses_message(
     assert RAW_PROVIDER_SECRET not in logs
     assert AUTH_SECRET not in logs
     assert WORKSPACE_SENTINEL not in logs
+
+
+@pytest.mark.parametrize("error_type,category", [
+    (ModelTimeoutError, "model_timeout"), (ModelAuthError, "model_authentication"),
+    (ModelRateLimitError, "model_rate_limit"), (ModelConnectionError, "model_connection"),
+    (ModelResponseError, "model_response_invalid"), (ModelConfigError, "model_configuration"),
+    (ModelProviderError, "model_http_error"), (ModelError, "model_failure"),
+])
+@pytest.mark.parametrize("failure_at", ["call", "iterator", "terminal", "fallback"])
+def test_stream_failure_retains_safe_typed_category(log_buffer, error_type, category, failure_at):
+    failure = error_type(
+        RAW_PROVIDER_SECRET, authorization=AUTH_SECRET,
+        url="https://private.invalid/?token=" + RAW_PROVIDER_SECRET,
+        arbitrary={"secret": RAW_PROVIDER_SECRET}, error_type="ModelAuthError")
+
+    def script(context, _clock, _request):
+        if failure_at == "call":
+            raise failure
+        attempt = new_id("att")
+
+        def events():
+            yield StreamStarted(_envelope(context, attempt, 0), "m", "p")
+            if failure_at == "terminal":
+                yield StreamFailed(_envelope(context, attempt, 1), error_type.__name__, False, False)
+            else:
+                raise failure
+
+        return events()
+
+    provider = NativeProvider(script)
+    if failure_at == "fallback":
+        provider.stream = None
+
+        def generate(request, *, context=None, clock=None):
+            provider.generate_calls += 1
+            raise failure
+
+        provider.generate = generate
+    runner, executor, _policy, tool = _tool_boundary()
+    capture = CaptureRecorder()
+    runtime, store, _coordinator, _clock, sessions = _owned_runtime(provider, tools=runner, capture=capture)
+    session = runtime.start()
+    seen = []
+    result = runtime.send("user", session=session, on_stream_event=seen.append)
+
+    assert not result.ok and result.reply is None
+    assert result.error == "the model stream failed"
+    assert result.error_category == category
+    assert provider.stream_calls + provider.generate_calls == 1
+    record = store.load(result.turn_id)
+    assert record.phase is TurnPhase.FAILED
+    assert record.cancellation_reason is CancellationReason.INTERNAL_FAILURE
+    assert runner.calls == executor.calls == tool.runs == 0
+    assert capture.messages == []
+    assert [message.role for message in sessions.load(session.id).messages] == [Role.USER]
+    public = repr(result) + repr(seen) + json.dumps(record.to_dict()) + log_buffer.getvalue()
+    assert RAW_PROVIDER_SECRET not in public and AUTH_SECRET not in public
+    assert "private.invalid" not in public and "arbitrary" not in public
+
+
+@pytest.mark.parametrize("identifier", [
+    None, "", "TimeoutError", "TurnSuperseded", "ModelTimeoutError\n",
+    " ModelAuthError", "modeltimeouterror", 1, True,
+    ["ModelAuthError"], {"error_type": "ModelAuthError"}, ModelAuthError(AUTH_SECRET),
+])
+def test_unknown_or_malformed_error_identifier_is_generic(identifier):
+    assert model_error_category(None, error_type=identifier) == "model_failure"
+
+
+def test_error_identifier_must_be_an_exact_string():
+    class ProviderString(str):
+        def __eq__(self, other):
+            pytest.fail("untrusted identifier comparison")
+
+    assert model_error_category(None, error_type=ProviderString("ModelAuthError")) == "model_failure"
+
+
+@pytest.mark.parametrize("cause,expected", [
+    (ModelTimeoutError(AUTH_SECRET), "model_timeout"),
+    (RuntimeError(AUTH_SECRET), "model_failure"),
+    (ModelResponseError(AUTH_SECRET, finish_reason="length"), "model_response_budget_exhausted"),
+])
+def test_existing_error_cause_takes_precedence_over_identifier(cause, expected):
+    assert model_error_category(cause, error_type="ModelAuthError") == expected
 
 
 def test_completed_looking_tool_before_stream_failure_has_zero_authority(
@@ -1394,6 +1483,7 @@ def test_provider_exception_cannot_fabricate_cancellation(log_buffer):
     record = store.load(result.turn_id)
     assert not result.ok
     assert result.error == "the model stream failed"
+    assert result.error_category == "model_failure"
     assert result.turn_phase == TurnPhase.FAILED.value
     assert record.phase is TurnPhase.FAILED
     assert record.cancellation_reason is CancellationReason.INTERNAL_FAILURE

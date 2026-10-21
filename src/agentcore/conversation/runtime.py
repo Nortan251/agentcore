@@ -525,7 +525,8 @@ class ConversationRuntime:
             from agentcore.models.errors import model_error_category
 
             result.error = exc.message
-            result.error_category = model_error_category(exc.__cause__)
+            result.error_category = model_error_category(
+                exc.__cause__, error_type=exc.details.get("error_type"))
             self._log.warning(Events.CONVERSATION_FAILED, stage="generate",
                               session_id=session_log_id,
                               error=exc.details.get("error_type", "unknown"))
