@@ -44,7 +44,7 @@ does not stop the other checks once runtime construction succeeds.
   shutdown fails; `ok` is false.
 - `2`: configuration cannot be loaded/validated; later checks are `not_checked`.
 
-The computer-control adapter is currently an unavailable stub, so a default
+The computer-control adapter is disabled in the default doctor composition, so a default
 `doctor --json` invocation returns `1`. Legacy `doctor` still returns `0` for
 that report. A model explicitly configured but unavailable is a diagnostic
 failure; an intentionally unconfigured model is not.

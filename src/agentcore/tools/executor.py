@@ -337,7 +337,7 @@ class ToolExecutor:
         """Replace a complete host policy, or fail busy without changing it.
 
         Replacement from another thread is supported. Once an authenticated
-        dispatch or ExternalReadTool leases its evaluated generation, replacement
+        dispatch, ExternalReadTool, or ephemeral control leases its evaluated generation, replacement
         fails busy until that dispatch exits. No policy mutex is held across callbacks or
         I/O. In-place changes to published policy authority are unsupported.
         This lease does not change Stage 5 mutation/approval ownership.
@@ -1374,7 +1374,7 @@ class ToolExecutor:
                     ))
             else:
                 with (self._external_read_policy_lease(tool, tool_spec, policy, generation)
-                      if external_read else nullcontext()):
+                      if external_read or not tool_spec.read_only else nullcontext()):
                     result = tool.run(cleaned, self._context(tool_spec.name))
             if not isinstance(result, ToolResult):
                 result = ToolResult.success(result)
@@ -1444,7 +1444,7 @@ class ToolExecutor:
 
     @contextmanager
     def _external_read_policy_lease(self, tool, tool_spec, policy, generation) -> Iterator[None]:
-        """Fence an evaluated ALLOW across synchronous owned external read I/O.
+        """Fence an evaluated ALLOW across external reads and ephemeral controls.
 
         Registry execution_lease already pins the exact tool. Completed policy
         replacement, including replacement-back ABA, invalidates this snapshot.

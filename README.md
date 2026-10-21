@@ -279,6 +279,10 @@ Jarvis > ...
 only input, output and the local `/` commands. Memory retrieval, capture,
 correction, conflict detection and persistence all stay in the runtime.
 
+On Windows 11, opt into the bounded Notepad action with
+`agentcore --config agent.local.toml chat --enable-desktop`. See the
+[Notepad demonstration and authorization instructions](docs/architecture/desktop-notepad-v1.md).
+
 One Agent, one runtime and one session serve the whole loop. `/help`,
 `/session`, `/conflicts`, `/exit` and `/quit` are handled locally: they never
 reach the model and are never stored as conversation.

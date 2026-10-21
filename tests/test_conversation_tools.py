@@ -759,7 +759,9 @@ def test_executor_explosion_is_contained():
     runner = ConversationToolRunner(ExplodingExecutor(), registry)
     [outcome] = runner.run_calls([call("echo_test", {"text": "x"})]).outcomes
     assert outcome.status == "failed"
-    assert "could not be run" in outcome.content
+    assert not outcome.not_invoked and outcome.invocation is None
+    assert "outcome could not be confirmed" in outcome.content
+    assert "may have executed; do not retry automatically" in outcome.content
 
 
 def test_a_failed_tool_is_not_retried_automatically():

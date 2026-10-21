@@ -7,7 +7,7 @@ those tools and otherwise knows nothing about the transport.
 
 This is the seam the local Windows control layer will use: it runs as a
 separate process on the user's machine, and a ``ComputerControlAdapter``
-implemented in a later task will connect to it and expose its tools here. No
+connects to it and exposes its tools here when explicitly enabled. No
 part of the core agent changes when that happens.
 """
 
