@@ -244,7 +244,7 @@ def _build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--json", action="store_true", dest="as_json",
                       help="emit the turn as JSON (requires --message)")
     chat.add_argument("--enable-desktop", action="store_true",
-                      help="enable the local Windows 11 Notepad service for this chat")
+                      help="enable configured Windows 11 Notepad and foreground observation tools for this chat")
 
     workspace = sub.add_parser("workspace", help="one explicitly enabled create-only workspace turn")
     workspace.add_argument("--enable-write", action="store_true",
@@ -2145,7 +2145,9 @@ def _chat_notices(result: Any) -> list[str]:
 
 def _turn_payload(result: Any) -> dict[str, Any]:
     """Machine-readable turn summary. Same fields the human view is built on."""
-    return {
+    from agentcore.desktop.chat import desktop_observations
+
+    payload = {
         "session_id": result.session.id,
         "ok": bool(result.ok),
         "reply": result.reply.content if result.reply else None,
@@ -2159,6 +2161,12 @@ def _turn_payload(result: Any) -> dict[str, Any]:
                               None) and result.correction.status.value,
         "notices": _chat_notices(result),
     }
+    observations = desktop_observations(result)
+    if observations:
+        payload["desktop_observations"] = observations
+    if getattr(result, "error_category", None):
+        payload["error_category"] = result.error_category
+    return payload
 
 
 def _chat_session(runtime: Any, args: argparse.Namespace) -> tuple[Any, str]:
@@ -2238,9 +2246,9 @@ def _command_chat(args: argparse.Namespace, config: AgentConfig) -> int:
     if desktop is not None:
         from agentcore.desktop.chat import NotepadConversationRunner
 
-        if desktop.register_into(agent.registry) != 1:
+        if desktop.register_into(agent.registry) == 0:
             agent.shutdown()
-            print("[Desktop] open_notepad is disabled by tool configuration.", file=sys.stderr)
+            print("[Desktop] Desktop tools are disabled by tool configuration.", file=sys.stderr)
             return 2
         tools = NotepadConversationRunner(
             agent.executor, agent.registry, notepad_tool=desktop.provided_tools()[0],

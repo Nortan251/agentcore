@@ -2,7 +2,8 @@
 
 from agentcore.conversation.tool_use import ConversationToolRunner, ToolCallOutcome
 from agentcore.permissions.levels import Capability
-from agentcore.integrations.computer_control import STATUS_TEXT
+from agentcore.integrations.computer_control import APP_NAMES, OBSERVATION_TEXT, STATUS_TEXT
+from agentcore.desktop.service import UNKNOWN_REASONS
 
 
 _PRE_DISPATCH_REFUSALS = frozenset({
@@ -63,6 +64,19 @@ class NotepadConversationRunner(ConversationToolRunner):
 def desktop_notices(result):
     notices = []
     for outcome in getattr(result, "tool_outcomes", ()):
+        if outcome.call.name == "get_foreground_app":
+            invocation = outcome.invocation
+            observation = invocation.result.output if invocation is not None else None
+            category = invocation.result.metadata.get("kind") if invocation is not None else None
+            if (category == "observed" and invocation.result.ok and type(observation) is dict
+                    and type(observation.get("app")) is str and observation["app"] in APP_NAMES.values()):
+                message = "Observed foreground application: " + observation["app"] + "."
+            elif category in OBSERVATION_TEXT:
+                message = OBSERVATION_TEXT[category]
+            else:
+                message = "No foreground application observation was obtained."
+            notices.append("[Desktop] " + message)
+            continue
         if outcome.call.name != "open_notepad":
             continue
         category = _desktop_category(outcome)
@@ -70,3 +84,23 @@ def desktop_notices(result):
                    if category == "not_launched" else STATUS_TEXT[category])
         notices.append("[Desktop] " + message)
     return notices
+
+
+def desktop_observations(result):
+    """Tool evidence for JSON callers, separate from generated model prose."""
+    observations = []
+    for outcome in getattr(result, "tool_outcomes", ()):
+        if outcome.call.name != "get_foreground_app":
+            continue
+        invocation = outcome.invocation
+        category = invocation.result.metadata.get("kind") if invocation is not None else None
+        output = invocation.result.output if invocation is not None else None
+        if (category == "observed" and invocation.result.ok and type(output) is dict
+                and type(output.get("app")) is str and output["app"] in APP_NAMES.values()):
+            observations.append({"status": "observed", "app": output["app"]})
+        else:
+            observations.append({"status": category if category in OBSERVATION_TEXT else "not_observed", "app": None})
+            reason = invocation.result.metadata.get("observation_reason") if invocation is not None else None
+            if category == "unknown" and type(reason) is str and reason in UNKNOWN_REASONS:
+                observations[-1]["reason"] = reason
+    return observations

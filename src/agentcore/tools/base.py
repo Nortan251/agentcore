@@ -255,7 +255,7 @@ class ExternalReadTool(Tool):
 
     def validate_args(self, args: Mapping[str, Any]) -> dict[str, Any]:
         spec = self.spec
-        if (not spec.read_only or Capability.NET_READ not in spec.capabilities
+        if (not spec.read_only or not spec.capabilities & {Capability.NET_READ, Capability.SCREEN_OBSERVE}
                 or not spec.capabilities <= READ_ONLY_CAPABILITIES):
             raise ToolValidationError("invalid external read contract", tool=spec.name)
         return super().validate_args(args)
