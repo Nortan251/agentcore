@@ -9,8 +9,33 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import sys
+
+
+APP_NAMES = {
+    "notepad.exe": "Notepad",
+    "chrome.exe": "Google Chrome",
+    "msedge.exe": "Microsoft Edge",
+    "code.exe": "Visual Studio Code",
+    "explorer.exe": "File Explorer",
+    "windowsterminal.exe": "Windows Terminal",
+}
+OBSERVATION_STATUSES = frozenset({
+    "observed", "unknown", "inaccessible", "desktop_unavailable",
+    "unsupported_os", "service_unavailable",
+})
+
+
+def decode_message(raw):
+    def unique_object(pairs):
+        result = dict(pairs)
+        if len(result) != len(pairs):
+            raise ValueError("duplicate protocol key")
+        return result
+    if type(raw) is not bytes or len(raw) > 256:
+        raise ValueError("invalid protocol size")
+    return json.loads(raw, object_pairs_hook=unique_object)
 
 
 def service_environment():
@@ -93,12 +118,80 @@ def _launch_notepad():
         return "launch_unknown"
 
 
+def _process_app(process):
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True, winmode=0x800)
+    query = kernel.QueryFullProcessImageNameW
+    query.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                      ctypes.POINTER(wintypes.DWORD)]
+    query.restype = wintypes.BOOL
+    buffer = ctypes.create_unicode_buffer(32768)
+    size = wintypes.DWORD(len(buffer))
+    if not query(int(process), 0, buffer, ctypes.byref(size)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    if not 0 < size.value < len(buffer):
+        return None
+    # This is an executable-name label, never publisher authentication or authority.
+    return APP_NAMES.get(PureWindowsPath(buffer.value).name.casefold())
+
+
+def _foreground_app():
+    import win32api
+    import win32con
+    import win32gui
+    import win32process
+    import win32security
+    import win32ts
+
+    window = win32gui.GetForegroundWindow()
+    if not window:
+        return {"status": "unknown", "app": None}
+    thread, pid = win32process.GetWindowThreadProcessId(window)
+    if not thread or not pid:
+        return {"status": "unknown", "app": None}
+    # Query only this process, with no memory-read, control or privilege rights.
+    process = win32api.OpenProcess(0x1000, False, pid)
+    try:
+        token = win32security.OpenProcessToken(process, win32con.TOKEN_QUERY)
+        try:
+            if win32security.GetTokenInformation(token, win32security.TokenSessionId) != win32ts.ProcessIdToSessionId(os.getpid()):
+                return {"status": "inaccessible", "app": None}
+        finally:
+            token.Close()
+        app = _process_app(process)
+        if app == "File Explorer" and win32gui.GetClassName(window) not in {"CabinetWClass", "ExploreWClass"}:
+            app = None
+        # Refuse a changed/locked desktop or a focus change instead of guessing.
+        if not _desktop_available():
+            return {"status": "desktop_unavailable", "app": None}
+        if (win32gui.GetForegroundWindow() != window
+                or win32process.GetWindowThreadProcessId(window) != (thread, pid)
+                or win32process.GetExitCodeProcess(process) != 259):
+            return {"status": "unknown", "app": None}
+    finally:
+        process.Close()
+    return {"status": "observed" if app else "unknown", "app": app}
+
+
 def handle_request(request):
     if (type(request) is not dict or set(request) != {"v", "operation"}
             or type(request["v"]) is not int or request["v"] != 1
-            or request["operation"] not in ("health", "open_notepad")):
+            or type(request["operation"]) is not str
+            or request["operation"] not in ("health", "open_notepad", "get_foreground_app")):
         return "invalid_request"
     status = availability()
+    if request["operation"] == "get_foreground_app":
+        if status != "ready":
+            return {"status": status, "app": None}
+        try:
+            return _foreground_app()
+        except ImportError:
+            return {"status": "service_unavailable", "app": None}
+        except Exception:
+            # Native errors may contain private process information; never render them.
+            return {"status": "inaccessible", "app": None}
     if status != "ready" or request["operation"] == "health":
         return status
     try:
@@ -112,13 +205,13 @@ def handle_request(request):
 def main():
     try:
         raw = sys.stdin.buffer.read(257)
-        status = handle_request(json.loads(raw)) if len(raw) <= 256 else "invalid_request"
+        status = handle_request(decode_message(raw))
     except (ValueError, TypeError):
         status = "invalid_request"
     except Exception:
         # Unexpected failure may follow physical entry; never infer non-application.
         status = "launch_unknown"
-    print(json.dumps({"v": 1, "status": status}))
+    print(json.dumps({"v": 1, **status} if type(status) is dict else {"v": 1, "status": status}))
     return 0
 
 

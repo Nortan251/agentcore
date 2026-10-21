@@ -8,6 +8,7 @@ path, environment, or executable crosses this boundary.
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
 import subprocess
 import sys
@@ -15,10 +16,10 @@ import threading
 
 from agentcore.action_journal.adapters import ActionAdapterSpec
 from agentcore.action_journal.models import ActionJournalEligibility
-from agentcore.desktop.service import service_environment
+from agentcore.desktop.service import APP_NAMES, OBSERVATION_STATUSES, decode_message, service_environment
 from agentcore.integrations.base import Integration, IntegrationStatus
 from agentcore.permissions.levels import Capability
-from agentcore.tools.base import Tool, ToolResult, ToolSpec
+from agentcore.tools.base import ExternalReadTool, Tool, ToolResult, ToolSpec
 
 
 PLANNED_CAPABILITIES = frozenset({
@@ -34,6 +35,54 @@ STATUS_TEXT = {
     "launch_failed": "Windows could not start Notepad successfully.",
     "launch_unknown": "Notepad may have opened; the launch could not be confirmed. Check the desktop before trying again.",
 }
+
+
+OBSERVATION_TEXT = {
+    "unsupported_os": "Foreground observation requires Windows 11.",
+    "desktop_unavailable": "An active, unlocked Windows desktop is required.",
+    "service_unavailable": "The foreground observation could not be obtained from the local desktop service.",
+    "inaccessible": "The foreground application is inaccessible; its identity could not be observed.",
+    "unknown": "The foreground application could not be identified safely.",
+}
+
+
+def _run_service(command, *, input, timeout, **kwargs):
+    """Bound captured stdout before decoding, including a nonterminating service."""
+    with subprocess.Popen(command, stdin=subprocess.PIPE, **kwargs) as process:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            def exchange():
+                process.stdin.write(input)
+                process.stdin.close()
+                output = process.stdout.read(257)
+                if len(output) > 256:
+                    process.kill()
+                return subprocess.CompletedProcess(command, process.wait(), output)
+            future = pool.submit(exchange)
+            try:
+                return future.result(timeout=timeout)
+            except TimeoutError:
+                raise subprocess.TimeoutExpired("desktop service", timeout) from None
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.wait()
+
+
+class GetForegroundAppTool(ExternalReadTool):
+    spec = ToolSpec(
+        name="get_foreground_app",
+        description="Observe the foreground application on the local Windows 11 desktop now. "
+                    "No arguments. Returns a fixed app label or a truthful unavailable/unknown status.",
+        capabilities=frozenset({Capability.SCREEN_OBSERVE}),
+        read_only=True,
+        tags=("private_arguments",),
+    )
+
+    def __init__(self, adapter: ComputerControlAdapter) -> None:
+        self._adapter = adapter
+
+    def run(self, args, context):
+        return self._adapter.get_foreground_app()
 
 
 class OpenNotepadTool(Tool):
@@ -67,32 +116,48 @@ class ComputerControlAdapter(Integration):
     def __init__(self, settings: dict | None = None) -> None:
         super().__init__("computer_control", settings)
         self._tool = OpenNotepadTool(self)
+        self._foreground_tool = GetForegroundAppTool(self)
         self._launch_lock = threading.Lock()
         self._uncertain = False
         self.detail = STATUS_TEXT["service_unavailable"]
 
-    def _request(self, operation: str) -> str:
-        if operation not in {"health", "open_notepad"}:
+    def _request(self, operation: str) -> str | dict:
+        if operation not in {"health", "open_notepad", "get_foreground_app"}:
             raise ValueError("unsupported desktop operation")
+        observation = operation == "get_foreground_app"
         if sys.platform != "win32":
-            return "unsupported_os"
+            return {"status": "unsupported_os", "app": None} if observation else "unsupported_os"
         unknown = "launch_unknown" if operation == "open_notepad" else "service_unavailable"
+        fallback = {"status": unknown, "app": None} if observation else unknown
         try:
-            completed = subprocess.run(
+            completed = _run_service(
                 [sys.executable, "-I", str(Path(__file__).resolve().parents[1] / "desktop" / "service.py")],
                 input=json.dumps({"v": 1, "operation": operation}).encode("ascii"),
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                timeout=10, check=False, shell=False, close_fds=True,
+                timeout=10, shell=False, close_fds=True,
                 creationflags=subprocess.CREATE_NO_WINDOW,
                 env=service_environment(),
             )
         except OSError:
-            return unknown
+            return fallback
         except subprocess.TimeoutExpired:
             # Killing a timed-out service cannot undo a launch it already made.
-            return unknown
+            return fallback
         try:
-            payload = json.loads(completed.stdout) if len(completed.stdout) <= 256 else None
+            payload = decode_message(completed.stdout)
+            if observation:
+                if (completed.returncode != 0 or type(payload) is not dict
+                        or set(payload) != {"v", "status", "app"}
+                        or type(payload["v"]) is not int or payload["v"] != 1
+                        or type(payload["status"]) is not str
+                        or payload["status"] not in OBSERVATION_STATUSES):
+                    return fallback
+                if payload["status"] == "observed":
+                    if type(payload["app"]) is not str or payload["app"] not in APP_NAMES.values():
+                        return fallback
+                elif payload["app"] is not None:
+                    return fallback
+                return {"status": payload["status"], "app": payload["app"]}
             allowed = ({"ready", "unsupported_os", "desktop_unavailable", "service_unavailable"}
                        if operation == "health" else set(STATUS_TEXT) - {"ready"})
             if completed.returncode != 0 or type(payload) is not dict or set(payload) != {"v", "status"}:
@@ -101,7 +166,7 @@ class ComputerControlAdapter(Integration):
                 return unknown
             return payload["status"]
         except (ValueError, TypeError):
-            return unknown
+            return fallback
 
     def connect(self) -> IntegrationStatus:
         category = self._request("health") if self.settings.get("enabled") is True else "service_unavailable"
@@ -110,7 +175,16 @@ class ComputerControlAdapter(Integration):
         return self.status
 
     def provided_tools(self):
-        return (self._tool,) if self.status is IntegrationStatus.CONNECTED else ()
+        return (self._tool, self._foreground_tool) if self.status is IntegrationStatus.CONNECTED else ()
+
+    def get_foreground_app(self) -> ToolResult:
+        result = (self._request("get_foreground_app")
+                  if self.settings.get("enabled") is True and self.status is IntegrationStatus.CONNECTED
+                  else {"status": "service_unavailable", "app": None})
+        category = result["status"]
+        if category in {"observed", "unknown"}:
+            return ToolResult.success(result, kind=category)
+        return ToolResult.failure(OBSERVATION_TEXT[category], kind=category, retryable=False)
 
     def open_notepad(self) -> ToolResult:
         with self._launch_lock:

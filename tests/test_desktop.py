@@ -41,7 +41,7 @@ def connected(monkeypatch):
 
 def executor_for(adapter, *, level=PermissionLevel.CONFIRM, gate=None, blocked=()):
     registry = ToolRegistry()
-    assert adapter.register_into(registry) == 1
+    assert adapter.register_into(registry) == 2
     tool = adapter.provided_tools()[0]
     actions = ActionAdapterRegistry()
     actions.register(tool, control.NotepadActionAdapter())
@@ -200,7 +200,7 @@ def test_private_transport_has_fixed_command_and_no_secrets(monkeypatch):
         assert kwargs["creationflags"] == 0x08000000 and kwargs["timeout"] == 10
         assert "MODEL_API_KEY" not in kwargs["env"] and "PYTHONPATH" not in kwargs["env"]
         return SimpleNamespace(returncode=0, stdout=b'{"v":1,"status":"launch_accepted"}')
-    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(control, "_run_service", run)
     assert control.ComputerControlAdapter()._request("open_notepad") == "launch_accepted"
 
 
@@ -209,7 +209,7 @@ def test_private_transport_has_fixed_command_and_no_secrets(monkeypatch):
 def test_invalid_launch_response_is_unknown(monkeypatch, response):
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", 0, raising=False)
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0, stdout=response))
+    monkeypatch.setattr(control, "_run_service", lambda *a, **k: SimpleNamespace(returncode=0, stdout=response))
     assert control.ComputerControlAdapter()._request("open_notepad") == "launch_unknown"
 
 
@@ -219,7 +219,7 @@ def test_timeout_preserves_launch_uncertainty(monkeypatch, operation, expected):
     monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", 0, raising=False)
     def timeout(*args, **kwargs):
         raise subprocess.TimeoutExpired("service", 10)
-    monkeypatch.setattr(subprocess, "run", timeout)
+    monkeypatch.setattr(control, "_run_service", timeout)
     assert control.ComputerControlAdapter()._request(operation) == expected
 
 
@@ -228,7 +228,7 @@ def test_transport_oserror_after_possible_entry_is_unknown(monkeypatch):
     monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", 0, raising=False)
     def broken_pipe(*args, **kwargs):
         raise OSError("pipe lost after service launch")
-    monkeypatch.setattr(subprocess, "run", broken_pipe)
+    monkeypatch.setattr(control, "_run_service", broken_pipe)
     assert control.ComputerControlAdapter()._request("open_notepad") == "launch_unknown"
 
 
@@ -261,7 +261,7 @@ def test_windows_11_workstation_gate(monkeypatch, major, build, product, expecte
 
 def test_non_windows_has_no_native_or_process_access(monkeypatch):
     monkeypatch.setattr(sys, "platform", "linux")
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("process on unsupported OS"))
+    monkeypatch.setattr(control, "_run_service", lambda *a, **k: pytest.fail("process on unsupported OS"))
     assert service.availability() == "unsupported_os"
     assert control.ComputerControlAdapter({"enabled": True}).connect() is IntegrationStatus.UNAVAILABLE
 

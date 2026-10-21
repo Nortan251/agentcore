@@ -1,5 +1,9 @@
 # Windows 11 Notepad control v1
 
+The [desktop awareness extension](desktop-awareness-v1.md) adds an independently
+configured read-only foreground tool to the same service. The Notepad-only
+allowlist and approval flow below remain supported.
+
 `agentcore chat --enable-desktop` adds one zero-argument tool, `open_notepad`,
 to an ordinary conversation. The model must support structured tool calls.
 The offline `echo` provider cannot demonstrate this action.
