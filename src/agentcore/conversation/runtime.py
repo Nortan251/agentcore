@@ -182,6 +182,7 @@ class TurnResult:
     turn_id: str | None = None
     turn_generation: int | None = None
     turn_phase: str | None = None
+    error_category: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -521,7 +522,10 @@ class ConversationRuntime:
                 raise fence_exc
             # No fabricated assistant message, and nothing captured from a
             # turn whose outcome is unknown.
+            from agentcore.models.errors import model_error_category
+
             result.error = exc.message
+            result.error_category = model_error_category(exc.__cause__)
             self._log.warning(Events.CONVERSATION_FAILED, stage="generate",
                               session_id=session_log_id,
                               error=exc.details.get("error_type", "unknown"))

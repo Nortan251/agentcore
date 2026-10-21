@@ -2164,6 +2164,8 @@ def _turn_payload(result: Any) -> dict[str, Any]:
     observations = desktop_observations(result)
     if observations:
         payload["desktop_observations"] = observations
+    if getattr(result, "error_category", None):
+        payload["error_category"] = result.error_category
     return payload
 
 

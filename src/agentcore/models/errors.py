@@ -79,3 +79,18 @@ class ModelProviderError(ModelError):
             self.details["status_code"] = status_code
             # Server-side faults are transient; client-side ones are not.
             self.retryable = status_code >= 500
+
+
+def model_error_category(error: BaseException | None) -> str:
+    """Closed error vocabulary for operator output; never exception/provider text."""
+    if isinstance(error, ModelResponseError) and error.details.get("finish_reason") == "length":
+        return "model_response_budget_exhausted"
+    for kind, category in (
+        (ModelAuthError, "model_authentication"), (ModelRateLimitError, "model_rate_limit"),
+        (ModelTimeoutError, "model_timeout"), (ModelConnectionError, "model_connection"),
+        (ModelConfigError, "model_configuration"), (ModelResponseError, "model_response_invalid"),
+        (ModelProviderError, "model_http_error"),
+    ):
+        if isinstance(error, kind):
+            return category
+    return "model_failure"

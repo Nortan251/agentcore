@@ -135,7 +135,7 @@ with the config path resolved before switching focus:
 $demoConfig = (Resolve-Path agent.local.toml).Path
 Write-Host 'Select Notepad now; keep it selected until the result appears.'
 Start-Sleep -Seconds 8
-python -m agentcore --config $demoConfig chat --enable-desktop `
+python -m agentcore.cli --config $demoConfig chat --enable-desktop `
   --message 'Jarvis, what application am I using right now? Use get_foreground_app.' --json
 ```
 
@@ -145,6 +145,54 @@ unrecognized application for truthful `unknown`; do not change security
 settings merely to manufacture an inaccessible window. If naturally
 inaccessible native access cannot be demonstrated, record that part NOT RUN.
 Mocked access-denial tests remain separate from native evidence.
+
+### Separate provider and native checks
+
+From the checkout root, run a provider-only diagnostic with the same config:
+
+```powershell
+python src/agentcore/desktop/diagnostics.py provider --config agent.local.toml
+```
+
+This sends one fixed tiny completion request through the existing provider
+factory and HTTP client, with one total attempt, 128 output tokens, a 20-second
+socket timeout and a 30-second child-process limit. These are diagnostic-only
+overrides; production and saved provider defaults are unchanged. The child
+disables logging and inherited TLS key logging. HTTP redirects are refused;
+responses are bounded to 64 KiB and error bodies are not read. Only fixed
+categories, status, phase, timing and budget metadata are returned. No provider
+text, reasoning text, headers or credentials are printed or saved.
+
+`endpoint` is a separate unauthenticated GET reachability check. An HTTP response
+does not prove authentication or completion availability. `provider-tools` is an
+optional separate one-attempt test asking for a `diagnostic_noop` call; nothing
+it returns is executed. `tool_call_returned` proves this sampled structured call
+worked. `tool_call_not_returned` does not prove tool calls are unsupported.
+`model_response_budget_exhausted` distinguishes a length-limited answer from
+connection failure. A timeout alone cannot identify throttling, invalid
+credentials, configuration rejection or the server's reason for delay; use
+observed HTTP status and response phase, and retain uncertainty otherwise.
+
+For a model-independent foreground smoke test, manually select the target
+window during a short delay:
+
+```powershell
+Start-Sleep -Seconds 8
+python src/agentcore/desktop/diagnostics.py native --config agent.local.toml --enable-desktop
+```
+
+This needs no API key or provider connectivity. It registers only the existing
+`get_foreground_app` tool and calls `ToolExecutor` with the config's current
+permission policy. Desktop opt-in, conversation tool enablement, the original
+tool allowlist and explicit screen-observation denials are all enforced. It
+never constructs a model or approves Notepad. Results remain unconfirmed until
+the operator verifies them. Native results do not prove a model used a tool.
+
+Failed conversation JSON now retains a fixed `error_category` (authentication,
+rate limit, timeout, connection, configuration, invalid response, budget exhaustion,
+HTTP failure, or generic model failure), while keeping the existing generic
+human-readable error. Tool evidence collected before a later model failure
+remains available separately; an error must not erase an actual observation.
 
 Record the exact commit, Windows build, expected app chosen by the operator,
 `desktop_observations`, generated `reply`, and the operator's explicit
