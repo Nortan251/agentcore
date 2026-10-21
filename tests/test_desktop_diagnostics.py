@@ -50,7 +50,8 @@ def response(*, text="OK", finish="stop", calls=None, reasoning=None):
 
 
 @pytest.mark.parametrize("tools", [False, True])
-def test_provider_is_one_small_attempt_and_never_executes_tools(monkeypatch, tools):
+@pytest.mark.parametrize("trailing_slashes", ["", "/", "///"])
+def test_provider_is_one_small_attempt_and_never_executes_tools(monkeypatch, tools, trailing_slashes):
     monkeypatch.setenv("NVIDIA_API_KEY", SECRET)
     calls = []
     tool_calls = [{"id": "diagnostic", "type": "function", "function": {"name": "diagnostic_noop", "arguments": "{}"}}]
@@ -66,11 +67,13 @@ def test_provider_is_one_small_attempt_and_never_executes_tools(monkeypatch, too
     monkeypatch.setattr(UrllibTransport, "open_stream", open_stream)
     monkeypatch.setattr(ComputerControlAdapter, "connect", lambda _: pytest.fail("provider probe touched desktop"))
     original = config()
+    original = replace(original, model=replace(original.model, base_url=diag.ENDPOINT + trailing_slashes))
     result = diag.provider_check(original, tools=tools)
     assert result["category"] == ("tool_call_returned" if tools else "provider_ok")
     assert result["attempts"] == 1 and result["http_status"] == 200 and calls == [True]
     assert SECRET not in json.dumps(result) and stream.closed
     assert original.model.timeout_seconds == 120 and original.model.max_output_tokens == 4096
+    assert original.model.base_url == diag.ENDPOINT + trailing_slashes
 
 
 @pytest.mark.parametrize("status,category", [(401, "model_authentication"), (403, "model_authentication"),
@@ -127,6 +130,28 @@ def test_no_key_or_wrong_endpoint_does_not_send_a_request(monkeypatch):
     monkeypatch.setattr(UrllibTransport, "open_stream", lambda *a, **k: pytest.fail("unexpected HTTP"))
     assert diag.provider_check(config()) == {"category": "credential_unavailable", "attempts": 0}
     bad = replace(config(), model=replace(config().model, base_url="https://untrusted.invalid"))
+    assert diag.provider_check(bad) == {"category": "model_configuration", "attempts": 0}
+
+
+@pytest.mark.parametrize("base_url", [
+    None,
+    "http://integrate.api.nvidia.com/v1/",
+    "https://untrusted.invalid/v1/",
+    "https://integrate.api.nvidia.com.untrusted.invalid/v1/",
+    "https://integrate.api.nvidia.com@untrusted.invalid/v1/",
+    "https://untrusted.invalid@integrate.api.nvidia.com/v1/",
+    "https://integrate.api.nvidia.com:443/v1/",
+    "https://integrate.api.nvidia.com/v10/",
+    "https://integrate.api.nvidia.com/v1/other/",
+    "https://integrate.api.nvidia.com/v1/../v1/",
+    "https://integrate.api.nvidia.com/v1?query=1",
+    "https://integrate.api.nvidia.com/v1#fragment",
+])
+def test_endpoint_pin_rejects_wrong_hosts_and_paths_before_network(monkeypatch, base_url):
+    monkeypatch.setenv("NVIDIA_API_KEY", SECRET)
+    monkeypatch.setattr(UrllibTransport, "open_stream", lambda *a, **k: pytest.fail("unexpected HTTP"))
+    original = config()
+    bad = replace(original, model=replace(original.model, base_url=base_url))
     assert diag.provider_check(bad) == {"category": "model_configuration", "attempts": 0}
 
 

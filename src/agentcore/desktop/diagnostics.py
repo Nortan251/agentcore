@@ -76,7 +76,7 @@ class DiagnosticTransport:
 
 
 def provider_check(config, *, tools=False):
-    if (config.model.provider != "openai_compatible" or config.model.base_url != ENDPOINT
+    if (config.model.provider != "openai_compatible" or (config.model.base_url or "").rstrip("/") != ENDPOINT
             or config.model.name != "z-ai/glm-5.3-flash" or config.model.api_key_env != "NVIDIA_API_KEY"):
         return {"category": "model_configuration", "attempts": 0}
     if not config.model.resolve_api_key():
