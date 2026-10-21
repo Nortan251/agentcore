@@ -412,6 +412,16 @@ def test_json_cannot_implicitly_authorize(connected, tmp_path, monkeypatch, caps
     assert calls == ["health"]
 
 
+def test_redirected_input_cannot_implicitly_authorize(connected, tmp_path, monkeypatch, capsys):
+    _, calls = connected
+    monkeypatch.setattr(cli.Agent, "_build_model", lambda _: ScriptedModel())
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr("builtins.input", lambda _: pytest.fail("redirected input prompted for approval"))
+    assert cli.main(chat_config(tmp_path) + ["chat", "--enable-desktop", "--message", "Open Notepad"]) == 0
+    assert "[Desktop] Notepad was not launched by this request." in capsys.readouterr().out
+    assert calls == ["health"]
+
+
 def test_ordinary_chat_does_not_connect_desktop(connected, tmp_path, monkeypatch, capsys):
     _, calls = connected
     monkeypatch.setattr(cli.Agent, "_build_model", lambda _: ScriptedModel())
@@ -438,7 +448,10 @@ def test_notepad_runner_does_not_approve_other_tools_or_replacement(connected):
     executor, tool = executor_for(adapter)
     runner = NotepadConversationRunner(executor, executor.registry, notepad_tool=tool)
     executor.registry.register(control.OpenNotepadTool(adapter), replace=True)
-    assert runner.run_calls([ToolCall("open", "open_notepad", {})]).needs_approval
+    round_ = runner.run_calls([ToolCall("open", "open_notepad", {})])
+    assert round_.needs_approval
+    assert desktop_notices(SimpleNamespace(tool_outcomes=round_.outcomes)) == [
+        "[Desktop] Notepad was not launched by this request."]
     assert not calls
 
 
@@ -461,3 +474,77 @@ def test_unknown_executor_failure_never_claims_non_application():
     outcome = SimpleNamespace(call=ToolCall("open", "open_notepad", {}), invocation=SimpleNamespace(
         result=SimpleNamespace(metadata={"kind": "unhandled_exception"})))
     assert "may have opened" in desktop_notices(SimpleNamespace(tool_outcomes=[outcome]))[0]
+
+
+def test_missing_invocation_without_refusal_evidence_is_unknown():
+    outcome = SimpleNamespace(call=ToolCall("open", "open_notepad", {}), invocation=None)
+    assert "may have opened" in desktop_notices(SimpleNamespace(tool_outcomes=[outcome]))[0]
+
+
+def test_cli_executor_result_loss_preserves_uncertain_notice(connected, tmp_path, monkeypatch, capsys):
+    _, calls = connected
+    invoke = ToolExecutor.invoke
+
+    def lose_result(self, *args, **kwargs):
+        invocation = invoke(self, *args, **kwargs)
+        assert invocation.result.metadata["kind"] == "launch_accepted"
+        raise RuntimeError("executor result lost")
+
+    monkeypatch.setattr(ToolExecutor, "invoke", lose_result)
+    monkeypatch.setattr(cli.Agent, "_build_model", lambda _: ScriptedModel())
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: "open notepad")
+    assert cli.main(chat_config(tmp_path) + ["chat", "--enable-desktop", "--message", "Open Notepad"]) == 0
+    output = capsys.readouterr().out
+    assert "[Desktop] Notepad may have opened" in output
+    assert "Notepad was not launched" not in output
+    assert calls == ["health", "open_notepad"]
+
+
+@pytest.mark.parametrize("lost_result", [True, False])
+def test_result_loss_after_accepted_dispatch_blocks_chat_retries(connected, monkeypatch, lost_result):
+    adapter, calls = connected
+    executor, tool = executor_for(adapter, level=PermissionLevel.AUTONOMOUS)
+    runner = NotepadConversationRunner(executor, executor.registry, notepad_tool=tool)
+    invoke = executor.invoke
+    invocations = []
+
+    def lose_result(*args, **kwargs):
+        invocations.append(True)
+        invocation = invoke(*args, **kwargs)
+        assert invocation.result.metadata["kind"] == "launch_accepted"
+        if lost_result:
+            raise RuntimeError("executor result lost after service acceptance")
+        invocation.result = control.ToolResult.failure("result lost", kind="unhandled_exception")
+        return invocation
+
+    monkeypatch.setattr(executor, "invoke", lose_result)
+    # Cover duplicates in one model response, a later round, and a later user turn.
+    outcomes = runner.run_calls([ToolCall("first", "open_notepad", {}),
+                                ToolCall("duplicate", "open_notepad", {})]).outcomes
+    for identifier in ("next_round", "next_turn"):
+        outcomes += runner.run_calls([ToolCall(identifier, "open_notepad", {})]).outcomes
+    assert len(outcomes) == 4 and all(not outcome.ok for outcome in outcomes)
+    notices = desktop_notices(SimpleNamespace(tool_outcomes=outcomes))
+    assert all("may have opened" in notice and "Check the desktop" in notice for notice in notices)
+    assert all("may have opened" in outcome.content for outcome in outcomes)
+    assert calls == ["open_notepad"]
+    assert invocations == [True]
+
+
+def test_pre_dispatch_refusals_do_not_latch_notepad(connected):
+    adapter, calls = connected
+    executor, tool = executor_for(adapter, level=PermissionLevel.AUTONOMOUS)
+    runner = NotepadConversationRunner(executor, executor.registry, notepad_tool=tool)
+    executor.registry.unregister(tool.name)
+    missing = runner.run_calls([ToolCall("missing", "open_notepad", {})]).outcomes[0]
+    executor.registry.register(tool)
+    invalid = runner.run_calls([ToolCall("invalid", "open_notepad", {"path": "other.exe"})]).outcomes[0]
+    executor.policy = PermissionPolicy()
+    denied = runner.run_calls([ToolCall("denied", "open_notepad", {})]).outcomes[0]
+    assert desktop_notices(SimpleNamespace(tool_outcomes=[missing, invalid, denied])) == [
+        "[Desktop] Notepad was not launched by this request."] * 3
+    assert not calls
+    executor.policy = PermissionPolicy(PermissionConfig(level=PermissionLevel.AUTONOMOUS))
+    assert runner.run_calls([ToolCall("allowed", "open_notepad", {})]).outcomes[0].ok
+    assert calls == ["open_notepad"]

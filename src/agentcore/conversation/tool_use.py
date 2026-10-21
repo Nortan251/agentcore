@@ -53,9 +53,8 @@ MAX_TOOL_NAME_CHARS = 256
 class ToolCallOutcome:
     """What happened to one requested tool call.
 
-    ``executed`` is the honest record: it is False for an unknown tool, a
-    denied call and an approval-required call, so no caller can mistake a
-    refusal for a run.
+    ``executed`` confirms a successful run. False does not prove that no
+    physical effect occurred: the executor's result may have been lost.
     """
 
     call: ToolCall
@@ -66,6 +65,8 @@ class ToolCallOutcome:
     duration_ms: float = 0.0
     #: The executor's record, when the call actually reached it.
     invocation: Any | None = None
+    #: Positive evidence that this runner refused before entering the executor.
+    not_invoked: bool = False
 
     @property
     def ok(self) -> bool:
@@ -306,7 +307,7 @@ class ConversationToolRunner:
                         capability=str(pending.capability)
                         if pending.capability else None)
             return ToolCallOutcome(
-                call=call, status="approval_required", executed=False,
+                call=call, status="approval_required", executed=False, not_invoked=True,
                 content=self._render_refusal(
                     call, "This action needs human approval before it can "
                           f"run: {pending.reason}. It was NOT executed."))
@@ -318,10 +319,11 @@ class ConversationToolRunner:
         except Exception as exc:  # noqa: BLE001 - never kill the conversation
             log.warning(Events.CONVERSATION_TOOL_FAILED,
                         reason="executor_error", error=type(exc).__name__)
-            return self._refuse(
-                call, "failed",
-                f"the tool could not be run: {type(exc).__name__}", log,
-                already_logged=True)
+            return ToolCallOutcome(
+                call=call, status="failed",
+                content=self._render_refusal(
+                    call, f"The tool outcome could not be confirmed: {type(exc).__name__}. "
+                          "It may have executed; do not retry automatically."))
 
         return self._from_invocation(call, invocation, log)
 
@@ -385,7 +387,7 @@ class ConversationToolRunner:
                 already_logged: bool = False) -> ToolCallOutcome:
         if not already_logged:
             log.warning(Events.CONVERSATION_TOOL_FAILED, reason=status)
-        return ToolCallOutcome(call=call, status=status, executed=False,
+        return ToolCallOutcome(call=call, status=status, executed=False, not_invoked=True,
                                content=self._render_refusal(call, message))
 
     # -- rendering ---------------------------------------------------------

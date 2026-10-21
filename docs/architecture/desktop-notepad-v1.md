@@ -119,7 +119,13 @@ it is not a window-visibility receipt. Modern Notepad may forward activation
 to another process. Native creation failure is reported as failure. A timeout,
 malformed/lost response or post-creation error preserves uncertainty and blocks
 further launch dispatch through that adapter for the rest of the chat process.
-There is no automatic retry. After uncertainty, inspect the desktop before
+The conversation runner also latches against further Notepad dispatch when the
+executor loses its result or returns an unclassified failure, including after
+service acceptance. A missing invocation alone is not proof of non-launch:
+only explicit pre-dispatch refusal evidence supports that notice. Unknown
+outcomes tell both the operator and model that Notepad may have opened.
+There is no automatic retry, including duplicate calls in one response or later
+rounds and user turns in that running chat. After uncertainty, inspect the desktop before
 explicitly starting a new chat process and requesting another launch.
 
 ## Verification boundaries
