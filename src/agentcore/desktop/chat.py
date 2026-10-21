@@ -86,6 +86,26 @@ def desktop_notices(result):
     return notices
 
 
+def desktop_tool_calls(result):
+    """Closed desktop call metadata; invalid arguments and call IDs stay private.
+
+    A missing executor return does not prove that an external effect was absent.
+    """
+    calls = []
+    for outcome in getattr(result, "tool_outcomes", ()):
+        name = outcome.call.name
+        if type(name) is not str or name not in ("get_foreground_app", "open_notepad"):
+            continue
+        arguments = outcome.call.arguments
+        status = getattr(outcome, "status", None)
+        calls.append({"name": name,
+                      "arguments": {} if type(arguments) is dict and not arguments else None,
+                      "status": status if status in ("ok", "failed", "denied", "approval_required") else "unknown",
+                      "executor_returned": outcome.invocation is not None,
+                      "executed": bool(getattr(outcome, "executed", False))})
+    return calls
+
+
 def desktop_observations(result):
     """Tool evidence for JSON callers, separate from generated model prose."""
     observations = []

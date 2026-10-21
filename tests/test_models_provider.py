@@ -238,6 +238,25 @@ def test_request_uses_configured_model_and_parameters():
     assert transport.requests[0]["url"] == "https://api.example.com/v1/chat/completions"
 
 
+def test_generate_explicitly_requests_json_when_server_defaults_to_streaming():
+    class StreamingDefaultTransport(FakeTransport):
+        def post_json(self, url, payload, headers, timeout):
+            if payload.get("stream") is not False:
+                return HttpResponse(200, b'data: {"choices": []}\n\n')
+            return super().post_json(url, payload, headers, timeout)
+
+    transport = StreamingDefaultTransport([http(200, ok_body("OK"))])
+    assert build(transport).complete("hi") == "OK"
+    assert len(transport.requests) == 1
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_thinking_wire_option_is_explicitly_configured(enabled):
+    transport = FakeTransport([http(200, ok_body())])
+    build(transport, enable_thinking=enabled).complete("hi")
+    assert transport.requests[0]["payload"]["chat_template_kwargs"] == {"enable_thinking": enabled}
+
+
 def test_request_message_structure():
     transport = FakeTransport([http(200, ok_body())])
     build(transport).complete("do the thing", system="you are terse")
@@ -268,6 +287,7 @@ def test_optional_fields_omitted_when_unset():
     assert "stop" not in payload
     assert "tools" not in payload
     assert "response_format" not in payload
+    assert "chat_template_kwargs" not in payload
 
 
 def test_neutral_tools_translated_and_response_format_forwarded_when_present():

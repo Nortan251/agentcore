@@ -743,7 +743,10 @@ class OpenAICompatibleProvider(BaseModelProvider):
         payload: dict[str, Any] = {
             "model": request.model or self.config.name,
             "messages": _wire_messages(request.messages),
+            "stream": False,
         }
+        if self.config.enable_thinking is not None:
+            payload["chat_template_kwargs"] = {"enable_thinking": self.config.enable_thinking}
         temperature = (request.temperature if request.temperature is not None
                        else self.config.temperature)
         payload["temperature"] = temperature

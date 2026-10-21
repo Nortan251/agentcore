@@ -312,6 +312,8 @@ def test_chat_tool_only_enablement_and_authoritative_observation(observation, tm
     assert [t["name"] for t in model.requests[0].tools] == ["get_foreground_app"]
     assert "Observed foreground application: Notepad." in str(output["notices"])
     assert output["desktop_observations"] == [{"status": "observed", "app": "Notepad"}]
+    assert output["desktop_tool_calls"] == [{"name": "get_foreground_app", "arguments": {},
+        "status": "ok", "executor_returned": True, "executed": True}]
     assert "Notepad" in str(model.requests[-1])
 
 
@@ -322,6 +324,82 @@ def test_without_desktop_opt_in_neither_tool_is_exposed(observation, tmp_path, m
     assert cli.main(config_for(tmp_path, ["get_foreground_app", "open_notepad"]) + ["chat", "--message", "Which app?"]) == 0
     capsys.readouterr()
     assert not calls and not model.requests[0].tools
+
+
+@pytest.mark.parametrize("native,reply", [
+    ({"status": "observed", "app": "Notepad"}, "You are using Notepad."),
+    ({"status": "unknown", "app": None}, "The foreground application is unknown."),
+])
+def test_configured_json_provider_reaches_conversation_executor_and_native_boundary(
+        observation, tmp_path, monkeypatch, capsys, caplog, native, reply):
+    from agentcore.models import factory
+    from agentcore.models.providers.openai_compatible import OpenAICompatibleProvider
+    from test_models_provider import FakeTransport, http, ok_body
+
+    _, calls = observation
+    def request(self, operation):
+        calls.append(operation)
+        assert operation in {"health", "get_foreground_app"}
+        return "ready" if operation == "health" else dict(native)
+    monkeypatch.setattr(control.ComputerControlAdapter, "_request", request)
+    secret = "task49-test-header-only-credential"
+    monkeypatch.setenv("TASK49_TEST_KEY", secret)
+    call_body = {"choices": [{"message": {"content": None, "tool_calls": [{
+        "id": "observe49", "type": "function", "function": {
+            "name": "get_foreground_app", "arguments": "{}"}}]}, "finish_reason": "tool_calls"}]}
+    transport = FakeTransport([http(200, call_body), http(200, ok_body(reply))])
+    monkeypatch.setitem(factory._REGISTRY, "openai_compatible",
+                        lambda config: OpenAICompatibleProvider(config, transport=transport))
+    args = config_for(tmp_path, ["get_foreground_app"])
+    with Path(args[1]).open("a", encoding="utf-8") as config:
+        config.write('\n[model]\nprovider = "openai_compatible"\nname = "configured-test-model"\n'
+                     'base_url = "https://example.invalid/v1"\napi_key_env = "TASK49_TEST_KEY"\n'
+                     'enable_thinking = false\nmax_retries = 1\nmax_output_tokens = 128\ntimeout_seconds = 20\n')
+    assert cli.main(args + ["chat", "--enable-desktop", "--message",
+                            "Jarvis, what application am I using right now?", "--json"]) == 0
+    output = capsys.readouterr()
+    payload = json.loads(output.out)
+    assert payload["reply"] == reply and payload["desktop_observations"] == [native]
+    assert payload["desktop_tool_calls"] == [{"name": "get_foreground_app", "arguments": {},
+        "status": "ok", "executor_returned": True, "executed": True}]
+    assert calls == ["health", "get_foreground_app"]
+    assert len(transport.requests) == 2
+    for sent in transport.requests:
+        assert sent["payload"]["stream"] is False
+        assert sent["payload"]["chat_template_kwargs"] == {"enable_thinking": False}
+        assert sent["timeout"] == 20 and sent["payload"]["max_tokens"] == 128
+    assert [t["function"]["name"] for t in transport.requests[0]["payload"]["tools"]] == ["get_foreground_app"]
+    followup = transport.requests[1]["payload"]["messages"]
+    assert followup[-2]["tool_calls"][0]["id"] == followup[-1]["tool_call_id"] == "observe49"
+    assert native["status"] in followup[-1]["content"]
+    assert secret not in output.out + output.err + caplog.text
+    for path in tmp_path.rglob("*"):
+        if path.is_file():
+            assert secret.encode() not in path.read_bytes()
+
+
+def test_model_prose_cannot_create_desktop_evidence(observation, tmp_path, monkeypatch, capsys):
+    _, calls = observation
+    monkeypatch.setattr(cli.Agent, "_build_model", lambda _: SimpleNamespace(
+        generate=lambda request: ModelResponse(text="I observed Notepad using get_foreground_app.")))
+    assert cli.main(config_for(tmp_path, ["get_foreground_app"]) + [
+        "chat", "--enable-desktop", "--message", "Which app?", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert calls == ["health"]
+    assert "desktop_observations" not in payload and "desktop_tool_calls" not in payload
+
+
+def test_desktop_call_metadata_omits_invalid_arguments_ids_and_unknown_names():
+    from agentcore.conversation.tool_use import ToolCallOutcome
+    from agentcore.desktop.chat import desktop_tool_calls
+
+    secret = "private-call-data"
+    outcomes = [ToolCallOutcome(ToolCall(secret, "get_foreground_app", {"path": secret}), "denied"),
+                ToolCallOutcome(ToolCall(secret, secret, {}), "denied")]
+    evidence = desktop_tool_calls(SimpleNamespace(tool_outcomes=outcomes))
+    assert evidence == [{"name": "get_foreground_app", "arguments": None,
+                         "status": "denied", "executor_returned": False, "executed": False}]
+    assert secret not in json.dumps(evidence)
 
 
 def test_private_response_never_reaches_model_logs_or_persistence(tmp_path, monkeypatch, capsys, caplog):

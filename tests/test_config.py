@@ -16,6 +16,22 @@ def test_defaults_are_safe():
     assert cfg.model.provider == "none"
 
 
+def test_optional_model_thinking_setting_and_precedence(tmp_path):
+    assert load_config(env={}).model.enable_thinking is None
+    path = tmp_path / "agent.toml"
+    path.write_text('[model]\nenable_thinking = false\n', encoding="utf-8")
+    assert load_config(path, env={}).model.enable_thinking is False
+    assert load_config(path, env={"AGENTCORE_MODEL__ENABLE_THINKING": "true"}).model.enable_thinking is True
+    assert load_config(path, env={"AGENTCORE_MODEL__ENABLE_THINKING": "true"},
+                       overrides={"model": {"enable_thinking": False}}).model.enable_thinking is False
+
+
+@pytest.mark.parametrize("value", [0, 1, [], {}, "maybe"])
+def test_model_thinking_setting_rejects_non_booleans(value):
+    with pytest.raises(ConfigError):
+        load_config(env={}, overrides={"model": {"enable_thinking": value}})
+
+
 def test_load_from_toml(tmp_path):
     path = tmp_path / "agent.toml"
     path.write_text(

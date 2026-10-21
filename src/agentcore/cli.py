@@ -2145,7 +2145,7 @@ def _chat_notices(result: Any) -> list[str]:
 
 def _turn_payload(result: Any) -> dict[str, Any]:
     """Machine-readable turn summary. Same fields the human view is built on."""
-    from agentcore.desktop.chat import desktop_observations
+    from agentcore.desktop.chat import desktop_observations, desktop_tool_calls
 
     payload = {
         "session_id": result.session.id,
@@ -2164,6 +2164,9 @@ def _turn_payload(result: Any) -> dict[str, Any]:
     observations = desktop_observations(result)
     if observations:
         payload["desktop_observations"] = observations
+    calls = desktop_tool_calls(result)
+    if calls:
+        payload["desktop_tool_calls"] = calls
     if getattr(result, "error_category", None):
         payload["error_category"] = result.error_category
     return payload

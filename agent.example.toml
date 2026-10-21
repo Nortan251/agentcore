@@ -19,6 +19,7 @@ temperature = 0.2
 max_output_tokens = 4096
 timeout_seconds = 60.0
 max_retries = 3                   # total attempts; retries transient failures only
+# enable_thinking = false        # opt-in chat_template_kwargs setting, if supported
 
 [tools]
 enabled = []                      # empty = allow all registered tools
