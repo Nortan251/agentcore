@@ -108,6 +108,12 @@ verification fails after the CLI ran, any original CLI receipt stays unchanged,
 without a retrospective commit/PASS assertion; do not retry an uncertain effect.
 These verification points detect checkout divergence but do not constitute an
 immutable execution sandbox or prove there was no transient edit-and-revert.
+Python is additionally launched with `-B` and a fresh per-run
+`-X pycache_prefix=...` outside the repository, so it neither loads ignored
+`src/**/__pycache__/*.pyc` files nor generates new bytecode in the checkout.
+The isolated prefix is removed at exit. This protects against a forged cache
+whose timestamp and size match the tracked Python source without requiring
+operators to delete caches created by normal development or test runs.
 Receipts include the commit; by default
 they are saved under `.agent_workspace/desktop-demo`. `-EvidenceDirectory` can
 select the operator's local evidence folder.
@@ -208,7 +214,11 @@ finishes successfully does the launcher ask two independent questions:
    inventing success/failure or claiming independent visual verification?
 
 The launcher records both confirmations and the commit separately from native
-evidence. A pass requires both answers to be `yes` and all structured evidence
+evidence. Receipt enrichment writes a new unique temporary file in the same
+directory, then atomically replaces the original CLI receipt via
+`System.IO.File.Replace`. An interrupted/failed serialization leaves the
+original CLI/native evidence untouched; a partial temporary file is cleaned
+up without claiming success. A pass requires both answers to be `yes` and all structured evidence
 to match. Nonempty/invalid arguments, missing calls, missing approval, denial,
 duplicate calls, failed/unknown native outcomes, lost executor results, missing
 answers and model failures cannot pass. Unconfirmed human fields mean no human
