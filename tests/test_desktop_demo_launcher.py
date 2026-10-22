@@ -484,7 +484,9 @@ def test_isolated_bytecode_prefix_prevents_ignored_cache_execution(tmp_path):
     safe = 'RESULT = "SAFE"\n'
     assert len(evil) == len(safe)
     module.write_text(evil, encoding="utf-8")
-    py_compile.compile(str(module), cfile=cache_from_source(str(module)), doraise=True)
+    py_compile.compile(str(module), cfile=cache_from_source(str(module)),
+                       invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
+                       doraise=True)
     stat = module.stat()
     module.write_text(safe, encoding="utf-8")
     os.utime(module, (stat.st_atime, stat.st_mtime))
@@ -538,7 +540,7 @@ function Read-Host {{
 }}
 function python {{
     $record = $args[[array]::IndexOf($args, '--desktop-evidence') + 1]
-    Microsoft.PowerShell.Management\Set-Content -LiteralPath $record -Value (Get-Content -LiteralPath {ps_quote(fixture)} -Raw) -Encoding utf8
+    Microsoft.PowerShell.Management\\Set-Content -LiteralPath $record -Value (Get-Content -LiteralPath {ps_quote(fixture)} -Raw) -Encoding utf8
     $global:LASTEXITCODE = 0
 }}
 function Set-Content {{
