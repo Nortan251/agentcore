@@ -6,6 +6,15 @@ from agentcore.integrations.computer_control import APP_NAMES, OBSERVATION_TEXT,
 from agentcore.desktop.service import UNKNOWN_REASONS
 
 
+FOREGROUND_RESULT_INSTRUCTIONS = (
+    "For get_foreground_app, report the returned app label when status is observed. "
+    "A successful unknown result with app=null means the foreground check completed "
+    "but could not safely identify the app. Do not guess an app name or describe "
+    "that successful result as missing access, permission denial or tool unavailability. "
+    "Only report an access or availability failure when the tool reports it."
+)
+
+
 _PRE_DISPATCH_REFUSALS = frozenset({
     "permission_denied", "validation", "tool_shape_changed", "tool_registration_changed",
     "action_adapter_missing", "action_adapter_invalid", "action_adapter_version_mismatch",

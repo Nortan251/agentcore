@@ -30,6 +30,8 @@ def ps_quote(value):
     ({"ok": False, "error_category": "model_timeout", "reply": None}, ["yes"], "Notepad", False),
     ({"desktop_observations": [{"status": "unknown", "app": None}],
       "reply": "The foreground application is unknown."}, ["yes", "yes"], "unknown", True),
+    ({"desktop_observations": [{"status": "unknown", "app": None, "reason": "shared_application_host"}],
+      "reply": "I don't have access to your current application context."}, ["yes", "no"], "unknown", False),
     ({"desktop_observations": [{"status": "observed", "app": "Google Chrome"}]}, ["yes"], "Notepad", False),
     ({"desktop_tool_calls": [{**CALL, "arguments": None}]}, ["yes"], "Notepad", False),
     ({"desktop_tool_calls": [CALL, CALL]}, ["yes"], "Notepad", False),
@@ -77,6 +79,8 @@ if ($global:task49Answers.Count -ne 0) {{ throw 'Missing operator question.' }}
     assert receipt["desktop_tool_calls"] == payload["desktop_tool_calls"]
     assert receipt["desktop_observations"] == payload["desktop_observations"]
     assert receipt["model_reply"] == payload["reply"]
+    assert receipt["operator_confirmed_native"] is bool(answers and answers[0] == "yes")
+    assert receipt["operator_confirmed_reply"] is bool(len(answers) > 1 and answers[1] == "yes")
     assert ("PASS for this single" in completed.stdout) is passed
     assert receipt["commit"] == "42fae5e72cd6ba014982bd6da0c77d3cbd88b996"
     sent = json.loads(invocation.read_text(encoding="utf-8-sig"))

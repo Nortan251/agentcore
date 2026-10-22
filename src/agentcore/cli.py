@@ -2258,7 +2258,14 @@ def _command_chat(args: argparse.Namespace, config: AgentConfig) -> int:
             max_result_chars=config.conversation.max_tool_result_chars,
             max_calls_per_round=config.conversation.max_tool_calls_per_round,
         )
-    runtime = agent.conversation(tools=tools)
+    system_prompt = None
+    if desktop is not None and "get_foreground_app" in agent.registry:
+        from agentcore.conversation.runtime import SYSTEM_PROMPT
+        from agentcore.desktop.chat import FOREGROUND_RESULT_INSTRUCTIONS
+
+        # Keep result semantics after the final round stops offering tools.
+        system_prompt = SYSTEM_PROMPT + "\n\n" + FOREGROUND_RESULT_INSTRUCTIONS
+    runtime = agent.conversation(tools=tools, system_prompt=system_prompt)
 
     session, banner = _chat_session(runtime, args)
     if session is None:

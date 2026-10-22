@@ -68,7 +68,16 @@ Open Notepad manually first. During the eight-second delay, select it and keep
 it foreground until the result appears. Return to the terminal to answer the
 two confirmation questions. For an unsupported application, repeat with
 `-ExpectedApp unknown`; confirm only if the native result is truthfully unknown
-and the model does not invent an app identity.
+and the model accurately explains that the check completed without safely
+identifying the app. A successful unknown result is not permission denial or
+tool unavailability. Reject an answer that claims missing access or invents
+an app identity.
+
+When the foreground tool is enabled, desktop chat keeps this distinction in
+the system prompt through the final response, including when the tool-round
+budget is exhausted and no further tools are offered. Operator-only diagnostic
+reasons remain outside model requests. This prompt clarification does not
+guarantee model compliance; both human confirmations are still required.
 
 The ordinary runtime performs:
 `model -> structured call -> ToolRegistry -> argument validation -> PermissionPolicy -> ToolExecutor -> isolated Windows service -> tool result -> final model response`.
