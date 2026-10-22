@@ -38,6 +38,11 @@ function Assert-DemoSourceProvenance {
 }
 Assert-DemoSourceProvenance
 
+# A fresh Python cache prefix prevents imports from reading ignored bytecode
+# in the checkout. -B additionally prohibits new bytecode cache writes.
+$demoPycacheRoot = Join-Path ([IO.Path]::GetTempPath()) ('agentcore-demo-pycache-' + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $demoPycacheRoot -ErrorAction Stop | Out-Null
+try {
 if ($NotepadDenial -or $NotepadApproval) {
     $demoMode = if ($NotepadApproval) { 'NotepadApproval' } else { 'NotepadDenial' }
     $demoPrefix = if ($NotepadApproval) { 'notepad-approval-' } else { 'notepad-denial-' }
@@ -53,7 +58,7 @@ if ($NotepadDenial -or $NotepadApproval) {
     Push-Location (Join-Path $demoRepo 'src')
     try {
         # Keep console stdin/stderr: input() prompts on stderr; PS 5.1 redirection turns it into an error.
-        & python -m agentcore.cli --config $demoConfig chat --enable-desktop --message 'Jarvis, open Notepad.' --desktop-evidence $demoRecord
+        & python -B -X "pycache_prefix=$demoPycacheRoot" -m agentcore.cli --config $demoConfig chat --enable-desktop --message 'Jarvis, open Notepad.' --desktop-evidence $demoRecord
         $demoExit = $LASTEXITCODE
     } finally {
         Pop-Location
@@ -116,7 +121,17 @@ if ($NotepadDenial -or $NotepadApproval) {
         $demoFields.denial_test_pass = [bool]($demoDenied -and $demoVisualConfirmed -and $demoReplyConfirmed)
     }
     $demoEvidence | Add-Member -NotePropertyMembers $demoFields -Force
-    $demoEvidence | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $demoRecord -Encoding utf8
+    # A failed write must never truncate the only CLI/native-action receipt.
+    # The new file shares the receipt's directory/volume for atomic replacement.
+    $demoTemp = Join-Path (Split-Path -Parent $demoRecord) ('.' + [IO.Path]::GetFileName($demoRecord) + '.' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        $demoEvidence | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $demoTemp -Encoding utf8 -ErrorAction Stop
+        [IO.File]::Replace($demoTemp, $demoRecord, $null)
+    } finally {
+        if (Test-Path -LiteralPath $demoTemp) {
+            Remove-Item -LiteralPath $demoTemp -Force -ErrorAction SilentlyContinue
+        }
+    }
     Write-Host "Recorded: $demoRecord"
     if ($NotepadApproval) {
         if ($demoEvidence.approval_test_pass) { Write-Host 'LIVE NOTEPAD APPROVAL PASS for this single operator-confirmed case.' }
@@ -135,7 +150,7 @@ Write-Host 'Keep that window foreground until the tool result and model reply ap
 Start-Sleep -Seconds 8
 Push-Location (Join-Path $demoRepo 'src')
 try {
-    $demoRaw = & python -m agentcore.cli --config $demoConfig chat --enable-desktop --message 'Jarvis, what application am I using right now?' --json 2>$null
+    $demoRaw = & python -B -X "pycache_prefix=$demoPycacheRoot" -m agentcore.cli --config $demoConfig chat --enable-desktop --message 'Jarvis, what application am I using right now?' --json 2>$null
     $demoExit = $LASTEXITCODE
 } finally {
     Pop-Location
@@ -203,4 +218,8 @@ if ($demoPass) {
     Write-Host 'LIVE CONVERSATION PASS for this single operator-confirmed case. Complete other cases separately.'
 } else {
     Write-Host 'LIVE CONVERSATION PASS not established. Review the separate evidence and confirmations.'
+}
+
+} finally {
+    Remove-Item -LiteralPath $demoPycacheRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
