@@ -389,6 +389,7 @@ function python {{ throw 'CLI must not be invoked.' }}
 @pytest.mark.parametrize("case", [
     "dirty_before", "staged_before", "untracked_before", "dirty_after",
     "head_after", "status_error", "ignored_legacy_bytecode",
+    "ignored_quoted_legacy_bytecode",
 ])
 def test_launcher_refuses_unverifiable_checkout_without_commit_attribution(
         tmp_path, shell_name, mode, case):
@@ -439,6 +440,9 @@ function git {{
         }}
         if ('{case}' -eq 'ignored_legacy_bytecode' -and -not ($args -contains '--exclude-standard')) {{
             return 'src/agentcore/shadow.pyc'
+        }}
+        if ('{case}' -eq 'ignored_quoted_legacy_bytecode' -and -not ($args -contains '--exclude-standard')) {{
+            return '"src/agentcore/\\303\\251vil.pyc"'
         }}
         return
     }}

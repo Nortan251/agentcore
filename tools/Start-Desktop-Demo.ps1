@@ -38,8 +38,9 @@ function Assert-DemoSourceProvenance {
     # -X pycache_prefix bypasses __pycache__, but CPython can still import a
     # source-less legacy module.pyc sitting directly in an importable directory.
     # Gitignore hides those files from the preceding --exclude-standard check.
+    # Git quotes paths containing non-ASCII characters; match the closing quote.
     $looseBytecode = @(git -C $demoRepo ls-files --others -- src tools | Where-Object {
-        $_ -match '\.pyc$' -and $_ -notmatch '(^|/)__pycache__/'
+        $_ -match '\.pyc"?$' -and $_ -notmatch '(^|/)__pycache__/'
     })
     if ($LASTEXITCODE -ne 0 -or $looseBytecode.Count -ne 0) {
         throw 'Demo provenance unavailable: ignored loadable legacy Python bytecode. Do not retry uncertain effects.'
