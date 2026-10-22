@@ -552,7 +552,7 @@ function Set-Content {{
             [IO.File]::WriteAllText($LiteralPath, '{{"partial":')
             throw 'INJECTED_PARTIAL_WRITE_FAILURE'
         }}
-        Microsoft.PowerShell.Management\Set-Content -LiteralPath $LiteralPath -Value $InputObject -Encoding $Encoding
+        Microsoft.PowerShell.Management\\Set-Content -LiteralPath $LiteralPath -Value $InputObject -Encoding $Encoding
     }}
 }}
 try {{
