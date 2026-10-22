@@ -1,7 +1,10 @@
 """Offline PowerShell receipt checks, including native Python console input."""
 
 import json
+import os
 from pathlib import Path
+import py_compile
+from importlib.util import cache_from_source
 import shutil
 import subprocess
 import sys
@@ -89,7 +92,10 @@ if ($global:task49Answers.Count -ne 0) {{ throw 'Missing operator question.' }}
     assert ("PASS for this single" in completed.stdout) is passed
     assert receipt["commit"] == "42fae5e72cd6ba014982bd6da0c77d3cbd88b996"
     sent = json.loads(invocation.read_text(encoding="utf-8-sig"))
-    assert sent == ["-m", "agentcore.cli", "--config", str(config), "chat", "--enable-desktop",
+    assert sent[:2] == ["-B", "-X"]
+    assert sent[2].startswith("pycache_prefix=")
+    assert not Path(sent[2].split("=", 1)[1]).exists()
+    assert sent[3:] == ["-m", "agentcore.cli", "--config", str(config), "chat", "--enable-desktop",
                     "--message", "Jarvis, what application am I using right now?", "--json"]
 
 
@@ -169,7 +175,10 @@ if ($global:task49Answers.Count -ne 0) {{ throw 'Missing operator question.' }}
     assert receipt["operator_confirmed_reply"] is bool(len(answers) > 1 and answers[1] == "yes")
     assert ("LIVE NOTEPAD DENIAL PASS" in completed.stdout) is passed
     sent = json.loads(invocation.read_text(encoding="utf-8-sig"))
-    assert sent == ["-m", "agentcore.cli", "--config", str(config), "chat", "--enable-desktop",
+    assert sent[:2] == ["-B", "-X"]
+    assert sent[2].startswith("pycache_prefix=")
+    assert not Path(sent[2].split("=", 1)[1]).exists()
+    assert sent[3:] == ["-m", "agentcore.cli", "--config", str(config), "chat", "--enable-desktop",
                     "--message", "Jarvis, open Notepad.", "--desktop-evidence", str(records[0])]
 
 
@@ -464,3 +473,102 @@ Write-Host "INVOCATIONS=$global:task49Invocations"
         assert json.loads(receipts[0].read_text(encoding="utf-8-sig")) == payload
     else:
         assert not results.exists()
+
+
+def test_isolated_bytecode_prefix_prevents_ignored_cache_execution(tmp_path):
+    """A loadable malicious checkout cache must not override committed .py source."""
+    source = tmp_path / "src"
+    source.mkdir()
+    module = source / "cacheprobe.py"
+    evil = 'RESULT = "EVIL"\n'
+    safe = 'RESULT = "SAFE"\n'
+    assert len(evil) == len(safe)
+    module.write_text(evil, encoding="utf-8")
+    py_compile.compile(str(module), cfile=cache_from_source(str(module)), doraise=True)
+    stat = module.stat()
+    module.write_text(safe, encoding="utf-8")
+    os.utime(module, (stat.st_atime, stat.st_mtime))
+
+    def execute(*options):
+        process = subprocess.run([sys.executable, *options, "-c",
+                                  "import cacheprobe; print(cacheprobe.RESULT)"],
+                                 cwd=source, capture_output=True, text=True,
+                                 timeout=20, check=True)
+        return process.stdout.strip()
+
+    # -B alone prevents writes but does not prevent loading forged existing bytecode.
+    assert execute("-B") == "EVIL"
+    fresh = tmp_path / "fresh-bytecode-cache"
+    assert execute("-B", "-X", f"pycache_prefix={fresh}") == "SAFE"
+    assert not list(fresh.rglob("*.pyc"))
+
+
+@pytest.mark.parametrize("shell_name", ["powershell", "pwsh"])
+def test_receipt_enrichment_partial_write_failure_keeps_cli_evidence(tmp_path, shell_name):
+    shell = shutil.which(shell_name)
+    if shell_name == "pwsh" and not shell:
+        pytest.skip("Optional PowerShell 7 is not installed")
+    assert shell
+    config = tmp_path / "agent.local.toml"
+    config.write_text("# offline fixture\n", encoding="utf-8")
+    receipt_dir = tmp_path / "receipts"
+    payload = {
+        "conversation_ok": True, "model_reply": "Windows accepted the launch.",
+        "error_category": None,
+        "desktop_tool_calls": [{**CALL, "name": "open_notepad"}],
+        "approval": {"request_count": 1, "decision": "approved", "explicit_denial": False},
+        "launch_results": [{"arguments_validated": True, "executor_category": "launch_accepted",
+                            "launch_assessment": "launch_accepted", "native_action_invoked": True,
+                            "native_outcome": "launch_accepted"}],
+    }
+    fixture = tmp_path / "cli.json"
+    fixture.write_text(json.dumps(payload), encoding="utf-8")
+    command = f"""$ErrorActionPreference = 'Stop'
+function git {{
+    $global:LASTEXITCODE = 0
+    if ($args -contains 'rev-parse') {{ return '6bdf479f4ddaa609f47c47a5642b23566c480938' }}
+    if ($args -contains 'status' -or $args -contains 'ls-files') {{ return }}
+    throw 'Unexpected git command.'
+}}
+$global:task49Confirmations = 0
+function Read-Host {{
+    param([string]$Prompt)
+    $global:task49Confirmations++
+    return 'yes'
+}}
+function python {{
+    $record = $args[[array]::IndexOf($args, '--desktop-evidence') + 1]
+    Microsoft.PowerShell.Management\Set-Content -LiteralPath $record -Value (Get-Content -LiteralPath {ps_quote(fixture)} -Raw) -Encoding utf8
+    $global:LASTEXITCODE = 0
+}}
+function Set-Content {{
+    [CmdletBinding()]
+    param([Parameter(ValueFromPipeline = $true)] $InputObject,
+          [string]$LiteralPath, [string]$Encoding)
+    process {{
+        if ($LiteralPath -like '*.tmp') {{
+            [IO.File]::WriteAllText($LiteralPath, '{{"partial":')
+            throw 'INJECTED_PARTIAL_WRITE_FAILURE'
+        }}
+        Microsoft.PowerShell.Management\Set-Content -LiteralPath $LiteralPath -Value $InputObject -Encoding $Encoding
+    }}
+}}
+try {{
+    & {ps_quote(LAUNCHER)} -Config {ps_quote(config)} -NotepadApproval -EvidenceDirectory {ps_quote(receipt_dir)}
+    throw 'Launcher should not succeed after interrupted enrichment.'
+}} catch {{
+    if ($_.Exception.Message -notmatch 'INJECTED_PARTIAL_WRITE_FAILURE') {{ throw }}
+    Write-Host 'EXPECTED_ENRICHMENT_FAILURE'
+}}
+Write-Host "CONFIRMATIONS=$global:task49Confirmations"
+"""
+    completed = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-Command", command],
+                               capture_output=True, text=True, timeout=20, check=False)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "EXPECTED_ENRICHMENT_FAILURE" in completed.stdout
+    assert "CONFIRMATIONS=2" in completed.stdout
+    records = list(receipt_dir.glob("notepad-approval-*.json"))
+    assert len(records) == 1
+    assert json.loads(records[0].read_text(encoding="utf-8-sig")) == payload
+    assert not list(receipt_dir.glob("*.tmp"))
+    assert "LIVE NOTEPAD APPROVAL PASS" not in completed.stdout
