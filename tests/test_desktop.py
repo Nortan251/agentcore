@@ -412,6 +412,155 @@ def test_json_cannot_implicitly_authorize(connected, tmp_path, monkeypatch, caps
     assert calls == ["health"]
 
 
+def denial_config(tmp_path):
+    args = chat_config(tmp_path)
+    path = Path(args[1])
+    path.write_text(path.read_text(encoding="utf-8").replace(
+        "tools_enabled = true\n", "tools_enabled = true\nmax_tool_rounds = 1\nmax_tool_calls_per_round = 1\n")
+        + '[tools]\nenabled = ["open_notepad"]\n', encoding="utf-8")
+    return args
+
+
+@pytest.mark.parametrize("answer,decision,explicit", [("no", "denied", True),
+    ("yes", "denied", False), ("", "denied", False), (None, "cancelled", False),
+    ("PRIVATE_OPERATOR_INPUT_credential_marker", "denied", False)])
+def test_interactive_notepad_receipt_records_real_gate_denial(
+        connected, tmp_path, monkeypatch, capsys, answer, decision, explicit):
+    _, calls = connected
+    model = ScriptedModel()
+    monkeypatch.setattr(cli.Agent, "_build_model", lambda _: model)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    prompts = []
+    def respond(prompt):
+        prompts.append(prompt)
+        if answer is None:
+            raise EOFError
+        return answer
+    monkeypatch.setattr("builtins.input", respond)
+    receipt = tmp_path / "receipt.json"
+    assert cli.main(denial_config(tmp_path) + ["chat", "--enable-desktop", "--message",
+        "Jarvis, open Notepad.", "--desktop-evidence", str(receipt)]) == 0
+    evidence = json.loads(receipt.read_text(encoding="utf-8"))
+    assert prompts == ["[Desktop approval] Open Notepad? Type 'open notepad' to allow: "]
+    assert calls == ["health"]
+    assert evidence["approval"] == {"request_count": 1, "decision": decision, "explicit_denial": explicit}
+    assert evidence["desktop_tool_calls"] == [{"name": "open_notepad", "arguments": {},
+        "status": "denied", "executor_returned": True, "executed": False}]
+    assert evidence["launch_results"] == [{"arguments_validated": True,
+        "executor_category": "permission_denied", "launch_assessment": "not_launched",
+        "native_action_invoked": False, "native_outcome": None}]
+    assert evidence["conversation_ok"] is True
+    assert evidence["model_reply"] == "Consult the desktop status below."
+    assert "Permission denied" in model.requests[-1].messages[-1].content
+    output = capsys.readouterr()
+    assert "Notepad was not launched by this request" in output.out
+    assert "PRIVATE_OPERATOR_INPUT" not in output.out + output.err + json.dumps(evidence)
+    for path in tmp_path.rglob("*"):
+        if path.is_file(): assert b"PRIVATE_OPERATOR_INPUT" not in path.read_bytes()
+    assert [tool["name"] for tool in model.requests[0].tools] == ["open_notepad"]
+
+
+@pytest.mark.parametrize("unsafe", ["json", "redirected", "no_desktop", "autonomous", "override",
+    "other_tools", "extra_round", "extra_call", "resume"])
+def test_notepad_evidence_refuses_unsafe_demo_modes(connected, tmp_path, monkeypatch, capsys, unsafe):
+    _, calls = connected
+    args = denial_config(tmp_path)
+    path = Path(args[1])
+    text = path.read_text(encoding="utf-8")
+    replacements = {"autonomous": ('level = "confirm"', 'level = "autonomous"'),
+        "override": ('level = "confirm"', 'level = "confirm"\ncapability_overrides = {"app.control" = "autonomous"}'),
+        "other_tools": ('enabled = ["open_notepad"]', 'enabled = ["get_foreground_app"]'),
+        "extra_round": ('max_tool_rounds = 1', 'max_tool_rounds = 2'),
+        "extra_call": ('max_tool_calls_per_round = 1', 'max_tool_calls_per_round = 2')}
+    if unsafe in replacements:
+        text = text.replace(*replacements[unsafe])
+    path.write_text(text, encoding="utf-8")
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: unsafe != "redirected")
+    monkeypatch.setattr(cli.Agent, "_build_model", lambda _: pytest.fail("unsafe demo reached model"))
+    command = ["chat", "--message", "Jarvis, open Notepad.", "--desktop-evidence", str(tmp_path / "receipt.json")]
+    if unsafe != "no_desktop":
+        command.append("--enable-desktop")
+    if unsafe == "json": command.append("--json")
+    if unsafe == "resume": command += ["--session", "conv_123456789abc"]
+    assert cli.main(args + command) == 2
+    capsys.readouterr()
+    assert not calls
+
+
+def test_notepad_evidence_will_not_overwrite_or_start_turn(connected, tmp_path, monkeypatch, capsys):
+    _, calls = connected
+    model = ScriptedModel()
+    monkeypatch.setattr(cli.Agent, "_build_model", lambda _: model)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    receipt = tmp_path / "receipt.json"
+    receipt.write_text("preserve", encoding="utf-8")
+    assert cli.main(denial_config(tmp_path) + ["chat", "--enable-desktop", "--message",
+        "Jarvis, open Notepad.", "--desktop-evidence", str(receipt)]) == 2
+    capsys.readouterr()
+    assert receipt.read_text(encoding="utf-8") == "preserve"
+    assert not model.requests and calls == ["health"]
+
+
+@pytest.mark.parametrize("arguments", [None, {"path": "private-call-data"}])
+def test_notepad_evidence_cannot_invent_model_call_or_approval(connected, tmp_path, monkeypatch, capsys, arguments):
+    _, calls = connected
+    requests = []
+    def generate(request):
+        requests.append(request)
+        if len(requests) == 1 and arguments is not None:
+            return ModelResponse(text="", tool_calls=(ToolCall("private-call-data", "open_notepad", arguments),))
+        return ModelResponse(text="No launch was performed.")
+    monkeypatch.setattr(cli.Agent, "_build_model", lambda _: SimpleNamespace(generate=generate))
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: pytest.fail("invalid/missing call prompted"))
+    receipt = tmp_path / "receipt.json"
+    assert cli.main(denial_config(tmp_path) + ["chat", "--enable-desktop", "--message",
+        "Jarvis, open Notepad.", "--desktop-evidence", str(receipt)]) == 0
+    capsys.readouterr()
+    raw = receipt.read_text(encoding="utf-8")
+    evidence = json.loads(raw)
+    assert "private-call-data" not in raw
+    assert evidence["approval"] == {"request_count": 0, "decision": None, "explicit_denial": False}
+    assert calls == ["health"]
+    if arguments is None:
+        assert evidence["desktop_tool_calls"] == evidence["launch_results"] == []
+    else:
+        assert evidence["desktop_tool_calls"][0]["arguments"] is None
+        assert evidence["launch_results"][0]["arguments_validated"] is False
+
+
+def test_notepad_evidence_keeps_lost_invocation_uncertain():
+    from agentcore.conversation.tool_use import ToolCallOutcome
+    from agentcore.desktop.chat import notepad_evidence
+    result = SimpleNamespace(ok=False, reply=None, tool_outcomes=[ToolCallOutcome(
+        ToolCall("private-call-id", "open_notepad", {}), "failed")])
+    evidence = notepad_evidence(result, ConsoleNotepadApproval())
+    assert evidence["launch_results"] == [{"arguments_validated": False, "executor_category": None,
+        "launch_assessment": "launch_unknown", "native_action_invoked": None, "native_outcome": None}]
+    assert "private-call-id" not in json.dumps(evidence)
+
+
+def test_receipt_write_failure_after_mock_dispatch_never_retries(connected, tmp_path, monkeypatch, capsys):
+    _, calls = connected
+    model = ScriptedModel()
+    monkeypatch.setattr(cli.Agent, "_build_model", lambda _: model)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: "open notepad")
+    receipt = tmp_path / "receipt.json"
+    original_open = Path.open
+    class FailingReceipt:
+        def write(self, text): raise OSError("private-io-detail")
+        def close(self): pass
+    monkeypatch.setattr(Path, "open", lambda path, *a, **kw: FailingReceipt()
+                        if path == receipt else original_open(path, *a, **kw))
+    assert cli.main(denial_config(tmp_path) + ["chat", "--enable-desktop", "--message",
+        "Jarvis, open Notepad.", "--desktop-evidence", str(receipt)]) == 1
+    output = capsys.readouterr()
+    assert calls == ["health", "open_notepad"]
+    assert "may have executed. Do not retry automatically" in output.err
+    assert "private-io-detail" not in output.out + output.err
+
+
 def test_redirected_input_cannot_implicitly_authorize(connected, tmp_path, monkeypatch, capsys):
     _, calls = connected
     monkeypatch.setattr(cli.Agent, "_build_model", lambda _: ScriptedModel())

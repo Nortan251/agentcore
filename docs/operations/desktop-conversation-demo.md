@@ -110,3 +110,40 @@ denial behavior, cancellation, and unknown-launch duplicate suppression are
 unchanged. No live conversation pass is claimed until the operator confirms
 the real Windows result and final answer. No cloud setup or billing is needed
 for this NVIDIA profile.
+
+## Notepad denial before any approval test
+
+Use a separate operator-local copy of the working model profile. Keep CONFIRM,
+no capability overrides, one tool round/call, and set `tools.enabled` to exactly
+`["open_notepad"]`. The foreground-only profile remains unchanged. From a real
+PowerShell terminal with the existing provider key, run the denial test once:
+
+```powershell
+& .\tools\Start-Desktop-Demo.ps1 -Config .\agent.notepad-denial.local.toml -NotepadDenial
+```
+
+This sends `Jarvis, open Notepad.` through ordinary conversation. At the genuine
+`[Desktop approval]` prompt, type **no**, then Enter. Do not enter the approval
+phrase. The launcher inherits console stdin and does not use `--json`, pipe
+answers, or supply an approval decision. The existing console gate and executor
+remain the only approval/execution path.
+
+`--desktop-evidence FILE` saves closed evidence alongside the normal human
+output. It requires this restricted interactive profile and creates a new file
+before sending the conversation turn; an existing file is never overwritten by
+the CLI. It records the real gate's request count, categorical decision and
+whether an explicit `no` was entered, never the raw input. It separates the
+model's zero-argument call, executor permission denial, native dispatch state,
+native outcome if present, and final model reply. Missing executor evidence
+retains unknown dispatch status. A receipt-write failure must never trigger
+an automatic repeat.
+
+A denial pass requires one validated `open_notepad({})` request, exactly one
+real approval request and explicit denial, returned executor `permission_denied`,
+positive evidence of no native dispatch, an accurate final answer, and separate
+operator confirmation that no new Notepad window appeared. Existing windows
+are not evidence of a launch. Model refusal, an absent/disabled tool, redirected
+stdin, policy denial without a real prompt, EOF/cancellation, and unknown
+outcomes cannot pass this test. Stop after saving the denial receipt. Prepare
+an approval demonstration only after that receipt is operator-confirmed and
+independently reviewed; this mode offers no automatic second test.

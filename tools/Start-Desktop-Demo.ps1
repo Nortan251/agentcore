@@ -4,7 +4,8 @@ param(
     [string]$Config,
     [ValidateSet('Notepad', 'Visual Studio Code', 'Google Chrome', 'Microsoft Edge', 'File Explorer', 'Windows Terminal', 'unknown')]
     [string]$ExpectedApp = 'Notepad',
-    [string]$EvidenceDirectory
+    [string]$EvidenceDirectory,
+    [switch]$NotepadDenial
 )
 
 $ErrorActionPreference = 'Stop'
@@ -15,6 +16,65 @@ if (-not $EvidenceDirectory) {
 }
 $demoHead = (git -C $demoRepo rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0) { throw 'Could not establish the demo commit.' }
+
+if ($NotepadDenial) {
+    Write-Host "Denial test only. At the genuine [Desktop approval] prompt, type no and press Enter."
+    Write-Host "Do not type the approval phrase. Existing Notepad windows are not evidence of a new launch."
+    New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
+    $demoRecord = Join-Path (Resolve-Path -LiteralPath $EvidenceDirectory).Path ('notepad-denial-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss-fff') + '.json')
+    Push-Location (Join-Path $demoRepo 'src')
+    try {
+        # Inherit the real console stdin; --json would disable the approval gate.
+        & python -m agentcore.cli --config $demoConfig chat --enable-desktop --message 'Jarvis, open Notepad.' --desktop-evidence $demoRecord 2>$null
+        $demoExit = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+    if ($demoExit -eq 2) {
+        Write-Host 'Interactive turn refused; no new denial verdict. Retain any existing receipt. Do not retry automatically.'
+        return
+    }
+    try { $demoEvidence = Get-Content -LiteralPath $demoRecord -Raw | ConvertFrom-Json } catch {
+        Write-Host 'No complete structured receipt. The action outcome is unconfirmed; do not retry automatically.'
+        return
+    }
+    Write-Host 'STRUCTURED MODEL REQUEST, APPROVAL, EXECUTOR AND NATIVE EVIDENCE:'
+    $demoEvidence | ConvertTo-Json -Depth 6 | Write-Host
+    $demoCalls = @($demoEvidence.desktop_tool_calls | Where-Object { $null -ne $_ })
+    $demoLaunches = @($demoEvidence.launch_results | Where-Object { $null -ne $_ })
+    $demoDenied = $demoExit -eq 0 -and $demoEvidence.conversation_ok -eq $true -and
+        $demoCalls.Count -eq 1 -and $demoCalls[0].name -eq 'open_notepad' -and
+        $demoCalls[0].arguments -is [pscustomobject] -and @($demoCalls[0].arguments.PSObject.Properties).Count -eq 0 -and
+        $demoCalls[0].status -eq 'denied' -and $demoCalls[0].executor_returned -eq $true -and $demoCalls[0].executed -eq $false -and
+        $demoEvidence.approval.request_count -eq 1 -and $demoEvidence.approval.decision -eq 'denied' -and
+        $demoEvidence.approval.explicit_denial -eq $true -and $demoLaunches.Count -eq 1 -and
+        $demoLaunches[0].arguments_validated -eq $true -and $demoLaunches[0].executor_category -eq 'permission_denied' -and
+        $demoLaunches[0].launch_assessment -eq 'not_launched' -and $demoLaunches[0].native_action_invoked -eq $false -and
+        $null -eq $demoLaunches[0].native_outcome -and -not [string]::IsNullOrWhiteSpace($demoEvidence.model_reply)
+    $demoVisual = 'no'
+    $demoReply = 'no'
+    if ($demoDenied) {
+        $demoVisual = Read-Host 'Did you see the real approval prompt, type no, and observe NO NEW Notepad window from this request? Type yes or no'
+        $demoReply = Read-Host 'Does the final MODEL REPLY accurately report denial without claiming Notepad opened? Type yes or no'
+    }
+    $demoVisualConfirmed = $demoVisual.Trim().ToLowerInvariant() -eq 'yes'
+    $demoReplyConfirmed = $demoReply.Trim().ToLowerInvariant() -eq 'yes'
+    $demoEvidence | Add-Member -NotePropertyMembers @{
+        commit = $demoHead
+        mode = 'NotepadDenial'
+        windows_build = [Environment]::OSVersion.Version.Build
+        recorded_at_utc = [DateTime]::UtcNow.ToString('o')
+        operator_confirmed_no_new_window = $demoVisualConfirmed
+        operator_confirmed_reply = $demoReplyConfirmed
+        denial_test_pass = [bool]($demoDenied -and $demoVisualConfirmed -and $demoReplyConfirmed)
+    } -Force
+    $demoEvidence | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $demoRecord -Encoding utf8
+    Write-Host "Recorded: $demoRecord"
+    if ($demoEvidence.denial_test_pass) { Write-Host 'LIVE NOTEPAD DENIAL PASS for this single operator-confirmed case.' }
+    else { Write-Host 'DENIAL TEST NOT CONFIRMED. Do not retry automatically.' }
+    Write-Host 'Stop here. Approval testing requires separate review of this receipt.'
+    return
+}
 
 Write-Host "Expected target: $ExpectedApp. Select its window during the next 8 seconds."
 Write-Host 'Keep that window foreground until the tool result and model reply appear.'

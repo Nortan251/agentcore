@@ -32,13 +32,25 @@ def _desktop_category(outcome):
 
 
 class ConsoleNotepadApproval:
+    def __init__(self):
+        self.request_count = 0
+        self.decision = None
+        self.explicit_denial = False
+
     def request_many(self, capabilities, description):
         if not frozenset(capabilities) <= {Capability.APP_CONTROL, Capability.PROCESS_SPAWN}:
             return False
+        self.request_count += 1
+        self.explicit_denial = False
         try:
-            return input("[Desktop approval] Open Notepad? Type 'open notepad' to allow: ").strip().lower() == "open notepad"
+            answer = input("[Desktop approval] Open Notepad? Type 'open notepad' to allow: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
+            self.decision = "cancelled"
             return False
+        allowed = answer == "open notepad"
+        self.decision = "approved" if allowed else "denied"
+        self.explicit_denial = answer == "no"
+        return allowed
 
     def request(self, capability, description):
         return self.request_many((capability,), description)
@@ -113,6 +125,36 @@ def desktop_tool_calls(result):
                       "executor_returned": outcome.invocation is not None,
                       "executed": bool(getattr(outcome, "executed", False))})
     return calls
+
+
+def notepad_evidence(result, approval):
+    """Closed operator evidence; gate input, call IDs and arguments stay private."""
+    launches = []
+    for outcome in result.tool_outcomes:
+        if outcome.call.name != "open_notepad":
+            continue
+        invocation = outcome.invocation
+        kind = invocation.result.metadata.get("kind") if invocation is not None else None
+        native = kind if type(kind) is str and kind in STATUS_TEXT and kind != "ready" else None
+        assessment = _desktop_category(outcome)
+        launches.append({
+            "arguments_validated": (type(outcome.call.arguments) is dict and not outcome.call.arguments
+                                    and (kind == "permission_denied" or native is not None)),
+            "executor_category": kind if type(kind) is str and kind in _PRE_DISPATCH_REFUSALS | STATUS_TEXT.keys() else None,
+            "launch_assessment": assessment,
+            "native_action_invoked": (False if assessment == "not_launched" else
+                                      True if native == "launch_accepted" else None),
+            "native_outcome": native,
+        })
+    return {
+        "conversation_ok": bool(result.ok),
+        "model_reply": result.reply.content if result.reply is not None else None,
+        "error_category": getattr(result, "error_category", None),
+        "desktop_tool_calls": desktop_tool_calls(result),
+        "approval": {"request_count": approval.request_count, "decision": approval.decision,
+                     "explicit_denial": approval.explicit_denial},
+        "launch_results": launches,
+    }
 
 
 def desktop_observations(result):
