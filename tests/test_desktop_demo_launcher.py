@@ -60,7 +60,12 @@ function Read-Host {{
     return $global:task49Answers.Dequeue()
 }}
 function Start-Sleep {{ param([int]$Seconds) if ($Seconds -ne 8) {{ throw 'Wrong focus delay.' }} }}
-function git {{ $global:LASTEXITCODE = 0; return '42fae5e72cd6ba014982bd6da0c77d3cbd88b996' }}
+function git {{
+    $global:LASTEXITCODE = 0
+    if ($args -contains 'rev-parse') {{ return '42fae5e72cd6ba014982bd6da0c77d3cbd88b996' }}
+    if ($args -contains 'status' -or $args -contains 'ls-files') {{ return }}
+    throw 'Unexpected Git provenance command.'
+}}
 function python {{
     ConvertTo-Json -InputObject @($args) | Set-Content -LiteralPath {ps_quote(invocation)} -Encoding utf8
     $global:LASTEXITCODE = {0 if payload['ok'] else 1}
@@ -132,7 +137,12 @@ function Read-Host {{
     return $global:task49Answers.Dequeue()
 }}
 function Start-Sleep {{ throw 'Denial test must not use the foreground delay.' }}
-function git {{ $global:LASTEXITCODE = 0; return '55c6ca468dd7981c3bdc2c6489c31b9b2ab7a68b' }}
+function git {{
+    $global:LASTEXITCODE = 0
+    if ($args -contains 'rev-parse') {{ return '55c6ca468dd7981c3bdc2c6489c31b9b2ab7a68b' }}
+    if ($args -contains 'status' -or $args -contains 'ls-files') {{ return }}
+    throw 'Unexpected Git provenance command.'
+}}
 function python {{
     ConvertTo-Json -InputObject @($args) | Set-Content -LiteralPath {ps_quote(invocation)} -Encoding utf8
     $taskReceipt = $args[[array]::IndexOf($args, '--desktop-evidence') + 1]
@@ -219,7 +229,12 @@ sys.exit({1 if case == 'cli_failure' else 2 if case == 'refused' else 0})
     driver = tmp_path / "driver.ps1"
     driver.write_text(f"""$ErrorActionPreference = 'Stop'
 Set-Alias python {ps_quote(sys.executable)}
-function git {{ $global:LASTEXITCODE = 0; return '59182ddce411a73a96b4c333aeeab06fbff9b50a' }}
+function git {{
+    $global:LASTEXITCODE = 0
+    if ($args -contains 'rev-parse') {{ return '59182ddce411a73a96b4c333aeeab06fbff9b50a' }}
+    if ($args -contains 'status' -or $args -contains 'ls-files') {{ return }}
+    throw 'Unexpected Git provenance command.'
+}}
 & {ps_quote(launcher)} -Config {ps_quote(config)} -{'NotepadApproval' if approval_mode else 'NotepadDenial'} -EvidenceDirectory {ps_quote(results)}
 Write-Host 'OFFLINE_LAUNCHER_RETURNED'
 """, encoding="utf-8-sig")
@@ -309,7 +324,12 @@ function Read-Host {{
     return $global:task49Answers.Dequeue()
 }}
 function Start-Sleep {{ throw 'No foreground delay in the Notepad approval test.' }}
-function git {{ $global:LASTEXITCODE = 0; return '8bde554a898fa90bd162ad5e0e93dd436b8a0717' }}
+function git {{
+    $global:LASTEXITCODE = 0
+    if ($args -contains 'rev-parse') {{ return '8bde554a898fa90bd162ad5e0e93dd436b8a0717' }}
+    if ($args -contains 'status' -or $args -contains 'ls-files') {{ return }}
+    throw 'Unexpected Git provenance command.'
+}}
 function python {{
     $global:task49Attempts++
     if (@($args) -contains '--json' -or $args[-3] -ne 'Jarvis, open Notepad.') {{ throw 'Wrong interactive request.' }}
@@ -353,3 +373,94 @@ function python {{ throw 'CLI must not be invoked.' }}
                                capture_output=True, text=True, timeout=20, check=False)
     assert completed.returncode != 0 and "Select only one Notepad test" in completed.stderr
     assert "CLI must not be invoked" not in completed.stderr
+
+
+@pytest.mark.parametrize("shell_name", ["powershell", "pwsh"])
+@pytest.mark.parametrize("mode", ["foreground", "approval"])
+@pytest.mark.parametrize("case", [
+    "dirty_before", "staged_before", "untracked_before", "dirty_after",
+    "head_after", "status_error",
+])
+def test_launcher_refuses_unverifiable_checkout_without_commit_attribution(
+        tmp_path, shell_name, mode, case):
+    shell = shutil.which(shell_name)
+    if shell_name == "pwsh" and not shell:
+        pytest.skip("Optional PowerShell 7 is not installed")
+    assert shell
+    fixture = tmp_path / "cli.json"
+    payload = ({"ok": True, "reply": "You are using Notepad.",
+                "desktop_tool_calls": [CALL], "desktop_observations": [OBSERVED]}
+               if mode == "foreground" else
+               {"conversation_ok": True, "model_reply": "Windows accepted the launch.",
+                "error_category": None, "desktop_tool_calls": [{**CALL, "name": "open_notepad"}],
+                "approval": {"request_count": 1, "decision": "approved", "explicit_denial": False},
+                "launch_results": [{"arguments_validated": True, "executor_category": "launch_accepted",
+                                    "launch_assessment": "launch_accepted", "native_action_invoked": True,
+                                    "native_outcome": "launch_accepted"}]})
+    fixture.write_text(json.dumps(payload), encoding="utf-8")
+    config = tmp_path / "agent.local.toml"
+    config.write_text("# test only\n", encoding="utf-8")
+    results = tmp_path / "receipts"
+    command = f"""$ErrorActionPreference = 'Stop'
+$global:task49Checks = 0
+$global:task49Invocations = 0
+function Read-Host {{ throw 'An unverified run must not solicit a positive verdict.' }}
+function Start-Sleep {{ param([int]$Seconds) }}
+function git {{
+    $global:LASTEXITCODE = 0
+    if ($args -contains 'rev-parse') {{
+        if ('{case}' -eq 'head_after' -and $global:task49Checks -gt 0) {{
+            return '0000000000000000000000000000000000000000'
+        }}
+        return 'b6ca6176af7e42aeb709912eb3a1b4fa75c4686e'
+    }}
+    if ($args -contains 'status') {{
+        $global:task49Checks++
+        if ('{case}' -eq 'status_error') {{ $global:LASTEXITCODE = 1; return }}
+        if ('{case}' -eq 'dirty_before') {{ return ' M tools/Start-Desktop-Demo.ps1' }}
+        if ('{case}' -eq 'staged_before') {{ return 'M  tools/Start-Desktop-Demo.ps1' }}
+        if ('{case}' -eq 'dirty_after' -and $global:task49Checks -gt 1) {{
+            return ' M src/agentcore/cli.py'
+        }}
+        return
+    }}
+    if ($args -contains 'ls-files') {{
+        if ('{case}' -eq 'untracked_before') {{ return 'src/agentcore/shadow.py' }}
+        return
+    }}
+    throw 'Unexpected git invocation.'
+}}
+function python {{
+    $global:task49Invocations++
+    if ('{mode}' -eq 'foreground') {{
+        Get-Content -LiteralPath {ps_quote(fixture)}
+    }} else {{
+        $record = $args[[array]::IndexOf($args, '--desktop-evidence') + 1]
+        Get-Content -LiteralPath {ps_quote(fixture)} -Raw | Set-Content -LiteralPath $record -Encoding utf8
+    }}
+    $global:LASTEXITCODE = 0
+}}
+try {{
+    & {ps_quote(LAUNCHER)} -Config {ps_quote(config)} -EvidenceDirectory {ps_quote(results)} {'-NotepadApproval' if mode == 'approval' else ''}
+    throw 'The launcher accepted an unverifiable checkout.'
+}} catch {{
+    if ($_.Exception.Message -notmatch 'Demo provenance unavailable') {{ throw }}
+    Write-Host 'EXPECTED_PROVENANCE_REFUSAL'
+}}
+Write-Host "INVOCATIONS=$global:task49Invocations"
+"""
+    completed = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-Command", command],
+                               capture_output=True, text=True, timeout=20, check=False)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "EXPECTED_PROVENANCE_REFUSAL" in completed.stdout
+    expected_calls = 1 if case in ("dirty_after", "head_after") else 0
+    assert f"INVOCATIONS={expected_calls}" in completed.stdout
+    if mode == "foreground":
+        assert not list(results.glob("conversation-*.json"))
+    elif expected_calls:
+        receipts = list(results.glob("notepad-approval-*.json"))
+        assert len(receipts) == 1
+        # Original CLI receipt survives without SHA or PASS backfill.
+        assert json.loads(receipts[0].read_text(encoding="utf-8-sig")) == payload
+    else:
+        assert not results.exists()
