@@ -114,6 +114,10 @@ Python is additionally launched with `-B` and a fresh per-run
 The isolated prefix is removed at exit. This protects against a forged cache
 whose timestamp and size match the tracked Python source without requiring
 operators to delete caches created by normal development or test runs.
+CPython can still import source-less legacy `module.pyc` files outside
+`__pycache__`, even with `-B -X pycache_prefix`. The launcher separately
+rejects these ignored, loadable files in `src/` and `tools/` before and after
+execution. Normal `__pycache__` directories remain permitted.
 Receipts include the commit; by default
 they are saved under `.agent_workspace/desktop-demo`. `-EvidenceDirectory` can
 select the operator's local evidence folder.

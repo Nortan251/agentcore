@@ -388,7 +388,7 @@ function python {{ throw 'CLI must not be invoked.' }}
 @pytest.mark.parametrize("mode", ["foreground", "approval"])
 @pytest.mark.parametrize("case", [
     "dirty_before", "staged_before", "untracked_before", "dirty_after",
-    "head_after", "status_error",
+    "head_after", "status_error", "ignored_legacy_bytecode",
 ])
 def test_launcher_refuses_unverifiable_checkout_without_commit_attribution(
         tmp_path, shell_name, mode, case):
@@ -434,7 +434,12 @@ function git {{
         return
     }}
     if ($args -contains 'ls-files') {{
-        if ('{case}' -eq 'untracked_before') {{ return 'src/agentcore/shadow.py' }}
+        if ('{case}' -eq 'untracked_before' -and $args -contains '--exclude-standard') {{
+            return 'src/agentcore/shadow.py'
+        }}
+        if ('{case}' -eq 'ignored_legacy_bytecode' -and -not ($args -contains '--exclude-standard')) {{
+            return 'src/agentcore/shadow.pyc'
+        }}
         return
     }}
     throw 'Unexpected git invocation.'
@@ -503,6 +508,16 @@ def test_isolated_bytecode_prefix_prevents_ignored_cache_execution(tmp_path):
     fresh = tmp_path / "fresh-bytecode-cache"
     assert execute("-B", "-X", f"pycache_prefix={fresh}") == "SAFE"
     assert not list(fresh.rglob("*.pyc"))
+    # Legacy source-less bytecode remains importable despite the cache prefix.
+    legacy_source = source / "legacyprobe.py"
+    legacy_source.write_text('RESULT = "EVIL"\n', encoding="utf-8")
+    py_compile.compile(str(legacy_source), cfile=str(source / "legacyprobe.pyc"), doraise=True)
+    legacy_source.unlink()
+    process = subprocess.run([sys.executable, "-B", "-X", f"pycache_prefix={fresh}",
+                              "-c", "import legacyprobe; print(legacyprobe.RESULT)"],
+                             cwd=source, capture_output=True, text=True,
+                             timeout=20, check=True)
+    assert process.stdout.strip() == "EVIL"
 
 
 @pytest.mark.parametrize("shell_name", ["powershell", "pwsh"])
