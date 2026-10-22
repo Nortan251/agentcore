@@ -5,10 +5,12 @@ param(
     [ValidateSet('Notepad', 'Visual Studio Code', 'Google Chrome', 'Microsoft Edge', 'File Explorer', 'Windows Terminal', 'unknown')]
     [string]$ExpectedApp = 'Notepad',
     [string]$EvidenceDirectory,
-    [switch]$NotepadDenial
+    [switch]$NotepadDenial,
+    [switch]$NotepadApproval
 )
 
 $ErrorActionPreference = 'Stop'
+if ($NotepadDenial -and $NotepadApproval) { throw 'Select only one Notepad test.' }
 $demoRepo = Split-Path $PSScriptRoot -Parent
 $demoConfig = (Resolve-Path -LiteralPath $Config).Path
 if (-not $EvidenceDirectory) {
@@ -17,11 +19,18 @@ if (-not $EvidenceDirectory) {
 $demoHead = (git -C $demoRepo rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0) { throw 'Could not establish the demo commit.' }
 
-if ($NotepadDenial) {
-    Write-Host "Denial test only. At the genuine [Desktop approval] prompt, type no and press Enter."
-    Write-Host "Do not type the approval phrase. Existing Notepad windows are not evidence of a new launch."
+if ($NotepadDenial -or $NotepadApproval) {
+    $demoMode = if ($NotepadApproval) { 'NotepadApproval' } else { 'NotepadDenial' }
+    $demoPrefix = if ($NotepadApproval) { 'notepad-approval-' } else { 'notepad-denial-' }
+    if ($NotepadApproval) {
+        Write-Host "Approval test only. A launch requires you to type open notepad at the genuine [Desktop approval] prompt."
+        Write-Host "Note existing Notepad windows first. Native launch acceptance does not verify a new visible window."
+    } else {
+        Write-Host "Denial test only. At the genuine [Desktop approval] prompt, type no and press Enter."
+        Write-Host "Do not type the approval phrase. Existing Notepad windows are not evidence of a new launch."
+    }
     New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
-    $demoRecord = Join-Path (Resolve-Path -LiteralPath $EvidenceDirectory).Path ('notepad-denial-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss-fff') + '.json')
+    $demoRecord = Join-Path (Resolve-Path -LiteralPath $EvidenceDirectory).Path ($demoPrefix + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss-fff') + '.json')
     Push-Location (Join-Path $demoRepo 'src')
     try {
         # Keep console stdin/stderr: input() prompts on stderr; PS 5.1 redirection turns it into an error.
@@ -31,7 +40,7 @@ if ($NotepadDenial) {
         Pop-Location
     }
     if ($demoExit -eq 2) {
-        Write-Host 'Interactive turn refused; no new denial verdict. Retain any existing receipt. Do not retry automatically.'
+        Write-Host 'Interactive turn refused; no new test verdict. Retain any existing receipt. Do not retry automatically.'
         return
     }
     try { $demoEvidence = Get-Content -LiteralPath $demoRecord -Raw | ConvertFrom-Json } catch {
@@ -42,37 +51,59 @@ if ($NotepadDenial) {
     $demoEvidence | ConvertTo-Json -Depth 6 | Write-Host
     $demoCalls = @($demoEvidence.desktop_tool_calls | Where-Object { $null -ne $_ })
     $demoLaunches = @($demoEvidence.launch_results | Where-Object { $null -ne $_ })
-    $demoDenied = $demoExit -eq 0 -and $demoEvidence.conversation_ok -eq $true -and
+    $demoNotepadVerified = $demoExit -eq 0 -and $demoEvidence.conversation_ok -eq $true -and
         $demoCalls.Count -eq 1 -and $demoCalls[0].name -eq 'open_notepad' -and
         $demoCalls[0].arguments -is [pscustomobject] -and @($demoCalls[0].arguments.PSObject.Properties).Count -eq 0 -and
-        $demoCalls[0].status -eq 'denied' -and $demoCalls[0].executor_returned -eq $true -and $demoCalls[0].executed -eq $false -and
-        $demoEvidence.approval.request_count -eq 1 -and $demoEvidence.approval.decision -eq 'denied' -and
-        $demoEvidence.approval.explicit_denial -eq $true -and $demoLaunches.Count -eq 1 -and
-        $demoLaunches[0].arguments_validated -eq $true -and $demoLaunches[0].executor_category -eq 'permission_denied' -and
+        $demoCalls[0].executor_returned -eq $true -and $demoEvidence.approval.request_count -eq 1 -and
+        $demoLaunches.Count -eq 1 -and $demoLaunches[0].arguments_validated -eq $true -and
+        -not [string]::IsNullOrWhiteSpace($demoEvidence.model_reply)
+    $demoDenied = $demoNotepadVerified -and $demoCalls[0].status -eq 'denied' -and $demoCalls[0].executed -eq $false -and
+        $demoEvidence.approval.decision -eq 'denied' -and $demoEvidence.approval.explicit_denial -eq $true -and
+        $demoLaunches[0].executor_category -eq 'permission_denied' -and
         $demoLaunches[0].launch_assessment -eq 'not_launched' -and $demoLaunches[0].native_action_invoked -eq $false -and
-        $null -eq $demoLaunches[0].native_outcome -and -not [string]::IsNullOrWhiteSpace($demoEvidence.model_reply)
+        $null -eq $demoLaunches[0].native_outcome
+    $demoAccepted = $demoNotepadVerified -and $null -eq $demoEvidence.error_category -and
+        $demoCalls[0].status -eq 'ok' -and $demoCalls[0].executed -eq $true -and
+        $demoEvidence.approval.decision -eq 'approved' -and $demoEvidence.approval.explicit_denial -eq $false -and
+        $demoLaunches[0].executor_category -eq 'launch_accepted' -and $demoLaunches[0].launch_assessment -eq 'launch_accepted' -and
+        $demoLaunches[0].native_action_invoked -eq $true -and $demoLaunches[0].native_outcome -eq 'launch_accepted'
     $demoVisual = 'no'
     $demoReply = 'no'
-    if ($demoDenied) {
+    if ($NotepadApproval -and $demoAccepted) {
+        $demoVisual = Read-Host 'Did you see the real approval prompt, type open notepad, and observe a NEW Notepad window from this request? Type yes or no'
+        $demoReply = Read-Host 'Does the final MODEL REPLY accurately describe the native result, without claiming independent visual verification? Type yes or no'
+    } elseif ($NotepadDenial -and $demoDenied) {
         $demoVisual = Read-Host 'Did you see the real approval prompt, type no, and observe NO NEW Notepad window from this request? Type yes or no'
         $demoReply = Read-Host 'Does the final MODEL REPLY accurately report denial without claiming Notepad opened? Type yes or no'
     }
     $demoVisualConfirmed = $demoVisual.Trim().ToLowerInvariant() -eq 'yes'
     $demoReplyConfirmed = $demoReply.Trim().ToLowerInvariant() -eq 'yes'
-    $demoEvidence | Add-Member -NotePropertyMembers @{
+    $demoFields = @{
         commit = $demoHead
-        mode = 'NotepadDenial'
+        mode = $demoMode
         windows_build = [Environment]::OSVersion.Version.Build
         recorded_at_utc = [DateTime]::UtcNow.ToString('o')
-        operator_confirmed_no_new_window = $demoVisualConfirmed
         operator_confirmed_reply = $demoReplyConfirmed
-        denial_test_pass = [bool]($demoDenied -and $demoVisualConfirmed -and $demoReplyConfirmed)
-    } -Force
+    }
+    if ($NotepadApproval) {
+        $demoFields.operator_confirmed_new_window = $demoVisualConfirmed
+        $demoFields.approval_test_pass = [bool]($demoAccepted -and $demoVisualConfirmed -and $demoReplyConfirmed)
+    } else {
+        $demoFields.operator_confirmed_no_new_window = $demoVisualConfirmed
+        $demoFields.denial_test_pass = [bool]($demoDenied -and $demoVisualConfirmed -and $demoReplyConfirmed)
+    }
+    $demoEvidence | Add-Member -NotePropertyMembers $demoFields -Force
     $demoEvidence | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $demoRecord -Encoding utf8
     Write-Host "Recorded: $demoRecord"
-    if ($demoEvidence.denial_test_pass) { Write-Host 'LIVE NOTEPAD DENIAL PASS for this single operator-confirmed case.' }
-    else { Write-Host 'DENIAL TEST NOT CONFIRMED. Do not retry automatically.' }
-    Write-Host 'Stop here. Approval testing requires separate review of this receipt.'
+    if ($NotepadApproval) {
+        if ($demoEvidence.approval_test_pass) { Write-Host 'LIVE NOTEPAD APPROVAL PASS for this single operator-confirmed case.' }
+        else { Write-Host 'APPROVAL TEST NOT CONFIRMED. An uncertain result does not prove non-execution. Do not retry automatically.' }
+        Write-Host 'Stop here for independent review of this receipt.'
+    } else {
+        if ($demoEvidence.denial_test_pass) { Write-Host 'LIVE NOTEPAD DENIAL PASS for this single operator-confirmed case.' }
+        else { Write-Host 'DENIAL TEST NOT CONFIRMED. Do not retry automatically.' }
+        Write-Host 'Stop here. Approval testing requires separate review of this receipt.'
+    }
     return
 }
 

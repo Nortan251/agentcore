@@ -540,6 +540,55 @@ def test_notepad_evidence_keeps_lost_invocation_uncertain():
     assert "private-call-id" not in json.dumps(evidence)
 
 
+@pytest.mark.parametrize("native_kind", ["launch_accepted", "launch_unknown", "launch_failed", "lost_executor"])
+def test_interactive_approved_receipt_separates_acceptance_failure_and_uncertainty(
+        connected, tmp_path, monkeypatch, capsys, native_kind):
+    _, calls = connected
+    model = ScriptedModel()
+    monkeypatch.setattr(cli.Agent, "_build_model", lambda _: model)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    prompts = []
+    def approve(prompt):
+        prompts.append(prompt)
+        return "open notepad"
+    monkeypatch.setattr("builtins.input", approve)
+    request = control.ComputerControlAdapter._request
+    def native_result(self, operation):
+        result = request(self, operation)
+        return result if operation == "health" or native_kind == "lost_executor" else native_kind
+    monkeypatch.setattr(control.ComputerControlAdapter, "_request", native_result)
+    invoke = ToolExecutor.invoke
+    if native_kind == "lost_executor":
+        def lose_result(self, *args, **kwargs):
+            invocation = invoke(self, *args, **kwargs)
+            assert invocation.result.metadata["kind"] == "launch_accepted"
+            raise RuntimeError("private-lost-result")
+        monkeypatch.setattr(ToolExecutor, "invoke", lose_result)
+    receipt = tmp_path / "approval.json"
+    assert cli.main(denial_config(tmp_path) + ["chat", "--enable-desktop", "--message",
+        "Jarvis, open Notepad.", "--desktop-evidence", str(receipt)]) == 0
+    evidence = json.loads(receipt.read_text(encoding="utf-8"))
+    assert prompts == ["[Desktop approval] Open Notepad? Type 'open notepad' to allow: "]
+    assert calls == ["health", "open_notepad"]
+    assert evidence["approval"] == {"request_count": 1, "decision": "approved", "explicit_denial": False}
+    call = evidence["desktop_tool_calls"][0]
+    assert call["name"] == "open_notepad" and call["arguments"] == {}
+    assert call["executor_returned"] is (native_kind != "lost_executor")
+    assert call["executed"] is (native_kind == "launch_accepted")
+    launch = evidence["launch_results"][0]
+    assert launch["arguments_validated"] is (native_kind != "lost_executor")
+    assert launch["native_outcome"] == (None if native_kind == "lost_executor" else native_kind)
+    assert launch["launch_assessment"] == ("launch_unknown" if native_kind == "lost_executor" else native_kind)
+    assert launch["native_action_invoked"] is (True if native_kind == "launch_accepted" else None)
+    assert "operator_confirmed_new_window" not in evidence and "approval_test_pass" not in evidence
+    assert [tool["name"] for tool in model.requests[0].tools] == ["open_notepad"]
+    assert len(model.requests) == 2
+    if native_kind == "launch_accepted":
+        assert "visible window is not verified" in model.requests[-1].messages[-1].content
+    output = capsys.readouterr()
+    assert "private-lost-result" not in output.out + output.err + json.dumps(evidence)
+
+
 def test_receipt_write_failure_after_mock_dispatch_never_retries(connected, tmp_path, monkeypatch, capsys):
     _, calls = connected
     model = ScriptedModel()

@@ -164,8 +164,9 @@ if ($global:task49Answers.Count -ne 0) {{ throw 'Missing operator question.' }}
 
 
 @pytest.mark.parametrize("shell_name", ["powershell", "pwsh"])
-@pytest.mark.parametrize("case", ["denied", "cli_failure", "refused", "missing_receipt"])
-def test_denial_launcher_with_native_python_console(tmp_path, shell_name, case):
+@pytest.mark.parametrize("approval_mode", [False, True])
+@pytest.mark.parametrize("case", ["completed", "cli_failure", "refused", "missing_receipt"])
+def test_notepad_launcher_with_native_python_console(tmp_path, shell_name, case, approval_mode):
     from _windows_console import run_console
 
     shell = shutil.which(shell_name)
@@ -188,8 +189,9 @@ from agentcore.permissions.levels import Capability
 assert sys.stdin.isatty() and sys.stdout.isatty()
 print('OFFLINE_STDIN_TTY', flush=True)
 gate = ConsoleNotepadApproval()
-assert gate.request_many((Capability.APP_CONTROL, Capability.PROCESS_SPAWN), 'offline fixture') is False
-assert gate.request_count == 1 and gate.decision == 'denied' and gate.explicit_denial
+assert gate.request_many((Capability.APP_CONTROL, Capability.PROCESS_SPAWN), 'offline fixture') is {approval_mode!r}
+assert gate.request_count == 1 and gate.decision == {'approved' if approval_mode else 'denied'!r}
+assert gate.explicit_denial is {not approval_mode!r}
 payload = {{'conversation_ok': True, 'model_reply': 'Request denied; Notepad was not opened.',
     'error_category': None,
     'desktop_tool_calls': [{{'name': 'open_notepad', 'arguments': {{}}, 'status': 'denied',
@@ -197,6 +199,11 @@ payload = {{'conversation_ok': True, 'model_reply': 'Request denied; Notepad was
     'approval': {{'request_count': gate.request_count, 'decision': gate.decision, 'explicit_denial': gate.explicit_denial}},
     'launch_results': [{{'arguments_validated': True, 'executor_category': 'permission_denied',
         'launch_assessment': 'not_launched', 'native_action_invoked': False, 'native_outcome': None}}]}}
+if {approval_mode!r}:
+    payload['model_reply'] = 'Windows accepted the launch; a visible window is not verified.'
+    payload['desktop_tool_calls'][0].update(status='ok', executed=True)
+    payload['launch_results'][0].update(executor_category='launch_accepted', launch_assessment='launch_accepted',
+        native_action_invoked=True, native_outcome='launch_accepted')
 record = Path(sys.argv[sys.argv.index('--desktop-evidence') + 1])
 with (record.parent / 'attempts.txt').open('a') as attempts:
     attempts.write('one attempt\\n')
@@ -213,32 +220,136 @@ sys.exit({1 if case == 'cli_failure' else 2 if case == 'refused' else 0})
     driver.write_text(f"""$ErrorActionPreference = 'Stop'
 Set-Alias python {ps_quote(sys.executable)}
 function git {{ $global:LASTEXITCODE = 0; return '59182ddce411a73a96b4c333aeeab06fbff9b50a' }}
-& {ps_quote(launcher)} -Config {ps_quote(config)} -NotepadDenial -EvidenceDirectory {ps_quote(results)}
+& {ps_quote(launcher)} -Config {ps_quote(config)} -{'NotepadApproval' if approval_mode else 'NotepadDenial'} -EvidenceDirectory {ps_quote(results)}
 Write-Host 'OFFLINE_LAUNCHER_RETURNED'
 """, encoding="utf-8-sig")
     code, output = run_console([shell, "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(driver)],
-                               ready="OFFLINE_STDIN_TTY", answers="no\ryes\ryes\r")
+                               ready="OFFLINE_STDIN_TTY",
+                               answers=("open notepad" if approval_mode else "no") + "\ryes\ryes\r")
     assert code == 0, output
     assert "OFFLINE_LAUNCHER_RETURNED" in output and "NativeCommandError" not in output
     assert "Type 'open notepad' to allow:" in output
     assert (results / "attempts.txt").read_text() == "one attempt\n"
-    records = list(results.glob("notepad-denial-*.json"))
+    verdict = "LIVE NOTEPAD APPROVAL PASS" if approval_mode else "LIVE NOTEPAD DENIAL PASS"
+    pass_field = "approval_test_pass" if approval_mode else "denial_test_pass"
+    visual_field = "operator_confirmed_new_window" if approval_mode else "operator_confirmed_no_new_window"
+    records = list(results.glob("notepad-approval-*.json" if approval_mode else "notepad-denial-*.json"))
     if case == "missing_receipt":
         assert not records and "No complete structured receipt" in output
-        assert "LIVE NOTEPAD DENIAL PASS" not in output
+        assert verdict not in output
         return
     assert len(records) == 1
     receipt = json.loads(records[0].read_text(encoding="utf-8-sig"))
-    assert receipt["approval"] == {"request_count": 1, "decision": "denied", "explicit_denial": True}
-    assert receipt["launch_results"][0]["native_action_invoked"] is False
+    assert receipt["approval"] == {"request_count": 1, "decision": "approved" if approval_mode else "denied",
+                                   "explicit_denial": not approval_mode}
+    assert receipt["launch_results"][0]["native_action_invoked"] is approval_mode
     if case == "refused":
-        assert "denial_test_pass" not in receipt and "Interactive turn refused" in output
+        assert pass_field not in receipt and "Interactive turn refused" in output
     else:
-        assert receipt["denial_test_pass"] is (case == "denied")
-        assert receipt["operator_confirmed_no_new_window"] is (case == "denied")
-        assert receipt["operator_confirmed_reply"] is (case == "denied")
-    assert ("LIVE NOTEPAD DENIAL PASS" in output) is (case == "denied")
-    assert ("Did you see the real approval prompt" in output) is (case == "denied")
-    assert ("Does the final MODEL REPLY" in output) is (case == "denied")
+        assert receipt[pass_field] is (case == "completed")
+        assert receipt[visual_field] is (case == "completed")
+        assert receipt["operator_confirmed_reply"] is (case == "completed")
+    assert (verdict in output) is (case == "completed")
+    assert ("Did you see the real approval prompt" in output) is (case == "completed")
+    assert ("Does the final MODEL REPLY" in output) is (case == "completed")
     if case == "cli_failure":
         assert "OFFLINE_CLI_FAILURE" in output
+
+
+@pytest.mark.parametrize("shell_name", ["powershell", "pwsh"])
+@pytest.mark.parametrize("case,answers,passed", [
+    ("accepted", ["yes", "yes"], True), ("no_window", ["no", "yes"], False),
+    ("bad_reply", ["yes", "no"], False), ("denied", [], False), ("no_call", [], False),
+    ("malformed", [], False), ("not_validated", [], False), ("no_prompt", [], False),
+    ("no_approval", [], False), ("uncertain", [], False), ("unknown", [], False),
+    ("native_failed", [], False), ("model_failed", [], False), ("duplicate", [], False),
+    ("cli_failed", [], False), ("refused", [], False),
+])
+def test_approval_launcher_requires_native_acceptance_and_two_human_confirmations(
+        tmp_path, shell_name, case, answers, passed):
+    shell = shutil.which(shell_name)
+    if shell_name == "pwsh" and not shell:
+        pytest.skip("Optional PowerShell 7 is not installed")
+    assert shell
+    payload = {"conversation_ok": True, "model_reply": "Windows accepted the launch; visibility is not verified.",
+        "error_category": None,
+        "desktop_tool_calls": [{**CALL, "name": "open_notepad"}],
+        "approval": {"request_count": 1, "decision": "approved", "explicit_denial": False},
+        "launch_results": [{"arguments_validated": True, "executor_category": "launch_accepted",
+            "launch_assessment": "launch_accepted", "native_action_invoked": True, "native_outcome": "launch_accepted"}]}
+    if case == "bad_reply": payload["model_reply"] = "I visually verified a new Notepad window."
+    if case == "denied":
+        payload["approval"].update(decision="denied", explicit_denial=True)
+        payload["desktop_tool_calls"][0].update(status="denied", executed=False)
+        payload["launch_results"][0].update(executor_category="permission_denied", launch_assessment="not_launched",
+                                            native_action_invoked=False, native_outcome=None)
+    if case == "no_call": payload["desktop_tool_calls"] = payload["launch_results"] = []
+    if case == "malformed": payload["desktop_tool_calls"][0]["arguments"] = None
+    if case == "not_validated": payload["launch_results"][0]["arguments_validated"] = False
+    if case in ("no_call", "no_prompt"): payload["approval"]["request_count"] = 0
+    if case == "no_approval": payload["approval"]["decision"] = None
+    if case in ("uncertain", "unknown", "native_failed"):
+        payload["desktop_tool_calls"][0].update(status="failed", executed=False, executor_returned=case != "uncertain")
+        kind = None if case == "uncertain" else "launch_failed" if case == "native_failed" else "launch_unknown"
+        payload["launch_results"][0].update(executor_category=kind,
+            launch_assessment=kind or "launch_unknown", native_action_invoked=None, native_outcome=kind)
+    if case == "model_failed": payload.update(conversation_ok=False, model_reply=None, error_category="model_timeout")
+    if case == "duplicate": payload["desktop_tool_calls"] *= 2
+    fixture = tmp_path / "cli.json"
+    fixture.write_text(json.dumps(payload), encoding="utf-8")
+    config = tmp_path / "agent.local.toml"
+    config.write_text("# offline fixture, no credential\n", encoding="utf-8")
+    results = tmp_path / "receipts"
+    command = f"""$global:task49Answers = [System.Collections.Generic.Queue[string]]::new()
+foreach ($answer in @({', '.join(ps_quote(answer) for answer in answers)})) {{ $global:task49Answers.Enqueue($answer) }}
+$global:task49Attempts = 0
+function Read-Host {{
+    param([string]$Prompt)
+    if ($global:task49Answers.Count -eq 0) {{ throw 'Unexpected operator question.' }}
+    return $global:task49Answers.Dequeue()
+}}
+function Start-Sleep {{ throw 'No foreground delay in the Notepad approval test.' }}
+function git {{ $global:LASTEXITCODE = 0; return '8bde554a898fa90bd162ad5e0e93dd436b8a0717' }}
+function python {{
+    $global:task49Attempts++
+    if (@($args) -contains '--json' -or $args[-3] -ne 'Jarvis, open Notepad.') {{ throw 'Wrong interactive request.' }}
+    $taskReceipt = $args[[array]::IndexOf($args, '--desktop-evidence') + 1]
+    Get-Content -LiteralPath {ps_quote(fixture)} -Raw | Set-Content -LiteralPath $taskReceipt -Encoding utf8
+    $global:LASTEXITCODE = {2 if case == 'refused' else 1 if case in ('cli_failed', 'model_failed') else 0}
+}}
+& {ps_quote(LAUNCHER)} -Config {ps_quote(config)} -NotepadApproval -EvidenceDirectory {ps_quote(results)}
+if ($global:task49Answers.Count -ne 0 -or $global:task49Attempts -ne 1) {{ throw 'Missing question or repeated invocation.' }}
+"""
+    completed = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-Command", command],
+                               capture_output=True, text=True, timeout=20, check=False)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    records = list(results.glob("notepad-approval-*.json"))
+    assert len(records) == 1 and not list(results.glob("notepad-denial-*.json"))
+    receipt = json.loads(records[0].read_text(encoding="utf-8-sig"))
+    for field in ("approval", "launch_results", "desktop_tool_calls", "model_reply"):
+        assert receipt[field] == payload[field]
+    if case == "refused":
+        assert receipt == payload and "LIVE NOTEPAD APPROVAL PASS" not in completed.stdout
+        return
+    assert receipt["approval_test_pass"] is passed
+    assert receipt["mode"] == "NotepadApproval" and receipt["commit"] == "8bde554a898fa90bd162ad5e0e93dd436b8a0717"
+    assert "denial_test_pass" not in receipt and "operator_confirmed_no_new_window" not in receipt
+    assert receipt["operator_confirmed_new_window"] is bool(answers and answers[0] == "yes")
+    assert receipt["operator_confirmed_reply"] is bool(answers and answers[1] == "yes")
+    assert ("LIVE NOTEPAD APPROVAL PASS" in completed.stdout) is passed
+
+
+@pytest.mark.parametrize("shell_name", ["powershell", "pwsh"])
+def test_notepad_modes_are_mutually_exclusive_before_any_cli_turn(tmp_path, shell_name):
+    shell = shutil.which(shell_name)
+    if shell_name == "pwsh" and not shell:
+        pytest.skip("Optional PowerShell 7 is not installed")
+    assert shell
+    command = f"""$ErrorActionPreference = 'Stop'
+function python {{ throw 'CLI must not be invoked.' }}
+& {ps_quote(LAUNCHER)} -Config {ps_quote(tmp_path / 'unused.toml')} -NotepadDenial -NotepadApproval
+"""
+    completed = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-Command", command],
+                               capture_output=True, text=True, timeout=20, check=False)
+    assert completed.returncode != 0 and "Select only one Notepad test" in completed.stderr
+    assert "CLI must not be invoked" not in completed.stderr

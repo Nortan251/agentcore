@@ -159,3 +159,51 @@ stdin, policy denial without a real prompt, EOF/cancellation, and unknown
 outcomes cannot pass this test. Stop after saving the denial receipt. Prepare
 an approval demonstration only after that receipt is operator-confirmed and
 independently reviewed; this mode offers no automatic second test.
+
+## Separate operator-controlled approval test
+
+After independent verification of a confirmed denial receipt, use a separate
+local profile with the same restricted CONFIRM settings, only `open_notepad`,
+one call/round, and a separate workspace. Note the existing Notepad windows
+before starting. Run once from the real terminal holding the provider key:
+
+```powershell
+& .\tools\Start-Desktop-Demo.ps1 -Config .\agent.notepad-approval.local.toml -NotepadApproval
+```
+
+This sends exactly `Jarvis, open Notepad.`. At the genuine prompt, only the
+operator can authorize launch by typing **open notepad**, then Enter. The mode
+switch does not grant approval. There is no supplied input, default approval,
+JSON shortcut or automatic second request. Stdin and stderr remain attached
+under Windows PowerShell 5.1 and PowerShell 7. The two Notepad modes cannot be
+selected together.
+
+The existing CLI, ConversationRuntime, registry, validation, CONFIRM policy,
+ToolExecutor, NotepadActionAdapter and isolated service perform the action.
+Both APP_CONTROL and PROCESS_SPAWN remain required. The Python runtime, gate,
+tool implementation and service are unchanged.
+
+Approval receipts use fresh `notepad-approval-*.json` files, never denial files.
+The CLI records the actual structured call and validated empty arguments, gate
+request count and categorical decision, executor status/return, native dispatch
+and outcome, and final model response. `decision=approved` comes only from the
+existing phrase gate; raw input is not stored. A native `launch_accepted` means
+Windows accepted the launch; it does not verify a visible window.
+
+Only after one successful approved call returns `launch_accepted` and the model
+finishes successfully does the launcher ask two independent questions:
+
+1. Did you see the real prompt, type the approval phrase, and observe a **new
+   Notepad window caused by this request**? An existing window brought forward
+   or a new tab in an existing window does not satisfy this window criterion.
+2. Does the model's answer accurately describe the native result without
+   inventing success/failure or claiming independent visual verification?
+
+The launcher records both confirmations and the commit separately from native
+evidence. A pass requires both answers to be `yes` and all structured evidence
+to match. Nonempty/invalid arguments, missing calls, missing approval, denial,
+duplicate calls, failed/unknown native outcomes, lost executor results, missing
+answers and model failures cannot pass. Unconfirmed human fields mean no human
+confirmation was obtained, not proof of non-execution. Unknown native dispatch
+stays null/uncertain even if the operator sees no new window. Do not automatically
+retry any failed or uncertain test. Stop after saving the receipt for review.
