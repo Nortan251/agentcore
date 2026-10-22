@@ -128,6 +128,18 @@ phrase. The launcher inherits console stdin and does not use `--json`, pipe
 answers, or supply an approval decision. The existing console gate and executor
 remain the only approval/execution path.
 
+The interactive Python invocation inherits stderr as well as stdin. CPython's
+console `input()` prompt uses stderr; redirecting it with `2>$null` under Windows
+PowerShell 5.1 and `ErrorActionPreference=Stop` turns a harmless prompt into a
+terminating `NativeCommandError`. Keep stderr attached so the prompt and actual
+CLI errors remain visible. Strict PowerShell error handling and the native exit
+code checks remain enabled; stderr text alone is not a failed CLI exit.
+
+If an older launcher stopped after the CLI saved its receipt, retain that file
+unchanged. A complete CLI receipt can establish permission denial and no native
+dispatch, but absent operator confirmations and launcher metadata cannot be
+reconstructed or treated as a live denial pass.
+
 `--desktop-evidence FILE` saves closed evidence alongside the normal human
 output. It requires this restricted interactive profile and creates a new file
 before sending the conversation turn; an existing file is never overwritten by

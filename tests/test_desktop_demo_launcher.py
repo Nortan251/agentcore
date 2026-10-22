@@ -1,4 +1,4 @@
-"""Offline PowerShell receipt checks; the CLI is substituted, no desktop is used."""
+"""Offline PowerShell receipt checks, including native Python console input."""
 
 import json
 from pathlib import Path
@@ -161,3 +161,84 @@ if ($global:task49Answers.Count -ne 0) {{ throw 'Missing operator question.' }}
     sent = json.loads(invocation.read_text(encoding="utf-8-sig"))
     assert sent == ["-m", "agentcore.cli", "--config", str(config), "chat", "--enable-desktop",
                     "--message", "Jarvis, open Notepad.", "--desktop-evidence", str(records[0])]
+
+
+@pytest.mark.parametrize("shell_name", ["powershell", "pwsh"])
+@pytest.mark.parametrize("case", ["denied", "cli_failure", "refused", "missing_receipt"])
+def test_denial_launcher_with_native_python_console(tmp_path, shell_name, case):
+    from _windows_console import run_console
+
+    shell = shutil.which(shell_name)
+    if shell_name == "pwsh" and not shell:
+        pytest.skip("Optional PowerShell 7 is not installed")
+    assert shell
+    # Copy only the launcher; substitute model/native work, never Python or input().
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    launcher = tools / LAUNCHER.name
+    shutil.copyfile(LAUNCHER, launcher)
+    package = tmp_path / "src" / "agentcore"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text(
+        f"__path__.append({str(LAUNCHER.parents[1] / 'src' / 'agentcore')!r})\n", encoding="utf-8")
+    (package / "cli.py").write_text(f"""import json, sys
+from pathlib import Path
+from agentcore.desktop.chat import ConsoleNotepadApproval
+from agentcore.permissions.levels import Capability
+assert sys.stdin.isatty() and sys.stdout.isatty()
+print('OFFLINE_STDIN_TTY', flush=True)
+gate = ConsoleNotepadApproval()
+assert gate.request_many((Capability.APP_CONTROL, Capability.PROCESS_SPAWN), 'offline fixture') is False
+assert gate.request_count == 1 and gate.decision == 'denied' and gate.explicit_denial
+payload = {{'conversation_ok': True, 'model_reply': 'Request denied; Notepad was not opened.',
+    'error_category': None,
+    'desktop_tool_calls': [{{'name': 'open_notepad', 'arguments': {{}}, 'status': 'denied',
+        'executor_returned': True, 'executed': False}}],
+    'approval': {{'request_count': gate.request_count, 'decision': gate.decision, 'explicit_denial': gate.explicit_denial}},
+    'launch_results': [{{'arguments_validated': True, 'executor_category': 'permission_denied',
+        'launch_assessment': 'not_launched', 'native_action_invoked': False, 'native_outcome': None}}]}}
+record = Path(sys.argv[sys.argv.index('--desktop-evidence') + 1])
+with (record.parent / 'attempts.txt').open('a') as attempts:
+    attempts.write('one attempt\\n')
+if {case != 'missing_receipt'!r}:
+    record.write_text(json.dumps(payload), encoding='utf-8')
+if {case == 'cli_failure'!r}:
+    print('OFFLINE_CLI_FAILURE', file=sys.stderr, flush=True)
+sys.exit({1 if case == 'cli_failure' else 2 if case == 'refused' else 0})
+""", encoding="utf-8")
+    config = tmp_path / "agent.local.toml"
+    config.write_text("# offline fixture, no credential\n", encoding="utf-8")
+    results = tmp_path / "receipts"
+    driver = tmp_path / "driver.ps1"
+    driver.write_text(f"""$ErrorActionPreference = 'Stop'
+Set-Alias python {ps_quote(sys.executable)}
+function git {{ $global:LASTEXITCODE = 0; return '59182ddce411a73a96b4c333aeeab06fbff9b50a' }}
+& {ps_quote(launcher)} -Config {ps_quote(config)} -NotepadDenial -EvidenceDirectory {ps_quote(results)}
+Write-Host 'OFFLINE_LAUNCHER_RETURNED'
+""", encoding="utf-8-sig")
+    code, output = run_console([shell, "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(driver)],
+                               ready="OFFLINE_STDIN_TTY", answers="no\ryes\ryes\r")
+    assert code == 0, output
+    assert "OFFLINE_LAUNCHER_RETURNED" in output and "NativeCommandError" not in output
+    assert "Type 'open notepad' to allow:" in output
+    assert (results / "attempts.txt").read_text() == "one attempt\n"
+    records = list(results.glob("notepad-denial-*.json"))
+    if case == "missing_receipt":
+        assert not records and "No complete structured receipt" in output
+        assert "LIVE NOTEPAD DENIAL PASS" not in output
+        return
+    assert len(records) == 1
+    receipt = json.loads(records[0].read_text(encoding="utf-8-sig"))
+    assert receipt["approval"] == {"request_count": 1, "decision": "denied", "explicit_denial": True}
+    assert receipt["launch_results"][0]["native_action_invoked"] is False
+    if case == "refused":
+        assert "denial_test_pass" not in receipt and "Interactive turn refused" in output
+    else:
+        assert receipt["denial_test_pass"] is (case == "denied")
+        assert receipt["operator_confirmed_no_new_window"] is (case == "denied")
+        assert receipt["operator_confirmed_reply"] is (case == "denied")
+    assert ("LIVE NOTEPAD DENIAL PASS" in output) is (case == "denied")
+    assert ("Did you see the real approval prompt" in output) is (case == "denied")
+    assert ("Does the final MODEL REPLY" in output) is (case == "denied")
+    if case == "cli_failure":
+        assert "OFFLINE_CLI_FAILURE" in output

@@ -24,8 +24,8 @@ if ($NotepadDenial) {
     $demoRecord = Join-Path (Resolve-Path -LiteralPath $EvidenceDirectory).Path ('notepad-denial-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss-fff') + '.json')
     Push-Location (Join-Path $demoRepo 'src')
     try {
-        # Inherit the real console stdin; --json would disable the approval gate.
-        & python -m agentcore.cli --config $demoConfig chat --enable-desktop --message 'Jarvis, open Notepad.' --desktop-evidence $demoRecord 2>$null
+        # Keep console stdin/stderr: input() prompts on stderr; PS 5.1 redirection turns it into an error.
+        & python -m agentcore.cli --config $demoConfig chat --enable-desktop --message 'Jarvis, open Notepad.' --desktop-evidence $demoRecord
         $demoExit = $LASTEXITCODE
     } finally {
         Pop-Location
