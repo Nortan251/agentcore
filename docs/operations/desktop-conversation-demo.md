@@ -100,7 +100,15 @@ A single-case pass requires one successful zero-argument `get_foreground_app`
 call, an actual native result matching the expected case, a successful final
 response, and both human confirmations. A model-only answer, denied call,
 duplicate call, mismatched app, timeout after observation, or missing answer
-cannot pass. Receipts include the commit; by default
+cannot pass. The launcher refuses staged/unstaged tracked changes and
+untracked source under `src/` or `tools/`, verifies the same HEAD after
+Python returns, and rechecks immediately before recording a commit-attributed
+verdict. Ignored workspaces and local model profiles are permitted. If this
+verification fails after the CLI ran, any original CLI receipt stays unchanged,
+without a retrospective commit/PASS assertion; do not retry an uncertain effect.
+These verification points detect checkout divergence but do not constitute an
+immutable execution sandbox or prove there was no transient edit-and-revert.
+Receipts include the commit; by default
 they are saved under `.agent_workspace/desktop-demo`. `-EvidenceDirectory` can
 select the operator's local evidence folder.
 
