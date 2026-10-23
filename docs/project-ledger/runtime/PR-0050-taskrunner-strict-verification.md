@@ -87,3 +87,48 @@ Scoped candidate repair commit: [`29f7ac82bba54d86f84023496dcd5ce505647803`](htt
 GitHub PR comment documenting both findings and candidate repair: https://github.com/Nortan251/agentcore/pull/50#issuecomment-6375648333.
 
 **CI on the new head and independent re-review pending.** Earlier CI/test results remain historical for the parent, not evidence of success on this new repair. Keep PR #50 DRAFT and unmerged; no Task 50B implementation authorized.
+
+## 2026-10-23 UTC amendment — final independent GO, Ready review and authorized merge
+
+This dated amendment supersedes the earlier pending/NO-GO snapshots above without rewriting them. Final status: **MERGED; Task 50A released**. Approved implementation head: [`29f7ac82bba54d86f84023496dcd5ce505647803`](https://github.com/Nortan251/agentcore/commit/29f7ac82bba54d86f84023496dcd5ce505647803), parent `89591c1ed82af9c818e9cc6df11d16388f525ba2`. No implementation source changed during release.
+
+Independent full-diff re-review found original **P1 FIXED**, original **P2 FIXED**, and **no new actionable P0/P1/P2**. Strict admission blocks all three non-PASSED completed verdicts before dependent or independent dispatch in live/restored tasks, including repeated invocations. PASSED continuation preserves completed execution evidence. Strict terminal-task reentry rejects CANCELLED, FAILED and COMPLETED tasks without altering terminal truth or dispatching tools. Cancellation precedence and exception/evidence handling were checked. The [independent engineering assessment](https://github.com/Nortan251/agentcore/pull/50#issuecomment-6376438653) is a conversation comment, **not a native GitHub APPROVED review**.
+
+Previously executed, exact-head local evidence was verified for this release rather than rerun:
+- Original failure/control probes: **10 passed**; the original terminal-report probe was replaced by checks of the repaired StateError contract.
+- Additional independent re-review checks: **27 passed**.
+- Compatibility suites: **257 passed**; authority/recovery suites: **332 passed, 5 skipped**. Focused counts overlap.
+- First full local invocation: **7,043 passed, 391 skipped, 62 failed, 89 warnings**. The 62 failures were existing WorkspaceAgent tests hitting a generated 267-character Windows temporary lock path, not represented as successful execution.
+- Unchanged-source affected-suite reruns under a shorter temporary root: **86 passed, 16 skipped**. JUnit case identity comparison confirmed all 62 previously failed cases passed.
+- Consolidated case coverage: **7,105 passed, 391 skipped across the original invocation and targeted reruns**, not one uninterrupted green full-suite execution.
+- Compilation, base-to-head whitespace validation and all **387** archived-source file comparisons passed in the independent re-review.
+
+All six final-head PR CI jobs were independently rechecked as **SUCCESS** before Ready and immediately before merge:
+- Linux full: [run 40030983159 / job 120678874740](https://github.com/Nortan251/agentcore/actions/runs/40030983159/job/120678874740) — **6,979 passed, 517 skipped, 98 warnings**.
+- Windows 3.11: [run 40030983161 / job 120678875172](https://github.com/Nortan251/agentcore/actions/runs/40030983161/job/120678875172) — SUCCESS.
+- Windows 3.12: [run 40030983161 / job 120678875017](https://github.com/Nortan251/agentcore/actions/runs/40030983161/job/120678875017) — SUCCESS.
+- Windows 3.13: [run 40030983161 / job 120678875281](https://github.com/Nortan251/agentcore/actions/runs/40030983161/job/120678875281) — SUCCESS.
+- Chromium Linux: [run 40030983166 / job 120678875362](https://github.com/Nortan251/agentcore/actions/runs/40030983166/job/120678875362) — SUCCESS.
+- Chromium Windows: [run 40030983166 / job 120678875117](https://github.com/Nortan251/agentcore/actions/runs/40030983166/job/120678875117) — SUCCESS.
+
+PR #50 was marked Ready at **23:01:30 UTC** after explicit owner authorization for this exact head. The automatically triggered [Codex review summary](https://github.com/Nortan251/agentcore/pull/50#issuecomment-6376442860) reports **completed at 23:03:27 UTC**, exact commit `29f7ac82bba54d86f84023496dcd5ce505647803`, `has_any_findings=false` and `has_unresolved_findings=false`. No duplicate review was requested. Native GitHub review submissions: **0**; inline review threads: **0**, hence no unresolved threads. No separate automated security-review completion is claimed.
+
+Final governance inspection reported unprotected main, **no active applied branch rules**, and an existing **disabled** repository ruleset. No governance setting changed and no protection bypass or forced merge was used. There was no native approval requirement to substitute for. Both remote head and main remained the owner-approved values immediately before merge; no actionable release-blocking finding remained.
+
+GitHub confirmed a normal merge at **2026-10-23T23:04:39Z**: [`f09f670dd7a6abccdb2889c6e5685537db6dda63`](https://github.com/Nortan251/agentcore/commit/f09f670dd7a6abccdb2889c6e5685537db6dda63). The merge used the exact expected-head SHA guard. Verified ordered parents:
+1. Unchanged main/base `042e6bc5bcacd2872222d5029a5df607fd733255`.
+2. Approved candidate `29f7ac82bba54d86f84023496dcd5ce505647803`.
+
+The actual merge tree is `628573a8a444995bd875a57edce02ddfd30b07e1`, identical to the candidate and the PR CI synthetic merge `9e66702ec01d2351021ab274db53a20361d34c2e`. Direct candidate-to-merge source diff is empty. PR state is closed/merged, not merely merge-requested.
+
+Post-merge push CI on `f09f670dd7a6abccdb2889c6e5685537db6dda63`, observed at **23:07 UTC**: Linux completed successfully; the other five jobs remain **IN PROGRESS**, not passed:
+- Linux full: [run 40037554337 / job 120700636153](https://github.com/Nortan251/agentcore/actions/runs/40037554337/job/120700636153) — SUCCESS.
+- Windows 3.11: [run 40037554332 / job 120700636607](https://github.com/Nortan251/agentcore/actions/runs/40037554332/job/120700636607).
+- Windows 3.12: [run 40037554332 / job 120700636351](https://github.com/Nortan251/agentcore/actions/runs/40037554332/job/120700636351).
+- Windows 3.13: [run 40037554332 / job 120700636484](https://github.com/Nortan251/agentcore/actions/runs/40037554332/job/120700636484).
+- Chromium Linux: [run 40037554432 / job 120700636688](https://github.com/Nortan251/agentcore/actions/runs/40037554432/job/120700636688).
+- Chromium Windows: [run 40037554432 / job 120700636961](https://github.com/Nortan251/agentcore/actions/runs/40037554432/job/120700636961).
+
+Task 50A's approved implementation and release are complete; post-merge CI observation remains pending at this snapshot. Remaining limits: strict verification trusts supplied task evidence; it does not provide authenticated workflow continuity, current supervised file-write authority, independent filesystem postconditions or restart reconciliation. Existing non-strict defaults are retained. The Windows short-temporary-path testing constraint remains documented.
+
+Recommended first Task 50B implementation milestone, after separate authorization: a bounded host using the existing planner/TaskRunner, an accepted fixed plan and durable workflow/step identity, current permission plus the canonical CONFIRM approval path for one create-only file action, independent filesystem read verification, and journal-backed restart reconciliation that blocks continuation on uncertainty. Resolve how WorkspaceAgent's AUTONOMOUS-plus-enable-write composition participates in that canonical approval path before adding the write. No Task 50B implementation was started. Keep this ledger branch independent and never merge it into main.
