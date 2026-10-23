@@ -480,3 +480,15 @@ All three native Windows jobs passed their security and full suites. Their repla
 No no-new-findings review automatically closes either P1. The earlier six resolved findings retain their resolutions. The independent ledger remains documentation-only and must never merge into main.
 
 Remaining limits: ambiguous replacement recovery requires human confirmation; existing Windows close-to-rename, directory-flush/power-loss and full-descriptor-access limits remain. No POSIX/macOS writer, native macOS verification or stronger filesystem CAS is claimed. **READY FOR INDEPENDENT REVIEW** of this bounded repair; retain Draft/unmerged and the explicit release hold. Any finding closure or release decision remains separate.
+
+## 2026-10-23 amendment — final PR #43 merge reconciliation
+
+The historical snapshots and October 20 review holds above remain preserved. This amendment supersedes their OPEN/DRAFT/UNMERGED status after subsequent repairs, review, owner decision and merge. It is a ledger correction based on current authenticated GitHub state, not a fresh reproduction of earlier tests.
+
+- Final implementation head: `161805e36d89c5ccb13ae9678986f3600d8b9fc4`. Base at merge: `de8432528042e5775a83d2091849c0a87cacf67c`.
+- [PR #43](https://github.com/Nortan251/agentcore/pull/43) is **MERGED**, October 20, 2026 at 21:59:01 UTC, as normal merge commit [`7d2f022f91d14ce608042231dec42384cfd43d00`](https://github.com/Nortan251/agentcore/commit/7d2f022f91d14ce608042231dec42384cfd43d00). GitHub confirms ordered merge parents (base, final head).
+- The complete GitHub review-thread inventory has **nine resolved threads, zero unresolved**. This is the current formal state; previous open P1s described above are historical.
+- All three [exact-final-head Linux](https://github.com/Nortan251/agentcore/actions/runs/39483328319), [Windows](https://github.com/Nortan251/agentcore/actions/runs/39483328747) and [Chromium](https://github.com/Nortan251/agentcore/actions/runs/39483328379) workflows report SUCCESS, collectively six jobs. These are final-head PR checks, not a claim of independently rerunning tests for this ledger amendment.
+- The design's residual boundary remains: an interrupted replacement without authenticated action-specific publication evidence may require human reconciliation. Matching current bytes alone do not establish historical publication or license an automatic retry. No broader POSIX replacement or stronger Windows CAS/durability guarantee is claimed.
+
+Final status: **MERGED AND RECORDED**. This amendment modifies only the independent documentation ledger, never production `main`.
