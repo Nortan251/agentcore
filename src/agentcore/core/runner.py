@@ -220,6 +220,17 @@ class TaskRunner:
         log = self._log.bind(run_id=state.run_id, task_id=task.id)
         report = RunReport(task_id=task.id, status=task.status)
 
+        # A previously blocked strict-verification step cannot be bypassed by
+        # re-entering the runner with another independently ready subtask.
+        # Only an explicit reconciled workflow may unblock that step.
+        if self.strict_verification and any(
+                sub.status is TaskStatus.BLOCKED for sub in task.subtasks):
+            if not task.status.is_terminal and task.status is not TaskStatus.BLOCKED:
+                task.transition_to(TaskStatus.BLOCKED)
+            report.status = TaskStatus.BLOCKED
+            report.blocked = True
+            return report
+
         try:
             # A. after attaching/validating task but BEFORE starting executable work
             control.checkpoint()
@@ -455,6 +466,7 @@ class TaskRunner:
                 if self.strict_verification:
                     subtask.transition_to(TaskStatus.PENDING)
                     subtask.transition_to(TaskStatus.BLOCKED)
+                    state.set_active_subtask(None)
                 raise
             if self.strict_verification and (
                     subtask.verification.status is not VerificationStatus.PASSED):

@@ -59,6 +59,9 @@ def test_strict_verification_blocks_dependent_and_keeps_execution_truth(
         agent.executor, verifier=verifier, recovery=NeverRetry(),
         strict_verification=True)
     task, first, second = make_chain()
+    unrelated = task.add_subtask(Subtask(
+        description="independent", tool_name="echo",
+        tool_args={"message": "unrelated"}))
 
     report = agent.run_task(task)
 
@@ -68,6 +71,7 @@ def test_strict_verification_blocks_dependent_and_keeps_execution_truth(
     assert first.result == "one"
     assert first.verification.status is status
     assert second.status is TaskStatus.PENDING
+    assert unrelated.status is TaskStatus.PENDING
     assert verifier.calls == 1
     assert len(agent.state.tool_calls) == 1
     assert agent.state.tool_calls[0]["result"]["output"] == "one"
@@ -77,6 +81,7 @@ def test_strict_verification_blocks_dependent_and_keeps_execution_truth(
     assert repeated.status is TaskStatus.BLOCKED
     assert len(agent.state.tool_calls) == 1
     assert second.status is TaskStatus.PENDING
+    assert unrelated.status is TaskStatus.PENDING
 
 
 def test_strict_pass_allows_dependency_only_after_verified(
@@ -129,6 +134,7 @@ def test_strict_verification_exception_blocks_dependency_and_propagates(
     assert first.status is TaskStatus.BLOCKED
     assert first.result == "one"
     assert second.status is TaskStatus.PENDING
+    assert agent.state.active_subtask_id is None
     assert len(agent.state.tool_calls) == 1
 
 
