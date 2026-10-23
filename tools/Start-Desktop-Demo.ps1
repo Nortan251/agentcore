@@ -35,15 +35,13 @@ function Assert-DemoSourceProvenance {
     if ($LASTEXITCODE -ne 0 -or $untrackedSource.Count -ne 0) {
         throw 'Demo provenance unavailable: untracked source or launcher files. Do not retry uncertain effects.'
     }
-    # -X pycache_prefix bypasses __pycache__, but CPython can still import a
-    # source-less legacy module.pyc sitting directly in an importable directory.
-    # Gitignore hides those files from the preceding --exclude-standard check.
+    # Cache-prefix isolation does not block source-less .pyc or native .pyd imports.
     # Git quotes paths containing non-ASCII characters; match the closing quote.
-    $looseBytecode = @(git -C $demoRepo ls-files --others -- src tools | Where-Object {
-        $_ -match '\.pyc"?$' -and $_ -notmatch '(^|/)__pycache__/'
+    $loadableArtifacts = @(git -C $demoRepo ls-files --others -- src tools | Where-Object {
+        ($_ -match '\.pyc"?$' -and $_ -notmatch '(^|/)__pycache__/') -or $_ -match '\.pyd"?$'
     })
-    if ($LASTEXITCODE -ne 0 -or $looseBytecode.Count -ne 0) {
-        throw 'Demo provenance unavailable: ignored loadable legacy Python bytecode. Do not retry uncertain effects.'
+    if ($LASTEXITCODE -ne 0 -or $loadableArtifacts.Count -ne 0) {
+        throw 'Demo provenance unavailable: ignored loadable Python artifacts. Do not retry uncertain effects.'
     }
 }
 Assert-DemoSourceProvenance

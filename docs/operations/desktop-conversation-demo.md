@@ -115,9 +115,11 @@ The isolated prefix is removed at exit. This protects against a forged cache
 whose timestamp and size match the tracked Python source without requiring
 operators to delete caches created by normal development or test runs.
 CPython can still import source-less legacy `module.pyc` files outside
-`__pycache__`, even with `-B -X pycache_prefix`. The launcher separately
-rejects these ignored, loadable files in `src/` and `tools/` before and after
-execution. Normal `__pycache__` directories remain permitted.
+`__pycache__`, and Windows native `.pyd` modules, even with
+`-B -X pycache_prefix`. A `.pyd` can take precedence over a tracked `.py` file.
+The launcher separately rejects these ignored, loadable files in `src/` and
+`tools/` before and after execution. Normal bytecode caches in `__pycache__`
+remain permitted; native extensions do not receive that exception.
 Receipts include the commit; by default
 they are saved under `.agent_workspace/desktop-demo`. `-EvidenceDirectory` can
 select the operator's local evidence folder.

@@ -4,7 +4,7 @@ import json
 import os
 from pathlib import Path
 import py_compile
-from importlib.util import cache_from_source
+from importlib.util import cache_from_source, find_spec
 import shutil
 import subprocess
 import sys
@@ -389,7 +389,7 @@ function python {{ throw 'CLI must not be invoked.' }}
 @pytest.mark.parametrize("case", [
     "dirty_before", "staged_before", "untracked_before", "dirty_after",
     "head_after", "status_error", "ignored_legacy_bytecode",
-    "ignored_quoted_legacy_bytecode",
+    "ignored_quoted_legacy_bytecode", "ignored_native_extension",
 ])
 def test_launcher_refuses_unverifiable_checkout_without_commit_attribution(
         tmp_path, shell_name, mode, case):
@@ -443,6 +443,9 @@ function git {{
         }}
         if ('{case}' -eq 'ignored_quoted_legacy_bytecode' -and -not ($args -contains '--exclude-standard')) {{
             return '"src/agentcore/\\303\\251vil.pyc"'
+        }}
+        if ('{case}' -eq 'ignored_native_extension' -and -not ($args -contains '--exclude-standard')) {{
+            return 'src/agentcore/cli.pyd'
         }}
         return
     }}
@@ -522,6 +525,23 @@ def test_isolated_bytecode_prefix_prevents_ignored_cache_execution(tmp_path):
                              cwd=source, capture_output=True, text=True,
                              timeout=20, check=True)
     assert process.stdout.strip() == "EVIL"
+
+
+def test_isolated_cache_prefix_does_not_block_native_extension_shadowing(tmp_path):
+    extension = Path(find_spec("_ssl").origin)
+    assert extension.suffix.lower() == ".pyd"
+    (tmp_path / "_ssl.py").write_text('TASK49_MARKER = "TRACKED_SOURCE"\n', encoding="utf-8")
+    script = ('import os, sys; dlls = os.add_dll_directory(sys.argv[1]); '
+              'import _ssl; print(getattr(_ssl, "TASK49_MARKER", "NATIVE_EXTENSION"))')
+    command = [sys.executable, "-S", "-B", "-X", f"pycache_prefix={tmp_path / 'fresh-cache'}",
+               "-c", script, str(extension.parent)]
+    before = subprocess.run(command, cwd=tmp_path, capture_output=True, text=True,
+                            timeout=20, check=True)
+    assert before.stdout.strip() == "TRACKED_SOURCE"
+    shutil.copyfile(extension, tmp_path / extension.name)
+    after = subprocess.run(command, cwd=tmp_path, capture_output=True, text=True,
+                           timeout=20, check=True)
+    assert after.stdout.strip() == "NATIVE_EXTENSION"
 
 
 @pytest.mark.parametrize("shell_name", ["powershell", "pwsh"])
