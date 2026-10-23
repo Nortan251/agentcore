@@ -2311,6 +2311,7 @@ def _chat_once(runtime: Any, session: Any, args: argparse.Namespace, *, approval
         except OSError:
             print("[Desktop evidence] Could not create a new receipt; no conversation turn was sent.", file=sys.stderr)
             return 2
+    receipt_failed = False
     try:
         result = runtime.send(text, session=session)
         if receipt is not None:
@@ -2320,11 +2321,17 @@ def _chat_once(runtime: Any, session: Any, args: argparse.Namespace, *, approval
                 json.dump(notepad_evidence(result, approval), receipt, ensure_ascii=True, indent=2)
                 receipt.flush()
             except OSError:
-                print("[Desktop evidence] Receipt write failed; the action may have executed. Do not retry automatically.", file=sys.stderr)
-                return 1
+                receipt_failed = True
     finally:
         if receipt is not None:
-            receipt.close()
+            try:
+                receipt.close()
+            except OSError:
+                receipt_failed = True
+        if receipt_failed:
+            print("[Desktop evidence] Receipt write failed; the action may have executed. Do not retry automatically.", file=sys.stderr)
+    if receipt_failed:
+        return 1
     if getattr(args, "as_json", False):
         _emit(_turn_payload(result))
         return 0 if result.ok else 1

@@ -589,7 +589,9 @@ def test_interactive_approved_receipt_separates_acceptance_failure_and_uncertain
     assert "private-lost-result" not in output.out + output.err + json.dumps(evidence)
 
 
-def test_receipt_write_failure_after_mock_dispatch_never_retries(connected, tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("failure", ["write", "flush", "close", "write_close", "flush_close"])
+def test_receipt_finalization_failure_after_mock_dispatch_never_retries(
+        connected, tmp_path, monkeypatch, capsys, failure):
     _, calls = connected
     model = ScriptedModel()
     monkeypatch.setattr(cli.Agent, "_build_model", lambda _: model)
@@ -597,17 +599,48 @@ def test_receipt_write_failure_after_mock_dispatch_never_retries(connected, tmp_
     monkeypatch.setattr("builtins.input", lambda _: "open notepad")
     receipt = tmp_path / "receipt.json"
     original_open = Path.open
+    closed = []
     class FailingReceipt:
-        def write(self, text): raise OSError("private-io-detail")
-        def close(self): pass
+        def write(self, text):
+            if failure.startswith("write"): raise OSError("private-io-detail")
+        def flush(self):
+            if failure.startswith("flush"): raise OSError("private-io-detail")
+        def close(self):
+            closed.append(True)
+            if failure.endswith("close"): raise OSError("private-io-detail")
     monkeypatch.setattr(Path, "open", lambda path, *a, **kw: FailingReceipt()
                         if path == receipt else original_open(path, *a, **kw))
     assert cli.main(denial_config(tmp_path) + ["chat", "--enable-desktop", "--message",
         "Jarvis, open Notepad.", "--desktop-evidence", str(receipt)]) == 1
     output = capsys.readouterr()
     assert calls == ["health", "open_notepad"]
-    assert "may have executed. Do not retry automatically" in output.err
+    assert closed == [True]
+    assert output.out == ""
+    assert output.err.count("may have executed. Do not retry automatically") == 1
     assert "private-io-detail" not in output.out + output.err
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, OSError, KeyboardInterrupt])
+@pytest.mark.parametrize("close_fails", [False, True])
+def test_receipt_close_preserves_unrelated_runtime_failure(monkeypatch, capsys, error_type, close_fails):
+    error = error_type("original-runtime-failure")
+    closed = []
+    class Receipt:
+        def close(self):
+            closed.append(True)
+            if close_fails: raise OSError("private-close-detail")
+    def fail(*args, **kwargs):
+        raise error
+    monkeypatch.setattr(Path, "open", lambda *a, **kw: Receipt())
+    args = SimpleNamespace(message="Open Notepad", desktop_evidence=Path("receipt.json"), as_json=False)
+    with pytest.raises(error_type) as raised:
+        cli._chat_once(SimpleNamespace(send=fail), None, args)
+    assert raised.value is error
+    assert closed == [True]
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert output.err.count("may have executed. Do not retry automatically") == int(close_fails)
+    assert "private-close-detail" not in output.out + output.err
 
 
 def test_redirected_input_cannot_implicitly_authorize(connected, tmp_path, monkeypatch, capsys):
