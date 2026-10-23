@@ -4,7 +4,7 @@ import json
 import os
 from pathlib import Path
 import py_compile
-from importlib.util import cache_from_source, find_spec
+from importlib.util import find_spec
 import shutil
 import subprocess
 import sys
@@ -487,7 +487,8 @@ Write-Host "INVOCATIONS=$global:task49Invocations"
         assert not results.exists()
 
 
-def test_isolated_bytecode_prefix_prevents_ignored_cache_execution(tmp_path):
+@pytest.mark.parametrize("isolated_parent", [False, True])
+def test_isolated_bytecode_prefix_prevents_ignored_cache_execution(tmp_path, monkeypatch, isolated_parent):
     """A loadable malicious checkout cache must not override committed .py source."""
     source = tmp_path / "src"
     source.mkdir()
@@ -496,9 +497,13 @@ def test_isolated_bytecode_prefix_prevents_ignored_cache_execution(tmp_path):
     safe = 'RESULT = "SAFE"\n'
     assert len(evil) == len(safe)
     module.write_text(evil, encoding="utf-8")
-    py_compile.compile(str(module), cfile=cache_from_source(str(module)),
-                       invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
-                       doraise=True)
+    if isolated_parent:
+        monkeypatch.setattr(sys, "pycache_prefix", str(tmp_path.parent / "p"))
+    # Compile where the import child looks, independent of pytest's cache prefix.
+    compiler = ("import py_compile, sys; py_compile.compile(sys.argv[1], "
+                "invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP, doraise=True)")
+    subprocess.run([sys.executable, "-B", "-c", compiler, str(module)], cwd=source,
+                   capture_output=True, text=True, timeout=20, check=True)
     stat = module.stat()
     module.write_text(safe, encoding="utf-8")
     os.utime(module, (stat.st_atime, stat.st_mtime))
