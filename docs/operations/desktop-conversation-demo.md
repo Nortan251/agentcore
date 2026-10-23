@@ -100,14 +100,26 @@ A single-case pass requires one successful zero-argument `get_foreground_app`
 call, an actual native result matching the expected case, a successful final
 response, and both human confirmations. A model-only answer, denied call,
 duplicate call, mismatched app, timeout after observation, or missing answer
-cannot pass. The launcher refuses staged/unstaged tracked changes and
-untracked source under `src/` or `tools/`, verifies the same HEAD after
-Python returns, and rechecks immediately before recording a commit-attributed
-verdict. Ignored workspaces and local model profiles are permitted. If this
-verification fails after the CLI ran, any original CLI receipt stays unchanged,
-without a retrospective commit/PASS assertion; do not retry an uncertain effect.
-These verification points detect checkout divergence but do not constitute an
-immutable execution sandbox or prove there was no transient edit-and-revert.
+cannot pass. The launcher retains clean-checkout and stable-HEAD checks before
+and after execution and before verdict publication. These checks alone are not
+executed-source evidence: Git index flags, stat caching or a transient edit and
+revert can hide changed bytes. Python instead executes a fresh snapshot of the
+fixed commit's raw `src/` blobs. The isolated `-I` bootstrap uses
+`git --no-replace-objects ls-tree` and `cat-file --batch`, rejects unsupported
+paths/modes and incomplete data, and imports AgentCore from that snapshot.
+Neither mutable checkout source nor archive `export-ignore`/`export-subst`
+transformations supply the executed project code. The matching service path is
+derived from that imported source as before.
+
+The original `repo/src` working directory is retained, so relative workspace,
+session and log paths do not move into the temporary snapshot. Operator-local
+configuration, environment, interpreter and dependencies are not attested by
+the recorded project commit. This trusts the reviewed launcher and host; it
+is not an OS sandbox against same-account modification of the private snapshot
+or interpreter. The snapshot is removed after the CLI finishes. If a post-run
+checkout check fails, any original CLI receipt stays unchanged, without a
+retrospective commit/PASS assertion; do not retry an uncertain effect.
+
 Python is additionally launched with `-B` and a fresh per-run
 `-X pycache_prefix=...` outside the repository, so it neither loads ignored
 `src/**/__pycache__/*.pyc` files nor generates new bytecode in the checkout.

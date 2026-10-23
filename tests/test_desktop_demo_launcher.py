@@ -1,5 +1,6 @@
 """Offline PowerShell receipt checks, including native Python console input."""
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ from importlib.util import find_spec
 import shutil
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -21,6 +23,21 @@ OBSERVED = {"status": "observed", "app": "Notepad"}
 
 def ps_quote(value):
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def fixture_git(repo, *args, input=None):
+    result = subprocess.run(["git", "-C", str(repo), *args], input=input,
+                            capture_output=True, timeout=20, check=True)
+    return result.stdout.strip()
+
+
+def commit_fixture_source(repo):
+    fixture_git(repo, "init", "--quiet")
+    fixture_git(repo, "config", "core.autocrlf", "false")
+    fixture_git(repo, "add", "--", "src", "tools")
+    fixture_git(repo, "-c", "user.name=Offline fixture", "-c", "user.email=fixture@example.invalid",
+                "commit", "--quiet", "-m", "offline source fixture")
+    return fixture_git(repo, "rev-parse", "HEAD").decode("ascii")
 
 
 @pytest.mark.parametrize("shell_name", ["pwsh", "powershell"])
@@ -92,10 +109,12 @@ if ($global:task49Answers.Count -ne 0) {{ throw 'Missing operator question.' }}
     assert ("PASS for this single" in completed.stdout) is passed
     assert receipt["commit"] == "42fae5e72cd6ba014982bd6da0c77d3cbd88b996"
     sent = json.loads(invocation.read_text(encoding="utf-8-sig"))
-    assert sent[:2] == ["-B", "-X"]
-    assert sent[2].startswith("pycache_prefix=")
-    assert not Path(sent[2].split("=", 1)[1]).exists()
-    assert sent[3:] == ["-m", "agentcore.cli", "--config", str(config), "chat", "--enable-desktop",
+    assert sent[:3] == ["-I", "-B", "-X"]
+    assert sent[3].startswith("pycache_prefix=")
+    cache = Path(sent[3].split("=", 1)[1])
+    assert not cache.exists()
+    assert sent[4] == "-c" and sent[6:9] == [str(LAUNCHER.parents[1]), receipt["commit"], str(cache / "source")]
+    assert sent[9:] == ["--config", str(config), "chat", "--enable-desktop",
                     "--message", "Jarvis, what application am I using right now?", "--json"]
 
 
@@ -175,10 +194,12 @@ if ($global:task49Answers.Count -ne 0) {{ throw 'Missing operator question.' }}
     assert receipt["operator_confirmed_reply"] is bool(len(answers) > 1 and answers[1] == "yes")
     assert ("LIVE NOTEPAD DENIAL PASS" in completed.stdout) is passed
     sent = json.loads(invocation.read_text(encoding="utf-8-sig"))
-    assert sent[:2] == ["-B", "-X"]
-    assert sent[2].startswith("pycache_prefix=")
-    assert not Path(sent[2].split("=", 1)[1]).exists()
-    assert sent[3:] == ["-m", "agentcore.cli", "--config", str(config), "chat", "--enable-desktop",
+    assert sent[:3] == ["-I", "-B", "-X"]
+    assert sent[3].startswith("pycache_prefix=")
+    cache = Path(sent[3].split("=", 1)[1])
+    assert not cache.exists()
+    assert sent[4] == "-c" and sent[6:9] == [str(LAUNCHER.parents[1]), receipt["commit"], str(cache / "source")]
+    assert sent[9:] == ["--config", str(config), "chat", "--enable-desktop",
                     "--message", "Jarvis, open Notepad.", "--desktop-evidence", str(records[0])]
 
 
@@ -232,18 +253,13 @@ if {case == 'cli_failure'!r}:
     print('OFFLINE_CLI_FAILURE', file=sys.stderr, flush=True)
 sys.exit({1 if case == 'cli_failure' else 2 if case == 'refused' else 0})
 """, encoding="utf-8")
+    commit_fixture_source(tmp_path)
     config = tmp_path / "agent.local.toml"
     config.write_text("# offline fixture, no credential\n", encoding="utf-8")
     results = tmp_path / "receipts"
     driver = tmp_path / "driver.ps1"
     driver.write_text(f"""$ErrorActionPreference = 'Stop'
 Set-Alias python {ps_quote(sys.executable)}
-function git {{
-    $global:LASTEXITCODE = 0
-    if ($args -contains 'rev-parse') {{ return '59182ddce411a73a96b4c333aeeab06fbff9b50a' }}
-    if ($args -contains 'status' -or $args -contains 'ls-files') {{ return }}
-    throw 'Unexpected Git provenance command.'
-}}
 & {ps_quote(launcher)} -Config {ps_quote(config)} -{'NotepadApproval' if approval_mode else 'NotepadDenial'} -EvidenceDirectory {ps_quote(results)}
 Write-Host 'OFFLINE_LAUNCHER_RETURNED'
 """, encoding="utf-8-sig")
@@ -485,6 +501,128 @@ Write-Host "INVOCATIONS=$global:task49Invocations"
         assert json.loads(receipts[0].read_text(encoding="utf-8-sig")) == payload
     else:
         assert not results.exists()
+
+
+@pytest.mark.parametrize("shell_name", ["powershell", "pwsh"])
+@pytest.mark.parametrize("mode", ["foreground", "approval"])
+@pytest.mark.parametrize("case", ["clean", "assume-unchanged", "skip-worktree", "stat-cache",
+                                  "transient-edit-revert", "export-ignore", "export-subst", "replace-blob",
+                                  "missing-cli", "symlink", "corrupt-blob"])
+def test_committed_source_snapshot_ignores_worktree_and_export_overrides(tmp_path, shell_name, mode, case):
+    shell = shutil.which(shell_name)
+    if shell_name == "pwsh" and not shell:
+        pytest.skip("Optional PowerShell 7 is not installed")
+    assert shell
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    launcher = tools / LAUNCHER.name
+    shutil.copyfile(LAUNCHER, launcher)
+    package = tmp_path / "src" / "agentcore"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    payload = ({"ok": True, "reply": "COMMITTED_SOURCE", "desktop_tool_calls": [CALL],
+                "desktop_observations": [OBSERVED]} if mode == "foreground" else
+               {"conversation_ok": True, "model_reply": "COMMITTED_SOURCE", "error_category": None,
+                "desktop_tool_calls": [{**CALL, "name": "open_notepad"}],
+                "approval": {"request_count": 1, "decision": "approved", "explicit_denial": False},
+                "launch_results": [{"arguments_validated": True, "executor_category": "launch_accepted",
+                                    "launch_assessment": "launch_accepted", "native_action_invoked": True,
+                                    "native_outcome": "launch_accepted"}]})
+    original = f'''import hashlib, json, sys
+from pathlib import Path
+# $Format:%H$
+proof = Path('.agent_workspace/source-proof.json')
+proof.parent.mkdir(parents=True, exist_ok=True)
+proof.write_text(json.dumps({{'cwd': str(Path.cwd()), 'source': __file__,
+    'sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}}), encoding='utf-8')
+payload = {payload!r}
+if '--desktop-evidence' in sys.argv:
+    Path(sys.argv[sys.argv.index('--desktop-evidence') + 1]).write_text(json.dumps(payload), encoding='utf-8')
+else:
+    print(json.dumps(payload))
+'''.encode("utf-8")
+    module = package / "cli.py"
+    module.write_bytes(original)
+    (tmp_path / ".gitignore").write_text(".agent_workspace/\n", encoding="utf-8")
+    head = commit_fixture_source(tmp_path)
+    untrusted = original.replace(b"COMMITTED_SOURCE", b"UNTRUSTED_SOURCE")
+    assert len(untrusted) == len(original) and untrusted != original
+    if case in {"assume-unchanged", "skip-worktree"}:
+        fixture_git(tmp_path, "update-index", "--" + case, "src/agentcore/cli.py")
+        module.write_bytes(untrusted)
+    elif case == "stat-cache":
+        fixture_git(tmp_path, "config", "core.trustctime", "false")
+        fixture_git(tmp_path, "config", "core.checkStat", "minimal")
+        stamp = module.stat()
+        time.sleep(1.1)
+        fixture_git(tmp_path, "update-index", "--force-write-index", "--refresh")
+        module.write_bytes(untrusted)
+        os.utime(module, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+    elif case.startswith("export-"):
+        (tmp_path / ".git" / "info" / "attributes").write_text(
+            f"src/agentcore/cli.py {case}\n", encoding="utf-8")
+    elif case == "replace-blob":
+        blob = fixture_git(tmp_path, "rev-parse", "HEAD:src/agentcore/cli.py").decode("ascii")
+        replacement = fixture_git(tmp_path, "hash-object", "-w", "--stdin", input=untrusted).decode("ascii")
+        fixture_git(tmp_path, "replace", blob, replacement)
+    elif case in {"missing-cli", "symlink"}:
+        if case == "missing-cli":
+            fixture_git(tmp_path, "rm", "src/agentcore/cli.py")
+        else:
+            fixture_git(tmp_path, "config", "core.symlinks", "false")
+            (package / "unsafe").write_bytes(b"cli.py")
+            blob = fixture_git(tmp_path, "hash-object", "-w", "--stdin", input=b"cli.py").decode("ascii")
+            fixture_git(tmp_path, "update-index", "--add", "--cacheinfo", f"120000,{blob},src/agentcore/unsafe")
+        fixture_git(tmp_path, "-c", "user.name=Offline fixture", "-c", "user.email=fixture@example.invalid",
+                    "commit", "--quiet", "-m", "unsupported source fixture")
+        head = fixture_git(tmp_path, "rev-parse", "HEAD").decode("ascii")
+    elif case == "corrupt-blob":
+        blob = fixture_git(tmp_path, "rev-parse", "HEAD:src/agentcore/cli.py").decode("ascii")
+        object_path = tmp_path / ".git" / "objects" / blob[:2] / blob[2:]
+        object_path.chmod(0o600)  # Git creates read-only loose objects, including in this owned fault fixture.
+        object_path.write_bytes(b"incomplete git object")
+    if case != "corrupt-blob":
+        assert fixture_git(tmp_path, "status", "--porcelain=v1", "--untracked-files=no") == b""
+    config = tmp_path / "agent.local.toml"
+    config.write_text("workspace_dir = './.agent_workspace'\n", encoding="utf-8")
+    results = tmp_path / "receipts"
+    saved = tmp_path / "original.py"
+    saved.write_bytes(original)
+    modified = tmp_path / "untrusted.py"
+    modified.write_bytes(untrusted)
+    command = f'''$ErrorActionPreference = 'Stop'
+function Start-Sleep {{ param([int]$Seconds) }}
+function Read-Host {{ param([string]$Prompt) return 'yes' }}
+function python {{
+    if ('{case}' -eq 'transient-edit-revert') {{ [IO.File]::Copy({ps_quote(modified)}, {ps_quote(module)}, $true) }}
+    try {{ & {ps_quote(sys.executable)} @args }} finally {{
+        if ('{case}' -eq 'transient-edit-revert') {{ [IO.File]::Copy({ps_quote(saved)}, {ps_quote(module)}, $true) }}
+    }}
+}}
+& {ps_quote(launcher)} -Config {ps_quote(config)} -EvidenceDirectory {ps_quote(results)} {'-NotepadApproval' if mode == 'approval' else ''}
+'''
+    completed = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-Command", command],
+                               capture_output=True, text=True, timeout=30, check=False)
+    records = list(results.glob("*.json"))
+    if case in {"missing-cli", "symlink", "corrupt-blob"}:
+        assert not records
+        assert not (tmp_path / "src" / ".agent_workspace" / "source-proof.json").exists()
+        # PS7 suppresses redirected native stderr; its wrapper still reports refusal.
+        assert ("no new test verdict" in completed.stdout or
+                "Demo provenance unavailable" in completed.stdout + completed.stderr)
+        assert "PASS for this single" not in completed.stdout
+        return
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert len(records) == 1
+    receipt = json.loads(records[0].read_text(encoding="utf-8-sig"))
+    assert receipt["commit"] == head
+    assert receipt["approval_test_pass" if mode == "approval" else "live_conversation_pass"] is True
+    assert receipt["model_reply"] == "COMMITTED_SOURCE"
+    proof = json.loads((tmp_path / "src" / ".agent_workspace" / "source-proof.json").read_text())
+    assert Path(proof["cwd"]) == tmp_path / "src"
+    assert proof["sha256"] == hashlib.sha256(original).hexdigest()
+    assert not Path(proof["source"]).is_relative_to(tmp_path)
+    assert not Path(proof["source"]).exists()  # Execution snapshot is cleaned, persistent state is retained.
 
 
 @pytest.mark.parametrize("isolated_parent", [False, True])

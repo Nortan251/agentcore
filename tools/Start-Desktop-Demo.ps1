@@ -16,28 +16,28 @@ $demoConfig = (Resolve-Path -LiteralPath $Config).Path
 if (-not $EvidenceDirectory) {
     $EvidenceDirectory = Join-Path $demoRepo '.agent_workspace\desktop-demo'
 }
-$demoHead = (git -C $demoRepo rev-parse HEAD).Trim()
+$demoHead = (git --no-replace-objects -C $demoRepo rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0 -or $demoHead -notmatch '^[0-9a-f]{40}$') {
     throw 'Demo provenance unavailable: no full commit SHA.'
 }
 
 # Exact-head receipts require a clean, unshadowed source checkout.
 function Assert-DemoSourceProvenance {
-    $actual = @(git -C $demoRepo rev-parse --verify HEAD)
+    $actual = @(git --no-replace-objects -C $demoRepo rev-parse --verify HEAD)
     if ($LASTEXITCODE -ne 0 -or $actual.Count -ne 1 -or $actual[0] -cne $demoHead) {
         throw 'Demo provenance unavailable: HEAD changed or cannot be verified. Do not retry uncertain effects.'
     }
-    $tracked = @(git -C $demoRepo status --porcelain=v1 --untracked-files=no)
+    $tracked = @(git --no-replace-objects -C $demoRepo status --porcelain=v1 --untracked-files=no)
     if ($LASTEXITCODE -ne 0 -or $tracked.Count -ne 0) {
         throw 'Demo provenance unavailable: staged or unstaged tracked changes. Do not retry uncertain effects.'
     }
-    $untrackedSource = @(git -C $demoRepo ls-files --others --exclude-standard -- src tools)
+    $untrackedSource = @(git --no-replace-objects -C $demoRepo ls-files --others --exclude-standard -- src tools)
     if ($LASTEXITCODE -ne 0 -or $untrackedSource.Count -ne 0) {
         throw 'Demo provenance unavailable: untracked source or launcher files. Do not retry uncertain effects.'
     }
     # Cache-prefix isolation does not block source-less .pyc or native .pyd imports.
     # Git quotes paths containing non-ASCII characters; match the closing quote.
-    $loadableArtifacts = @(git -C $demoRepo ls-files --others -- src tools | Where-Object {
+    $loadableArtifacts = @(git --no-replace-objects -C $demoRepo ls-files --others -- src tools | Where-Object {
         ($_ -match '\.pyc"?$' -and $_ -notmatch '(^|/)__pycache__/') -or $_ -match '\.pyd"?$'
     })
     if ($LASTEXITCODE -ne 0 -or $loadableArtifacts.Count -ne 0) {
@@ -50,6 +50,53 @@ Assert-DemoSourceProvenance
 # in the checkout. -B additionally prohibits new bytecode cache writes.
 $demoPycacheRoot = Join-Path ([IO.Path]::GetTempPath()) ('agentcore-demo-pycache-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $demoPycacheRoot -ErrorAction Stop | Out-Null
+$demoSource = Join-Path $demoPycacheRoot 'source'
+# Raw Git blobs pin Python source; -I excludes the live checkout without moving persistent paths.
+$demoPython = @'
+import io, runpy, subprocess, sys
+from pathlib import Path, PurePosixPath
+repo, revision, destination = sys.argv[1:4]
+arguments = sys.argv[4:]
+root = Path(destination).resolve()
+try:
+    def git(*args, data=None):
+        return subprocess.run(['git', '--no-replace-objects', '-C', repo, *args], input=data,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20, check=True).stdout
+    entries = []
+    names = set()
+    for entry in git('ls-tree', '-rz', '--full-tree', revision, '--', 'src').split(b'\0'):
+        if not entry:
+            continue
+        header, name = entry.split(b'\t', 1)
+        mode, kind, oid = header.split(b' ')
+        relative = PurePosixPath(name.decode('utf-8'))
+        target = root.joinpath(*relative.parts).resolve()
+        if (mode not in (b'100644', b'100755') or kind != b'blob' or
+                relative.parts[:1] != ('src',) or '..' in relative.parts or
+                not target.is_relative_to(root) or target in names):
+            raise ValueError('unsupported source tree')
+        names.add(target)
+        entries.append((target, oid))
+    if not {root / 'src/agentcore/__init__.py', root / 'src/agentcore/cli.py'} <= names:
+        raise ValueError('incomplete source tree')
+    stream = io.BytesIO(git('cat-file', '--batch', data=b''.join(oid + b'\n' for _, oid in entries)))
+    for target, expected in entries:
+        oid, kind, size = stream.readline().rstrip(b'\n').split(b' ')
+        size = int(size)
+        data = stream.read(size)
+        if oid != expected or kind != b'blob' or len(data) != size or stream.read(1) != b'\n':
+            raise ValueError('incomplete source blob')
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    if stream.read(1):
+        raise ValueError('unexpected source data')
+except (OSError, ValueError, subprocess.SubprocessError):
+    print('Demo provenance unavailable: committed source export failed; no CLI was started.', file=sys.stderr)
+    raise SystemExit(2)
+sys.path.insert(0, str(root / 'src'))
+sys.argv = ['agentcore.cli', *arguments]
+runpy.run_module('agentcore.cli', run_name='__main__', alter_sys=True)
+'@
 try {
 if ($NotepadDenial -or $NotepadApproval) {
     $demoMode = if ($NotepadApproval) { 'NotepadApproval' } else { 'NotepadDenial' }
@@ -66,7 +113,7 @@ if ($NotepadDenial -or $NotepadApproval) {
     Push-Location (Join-Path $demoRepo 'src')
     try {
         # Keep console stdin/stderr: input() prompts on stderr; PS 5.1 redirection turns it into an error.
-        & python -B -X "pycache_prefix=$demoPycacheRoot" -m agentcore.cli --config $demoConfig chat --enable-desktop --message 'Jarvis, open Notepad.' --desktop-evidence $demoRecord
+        & python -I -B -X "pycache_prefix=$demoPycacheRoot" -c $demoPython $demoRepo $demoHead $demoSource --config $demoConfig chat --enable-desktop --message 'Jarvis, open Notepad.' --desktop-evidence $demoRecord
         $demoExit = $LASTEXITCODE
     } finally {
         Pop-Location
@@ -159,10 +206,14 @@ Write-Host 'Keep that window foreground until the tool result and model reply ap
 Start-Sleep -Seconds 8
 Push-Location (Join-Path $demoRepo 'src')
 try {
-    $demoRaw = & python -B -X "pycache_prefix=$demoPycacheRoot" -m agentcore.cli --config $demoConfig chat --enable-desktop --message 'Jarvis, what application am I using right now?' --json 2>$null
+    $demoRaw = & python -I -B -X "pycache_prefix=$demoPycacheRoot" -c $demoPython $demoRepo $demoHead $demoSource --config $demoConfig chat --enable-desktop --message 'Jarvis, what application am I using right now?' --json 2>$null
     $demoExit = $LASTEXITCODE
 } finally {
     Pop-Location
+}
+if ($demoExit -eq 2) {
+    Write-Host 'Turn refused; no new test verdict. Retain any existing receipt. Do not retry automatically.'
+    return
 }
 Assert-DemoSourceProvenance
 try { $demoResult = ($demoRaw -join "`n") | ConvertFrom-Json } catch {
