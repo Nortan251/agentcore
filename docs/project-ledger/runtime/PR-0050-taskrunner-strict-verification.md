@@ -5,8 +5,8 @@ TASK: Prerequisite strict verification/dependency gating for Task 50 supervised 
 STATUS: DRAFT / OPEN / UNMERGED — TESTS AND REVIEW PENDING
 
 BASE SHA: `042e6bc5bcacd2872222d5029a5df607fd733255`
-HEAD SHA: `9d68812dfe76616bdb18f2ae9435b9b4a55e94cd`
-PARENT SHA: `e71a1926b33801219d6ca5763860be4938a896ef`
+HEAD SHA: `89591c1ed82af9c818e9cc6df11d16388f525ba2`
+PARENT SHA: `216a640fe3da84289f503dd03d5ae421bb3b02c5`
 BRANCH: `codex/task-50a-strict-verification`
 
 [PR #50](https://github.com/Nortan251/agentcore/pull/50) · [head](https://github.com/Nortan251/agentcore/commit/9d68812dfe76616bdb18f2ae9435b9b4a55e94cd) · [architecture note](https://github.com/Nortan251/agentcore/blob/9d68812dfe76616bdb18f2ae9435b9b4a55e94cd/docs/architecture/task-50a-strict-verification.md)
@@ -59,3 +59,9 @@ Validate or repair the narrow gate with failing-before/passing-after regressions
 
 ## Final verdict
 **DRAFT / NOT CLEARED FOR MERGE.**
+
+## 2026-10-23 amendment — fail-closed reentry and cancellation hardening
+
+The original candidate `9d68812dfe76616bdb18f2ae9435b9b4a55e94cd` was refined through `216a640fe3da84289f503dd03d5ae421bb3b02c5` to final currently proposed head `89591c1ed82af9c818e9cc6df11d16388f525ba2`. Source and focused tests were amended to refuse independently ready subtasks on reentry while any strict verification remains blocked, clear active subtask attribution on verifier exceptions, and preserve cancellation precedence over that fail-closed restart check. The branch retains exactly three cumulative changed files. No Task 50B implementation or new tool authority exists.
+
+All exact-head CI jobs and independent review remain pending at this amendment, and no local full-suite/compileall pass is claimed. Final merge status remains **DRAFT / OPEN / UNMERGED**. No work on `main`.
