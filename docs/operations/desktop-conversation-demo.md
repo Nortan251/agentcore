@@ -220,9 +220,14 @@ finishes successfully does the launcher ask two independent questions:
 The launcher records both confirmations and the commit separately from native
 evidence. Receipt enrichment writes a new unique temporary file in the same
 directory, then atomically replaces the original CLI receipt via
-`System.IO.File.Replace`. An interrupted/failed serialization leaves the
+`System.IO.File.Replace`. The optional backup path uses `[NullString]::Value`:
+ordinary PowerShell `$null` binds to an empty string and causes .NET to reject
+the path under both PowerShell 5.1 and 7. No non-atomic overwrite is used as a
+fallback. An interrupted/failed serialization leaves the
 original CLI/native evidence untouched; a partial temporary file is cleaned
-up without claiming success. A pass requires both answers to be `yes` and all structured evidence
+up without claiming success. A replacement failure also leaves the original
+receipt available and must not trigger another CLI invocation. A pass requires
+both answers to be `yes` and all structured evidence
 to match. Nonempty/invalid arguments, missing calls, missing approval, denial,
 duplicate calls, failed/unknown native outcomes, lost executor results, missing
 answers and model failures cannot pass. Unconfirmed human fields mean no human

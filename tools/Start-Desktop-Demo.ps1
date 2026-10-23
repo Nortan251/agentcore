@@ -136,7 +136,8 @@ if ($NotepadDenial -or $NotepadApproval) {
     $demoTemp = Join-Path (Split-Path -Parent $demoRecord) ('.' + [IO.Path]::GetFileName($demoRecord) + '.' + [Guid]::NewGuid().ToString('N') + '.tmp')
     try {
         $demoEvidence | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $demoTemp -Encoding utf8 -ErrorAction Stop
-        [IO.File]::Replace($demoTemp, $demoRecord, $null)
+        # Ordinary PowerShell $null becomes an invalid empty backup path.
+        [IO.File]::Replace($demoTemp, $demoRecord, [NullString]::Value)
     } finally {
         if (Test-Path -LiteralPath $demoTemp) {
             Remove-Item -LiteralPath $demoTemp -Force -ErrorAction SilentlyContinue

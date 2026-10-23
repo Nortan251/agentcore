@@ -525,7 +525,9 @@ def test_isolated_bytecode_prefix_prevents_ignored_cache_execution(tmp_path):
 
 
 @pytest.mark.parametrize("shell_name", ["powershell", "pwsh"])
-def test_receipt_enrichment_partial_write_failure_keeps_cli_evidence(tmp_path, shell_name):
+@pytest.mark.parametrize("mode", ["NotepadDenial", "NotepadApproval"])
+@pytest.mark.parametrize("phase", ["complete", "partial_write", "replace_failure"])
+def test_receipt_enrichment_is_atomic_for_native_action_evidence(tmp_path, shell_name, mode, phase):
     shell = shutil.which(shell_name)
     if shell_name == "pwsh" and not shell:
         pytest.skip("Optional PowerShell 7 is not installed")
@@ -542,6 +544,13 @@ def test_receipt_enrichment_partial_write_failure_keeps_cli_evidence(tmp_path, s
                             "launch_assessment": "launch_accepted", "native_action_invoked": True,
                             "native_outcome": "launch_accepted"}],
     }
+    approved = mode == "NotepadApproval"
+    if not approved:
+        payload["model_reply"] = "Request denied; Notepad was not opened."
+        payload["desktop_tool_calls"][0].update(status="denied", executed=False)
+        payload["approval"].update(decision="denied", explicit_denial=True)
+        payload["launch_results"][0].update(executor_category="permission_denied",
+            launch_assessment="not_launched", native_action_invoked=False, native_outcome=None)
     fixture = tmp_path / "cli.json"
     fixture.write_text(json.dumps(payload), encoding="utf-8")
     command = f"""$ErrorActionPreference = 'Stop'
@@ -552,14 +561,21 @@ function git {{
     throw 'Unexpected git command.'
 }}
 $global:task49Confirmations = 0
+$global:task49Invocations = 0
+$global:task49ReceiptLock = $null
 function Read-Host {{
     param([string]$Prompt)
     $global:task49Confirmations++
     return 'yes'
 }}
 function python {{
+    $global:task49Invocations++
     $record = $args[[array]::IndexOf($args, '--desktop-evidence') + 1]
-    Microsoft.PowerShell.Management\\Set-Content -LiteralPath $record -Value (Get-Content -LiteralPath {ps_quote(fixture)} -Raw) -Encoding utf8
+    [IO.File]::Copy({ps_quote(fixture)}, $record)
+    if ('{phase}' -eq 'replace_failure') {{
+        $global:task49ReceiptLock = [IO.File]::Open($record, [IO.FileMode]::Open,
+            [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    }}
     $global:LASTEXITCODE = 0
 }}
 function Set-Content {{
@@ -568,28 +584,50 @@ function Set-Content {{
           [string]$LiteralPath, [string]$Encoding)
     process {{
         if ($LiteralPath -like '*.tmp') {{
-            [IO.File]::WriteAllText($LiteralPath, '{{"partial":')
-            throw 'INJECTED_PARTIAL_WRITE_FAILURE'
+            $original = @(Get-ChildItem -LiteralPath {ps_quote(receipt_dir)} -Filter 'notepad-*.json')
+            if ($original.Count -ne 1 -or [IO.File]::ReadAllText($original[0].FullName) -cne
+                    [IO.File]::ReadAllText({ps_quote(fixture)})) {{
+                throw 'Original CLI evidence changed before replacement.'
+            }}
+            if ('{phase}' -eq 'partial_write') {{
+                [IO.File]::WriteAllText($LiteralPath, '{{"partial":')
+                throw 'INJECTED_PARTIAL_WRITE_FAILURE'
+            }}
         }}
         Microsoft.PowerShell.Management\\Set-Content -LiteralPath $LiteralPath -Value $InputObject -Encoding $Encoding
     }}
 }}
 try {{
-    & {ps_quote(LAUNCHER)} -Config {ps_quote(config)} -NotepadApproval -EvidenceDirectory {ps_quote(receipt_dir)}
-    throw 'Launcher should not succeed after interrupted enrichment.'
+    & {ps_quote(LAUNCHER)} -Config {ps_quote(config)} -{mode} -EvidenceDirectory {ps_quote(receipt_dir)}
 }} catch {{
-    if ($_.Exception.Message -notmatch 'INJECTED_PARTIAL_WRITE_FAILURE') {{ throw }}
+    if ('{phase}' -eq 'complete') {{ throw }}
+    if ('{phase}' -eq 'partial_write' -and $_.Exception.Message -notmatch 'INJECTED_PARTIAL_WRITE_FAILURE') {{ throw }}
+    if ('{phase}' -eq 'replace_failure' -and $_.Exception.GetBaseException() -isnot [IO.IOException]) {{ throw }}
     Write-Host 'EXPECTED_ENRICHMENT_FAILURE'
+}} finally {{
+    if ($null -ne $global:task49ReceiptLock) {{ $global:task49ReceiptLock.Dispose() }}
 }}
 Write-Host "CONFIRMATIONS=$global:task49Confirmations"
+Write-Host "INVOCATIONS=$global:task49Invocations"
 """
     completed = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-Command", command],
                                capture_output=True, text=True, timeout=20, check=False)
     assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert "EXPECTED_ENRICHMENT_FAILURE" in completed.stdout
+    assert ("EXPECTED_ENRICHMENT_FAILURE" in completed.stdout) is (phase != "complete")
     assert "CONFIRMATIONS=2" in completed.stdout
-    records = list(receipt_dir.glob("notepad-approval-*.json"))
+    assert "INVOCATIONS=1" in completed.stdout
+    records = list(receipt_dir.glob("notepad-approval-*.json" if approved else "notepad-denial-*.json"))
     assert len(records) == 1
-    assert json.loads(records[0].read_text(encoding="utf-8-sig")) == payload
+    if phase == "complete":
+        receipt = json.loads(records[0].read_text(encoding="utf-8-sig"))
+        for field in payload:
+            assert receipt[field] == payload[field]
+        assert receipt["commit"] == "6bdf479f4ddaa609f47c47a5642b23566c480938"
+        assert receipt["approval_test_pass" if approved else "denial_test_pass"] is True
+        assert receipt["operator_confirmed_new_window" if approved else "operator_confirmed_no_new_window"] is True
+        assert receipt["operator_confirmed_reply"] is True
+    else:
+        assert records[0].read_bytes() == fixture.read_bytes()
     assert not list(receipt_dir.glob("*.tmp"))
-    assert "LIVE NOTEPAD APPROVAL PASS" not in completed.stdout
+    verdict = "LIVE NOTEPAD APPROVAL PASS" if approved else "LIVE NOTEPAD DENIAL PASS"
+    assert (verdict in completed.stdout) is (phase == "complete")
