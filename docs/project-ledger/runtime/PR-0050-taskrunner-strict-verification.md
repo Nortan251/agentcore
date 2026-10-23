@@ -65,3 +65,15 @@ Validate or repair the narrow gate with failing-before/passing-after regressions
 The original candidate `9d68812dfe76616bdb18f2ae9435b9b4a55e94cd` was refined through `216a640fe3da84289f503dd03d5ae421bb3b02c5` to final currently proposed head `89591c1ed82af9c818e9cc6df11d16388f525ba2`. Source and focused tests were amended to refuse independently ready subtasks on reentry while any strict verification remains blocked, clear active subtask attribution on verifier exceptions, and preserve cancellation precedence over that fail-closed restart check. The branch retains exactly three cumulative changed files. No Task 50B implementation or new tool authority exists.
 
 All exact-head CI jobs and independent review remain pending at this amendment, and no local full-suite/compileall pass is claimed. Final merge status remains **DRAFT / OPEN / UNMERGED**. No work on `main`.
+
+## 2026-10-23 amendment — all six exact-head CI jobs successful
+
+Authenticated GitHub read confirms PR #50 remains **DRAFT / OPEN / UNMERGED** at `89591c1ed82af9c818e9cc6df11d16388f525ba2`; main/base remains `042e6bc5bcacd2872222d5029a5df607fd733255`. Required CI workflow results are now complete and successful:
+- Linux Python 3.13: [run 40011130495 / job 120611487055](https://github.com/Nortan251/agentcore/actions/runs/40011130495/job/120611487055) — SUCCESS.
+- Windows Python 3.11: [run 40011130430 / job 120611487144](https://github.com/Nortan251/agentcore/actions/runs/40011130430/job/120611487144) — SUCCESS.
+- Windows Python 3.12: [run 40011130430 / job 120611487074](https://github.com/Nortan251/agentcore/actions/runs/40011130430/job/120611487074) — SUCCESS.
+- Windows Python 3.13: [run 40011130430 / job 120611486717](https://github.com/Nortan251/agentcore/actions/runs/40011130430/job/120611486717) — SUCCESS.
+- Chromium Ubuntu: [run 40011130636 / job 120611489067](https://github.com/Nortan251/agentcore/actions/runs/40011130636/job/120611489067) — SUCCESS.
+- Chromium Windows: [run 40011130636 / job 120611488446](https://github.com/Nortan251/agentcore/actions/runs/40011130636/job/120611488446) — SUCCESS.
+
+No independent exact-head code review, local full-suite rerun or separate merge authorization is claimed. Current next action: arrange independent source/security review of the exact head and address findings before moving PR out of Draft. Task 50B remains unimplemented.
