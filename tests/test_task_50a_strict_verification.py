@@ -10,7 +10,8 @@ from __future__ import annotations
 import pytest
 
 from agentcore.core.agent import Agent
-from agentcore.core.runner import TaskRunner
+from agentcore.core.runner import RunControl, TaskRunner
+from agentcore.realtime.cancellation import CancellationReason, CancellationSource
 from agentcore.tasks.models import (
     Subtask, Task, TaskStatus, VerificationResult, VerificationStatus,
 )
@@ -156,5 +157,25 @@ def test_strict_mode_default_null_verifier_blocks(
     assert report.status is TaskStatus.BLOCKED
     assert first.status is TaskStatus.BLOCKED
     assert first.verification.status is VerificationStatus.SKIPPED
+    assert second.status is TaskStatus.PENDING
+    assert len(agent.state.tool_calls) == 1
+
+def test_cancelled_blocked_strict_run_reports_cancellation(
+        autonomous_config):
+    agent = Agent(autonomous_config)
+    agent.runner = TaskRunner(agent.executor, strict_verification=True)
+    task, first, second = make_chain()
+    agent.run_task(task)
+    assert task.status is TaskStatus.BLOCKED
+
+    source = CancellationSource()
+    source.cancel(CancellationReason.OPERATOR_CANCEL)
+    report = agent.runner.run(
+        task, agent.state, control=RunControl(cancellation=source.token))
+
+    assert report.status is TaskStatus.CANCELLED
+    assert report.cancellation_reason == CancellationReason.OPERATOR_CANCEL.value
+    assert task.status is TaskStatus.CANCELLED
+    assert first.status is TaskStatus.BLOCKED
     assert second.status is TaskStatus.PENDING
     assert len(agent.state.tool_calls) == 1
