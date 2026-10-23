@@ -70,7 +70,7 @@ def test_strict_verification_blocks_dependent_and_keeps_execution_truth(
     assert second.status is TaskStatus.PENDING
     assert verifier.calls == 1
     assert len(agent.state.tool_calls) == 1
-    assert agent.state.tool_calls[0].result.output == "one"
+    assert agent.state.tool_calls[0]["result"]["output"] == "one"
     # Re-entering the blocked task must not silently reexecute the first
     # action or advance the dependent step.
     repeated = agent.runner.run(task, agent.state)
@@ -94,7 +94,7 @@ def test_strict_pass_allows_dependency_only_after_verified(
     assert first.status is TaskStatus.COMPLETED
     assert second.status is TaskStatus.COMPLETED
     assert verifier.calls == 2
-    assert [x.result.output for x in agent.state.tool_calls] == ["one", "two"]
+    assert [x["result"]["output"] for x in agent.state.tool_calls] == ["one", "two"]
 
 
 @pytest.mark.parametrize("status", [
