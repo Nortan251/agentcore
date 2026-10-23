@@ -5,8 +5,8 @@ TASK: Prerequisite strict verification/dependency gating for Task 50 supervised 
 STATUS: DRAFT / OPEN / UNMERGED — TESTS AND REVIEW PENDING
 
 BASE SHA: `042e6bc5bcacd2872222d5029a5df607fd733255`
-HEAD SHA: `89591c1ed82af9c818e9cc6df11d16388f525ba2`
-PARENT SHA: `216a640fe3da84289f503dd03d5ae421bb3b02c5`
+HEAD SHA: `29f7ac82bba54d86f84023496dcd5ce505647803`
+PARENT SHA: `89591c1ed82af9c818e9cc6df11d16388f525ba2`
 BRANCH: `codex/task-50a-strict-verification`
 
 [PR #50](https://github.com/Nortan251/agentcore/pull/50) · [head](https://github.com/Nortan251/agentcore/commit/9d68812dfe76616bdb18f2ae9435b9b4a55e94cd) · [architecture note](https://github.com/Nortan251/agentcore/blob/9d68812dfe76616bdb18f2ae9435b9b4a55e94cd/docs/architecture/task-50a-strict-verification.md)
@@ -77,3 +77,13 @@ Authenticated GitHub read confirms PR #50 remains **DRAFT / OPEN / UNMERGED** at
 - Chromium Windows: [run 40011130636 / job 120611488446](https://github.com/Nortan251/agentcore/actions/runs/40011130636/job/120611488446) — SUCCESS.
 
 No independent exact-head code review, local full-suite rerun or separate merge authorization is claimed. Current next action: arrange independent source/security review of the exact head and address findings before moving PR out of Draft. Task 50B remains unimplemented.
+
+## 2026-10-23 amendment — independent P1/P2 review and scoped repair
+
+Independent review on `89591c1ed82af9c818e9cc6df11d16388f525ba2` reported **NO-GO**, P1:1 and P2:1, with eight failing characterization probes and three positive controls. The P1 was strict admission of existing `COMPLETED` steps whose verification was not PASSED, allowing pending dependent or independent work in live and serialized tasks. P2 was a misleading `BLOCKED` run report on re-entry of an already `CANCELLED` parent. Previously green exact-head CI did not detect these cases.
+
+Scoped candidate repair commit: [`29f7ac82bba54d86f84023496dcd5ce505647803`](https://github.com/Nortan251/agentcore/commit/29f7ac82bba54d86f84023496dcd5ce505647803), parent `89591c1ed82af9c818e9cc6df11d16388f525ba2`. Changed files remain the original three: runner, its dedicated regression tests, and strict-verification architecture note. Strict preflight now inspects existing completed verification status before dispatch; terminal tasks are explicitly rejected without changing their terminal state. No broad authority, recovery, executor or workflow host change.
+
+GitHub PR comment documenting both findings and candidate repair: https://github.com/Nortan251/agentcore/pull/50#issuecomment-6375648333.
+
+**CI on the new head and independent re-review pending.** Earlier CI/test results remain historical for the parent, not evidence of success on this new repair. Keep PR #50 DRAFT and unmerged; no Task 50B implementation authorized.
