@@ -192,7 +192,11 @@ class TaskRunner:
         logger: StructuredLogger | None = None,
         max_steps: int = 100,
         sleep: Callable[[float], None] | None = None,
+        strict_verification: bool = False,
     ) -> None:
+        if type(strict_verification) is not bool:
+            raise ValueError("strict_verification must be a boolean")
+        self.strict_verification = strict_verification
         self.executor = executor
         self.verifier = verifier or NullVerifier()
         self.recovery = recovery or NoRetryStrategy()
@@ -240,6 +244,10 @@ class TaskRunner:
 
                 self._run_subtask(task, subtask, state, report, log, control=control)
                 if task.has_failure():
+                    break
+                # An opt-in strict run cannot execute independent or dependent
+                # work after a missing, failed or inconclusive verification.
+                if self.strict_verification and report.blocked:
                     break
                 if report.replan_requested or report.escalated:
                     log.info(Events.RECOVERY_STOPPED,
@@ -438,8 +446,27 @@ class TaskRunner:
         if invocation.ok:
             subtask.result = invocation.result.output
             subtask.transition_to(TaskStatus.COMPLETED)
-            self._verify(subtask, state, slog, control=control)
-            if subtask.verification.status in _ADVERSE_VERDICTS:
+            try:
+                self._verify(subtask, state, slog, control=control)
+            except BaseException:
+                # A verifier/cancellation failure must not leave a completed
+                # dependency in strict mode. Preserve the tool invocation
+                # and result as physical truth; preserve the original error.
+                if self.strict_verification:
+                    subtask.transition_to(TaskStatus.PENDING)
+                    subtask.transition_to(TaskStatus.BLOCKED)
+                raise
+            if self.strict_verification and (
+                    subtask.verification.status is not VerificationStatus.PASSED):
+                # The verifier needs a COMPLETED subtask to build its evidence
+                # context. Once judged, remove dependency eligibility if proof
+                # was not positive. These are legal existing state transitions;
+                # no mutation retry or recovery strategy is invoked.
+                subtask.transition_to(TaskStatus.PENDING)
+                subtask.transition_to(TaskStatus.BLOCKED)
+                report.blocked = True
+                slog.warning(Events.TASK_BLOCKED, reason="verification_not_passed")
+            elif subtask.verification.status in _ADVERSE_VERDICTS:
                 self._recover(task, subtask, state, report, slog, control=control)
             else:
                 slog.info(Events.SUBTASK_FINISHED, outcome="completed")
