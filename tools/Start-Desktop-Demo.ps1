@@ -53,43 +53,76 @@ New-Item -ItemType Directory -Path $demoPycacheRoot -ErrorAction Stop | Out-Null
 $demoSource = Join-Path $demoPycacheRoot 'source'
 # Raw Git blobs pin Python source; -I excludes the live checkout without moving persistent paths.
 $demoPython = @'
-import io, runpy, subprocess, sys
+import hashlib, io, runpy, subprocess, sys, time
 from pathlib import Path, PurePosixPath
 repo, revision, destination = sys.argv[1:4]
 arguments = sys.argv[4:]
 root = Path(destination).resolve()
 try:
+    deadline = time.monotonic() + 20
     def git(*args, data=None):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('source export deadline')
         return subprocess.run(['git', '--no-replace-objects', '-C', repo, *args], input=data,
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20, check=True).stdout
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=remaining, check=True).stdout
+    def objects(requests):
+        stream = io.BytesIO(git('cat-file', '--batch', data=b''.join(oid + b'\n' for oid, _ in requests)))
+        result = []
+        for expected, expected_kind in requests:
+            oid, kind, size = stream.readline().rstrip(b'\n').split(b' ')
+            size = int(size)
+            if oid != expected or kind != expected_kind or size < 0:
+                raise ValueError('unexpected source object')
+            data = stream.read(size)
+            if len(data) != size or stream.read(1) != b'\n':
+                raise ValueError('incomplete source object')
+            actual = hashlib.sha1(kind + b' ' + str(size).encode('ascii') + b'\0' + data).hexdigest().encode('ascii')
+            if actual != expected:
+                raise ValueError('source object hash mismatch')
+            result.append(data)
+        if stream.read(1):
+            raise ValueError('unexpected source data')
+        return result
+    commit = objects([(revision.encode('ascii'), b'commit')])[0]
+    tree_line = commit.split(b'\n', 1)[0]
+    if not tree_line.startswith(b'tree ') or len(tree_line[5:]) != 40:
+        raise ValueError('invalid source commit')
+    pending = [(PurePosixPath(), tree_line[5:])]
     entries = []
     names = set()
-    for entry in git('ls-tree', '-rz', '--full-tree', revision, '--', 'src').split(b'\0'):
-        if not entry:
-            continue
-        header, name = entry.split(b'\t', 1)
-        mode, kind, oid = header.split(b' ')
-        relative = PurePosixPath(name.decode('utf-8'))
-        target = root.joinpath(*relative.parts).resolve()
-        if (mode not in (b'100644', b'100755') or kind != b'blob' or
-                relative.parts[:1] != ('src',) or '..' in relative.parts or
-                not target.is_relative_to(root) or target in names):
-            raise ValueError('unsupported source tree')
-        names.add(target)
-        entries.append((target, oid))
-    if not {root / 'src/agentcore/__init__.py', root / 'src/agentcore/cli.py'} <= names:
+    while pending:
+        level, pending = pending, []
+        for (directory, _), data in zip(level, objects([(oid, b'tree') for _, oid in level])):
+            offset = 0
+            while offset < len(data):
+                end = data.index(b'\0', offset)
+                mode, name = data[offset:end].split(b' ', 1)
+                oid = data[end + 1:end + 21]
+                offset = end + 21
+                if len(oid) != 20 or not name or b'/' in name or b'\\' in name or name in (b'.', b'..'):
+                    raise ValueError('invalid source tree entry')
+                if not directory.parts and name != b'src':
+                    continue
+                relative = directory / name.decode('utf-8')
+                target = root.joinpath(*relative.parts).resolve()
+                if relative.parts[:1] != ('src',) or not target.is_relative_to(root) or target in names:
+                    raise ValueError('unsupported source path')
+                names.add(target)
+                oid = oid.hex().encode('ascii')
+                if mode == b'40000':
+                    pending.append((relative, oid))
+                elif mode in (b'100644', b'100755'):
+                    entries.append((target, oid))
+                else:
+                    raise ValueError('unsupported source mode')
+    if not {root / 'src/agentcore/__init__.py', root / 'src/agentcore/cli.py'} <= {path for path, _ in entries}:
         raise ValueError('incomplete source tree')
-    stream = io.BytesIO(git('cat-file', '--batch', data=b''.join(oid + b'\n' for _, oid in entries)))
-    for target, expected in entries:
-        oid, kind, size = stream.readline().rstrip(b'\n').split(b' ')
-        size = int(size)
-        data = stream.read(size)
-        if oid != expected or kind != b'blob' or len(data) != size or stream.read(1) != b'\n':
-            raise ValueError('incomplete source blob')
+    for (target, _), data in zip(entries, objects([(oid, b'blob') for _, oid in entries])):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
-    if stream.read(1):
-        raise ValueError('unexpected source data')
+    if time.monotonic() >= deadline:
+        raise TimeoutError('source export deadline')
 except (OSError, ValueError, subprocess.SubprocessError):
     print('Demo provenance unavailable: committed source export failed; no CLI was started.', file=sys.stderr)
     raise SystemExit(2)

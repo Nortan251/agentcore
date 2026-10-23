@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import time
+import zlib
 
 import pytest
 
@@ -507,7 +508,8 @@ Write-Host "INVOCATIONS=$global:task49Invocations"
 @pytest.mark.parametrize("mode", ["foreground", "approval"])
 @pytest.mark.parametrize("case", ["clean", "assume-unchanged", "skip-worktree", "stat-cache",
                                   "transient-edit-revert", "export-ignore", "export-subst", "replace-blob",
-                                  "missing-cli", "symlink", "corrupt-blob"])
+                                  "missing-cli", "symlink", "corrupt-blob", "wrong-blob", "wrong-tree",
+                                  "wrong-commit"])
 def test_committed_source_snapshot_ignores_worktree_and_export_overrides(tmp_path, shell_name, mode, case):
     shell = shutil.which(shell_name)
     if shell_name == "pwsh" and not shell:
@@ -581,6 +583,30 @@ else:
         object_path = tmp_path / ".git" / "objects" / blob[:2] / blob[2:]
         object_path.chmod(0o600)  # Git creates read-only loose objects, including in this owned fault fixture.
         object_path.write_bytes(b"incomplete git object")
+    elif case.startswith("wrong-"):
+        kind, ref = {"wrong-blob": ("blob", "HEAD:src/agentcore/cli.py"),
+                     "wrong-tree": ("tree", "HEAD:src/agentcore"),
+                     "wrong-commit": ("commit", "HEAD")}[case]
+        oid = fixture_git(tmp_path, "rev-parse", ref).decode("ascii")
+        data = subprocess.run(["git", "-C", str(tmp_path), "cat-file", kind, oid],
+                              capture_output=True, timeout=20, check=True).stdout
+        if kind == "blob":
+            data = untrusted
+        elif kind == "tree":
+            blob = fixture_git(tmp_path, "rev-parse", "HEAD:src/agentcore/cli.py").decode("ascii")
+            replacement = fixture_git(tmp_path, "hash-object", "-w", "--stdin", input=untrusted).decode("ascii")
+            assert bytes.fromhex(blob) in data
+            data = data.replace(bytes.fromhex(blob), bytes.fromhex(replacement), 1)
+            fixture_git(tmp_path, "update-index", "--cacheinfo", f"100644,{replacement},src/agentcore/cli.py")
+            module.write_bytes(untrusted)
+        else:
+            assert b"author Offline fixture" in data
+            data = data.replace(b"author Offline fixture", b"author Altered fixture", 1)
+        raw = kind.encode("ascii") + b" " + str(len(data)).encode("ascii") + b"\0" + data
+        assert hashlib.sha1(raw).hexdigest() != oid
+        object_path = tmp_path / ".git" / "objects" / oid[:2] / oid[2:]
+        object_path.chmod(0o600)
+        object_path.write_bytes(zlib.compress(raw))
     if case != "corrupt-blob":
         assert fixture_git(tmp_path, "status", "--porcelain=v1", "--untracked-files=no") == b""
     config = tmp_path / "agent.local.toml"
@@ -604,7 +630,7 @@ function python {{
     completed = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-Command", command],
                                capture_output=True, text=True, timeout=30, check=False)
     records = list(results.glob("*.json"))
-    if case in {"missing-cli", "symlink", "corrupt-blob"}:
+    if case in {"missing-cli", "symlink", "corrupt-blob"} or case.startswith("wrong-"):
         assert not records
         assert not (tmp_path / "src" / ".agent_workspace" / "source-proof.json").exists()
         # PS7 suppresses redirected native stderr; its wrapper still reports refusal.

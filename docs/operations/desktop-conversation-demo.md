@@ -105,8 +105,12 @@ and after execution and before verdict publication. These checks alone are not
 executed-source evidence: Git index flags, stat caching or a transient edit and
 revert can hide changed bytes. Python instead executes a fresh snapshot of the
 fixed commit's raw `src/` blobs. The isolated `-I` bootstrap uses
-`git --no-replace-objects ls-tree` and `cat-file --batch`, rejects unsupported
-paths/modes and incomplete data, and imports AgentCore from that snapshot.
+`git --no-replace-objects cat-file --batch`, verifies the pinned commit's
+SHA-1, traverses only hash-verified raw trees, and verifies each source blob
+against the authenticated tree entry. Git's echoed object ID is not treated
+as content verification. It rejects unsupported paths/modes and incomplete or
+mismatched objects before starting the CLI, within a 20-second export deadline.
+AgentCore imports from the resulting snapshot.
 Neither mutable checkout source nor archive `export-ignore`/`export-subst`
 transformations supply the executed project code. The matching service path is
 derived from that imported source as before.
