@@ -22,7 +22,7 @@ from agentcore.core.action_binding import (
 )
 from agentcore.core.defaults import NoRetryStrategy, NullVerifier
 from agentcore.core.interfaces import RecoveryStrategy, Verifier
-from agentcore.errors import ToolNotFoundError
+from agentcore.errors import StateError, ToolNotFoundError
 from agentcore.observability.events import Events
 from agentcore.observability.logging import StructuredLogger, get_logger
 from agentcore.recovery.decision import RecoveryAction
@@ -192,7 +192,11 @@ class TaskRunner:
         logger: StructuredLogger | None = None,
         max_steps: int = 100,
         sleep: Callable[[float], None] | None = None,
+        strict_verification: bool = False,
     ) -> None:
+        if type(strict_verification) is not bool:
+            raise ValueError("strict_verification must be a boolean")
+        self.strict_verification = strict_verification
         self.executor = executor
         self.verifier = verifier or NullVerifier()
         self.recovery = recovery or NoRetryStrategy()
@@ -211,6 +215,13 @@ class TaskRunner:
         """
         control = control or RunControl()
         task.validate()
+        # A terminal task cannot be resumed by a strict runner. In particular,
+        # a prior CANCELLED/FAILED task must never be relabeled BLOCKED, and
+        # prior COMPLETED state must not bypass a new verification contract.
+        # Match Agent.run_task's existing terminal-task rejection.
+        if self.strict_verification and task.status.is_terminal:
+            raise StateError("strict runner cannot re-enter a terminal task",
+                             task_id=task.id, status=task.status.value)
         if state.current_task is not task:
             state.set_task(task)
         log = self._log.bind(run_id=state.run_id, task_id=task.id)
@@ -219,6 +230,23 @@ class TaskRunner:
         try:
             # A. after attaching/validating task but BEFORE starting executable work
             control.checkpoint()
+
+            # Admission must examine existing COMPLETED steps as well as
+            # BLOCKED steps: legacy or restored state may contain a completed
+            # action whose verification was SKIPPED, FAILED or UNVERIFIED.
+            # Task.ready_subtasks() only checks COMPLETED status, so without
+            # this preflight even dependent/independent work could run.
+            # Current cancellation retains precedence for nonterminal tasks.
+            if self.strict_verification and any(
+                    sub.status is TaskStatus.BLOCKED or (
+                        sub.status is TaskStatus.COMPLETED and
+                        sub.verification.status is not VerificationStatus.PASSED)
+                    for sub in task.subtasks):
+                if not task.status.is_terminal and task.status is not TaskStatus.BLOCKED:
+                    task.transition_to(TaskStatus.BLOCKED)
+                report.status = TaskStatus.BLOCKED
+                report.blocked = True
+                return report
 
             if task.status in (TaskStatus.PENDING, TaskStatus.BLOCKED):
                 task.transition_to(TaskStatus.RUNNING)
@@ -240,6 +268,10 @@ class TaskRunner:
 
                 self._run_subtask(task, subtask, state, report, log, control=control)
                 if task.has_failure():
+                    break
+                # An opt-in strict run cannot execute independent or dependent
+                # work after a missing, failed or inconclusive verification.
+                if self.strict_verification and report.blocked:
                     break
                 if report.replan_requested or report.escalated:
                     log.info(Events.RECOVERY_STOPPED,
@@ -438,8 +470,28 @@ class TaskRunner:
         if invocation.ok:
             subtask.result = invocation.result.output
             subtask.transition_to(TaskStatus.COMPLETED)
-            self._verify(subtask, state, slog, control=control)
-            if subtask.verification.status in _ADVERSE_VERDICTS:
+            try:
+                self._verify(subtask, state, slog, control=control)
+            except BaseException:
+                # A verifier/cancellation failure must not leave a completed
+                # dependency in strict mode. Preserve the tool invocation
+                # and result as physical truth; preserve the original error.
+                if self.strict_verification:
+                    subtask.transition_to(TaskStatus.PENDING)
+                    subtask.transition_to(TaskStatus.BLOCKED)
+                    state.set_active_subtask(None)
+                raise
+            if self.strict_verification and (
+                    subtask.verification.status is not VerificationStatus.PASSED):
+                # The verifier needs a COMPLETED subtask to build its evidence
+                # context. Once judged, remove dependency eligibility if proof
+                # was not positive. These are legal existing state transitions;
+                # no mutation retry or recovery strategy is invoked.
+                subtask.transition_to(TaskStatus.PENDING)
+                subtask.transition_to(TaskStatus.BLOCKED)
+                report.blocked = True
+                slog.warning(Events.TASK_BLOCKED, reason="verification_not_passed")
+            elif subtask.verification.status in _ADVERSE_VERDICTS:
                 self._recover(task, subtask, state, report, slog, control=control)
             else:
                 slog.info(Events.SUBTASK_FINISHED, outcome="completed")
