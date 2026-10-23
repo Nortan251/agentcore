@@ -711,7 +711,7 @@ def test_valid_text_stream_is_incremental_canonical_and_raw_free():
     assert _active_cancellation_callbacks(source) == 0
 
 
-def test_generate_stays_on_post_json_without_stream_flag_or_raw_scrub():
+def test_generate_stays_on_post_json_with_explicit_json_mode_and_without_raw_scrub():
     one_shot = {
         "id": "ordinary",
         "model": "configured-model",
@@ -731,7 +731,7 @@ def test_generate_stays_on_post_json_without_stream_flag_or_raw_scrub():
     assert RAW_PROVIDER_SECRET in json.dumps(response.raw)
     assert len(transport.post_calls) == 1
     assert transport.stream_calls == []
-    assert "stream" not in transport.post_calls[0]["payload"]
+    assert transport.post_calls[0]["payload"]["stream"] is False
     assert "stream_options" not in transport.post_calls[0]["payload"]
 
 
@@ -757,7 +757,7 @@ def test_conversation_without_sink_stays_on_ordinary_generate_path():
     assert result.ok and result.reply.content == "ordinary runtime reply"
     assert len(transport.post_calls) == 1
     assert transport.stream_calls == []
-    assert "stream" not in transport.post_calls[0]["payload"]
+    assert transport.post_calls[0]["payload"]["stream"] is False
 
 
 def test_native_openai_text_stream_integrates_through_conversation_runtime():

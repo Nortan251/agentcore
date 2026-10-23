@@ -128,6 +128,8 @@ def _build_model(data: Mapping[str, Any]) -> ModelConfig:
                                 "model.timeout_seconds"),
         max_retries=_coerce(int, data.get("max_retries", d.max_retries),
                             "model.max_retries"),
+        enable_thinking=_coerce(bool, data.get("enable_thinking", d.enable_thinking),
+                               "model.enable_thinking"),
     )
 
 

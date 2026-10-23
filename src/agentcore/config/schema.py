@@ -39,6 +39,8 @@ class ModelConfig:
     #: Attempts per request, including the first. Retries apply only to
     #: transient failures (timeout, connection, rate limit, 5xx).
     max_retries: int = 3
+    #: Optional chat-template setting; None preserves the provider's default.
+    enable_thinking: bool | None = None
 
     def resolve_api_key(self) -> str | None:
         """Read the secret from the environment. Never logged, never persisted."""
@@ -59,6 +61,8 @@ class ModelConfig:
         if self.max_retries < 1:
             raise ConfigError("model.max_retries must be at least 1",
                               value=self.max_retries)
+        if self.enable_thinking is not None and type(self.enable_thinking) is not bool:
+            raise ConfigError("model.enable_thinking must be a boolean when set")
         if self.base_url is not None and not str(self.base_url).startswith(
                 ("http://", "https://")):
             raise ConfigError("model.base_url must start with http:// or https://",

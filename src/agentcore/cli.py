@@ -245,6 +245,8 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="emit the turn as JSON (requires --message)")
     chat.add_argument("--enable-desktop", action="store_true",
                       help="enable configured Windows 11 Notepad and foreground observation tools for this chat")
+    chat.add_argument("--desktop-evidence", type=Path, metavar="FILE",
+                      help="save closed Notepad evidence for one interactive CONFIRM turn (no --json)")
 
     workspace = sub.add_parser("workspace", help="one explicitly enabled create-only workspace turn")
     workspace.add_argument("--enable-write", action="store_true",
@@ -2145,7 +2147,7 @@ def _chat_notices(result: Any) -> list[str]:
 
 def _turn_payload(result: Any) -> dict[str, Any]:
     """Machine-readable turn summary. Same fields the human view is built on."""
-    from agentcore.desktop.chat import desktop_observations
+    from agentcore.desktop.chat import desktop_observations, desktop_tool_calls
 
     payload = {
         "session_id": result.session.id,
@@ -2164,6 +2166,9 @@ def _turn_payload(result: Any) -> dict[str, Any]:
     observations = desktop_observations(result)
     if observations:
         payload["desktop_observations"] = observations
+    calls = desktop_tool_calls(result)
+    if calls:
+        payload["desktop_tool_calls"] = calls
     if getattr(result, "error_category", None):
         payload["error_category"] = result.error_category
     return payload
@@ -2215,6 +2220,16 @@ def _command_chat(args: argparse.Namespace, config: AgentConfig) -> int:
     detection and persistence all belong to the runtime and are not
     reimplemented here.
     """
+    if getattr(args, "desktop_evidence", None):
+        from agentcore.permissions.levels import PermissionLevel
+
+        if (not args.enable_desktop or args.as_json or not args.message or args.session_id
+                or not sys.stdin.isatty() or config.permissions.level is not PermissionLevel.CONFIRM
+                or config.permissions.capability_overrides or tuple(config.tools.enabled) != ("open_notepad",)
+                or config.conversation.max_tool_rounds != 1 or config.conversation.max_tool_calls_per_round != 1):
+            print("--desktop-evidence requires a fresh interactive --enable-desktop --message turn, "
+                  "CONFIRM without overrides, only open_notepad, one tool round/call, and no --json.", file=sys.stderr)
+            return 2
     if getattr(args, "as_json", False) and not getattr(args, "message", None):
         print("--json requires --message: an interactive session cannot emit "
               "a single JSON document", file=sys.stderr)
@@ -2255,7 +2270,14 @@ def _command_chat(args: argparse.Namespace, config: AgentConfig) -> int:
             max_result_chars=config.conversation.max_tool_result_chars,
             max_calls_per_round=config.conversation.max_tool_calls_per_round,
         )
-    runtime = agent.conversation(tools=tools)
+    system_prompt = None
+    if desktop is not None and "get_foreground_app" in agent.registry:
+        from agentcore.conversation.runtime import SYSTEM_PROMPT
+        from agentcore.desktop.chat import FOREGROUND_RESULT_INSTRUCTIONS
+
+        # Keep result semantics after the final round stops offering tools.
+        system_prompt = SYSTEM_PROMPT + "\n\n" + FOREGROUND_RESULT_INSTRUCTIONS
+    runtime = agent.conversation(tools=tools, system_prompt=system_prompt)
 
     session, banner = _chat_session(runtime, args)
     if session is None:
@@ -2267,7 +2289,7 @@ def _command_chat(args: argparse.Namespace, config: AgentConfig) -> int:
 
     try:
         if getattr(args, "message", None):
-            return _chat_once(runtime, session, args)
+            return _chat_once(runtime, session, args, approval=deps.approval_gate)
         return _chat_loop(agent, runtime, session, banner)
     finally:
         agent.shutdown()
@@ -2275,14 +2297,41 @@ def _command_chat(args: argparse.Namespace, config: AgentConfig) -> int:
             desktop.disconnect()
 
 
-def _chat_once(runtime: Any, session: Any, args: argparse.Namespace) -> int:
+def _chat_once(runtime: Any, session: Any, args: argparse.Namespace, *, approval=None) -> int:
     """Send one message and exit. Same runtime, same session, same memory."""
     text = _normalise_cli_text(args.message)
     if not text:
         print("nothing to send: --message was empty", file=sys.stderr)
         return 2
 
-    result = runtime.send(text, session=session)
+    receipt = None
+    if getattr(args, "desktop_evidence", None):
+        try:
+            receipt = args.desktop_evidence.open("x", encoding="utf-8")
+        except OSError:
+            print("[Desktop evidence] Could not create a new receipt; no conversation turn was sent.", file=sys.stderr)
+            return 2
+    receipt_failed = False
+    try:
+        result = runtime.send(text, session=session)
+        if receipt is not None:
+            from agentcore.desktop.chat import notepad_evidence
+
+            try:
+                json.dump(notepad_evidence(result, approval), receipt, ensure_ascii=True, indent=2)
+                receipt.flush()
+            except OSError:
+                receipt_failed = True
+    finally:
+        if receipt is not None:
+            try:
+                receipt.close()
+            except OSError:
+                receipt_failed = True
+        if receipt_failed:
+            print("[Desktop evidence] Receipt write failed; the action may have executed. Do not retry automatically.", file=sys.stderr)
+    if receipt_failed:
+        return 1
     if getattr(args, "as_json", False):
         _emit(_turn_payload(result))
         return 0 if result.ok else 1
