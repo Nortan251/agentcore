@@ -620,3 +620,22 @@ def test_revoked_read_prevents_restart_probe(setup, monkeypatch):
         blocked_capabilities=(Capability.FS_READ.value,)))
     with pytest.raises(WorkspaceHostError, match="workflow_read_denied"):
         setup[3](enabled=False, cfg=config)
+
+
+def test_real_provider_bridge_receives_draft_budget_and_no_tools(setup):
+    from agentcore.models.base import BaseModelProvider
+    from agentcore.models.messages import ModelResponse
+    class Provider(BaseModelProvider):
+        def __init__(self):
+            super().__init__()
+            self.requests = []
+        def generate(self, request, *, context=None, clock=None):
+            self.requests.append(request)
+            return ModelResponse(text=json.dumps(plan()) if len(self.requests) == 1 else BODY)
+    provider = Provider()
+    host = setup[3](model=provider)
+    run(host)
+    assert len(provider.requests) == 2
+    draft = provider.requests[1]
+    assert draft.max_output_tokens == 4096
+    assert draft.tools == [] and draft.response_format is None
