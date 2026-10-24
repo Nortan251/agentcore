@@ -255,6 +255,16 @@ def _build_parser() -> argparse.ArgumentParser:
     workspace.add_argument("--session", dest="session_id", metavar="ID")
     workspace.add_argument("--json", action="store_true", dest="as_json")
 
+    workflow = sub.add_parser("workflow", help="bounded supervised workspace inspect/create/verify")
+    workflow.add_argument("--enable-write", action="store_true", help="current CONFIRM write opt-in")
+    workflow.add_argument("--message", metavar="TEXT")
+    workflow.add_argument("--input", action="append", default=[], dest="inputs", metavar="PATH")
+    workflow.add_argument("--output", metavar="PATH")
+    workflow.add_argument("--max-bytes", type=int, default=4096)
+    workflow.add_argument("--max-seconds", type=int, default=120)
+    workflow.add_argument("--resume", metavar="WORKFLOW_ID", help="reconcile and explicitly verify; never write")
+    workflow.add_argument("--json", action="store_true", dest="as_json")
+
     browser = sub.add_parser("browser", help="read explicitly granted web pages")
     browser.add_argument("--allow-url", action="append", required=True,
                          metavar="URL", help="grant one exact URL for this turn; repeatable")
@@ -2644,6 +2654,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         logging.disable(sys.maxsize)  # Suppress critical and custom levels too.
         try:
             return _command_doctor_json(args)
+        finally:
+            logging.disable(previous_disable)
+    if args.command == "workflow":
+        import logging
+
+        from agentcore.workspace_host.workflow_cli import command_workflow
+
+        previous_disable = logging.root.manager.disable
+        logging.disable(sys.maxsize)
+        try:
+            return command_workflow(args)
         finally:
             logging.disable(previous_disable)
     if args.command == "workspace":
