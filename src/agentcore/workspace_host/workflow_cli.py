@@ -70,7 +70,9 @@ def command_workflow(args):
     if args.as_json:
         print(json.dumps(result, ensure_ascii=True))
     else:
-        print(result["status"])
+        print(result["status"] + (" (historical observation)" if result.get("historical") else ""))
         if result.get("workflow_id"):
             print(result["workflow_id"])
+        if result.get("verification") is not None:
+            print("Verified at: " + result["verification"]["observed_at"])
     return 0 if result["ok"] else 1

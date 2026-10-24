@@ -698,3 +698,23 @@ def test_stale_planner_identity_cannot_overwrite_completed_workflow(setup, monke
     assert not second._observations and not (setup[0] / "second.txt").exists()
     assert len(second._services.actions.audit(maximum_records=256)) == 1
     assert second._storage.records[result["workflow_id"]]["phase"] == "verified"
+
+
+def test_default_cli_labels_historical_verification_time(setup, monkeypatch, capsys):
+    from agentcore import cli
+    observed = "2026-01-01T00:00:00+00:00"
+    class Host:
+        def __init__(self, **kwargs):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *_):
+            pass
+        def resume(self, workflow_id):
+            return {"ok": True, "status": "completed_verified", "historical": True,
+                    "workflow_id": workflow_id, "verification": {"status": "passed", "observed_at": observed}}
+    monkeypatch.setattr(workflow_cli, "load_config", lambda _: setup[2])
+    monkeypatch.setattr(workflow_cli, "SupervisedWorkspaceWorkflow", Host)
+    assert cli.main(["workflow", "--resume", "task_000000000001"]) == 0
+    output = capsys.readouterr().out
+    assert "historical" in output and observed in output
