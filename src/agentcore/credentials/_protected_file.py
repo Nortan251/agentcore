@@ -71,7 +71,8 @@ class ProtectedFile(RuntimeOnly):
     def __init__(self, directory: Path, *, record_name: str = RECORD_NAME) -> None:
         # The host reuses the same pinned, private atomic-file boundary for
         # its inert continuity record. Never accept a path or the owner file.
-        if type(record_name) is not str or record_name not in {RECORD_NAME, "gmail-host.json"}:
+        if type(record_name) is not str or record_name not in {
+                RECORD_NAME, "gmail-host.json", "workspace-workflows.json"}:
             raise CredentialError(CredentialFailure.INVALID)
         self._record_name = record_name
         self._owner_pid = os.getpid()
