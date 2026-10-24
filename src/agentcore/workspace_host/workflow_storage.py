@@ -12,7 +12,7 @@ import re
 from agentcore.approvals import JsonFileApprovalStore, approval_state_mac
 from agentcore.credentials._protected_file import ProtectedFile
 from .errors import WorkspaceHostError
-from .storage import _new_private_directory, _validate_private
+from .storage import _new_private_directory, _private_lock_file, _validate_private
 
 MAX_WORKFLOWS = 256
 STATE_FILE = "workspace-workflows.json"
@@ -62,6 +62,9 @@ class WorkflowStorage:
                 if entry.name != ".agentcore-approval-store.lock" and not re.fullmatch(
                         r"apr_[0-9a-f]{12}\.json", entry.name):
                     raise WorkspaceHostError("workflow_storage_failed")
+            # The shared store opens its owner lock with ordinary defaults.
+            # As for workspace action/payload locks, create it privately first.
+            _private_lock_file(approval_dir / ".agentcore-approval-store.lock")
             self.approvals = JsonFileApprovalStore(approval_dir)
             if len(self.approvals.list_requests()) > MAX_WORKFLOWS:
                 raise WorkspaceHostError("workflow_capacity_exhausted")

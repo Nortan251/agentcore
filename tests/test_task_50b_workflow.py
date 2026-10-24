@@ -241,10 +241,44 @@ def test_existing_target_never_overwritten(setup):
 
 @pytest.mark.skipif(os.name == "nt", reason="native POSIX refusal")
 def test_posix_refuses_without_effect(setup):
+    from agentcore.action_journal import ActionAttemptStatus, EffectVerdict
     host = setup[3]()
     result = run(host)
     assert not result["ok"] and not (setup[0] / "out.txt").exists()
-    assert not host._services.actions.list_actions()
+    records = host._services.actions.audit(maximum_records=256)
+    assert len(records) == 1
+    record = records[0]
+    assert len(record.attempts) == 1 and record.attempts[0].status is ActionAttemptStatus.NOT_INVOKED
+    assert record.terminal_outcome.verdict is EffectVerdict.CONFIRMED_NOT_APPLIED
+    assert record.terminal_outcome.result_class == "filesystem.unsupported_publication"
+    assert host._steps[-1]["id"] not in host._observations
+    workflow_id = result["workflow_id"]
+    host.close()
+    resumed = setup[3](enabled=False)
+    assert not resumed.resume(workflow_id)["ok"]
+    assert len(resumed._services.actions.audit(maximum_records=256)[0].attempts) == 1
+
+
+def test_approval_owner_lock_is_private_and_restartable(setup):
+    from agentcore.workspace_host.storage import _validate_private
+    host = setup[3]()
+    owner = host._services.storage.directory / "workflow-approvals/.agentcore-approval-store.lock"
+    _validate_private(owner)
+    host.close()
+    restarted = setup[3]()
+    _validate_private(owner)
+    assert not restarted._storage.records
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode refusal")
+def test_existing_unsafe_approval_lock_is_refused_without_chmod(setup):
+    host = setup[3]()
+    owner = host._services.storage.directory / "workflow-approvals/.agentcore-approval-store.lock"
+    host.close()
+    owner.chmod(0o644)
+    with pytest.raises(WorkspaceHostError, match="workspace_storage_unsafe"):
+        setup[3]()
+    assert owner.stat().st_mode & 0o777 == 0o644
 
 
 def test_duplicate_callers_and_owner_thread(setup):
