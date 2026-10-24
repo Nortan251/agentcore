@@ -331,6 +331,8 @@ class SupervisedWorkspaceWorkflow:
         self._begin()
         task = self.propose(objective, profile)
         steps = self._validate_plan(task, profile)
+        if task.id in self._storage.records:
+            raise WorkspaceHostError("workflow_identity_invalid")
         review = {"workspace": str(self._guard.root), "profile": asdict(profile),
                   "objective": objective, "steps": steps, "stop": STOP,
                   "draft": "One bounded model draft after inspection; exact bytes require separate approval."}

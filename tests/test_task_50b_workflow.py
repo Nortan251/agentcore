@@ -673,3 +673,28 @@ def test_real_provider_bridge_receives_draft_budget_and_no_tools(setup):
     draft = provider.requests[1]
     assert draft.max_output_tokens == 4096
     assert draft.tools == [] and draft.response_format is None
+
+
+@NATIVE
+def test_stale_planner_identity_cannot_overwrite_completed_workflow(setup, monkeypatch):
+    first = setup[3]()
+    proposed = []
+    original = first.propose
+    def capture(*args):
+        task = original(*args)
+        proposed.append(task)
+        return task
+    monkeypatch.setattr(first, "propose", capture)
+    result = run(first)
+    assert result["ok"]
+    first.close()
+    second = setup[3]()
+    stale = proposed[0]
+    for step in stale.subtasks[-2:]:
+        step.tool_args["path"] = "second.txt"
+    monkeypatch.setattr(second, "propose", lambda *args: stale)
+    with pytest.raises(WorkspaceHostError, match="workflow_identity_invalid"):
+        second.run("another objective", WorkflowProfile(("input.txt",), "second.txt"))
+    assert not second._observations and not (setup[0] / "second.txt").exists()
+    assert len(second._services.actions.audit(maximum_records=256)) == 1
+    assert second._storage.records[result["workflow_id"]]["phase"] == "verified"
